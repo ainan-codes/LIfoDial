@@ -7,9 +7,10 @@ import json
 import logging
 import uuid
 import base64
+import os
 from datetime import datetime, timezone
 from typing import Optional, List
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, File, UploadFile
 from fastapi.responses import StreamingResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -417,12 +418,36 @@ async def fetch_provider_models(provider: str, db: AsyncSession = Depends(get_db
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
-# ── GET /platform/tts/voices/{provider} ──────────────────────────────────────
+# ── GET /platform/tts/voices/sarvam ──────────────────────────────────────────
+@router.get("/platform/tts/voices/sarvam")
+async def sarvam_voices():
+    return {
+        "provider": "sarvam",
+        "voices": [
+            {"id": "meera", "name": "Meera", "gender": "female", "language": "Hindi / English", "language_code": "hi-IN"},
+            {"id": "pavithra", "name": "Pavithra", "gender": "female", "language": "Kannada / English", "language_code": "kn-IN"},
+            {"id": "maitreyi", "name": "Maitreyi", "gender": "female", "language": "Hindi", "language_code": "hi-IN"},
+            {"id": "arvind", "name": "Arvind", "gender": "male", "language": "Hindi / English", "language_code": "hi-IN"},
+            {"id": "amol", "name": "Amol", "gender": "male", "language": "Marathi / English", "language_code": "mr-IN"},
+            {"id": "amartya", "name": "Amartya", "gender": "male", "language": "Bengali / English", "language_code": "bn-IN"},
+            {"id": "diya", "name": "Diya", "gender": "female", "language": "Hindi", "language_code": "hi-IN"},
+            {"id": "neel", "name": "Neel", "gender": "male", "language": "Hindi", "language_code": "hi-IN"},
+            {"id": "misha", "name": "Misha", "gender": "female", "language": "Hindi", "language_code": "hi-IN"},
+            {"id": "vian", "name": "Vian", "gender": "male", "language": "English (India)", "language_code": "en-IN"},
+            {"id": "arjun", "name": "Arjun", "gender": "male", "language": "Hindi", "language_code": "hi-IN"},
+            {"id": "maya", "name": "Maya", "gender": "female", "language": "Tamil / English", "language_code": "ta-IN"},
+            {"id": "shubh", "name": "Shubh", "gender": "male", "language": "Hindi", "language_code": "hi-IN"},
+            {"id": "anushka", "name": "Anushka", "gender": "female", "language": "Hindi", "language_code": "hi-IN"},
+            {"id": "karun", "name": "Karun", "gender": "male", "language": "Kannada", "language_code": "kn-IN"},
+            {"id": "hitesh", "name": "Hitesh", "gender": "male", "language": "Hindi", "language_code": "hi-IN"}
+        ]
+    }
+
+# KEEPING THE OLD list_voices endpoint for other providers (if needed)
 @router.get("/platform/tts/voices/{provider}")
 async def list_voices(provider: str, db: AsyncSession = Depends(get_db)):
     if provider == "sarvam":
-        raw_key = await _get_raw_key("sarvam", db)
-        return {"provider": "sarvam", "has_key": bool(raw_key), "voices": SARVAM_VOICES}
+        return await sarvam_voices()
 
     elif provider == "openai_tts":
         raw_key = await _get_raw_key("openai_tts", db)
@@ -459,40 +484,62 @@ async def list_voices(provider: str, db: AsyncSession = Depends(get_db)):
 # ── GET /platform/tts/preview ────────────────────────────────────────────────
 @router.get("/platform/tts/preview")
 async def tts_preview(
-    provider: str = Query(...),
-    voice_id: str = Query(...),
-    text: str = Query(default="Hello! I am your receptionist. How can I help you today?"),
-    pitch: float = Query(default=0.0),
-    pace: float = Query(default=1.0),
-    loudness: float = Query(default=1.0),
+    provider: str = "sarvam",
+    voice_id: str = "meera",
+    language: str = "hi-IN",
+    text: str = "Hello! I am your AI receptionist. How can I help you today?",
+    pitch: float = 0.0,
+    pace: float = 1.0,
+    loudness: float = 1.0,
     db: AsyncSession = Depends(get_db),
 ):
-    """Generate and return audio preview for a TTS voice. Browser-playable."""
+    if provider == "sarvam":
+        api_key = os.getenv("SARVAM_API_KEY")
+        if not api_key:
+            raw_key = await _get_raw_key("sarvam", db)
+            api_key = raw_key
+            
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.sarvam.ai/text-to-speech",
+                headers={
+                    "api-subscription-key": api_key,
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "inputs": [text],
+                    "target_language_code": language,
+                    "speaker": voice_id,
+                    "model": "bulbul:v2",
+                    "pitch": pitch,
+                    "pace": pace,
+                    "loudness": loudness,
+                    "speech_sample_rate": 22050,
+                    "enable_preprocessing": True,
+                    "output_audio_codec": "mp3"
+                }
+            )
+            
+            data = response.json()
+            if "audios" not in data or not data["audios"]:
+                raise HTTPException(status_code=400, detail=f"Sarvam TTS preview failed: {data}")
+            audio_base64 = data["audios"][0]
+            audio_bytes = base64.b64decode(audio_base64)
+            
+            return Response(
+                content=audio_bytes,
+                media_type="audio/mpeg",
+                headers={"Content-Disposition": "inline"}
+            )
+            
+    # Keep support for other providers just in case
     raw_key = await _get_raw_key(provider, db)
     if not raw_key:
         raise HTTPException(400, f"No API key configured for provider '{provider}'. Add it in AI Platform → Text-to-Speech.")
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            if provider == "sarvam":
-                r = await client.post(
-                    "https://api.sarvam.ai/text-to-speech/stream",
-                    headers={"api-subscription-key": raw_key, "Content-Type": "application/json"},
-                    json={
-                        "text": text,
-                        "target_language_code": "hi-IN",
-                        "speaker": voice_id,
-                        "model": "bulbul:v3",
-                        "pace": pace,
-                        "speech_sample_rate": 22050,
-                        "output_audio_codec": "mp3",
-                        "enable_preprocessing": True,
-                    }
-                )
-                r.raise_for_status()
-                return Response(content=r.content, media_type="audio/mpeg")
-
-            elif provider == "elevenlabs":
+            if provider == "elevenlabs":
                 r = await client.post(
                     f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream",
                     headers={"xi-api-key": raw_key, "Content-Type": "application/json"},
@@ -517,6 +564,42 @@ async def tts_preview(
         raise
     except Exception as e:
         raise HTTPException(500, f"TTS preview failed: {str(e)}")
+
+
+# ── POST /stt/transcribe ───────────────────────────────────────────────────────
+@router.post("/stt/transcribe")
+async def transcribe_audio(
+    audio_file: UploadFile = File(...),
+    language: str = "hi-IN"
+):
+    api_key = os.getenv("SARVAM_API_KEY")
+    if not api_key:
+        from backend.db import AsyncSessionLocal
+        async with AsyncSessionLocal() as s:
+            api_key = await _get_raw_key("sarvam", s)
+            
+    audio_bytes = await audio_file.read()
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            "https://api.sarvam.ai/speech-to-text",
+            headers={"api-subscription-key": api_key},
+            files={
+                "file": (audio_file.filename, audio_bytes, "audio/wav")
+            },
+            data={
+                "model": "saarika:v2",
+                "language_code": language,
+                "with_timestamps": "false",
+                "debug": "false"
+            }
+        )
+        
+        data = response.json()
+        return {
+            "transcript": data.get("transcript", ""),
+            "language_code": data.get("language_code", language)
+        }
 
 
 # ── GET /platform/models/{provider} — quick model list for dropdowns ─────────

@@ -91,8 +91,10 @@ async def preview_voice(req: PreviewRequest):
                     }
                 )
 
+                print(f"DEBUG: Sarvam response status: {response.status_code}")
                 if response.status_code == 200:
                     # /stream returns raw mp3 bytes — encode to base64 for browser playback
+                    print(f"DEBUG: Sarvam success, content length: {len(response.content)}")
                     audio_b64 = base64.b64encode(response.content).decode("utf-8")
                     return {
                         "audio_base64": f"data:audio/mpeg;base64,{audio_b64}",
@@ -100,6 +102,7 @@ async def preview_voice(req: PreviewRequest):
                         "latency_ms": 0
                     }
                 else:
+                    print(f"DEBUG: Sarvam failed: {response.status_code} {response.text}")
                     logger.error(f"Sarvam preview error: {response.status_code} {response.text}")
                     raise HTTPException(status_code=response.status_code, detail=f"Sarvam TTS error: {response.text[:200]}")
 

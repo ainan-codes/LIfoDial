@@ -150,6 +150,30 @@ async def update_clinic_status(tenant_id: str, data: StatusUpdate, db: AsyncSess
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@router.delete("/clinics/{tenant_id}", status_code=204)
+async def delete_clinic(tenant_id: str, db: AsyncSession = Depends(get_db)):
+    """Permanently delete a clinic and all its agents."""
+    try:
+        result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+        tenant = result.scalar_one_or_none()
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Clinic not found")
+
+        # Cascade delete agents
+        from backend.models.agent_config import AgentConfig
+        from sqlalchemy import delete as sa_delete
+        await db.execute(sa_delete(AgentConfig).where(AgentConfig.tenant_id == tenant_id))
+        await db.execute(sa_delete(Doctor).where(Doctor.tenant_id == tenant.id))
+
+        await db.delete(tenant)
+        await db.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ── Onboarding Request Routes ────────────────────────────────────────────────
 @router.post("/onboarding-requests", response_model=OnboardingResponse)
 async def create_onboarding_request(data: OnboardingCreate, db: AsyncSession = Depends(get_db)):

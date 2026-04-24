@@ -21,12 +21,28 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
   const [loadingAudioId, setLoadingAudioId] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [providerStatus, setProviderStatus] = useState<any>({
-    sarvam: { connected: true, voice_count: 6 },
-    gemini: { connected: true, voice_count: 7 },
+    sarvam: { connected: false, voice_count: 0 },
+    gemini: { connected: false, voice_count: 0 },
     elevenlabs: { connected: false, voice_count: 0 }
   });
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Load real connectivity status from backend
+  useEffect(() => {
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch(`${API_URL}/voices/`);
+        if (res.ok) {
+          const data = await res.json();
+          setProviderStatus(data.providers);
+        }
+      } catch (err) {
+        console.error("Failed to fetch provider status:", err);
+      }
+    };
+    fetchStatus();
+  }, []);
 
   // Stop currently playing audio on unmount or when playingId changes
   useEffect(() => {
@@ -44,11 +60,6 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
   const playVoice = async (voice: any, e: React.MouseEvent) => {
     e.stopPropagation();
     
-    if (voice.requires_key && !providerStatus[voice.provider]?.connected) {
-      alert(`Add ${voice.provider_label} API key in Settings → AI Platform to preview this voice`);
-      return;
-    }
-
     if (playingId === voice.id) {
        stopAudio();
        return;
@@ -56,70 +67,75 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
     
     stopAudio();
     setLoadingAudioId(voice.id);
-    
-    const cacheKey = `preview_${voice.provider}_${voice.voice_id}`;
-    let audioUrl = sessionStorage.getItem(cacheKey);
 
-    if (!audioUrl) {
-       try {
-         const res = await fetch(`${API_URL}/voices/preview`, {
-           method: 'POST',
-           headers: { 'Content-Type': 'application/json' },
-           body: JSON.stringify({
-             provider: voice.provider,
-             voice_id: voice.voice_id,
-             model: voice.model,
-             language: voice.language,
-             text: voice.sample_text
-           })
-         });
+    try {
+      console.log(`[VoiceLibrary] Requesting preview for ${voice.name} (${voice.provider})...`);
+      
+      const v_id = voice.voice_id || voice.id;
+      // FIX: use voice.language (which is a proper BCP-47 code like 'hi-IN') NOT language_label
+      const lang = voice.language || 'hi-IN';
+      const prov = voice.provider || 'sarvam';
+      const sampleText = voice.sample_text || 'Hello! I am your AI receptionist. How can I help you today?';
+      
+      // FIX: Use URLSearchParams so ALL values are properly percent-encoded.
+      // Raw template strings DON'T encode values — spaces/special chars break the URL
+      // causing TypeError: Failed to fetch at the browser network level.
+      const params = new URLSearchParams({
+        provider: prov,
+        voice_id: v_id,
+        language: lang,
+        text: sampleText,
+      });
 
-         if (!res.ok) {
-           const errText = await res.text();
-           console.error(`Voice preview HTTP ${res.status}:`, errText);
-           setLoadingAudioId(null);
-           setPlayingId(null);
-           alert(`Voice preview failed (${res.status}): ${errText.slice(0, 120)}`);
-           return;
-         }
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 25000); // 25s timeout
 
-         const data = await res.json();
-         if (data.audio_base64) {
-           audioUrl = data.audio_base64;
-           sessionStorage.setItem(cacheKey, audioUrl!);
-         } else {
-           console.error('No audio_base64 in response:', data);
-           setLoadingAudioId(null);
-           setPlayingId(null);
-           alert('Could not preview voice: server returned no audio data');
-           return;
-         }
-       } catch (err) {
-         console.error("Failed to fetch audio preview:", err);
-         setLoadingAudioId(null);
-         setPlayingId(null);
-         alert(`Could not preview voice: ${String(err)}`);
-         return;
-       }
-    }
+      const response = await fetch(
+        `${API_URL}/platform/tts/preview?${params.toString()}`,
+        { method: 'GET', signal: controller.signal }
+      );
+      clearTimeout(timeout);
 
-    setLoadingAudioId(null);
-    if (audioUrl) {
+      if (!response.ok) {
+        const errText = await response.text().catch(() => `HTTP ${response.status}`);
+        throw new Error(`Preview failed (${response.status}): ${errText.slice(0, 120)}`);
+      }
+
+      const audioBlob = await response.blob();
+      if (audioBlob.size < 512) {
+        throw new Error('Audio response too small — TTS may have failed silently');
+      }
+      const audioUrl = URL.createObjectURL(audioBlob);
+
       const audio = new Audio(audioUrl);
       audioRef.current = audio;
       setPlayingId(voice.id);
-      audio.onended = () => setPlayingId(null);
-      audio.onerror = (e) => {
-        console.error("Audio playback error:", e);
+      setLoadingAudioId(null);
+      
+      audio.onended = () => {
         setPlayingId(null);
-        alert('Audio loaded but could not be played by your browser.');
+        URL.revokeObjectURL(audioUrl);
       };
-      audio.play().catch(e => {
-         console.error("Audio play() blocked:", e);
-         setPlayingId(null);
-      });
+      
+      audio.onerror = (_err) => {
+        setPlayingId(null);
+        URL.revokeObjectURL(audioUrl);
+        alert('Browser error: Audio loaded but could not be played. Try Chrome or Edge.');
+      };
+
+      await audio.play();
+    } catch (err: any) {
+      console.error('Failed to fetch audio preview:', err);
+      setLoadingAudioId(null);
+      setPlayingId(null);
+      if (err?.name === 'AbortError') {
+        alert('Preview timed out — Sarvam API took too long. Check your SARVAM_API_KEY in .env');
+      } else {
+        alert(`Could not preview voice: ${String(err)}`);
+      }
     }
   };
+
 
   const syncVoices = async () => {
     setSyncing(true);
@@ -321,9 +337,7 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
                     display: 'grid', 
                     gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', 
                     gap: '12px',
-                    opacity: !isConnected ? 0.5 : 1,
-                    pointerEvents: !isConnected ? 'none' : 'auto' // only play button triggers in disabled mode realistically but we lock card
-                 }}>
+                                     }}>
                    {voices.map(voice => {
                       const isPlaying = playingId === voice.id;
                       const isLoading = loadingAudioId === voice.id;

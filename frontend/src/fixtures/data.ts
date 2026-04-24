@@ -209,6 +209,9 @@ export const FIXTURE_ALL_CLINICS = [
 ];
 
 // ── Fixture agents ─────────────────────────────────────────────────────────
+// IMPORTANT: These are fallback dev fixtures only.
+// Real agents come from GET /agents. Stats always come from GET /agents/{id}/health.
+// Hardcoded stats are intentionally 0 — real data is always fetched from the API.
 
 export type AgentStatus = 'ACTIVE' | 'CONFIGURED' | 'ERROR' | 'INACTIVE';
 
@@ -253,15 +256,15 @@ export const FIXTURE_AGENTS: FixtureAgent[] = [
     tts_model: 'bulbul:v2',
     tts_voice: 'meera',
     tts_language: 'hi-IN',
-    llm_provider: 'gemini',
-    llm_model: 'gemini-2.0-flash',
+    llm_provider: 'groq',
+    llm_model: 'llama-3.3-70b-versatile',
     ai_number: '+91 90001 23456',
     sip_provider: 'vobiz',
     sip_status: 'CONNECTED',
-    calls_today: 47,
-    bookings_today: 31,
-    avg_latency_ms: 823,
-    resolution_rate: 94,
+    calls_today: 0,
+    bookings_today: 0,
+    avg_latency_ms: 0,
+    resolution_rate: 0,
     languages: ['Hindi', 'English'],
   },
   {
@@ -283,10 +286,10 @@ export const FIXTURE_AGENTS: FixtureAgent[] = [
     ai_number: '+91 90001 34567',
     sip_provider: 'vobiz',
     sip_status: 'CONNECTED',
-    calls_today: 38,
-    bookings_today: 24,
-    avg_latency_ms: 756,
-    resolution_rate: 91,
+    calls_today: 0,
+    bookings_today: 0,
+    avg_latency_ms: 0,
+    resolution_rate: 0,
     languages: ['Malayalam', 'English'],
   },
   {

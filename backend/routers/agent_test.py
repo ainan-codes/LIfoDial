@@ -90,7 +90,7 @@ async def _send_greeting_audio_fast(websocket: WebSocket, agent: AgentConfig, fi
 
     try:
         # Avoid long startup stalls when provider has cold starts.
-        greeting_audio = await asyncio.wait_for(synthesize_speech(agent, first_msg), timeout=8.0)
+        greeting_audio = await asyncio.wait_for(synthesize_speech(agent, first_msg), timeout=25.0)
         if greeting_audio:
             _greeting_audio_cache[cache_key] = greeting_audio
             try:
@@ -98,7 +98,7 @@ async def _send_greeting_audio_fast(websocket: WebSocket, agent: AgentConfig, fi
             except RuntimeError:
                 return
     except asyncio.TimeoutError:
-        logger.warning("Greeting TTS timed out (>8s), skipping greeting audio for this call")
+        logger.warning("Greeting TTS timed out (>25s), skipping greeting audio for this call")
     except Exception as e:
         logger.warning(f"Greeting TTS failed (non-fatal): {e}")
 
@@ -956,117 +956,152 @@ async def handle_text_command(
         
 
 async def handle_audio_turn(
-    websocket: WebSocket, 
-    agent: AgentConfig, 
+    websocket: WebSocket,
+    agent: AgentConfig,
     audio_bytes: bytes,
     db: AsyncSession,
     session_id: str = ""
 ):
-    """Process one turn of audio: STT -> LLM -> TTS -> send back"""
-    
+    """Process one turn of audio: STT -> LLM -> TTS -> send back.
+    Issues 3+5: adds per-stage timing, tts_failed event, and graceful fallback."""
+    import time
+
     # Send "processing" status
     try:
         await websocket.send_json({"type": "status", "status": "processing"})
     except RuntimeError:
         return
-    
+
+    turn_start = time.monotonic()
+
     try:
         # Determine which language to use for STT based on ratio tracking
         dominant_lang = get_dominant_language(session_id, agent.tts_language or "en-IN")
-        
-        # Step 1: STT — transcribe audio to text
+
+        # ── Step 1: STT ──────────────────────────────────────────────────────────
+        stt_start = time.monotonic()
         transcript, detected_lang = await transcribe_audio(agent, audio_bytes, language_hint=dominant_lang)
-        
+        stt_ms = int((time.monotonic() - stt_start) * 1000)
+        logger.info(f"[TIMING] STT: {stt_ms}ms")
+
         if not transcript or transcript.strip() == "":
             try:
                 await websocket.send_json({
                     "type": "error",
-                    "message": "No speech detected or unsupported microphone audio format. Try speaking louder and ensure microphone permission is enabled.",
+                    "message": "No speech detected. Try speaking closer to the mic, or check that microphone permission is allowed.",
                     "code": "STT_EMPTY_TRANSCRIPT",
                 })
-                await websocket.send_json({
-                    "type": "status", 
-                    "status": "idle"
-                })
+                await websocket.send_json({"type": "status", "status": "idle"})
             except RuntimeError:
                 pass
             return
-        
+
         # Track detected language for ratio-based switching
         if detected_lang and session_id:
             track_language(session_id, detected_lang)
         elif session_id:
-            # If STT didn't detect language, infer from text
             text_lang = detect_text_language(transcript)
             if text_lang:
                 track_language(session_id, text_lang)
-        
-        # Get updated dominant language after this utterance
+
         current_dominant = get_dominant_language(session_id, agent.tts_language or "en-IN")
-        
-        # Send transcript back so frontend can display it
+
+        # Send user transcript back
         try:
             await websocket.send_json({
                 "type": "transcript",
                 "text": transcript,
                 "role": "user",
-                "detected_language": current_dominant
+                "detected_language": current_dominant,
             })
         except RuntimeError:
             return
-        
-        logger.info(f"Transcribed: {transcript} (lang: {detected_lang}, dominant: {current_dominant})")
-        
-        # Step 2: LLM — generate response
+
+        logger.info(f"Transcribed: '{transcript[:80]}' (lang: {detected_lang}, dominant: {current_dominant})")
+
+        # ── Step 2: LLM ──────────────────────────────────────────────────────────
         try:
             await websocket.send_json({"type": "status", "status": "thinking"})
         except RuntimeError:
             return
+
+        llm_start = time.monotonic()
         response_text = await generate_llm_response(agent, transcript, db)
-        
-        # Send text response back with language info
+        llm_ms = int((time.monotonic() - llm_start) * 1000)
+        logger.info(f"[TIMING] LLM: {llm_ms}ms — '{response_text[:80]}'")
+
+        # Send agent transcript back
         try:
             await websocket.send_json({
                 "type": "transcript",
                 "text": response_text,
                 "role": "assistant",
-                "detected_language": current_dominant
+                "detected_language": current_dominant,
             })
         except RuntimeError:
             return
-        
-        # Step 3: TTS — convert response to audio (use dominant language)
+
+        # ── Step 3: TTS ──────────────────────────────────────────────────────────
         try:
             await websocket.send_json({"type": "status", "status": "speaking"})
         except RuntimeError:
             return
-        audio_response = await synthesize_speech(agent, response_text, language_override=current_dominant)
-        
-        if audio_response:
-            try:
+
+        tts_ms = 0
+        tts_ok = False
+        try:
+            tts_start = time.monotonic()
+            # ISSUE 5: use retry-capable TTS wrapper
+            audio_response = await sarvam_synthesize_with_retry(
+                agent, response_text, language_override=current_dominant
+            ) if (agent.tts_provider or "sarvam") == "sarvam" else await synthesize_speech(
+                agent, response_text, language_override=current_dominant
+            )
+            tts_ms = int((time.monotonic() - tts_start) * 1000)
+            logger.info(f"[TIMING] TTS: {tts_ms}ms ({len(audio_response) if audio_response else 0} bytes)")
+
+            if audio_response and len(audio_response) >= 512:  # sanity-check non-empty
+                tts_ok = True
                 await websocket.send_bytes(audio_response)
-            except RuntimeError:
-                return
-        else:
+            else:
+                logger.warning(f"TTS returned empty/tiny response ({len(audio_response) if audio_response else 0}B) — sending tts_failed")
+        except Exception as tts_err:
+            tts_ms = int((time.monotonic() - tts_start) * 1000)  # type: ignore[possibly-unbound]
+            logger.error(f"[TIMING] TTS FAILED in {tts_ms}ms: {tts_err}", exc_info=True)
+
+        # ISSUE 5: If TTS failed, tell frontend so it shows the badge + keeps transcript visible
+        if not tts_ok:
             try:
                 await websocket.send_json({
-                    "type": "error",
-                    "message": "TTS synthesis failed or API key missing."
+                    "type": "tts_failed",
+                    "message": response_text,
+                    "reason": "TTS synthesis failed — check API key and provider settings.",
                 })
             except RuntimeError:
-                return
-                
+                pass
+
+        # ISSUE 3: Send timing breakdown to frontend
+        total_ms = int((time.monotonic() - turn_start) * 1000)
+        try:
+            await websocket.send_json({
+                "type": "timing",
+                "stt_ms": stt_ms,
+                "llm_ms": llm_ms,
+                "tts_ms": tts_ms,
+                "total_ms": total_ms,
+            })
+        except RuntimeError:
+            pass
+
         try:
             await websocket.send_json({"type": "status", "status": "idle"})
         except RuntimeError:
             pass
+
     except Exception as e:
-        logger.error(f"Error in audio turn (Full Traceback): {e}", exc_info=True)
+        logger.error(f"Error in audio turn: {e}", exc_info=True)
         try:
-            await websocket.send_json({
-                "type": "error",
-                "message": f"Processing error: {str(e)}"
-            })
+            await websocket.send_json({"type": "error", "message": f"Processing error: {str(e)}"})
         except RuntimeError:
             pass
 
@@ -1699,6 +1734,61 @@ async def synthesize_speech(agent: AgentConfig, text: str, language_override: st
     except Exception as e:
         logger.error(f"TTS synthesis failed: {e}", exc_info=True)
         return None
+
+
+# ISSUE 5: Sarvam-specific wrapper with retry + size validation
+async def sarvam_synthesize_with_retry(
+    agent: AgentConfig,
+    text: str,
+    language_override: str = "",
+    max_retries: int = 2,
+) -> bytes | None:
+    """Wraps sarvam_synthesize with retry logic and result size validation.
+    Falls back to synthesize_speech (which supports non-Sarvam providers) on
+    all retries failing."""
+    api_key = getattr(settings, 'sarvam_api_key', None) or os.getenv("SARVAM_API_KEY")
+    if not api_key:
+        logger.warning("sarvam_synthesize_with_retry: no API key")
+        return None
+
+    tts_language = language_override or agent.tts_language or "en-IN"
+
+    # Map legacy voice names to v3 set (same logic already in sarvam_synthesize)
+    raw_voice = (agent.tts_voice or "priya").strip().lower()
+    sarvam_voice_map = {
+        "meera": "shreya", "pavithra": "kavitha", "maitreyi": "priya",
+        "arvind": "rahul", "amol": "aditya", "amartya": "rohan",
+        "diya": "ritu", "neel": "amit", "misha": "simran", "vian": "shubh",
+    }
+    voice = sarvam_voice_map.get(raw_voice, raw_voice)
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            audio = await sarvam_synthesize(
+                api_key=api_key,
+                text=text,
+                voice=voice,
+                model=agent.tts_model or "bulbul:v3",
+                language=tts_language,
+                pitch=agent.tts_pitch or 0.0,
+                pace=agent.tts_pace or 1.0,
+                loudness=agent.tts_loudness or 1.0,
+            )
+            # Validate non-trivial response (corrupt / truncated payloads are < 512B)
+            if audio and len(audio) >= 512:
+                if attempt > 1:
+                    logger.info(f"Sarvam TTS succeeded on attempt {attempt}")
+                return audio
+            logger.warning(f"Sarvam TTS attempt {attempt}: response too small ({len(audio) if audio else 0}B), retrying")
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(f"Sarvam TTS attempt {attempt}/{max_retries} failed: {exc}")
+            if attempt < max_retries:
+                await asyncio.sleep(0.5 * attempt)  # brief backoff
+
+    logger.error(f"Sarvam TTS failed after {max_retries} attempts. Last error: {last_exc}")
+    return None
 
 
 async def sarvam_synthesize(api_key: str, text: str, voice: str,

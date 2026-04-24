@@ -24,7 +24,7 @@ import {
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { API_URL } from '../../api/client';
-import { WebCallModal } from '../../components/WebCallModal';
+import TestAgentModal from '../../components/TestAgentModal';
 import { FIXTURE_AGENTS } from '../../fixtures/data';
 import VoiceLibrary from './VoiceLibrary';
 import SimulationTab from './agent_detail/SimulationTab';
@@ -671,7 +671,9 @@ export default function AgentDetail() {
     loadAgent();
   }, [loadAgent]);
 
-  // Fetch models when provider changes — and auto-set model to first valid one
+  // Fetch models when provider changes.
+  // FIX: Only auto-reset model when the current model does NOT belong to the
+  // newly selected provider — preserves the user's explicit model choice.
   useEffect(() => {
     if (!agent?.llm_provider) return;
     fetch(`${API_URL}/platform/models/${agent.llm_provider}`)
@@ -679,15 +681,15 @@ export default function AgentDetail() {
       .then(d => {
         const models = d.models?.length ? d.models : getLlmFallbackModels(agent.llm_provider);
         setLlmModels(models);
-        // Auto-switch model if current one doesn't belong to new provider
-        if (agent.llm_model && !models.includes(agent.llm_model)) {
+        // Only reset if current model is unknown for this provider
+        if (!agent.llm_model || !models.includes(agent.llm_model)) {
           updateField('llm_model', models[0]);
         }
       })
       .catch(() => {
         const fallback = getLlmFallbackModels(agent.llm_provider);
         setLlmModels(fallback);
-        if (agent.llm_model && !fallback.includes(agent.llm_model)) {
+        if (!agent.llm_model || !fallback.includes(agent.llm_model)) {
           updateField('llm_model', fallback[0]);
         }
       });
@@ -700,7 +702,8 @@ export default function AgentDetail() {
       .then(d => {
         const models = d.models?.length ? d.models : ['bulbul:v3', 'bulbul:v2'];
         setTtsModels(models);
-        if (agent.tts_model && !models.includes(agent.tts_model)) {
+        // Only reset if current model is unknown for this TTS provider
+        if (!agent.tts_model || !models.includes(agent.tts_model)) {
           updateField('tts_model', models[0]);
         }
       })
@@ -714,7 +717,8 @@ export default function AgentDetail() {
       .then(d => {
         const models = d.models?.length ? d.models : ['saarika:v2'];
         setSttModels(models);
-        if (agent.stt_model && !models.includes(agent.stt_model)) {
+        // Only reset if current model is unknown for this STT provider
+        if (!agent.stt_model || !models.includes(agent.stt_model)) {
           updateField('stt_model', models[0]);
         }
       })
@@ -1272,9 +1276,16 @@ export default function AgentDetail() {
             {/* 11. EMBED / WEBSITE WIDGET */}
             <EmbedSection agent={agent} agentId={agentId} updateField={updateField} />
 
-            {/* 12. SIMULATION TESTING */}
-            <CollapsibleSection icon={Activity} title="Simulation Testing" summary="Run 8 pre-built patient scenarios">
-              <SimulationTab agentId={agentId!} />
+            {/* 12. SIMULATION TESTING / TEST PANEL */}
+            <CollapsibleSection icon={Activity} title="Simulation Testing" summary="Run real-time voice and text patient scenarios">
+              <div style={{ height: '600px', display: 'flex', flexDirection: 'column' }}>
+                <TestAgentModal 
+                  agent={{ ...agent, name: agent?.agent_name || agent?.name }}
+                  agentId={agentId}
+                  inline={true}
+                  onClose={() => {}}
+                />
+              </div>
             </CollapsibleSection>
 
             {/* 13. AGENT HEALTH DASHBOARD */}
@@ -1285,62 +1296,7 @@ export default function AgentDetail() {
           </div>
         </div>
 
-        {/* ── TEST PANEL ──────────────────────────────────────────────────────── */}
-        {false && showTest && (
-          <div style={{ 
-            width: '40%', minWidth: '400px', borderLeft: `1px solid ${BORDER}`, background: '#0a0a0a',
-            display: 'flex', flexDirection: 'column', zIndex: 20, boxShadow: '-5px 0 30px rgba(0,0,0,0.5)'
-          }}>
-            <div style={{ padding: '16px 20px', borderBottom: `1px solid ${BORDER}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <span style={{ fontSize: '15px', fontWeight: 600, color: '#fff' }}>Agent Testing</span>
-              <div style={{ display: 'flex', background: 'rgba(255,255,255,0.05)', borderRadius: '8px', padding: '4px' }}>
-                <button onClick={() => setTestTab('voice')} style={{ width: '80px', padding: '6px 0', border: 'none', background: testTab === 'voice' ? 'rgba(0,212,170,0.15)' : 'transparent', color: testTab === 'voice' ? ACCENT : '#888', borderRadius: '6px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}>🎙 Voice</button>
-                <button onClick={() => setTestTab('chat')} style={{ width: '80px', padding: '6px 0', border: 'none', background: testTab === 'chat' ? 'rgba(0,212,170,0.15)' : 'transparent', color: testTab === 'chat' ? ACCENT : '#888', borderRadius: '6px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}>💬 Chat</button>
-              </div>
-              <button onClick={() => setShowTest(false)} style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer' }}><span style={{fontSize: '20px'}}>×</span></button>
-            </div>
-            
-            <div style={{ display: 'flex', gap: '16px', padding: '10px 20px', borderBottom: `1px solid ${BORDER}`, fontSize: '11px', color: '#666' }}>
-              <span>Model: {agent.llm_provider} · {agent.llm_model}</span>
-              <span>Voice: {agent.tts_provider} · {agent.tts_voice}</span>
-            </div>
-
-            <div style={{ flex: 1, overflowY: 'auto', padding: '20px', display: 'flex', flexDirection: 'column' }}>
-              {testTab === 'voice' ? (
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1 }}>
-                  <button style={{ width: '120px', height: '120px', borderRadius: '60px', background: 'rgba(0,212,170,0.1)', border: `2px solid ${ACCENT}`, color: ACCENT, cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '8px', boxShadow: `0 0 30px rgba(0,212,170,0.2)` }}>
-                    <Mic size={32} />
-                    <span style={{ fontSize: '12px', fontWeight: 600 }}>Start Call</span>
-                  </button>
-                  <p style={{ marginTop: '40px', fontSize: '13px', color: '#666', textAlign: 'center', maxWidth: '80%' }}>
-                    This connects your microphone via LiveKit. The agent will respond realistically over voice.
-                  </p>
-                </div>
-              ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-                  <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '16px' }}>
-                    {chatLog.length === 0 && <div style={{ color: '#555', fontSize: '13px', textAlign: 'center', marginTop: '40px' }}>Send a message to test the agent.</div>}
-                    {chatLog.map((m, i) => (
-                      <div key={i} style={{ display: 'flex', justifyContent: m.from === 'user' ? 'flex-end' : 'flex-start' }}>
-                        <div style={{ maxWidth: '80%', padding: '10px 14px', borderRadius: '12px', fontSize: '13px', lineHeight: 1.5, background: m.from === 'user' ? ACCENT : '#1a1a1a', color: m.from === 'user' ? '#000' : '#fff', border: m.from === 'agent' ? `1px solid ${BORDER}` : 'none' }}>
-                          {m.text}
-                          <div style={{ fontSize: '10px', opacity: 0.6, marginTop: '4px', textAlign: 'right' }}>Now</div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                  <div style={{ display: 'flex', gap: '8px' }}>
-                    <input 
-                      value={chatIn} onChange={e => setChatIn(e.target.value)} onKeyDown={e => e.key === 'Enter' && sendTestChat()}
-                      placeholder="Type a message..." style={{ flex: 1, background: '#1a1a1a', border: `1px solid ${BORDER}`, borderRadius: '8px', padding: '10px 14px', color: '#fff', fontSize: '13px', outline: 'none' }} 
-                    />
-                    <button onClick={sendTestChat} style={{ background: ACCENT, color: '#000', border: 'none', borderRadius: '8px', padding: '0 16px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Send size={16} /></button>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
+        {/* ── TEST PANEL: rendered outside the scroll container as a fixed overlay ── */}
       </div>
 
       {/* ── FOOTER MANUAL SAVE ────────────────────────────────────────────────── */}
@@ -1379,8 +1335,9 @@ export default function AgentDetail() {
       )}
 
         {showTest && (
-          <WebCallModal
-            agent={{...agent, name: agent?.agent_name || agent?.name}}
+          <TestAgentModal
+            agent={{ ...agent, name: agent?.agent_name || agent?.name }}
+            agentId={agentId}
             onClose={() => setShowTest(false)}
           />
         )}

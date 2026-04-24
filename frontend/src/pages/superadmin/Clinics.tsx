@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { useSAStore, Clinic, PlanTier } from '../../store/saStore';
 import { PlanBadge, StatusBadge, Modal, SpinBtn, EmptyState } from '../../components/superadmin/SAShared';
-import { Search, Power, Zap, X, ChevronRight, Building2, Plus, Copy, Check, Mail } from 'lucide-react';
+import { Search, Power, Zap, X, ChevronRight, Building2, Plus, Copy, Check, Mail, Trash2 } from 'lucide-react';
 import { API_URL } from '../../api/client';
 
 const PLANS: PlanTier[] = ['Free', 'Pro', 'Enterprise'];
@@ -165,9 +165,10 @@ function AddClinicModal({ onClose }: { onClose: () => void }) {
 }
 
 // ── Clinic Drawer ────────────────────────────────────────────────────────────
-function ClinicDrawer({ clinic, onClose }: { clinic: Clinic; onClose: () => void }) {
+function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose: () => void; onDeleted: (id: string) => void }) {
   const { toggleSuspend, models, updateClinicModel } = useSAStore();
   const [suspending, setSuspending] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [assignOpen, setAssignOpen] = useState(false);
   const [selectedModel, setSelectedModel] = useState(clinic.model_id);
   const [reason, setReason] = useState('');
@@ -264,6 +265,32 @@ function ClinicDrawer({ clinic, onClose }: { clinic: Clinic; onClose: () => void
           <SpinBtn onClick={handleSuspend} loading={suspending} variant="danger" style={{ width: '100%', padding: '9px' }}>
             <Power size={14} /> {clinic.status === 'Suspended' ? 'Activate Clinic' : 'Suspend Clinic'}
           </SpinBtn>
+          <button
+            disabled={deleting}
+            onClick={async () => {
+              if (!window.confirm(`Permanently delete "${clinic.name}" and all its agents? This cannot be undone.`)) return;
+              setDeleting(true);
+              try {
+                const res = await fetch(`${API_URL}/admin/clinics/${clinic.id}`, { method: 'DELETE' });
+                if (res.ok || res.status === 204) {
+                  onDeleted(clinic.id);
+                  onClose();
+                } else {
+                  alert('Failed to delete clinic');
+                }
+              } catch { alert('Network error'); }
+              finally { setDeleting(false); }
+            }}
+            style={{
+              width: '100%', padding: '9px', backgroundColor: 'rgba(239,68,68,0.1)',
+              color: '#ef4444', border: '1px solid rgba(239,68,68,0.3)',
+              borderRadius: '8px', cursor: deleting ? 'not-allowed' : 'pointer',
+              fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
+              opacity: deleting ? 0.6 : 1, transition: 'all 0.15s',
+            }}
+          >
+            <Trash2 size={14} /> {deleting ? 'Deleting…' : 'Delete Clinic'}
+          </button>
         </div>
       </div>
     </div>
@@ -285,22 +312,25 @@ export default function SAClinics() {
         const mapped = data.map((c: any) => ({
           id: c.id,
           name: c.clinic_name,
-          location: c.location,
-          plan: 'Pro',
+          location: c.location || '—',
+          plan: c.plan || 'Pro',
           joined: new Date(c.created_at).toLocaleDateString(),
           status: c.is_active ? 'Active' : 'Suspended',
-          calls_month: randomInt(10, 500),
-          bookings: randomInt(0, 50),
-          res_rate: '94%',
-          avg_latency: '1.2s',
-          model_id: 'm1'
+          // Real stats: use 0/— until a stats table exists (no fake random data)
+          calls_month: c.calls_month || 0,
+          bookings: c.bookings || 0,
+          res_rate: c.res_rate || '—',
+          avg_latency: c.avg_latency || '—',
+          admin_email: c.admin_email || '',
+          model_id: 'm1',
         }));
         setClinics(mapped);
       })
+      .catch(() => setClinics([]))
       .finally(() => setLoading(false));
   }, []);
 
-  const randomInt = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1)) + min;
+
 
   const filtered = useMemo(() =>
     clinics.filter(c =>
@@ -362,7 +392,7 @@ export default function SAClinics() {
           )}
         </div>
       </div>
-      {selected && <ClinicDrawer clinic={selected} onClose={() => setSelected(null)} />}
+      {selected && <ClinicDrawer clinic={selected} onClose={() => setSelected(null)} onDeleted={(id) => setClinics(prev => prev.filter(c => c.id !== id))} />}
       {showAdd && <AddClinicModal onClose={() => setShowAdd(false)} />}
     </div>
   );

@@ -94,3 +94,20 @@ async def get_forwarding_instructions(id: uuid.UUID, db: AsyncSession = Depends(
     )
     
     return {"instructions": instructions}
+
+
+@router.delete("/{id}", status_code=204)
+async def delete_tenant(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """Delete a clinic and all associated agents."""
+    result = await db.execute(select(Tenant).where(Tenant.id == id))
+    tenant = result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # Delete associated agents first (FK constraint)
+    from backend.models.agent_config import AgentConfig
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(AgentConfig).where(AgentConfig.tenant_id == str(id)))
+
+    await db.delete(tenant)
+    await db.commit()

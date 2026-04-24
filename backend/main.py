@@ -184,11 +184,17 @@ async def serve_widget():
 
 
 # ── Catch-all WebSocket handlers ───────────────────────────────────────────────
-# Silently accept unknown WebSocket connections (e.g. LeadScout on same port)
+# Silently absorb unknown WebSocket connections (e.g. LeadScout on same port).
+#
+# Route ordering: agent_test.router (line 150) registers /ws/agent-call/{id} and
+# /ws/agent/{id}/tts-stream BEFORE this catch-all (line 198). Starlette matches
+# routes in insertion order, so the specific routes always win.
+# This handler only handles truly unknown /ws/* paths from foreign processes.
 from fastapi import WebSocket as _WS, WebSocketDisconnect as _WSD
 
 @app.websocket("/ws/{path:path}")
 async def catch_all_ws(websocket: _WS, path: str):
+    """Absorb unknown WebSocket paths. Known API paths are handled by included routers."""
     await websocket.accept()
     try:
         while True:

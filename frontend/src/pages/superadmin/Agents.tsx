@@ -23,6 +23,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import TestAgentModal from '../../components/TestAgentModal';
 import { AgentStatus, FIXTURE_AGENTS, FixtureAgent } from '../../fixtures/data';
+import { API_URL } from '../../api/client';
 
 // ── Status config ────────────────────────────────────────────────────────────
 
@@ -109,10 +110,11 @@ function AgentCard({ agent, onEdit, onTest, onDelete, onWebCall, onPhoneCall }: 
 
   return (
     <div
+      onClick={() => onEdit(agent.id)}
       style={{
         background: '#1A1A1A', border: '1px solid #2E2E2E', borderRadius: '14px',
         padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px',
-        transition: 'border-color 0.2s, box-shadow 0.2s', cursor: 'default',
+        transition: 'border-color 0.2s, box-shadow 0.2s', cursor: 'pointer',
       }}
       onMouseEnter={e => {
         (e.currentTarget as HTMLDivElement).style.borderColor = '#3ECF8E44';
@@ -138,7 +140,7 @@ function AgentCard({ agent, onEdit, onTest, onDelete, onWebCall, onPhoneCall }: 
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
           <button
             id={`edit-agent-${agent.id}`}
-            onClick={() => onEdit(agent.id)}
+            onClick={(e) => { e.stopPropagation(); onEdit(agent.id); }}
             style={{
               padding: '5px 12px', borderRadius: '7px', fontSize: '12px', fontWeight: 500,
               border: '1px solid #2E2E2E', background: 'none', color: '#A1A1A1',
@@ -151,7 +153,7 @@ function AgentCard({ agent, onEdit, onTest, onDelete, onWebCall, onPhoneCall }: 
           </button>
           <button
             id={`test-agent-${agent.id}`}
-            onClick={onTest}
+            onClick={(e) => { e.stopPropagation(); onTest(); }}
             style={{
               padding: '5px 12px', borderRadius: '7px', fontSize: '12px', fontWeight: 600,
               border: '1px solid #3ECF8E44', background: 'rgba(62,207,142,0.08)', color: '#3ECF8E',
@@ -162,7 +164,9 @@ function AgentCard({ agent, onEdit, onTest, onDelete, onWebCall, onPhoneCall }: 
           >
             <FlaskConical size={11} /> Test
           </button>
-          <AgentDropdown agent={agent} onDelete={onDelete} />
+          <div onClick={e => e.stopPropagation()}>
+            <AgentDropdown agent={agent} onDelete={onDelete} />
+          </div>
         </div>
       </div>
 
@@ -207,7 +211,8 @@ function AgentCard({ agent, onEdit, onTest, onDelete, onWebCall, onPhoneCall }: 
           <InfoPill icon={<Mic size={11} />} text={`${agent.tts_provider} · ${agent.tts_model} · ${agent.tts_voice}`} />
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <InfoPill icon={<Brain size={11} />} text={`${agent.llm_provider === 'gemini' ? 'Gemini' : agent.llm_provider} ${agent.llm_model.replace('gemini-', '')}`} />
+          {/* LLM model — show exact provider + model from DB */}
+          <InfoPill icon={<Brain size={11} />} text={`${agent.llm_provider || 'gemini'} · ${agent.llm_model || agent.model || 'gemini-2.0-flash'}`} />
         </div>
       </div>
 
@@ -237,7 +242,7 @@ function AgentCard({ agent, onEdit, onTest, onDelete, onWebCall, onPhoneCall }: 
         display: 'flex', gap: '8px', borderTop: '1px solid #222', paddingTop: '14px',
       }}>
         <button
-          onClick={onWebCall}
+          onClick={(e) => { e.stopPropagation(); onWebCall(); }}
           title="Test via browser (no phone needed)"
           style={{
             flex: 1, padding: '7px 0', borderRadius: '8px', fontSize: '12px', fontWeight: 600,
@@ -250,7 +255,7 @@ function AgentCard({ agent, onEdit, onTest, onDelete, onWebCall, onPhoneCall }: 
           🌐 Web Call
         </button>
         <button
-          onClick={onPhoneCall}
+          onClick={(e) => { e.stopPropagation(); onPhoneCall(); }}
           title="Make outbound phone call"
           disabled={!agent.sip_provider}
           style={{
@@ -351,22 +356,37 @@ export default function SAAgents() {
   });
 
   useEffect(() => {
-    fetch('/agents')
+    fetch(`${API_URL}/agents`)
       .then(res => res.json())
-      .then(data => {
+      .then(async data => {
         // Map backend agent dict to frontend expected format
         const mapped = data.map((a: any) => ({
           ...a,
           name: a.agent_name || a.name || 'AI Receptionist',
           languages: a.tts_language ? [a.tts_language.split('-')[0].toUpperCase()] : ['EN'],
-          metrics: { calls: 0, duration: 0, success: 100 }
+          // Stats: default 0, will be loaded individually via health API
+          calls_today: 0,
+          bookings_today: 0,
+          avg_latency_ms: 0,
+          resolution_rate: 0,
         }));
         setAgents(mapped);
         setLoadingAgents(false);
+
+        // Fetch real stats for each agent in the background
+        mapped.forEach(async (a: any) => {
+          try {
+            const h = await fetch(`${API_URL}/agents/${a.id}/health`).then(r => r.json());
+            setAgents(prev => prev.map(ag => ag.id === a.id ? {
+              ...ag,
+              calls_today: h.last_24h?.total_calls ?? 0,
+              avg_latency_ms: h.latency?.avg_ms ?? 0,
+            } : ag));
+          } catch {}
+        });
       })
       .catch(err => {
         console.error('Failed to fetch agents:', err);
-        setAgents(FIXTURE_AGENTS); // Fallback to fixtures if backend is unavailable
         setLoadingAgents(false);
       });
   }, []);
@@ -375,7 +395,13 @@ export default function SAAgents() {
   const [phoneCallTarget, setPhoneCallTarget] = useState<FixtureAgent | null>(null);
   const [phoneNumber, setPhoneNumber] = useState('');
 
-  const handleDelete = (id: string) => setAgents(prev => prev.filter(a => a.id !== id));
+  const handleDelete = async (id: string) => {
+    if (!window.confirm('Permanently delete this agent?')) return;
+    try {
+      await fetch(`${API_URL}/agents/${id}`, { method: 'DELETE' });
+    } catch {}
+    setAgents(prev => prev.filter(a => a.id !== id));
+  };
   const handleEdit = (id: string) => navigate(`/superadmin/agents/${id}`);
   const handleTest = (agent: FixtureAgent) => setTestTarget(agent);
   const handleCreate = () => navigate('/superadmin/agents/new');
