@@ -19,9 +19,9 @@ services:
     runtime: python
     region: singapore          # closest to India / Middle East
     plan: starter              # upgrade to standard when load grows
-    rootDir: backend
-    buildCommand: pip install -r ../requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2 --loop uvloop
+    # rootDir intentionally NOT set — run from repo root so requirements.txt is found
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT --workers 2
     healthCheckPath: /health
 
     envVars:
@@ -30,14 +30,13 @@ services:
         value: production
 
       - key: PORT
-        value: "8001"
+        value: "10000"        # Render uses 10000 by default for web services
 
-      # ── Database (Postgres on Render or Supabase) ────────────────────────────
-      # Set this in the Render dashboard → Environment → Secret
+      # ── Database — set this in Render dashboard (Supabase PostgreSQL URL) ────
       - key: DATABASE_URL
-        sync: false            # mark secret — set in dashboard
+        sync: false           # mark secret — paste postgresql://... in dashboard
 
-      # ── AI API Keys ──────────────────────────────────────────────────────────
+      # ── AI API Keys — set in Render dashboard ────────────────────────────────
       - key: SARVAM_API_KEY
         sync: false
 
@@ -57,19 +56,21 @@ services:
         sync: false
 
       # ── App secrets ──────────────────────────────────────────────────────────
-      - key: JWT_SECRET
-        generateValue: true    # Render auto-generates on first deploy
+      - key: SECRET_KEY
+        generateValue: true   # Render auto-generates on first deploy
 
       - key: ENCRYPTION_KEY
-        sync: false            # 32-byte base64 key — set in dashboard
+        sync: false           # 32-byte base64 key — set in dashboard (optional)
 
-      # ── CORS: allow your Vercel frontend domain ───────────────────────────────
+      # ── CORS: MUST match your Vercel frontend domain exactly ─────────────────
+      # Example: https://lifodial.vercel.app  OR  https://app.lifodial.com
       - key: CORS_ORIGIN
-        value: https://app.lifodial.com   # update to your real Vercel URL
+        sync: false           # set this manually in Render → Environment
 
-      # ── Uvicorn / Sentry (optional) ──────────────────────────────────────────
+      # ── Sentry (optional) ────────────────────────────────────────────────────
       - key: SENTRY_DSN
         sync: false
 
-    # Render will set up a free TLS cert automatically
-    # Custom domain: add in Render dashboard → Custom Domains
+    # Render provides free TLS automatically
+    # Add a custom domain: Render dashboard → Custom Domains
+

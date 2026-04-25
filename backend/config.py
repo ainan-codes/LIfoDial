@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
+    # ── CORS (production — set CORS_ORIGIN on Render) ──────────────────────
+    cors_origin: str = ""  # e.g. https://lifodial.vercel.app
+
     # ── Frontend ───────────────────────────────────────────────────────────
     vite_api_url: str = "http://localhost:8001"
     frontend_url: str = "http://localhost:5173"

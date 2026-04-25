@@ -1,6 +1,7 @@
 import React, { useState, useCallback } from 'react';
 
-const API = import.meta.env.VITE_API_URL || 'http://localhost:8001';
+import { API_URL } from '../../../api/client';
+const API = API_URL;
 
 interface SimulationScore {
   overall_score: number;
