@@ -174,6 +174,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
   const currentAudioUrlRef = useRef<string | null>(null);          // ISSUE 4
   const streamRef = useRef<MediaStream | null>(null);              // ISSUE 4
   const connectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null); // ISSUE 1
+  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null); // client-side WS keepalive
 
   // VAD (Voice Activity Detection) refs
   const vadSilenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -229,6 +230,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     if (vadSilenceTimerRef.current) { clearTimeout(vadSilenceTimerRef.current); vadSilenceTimerRef.current = null; }
     if (fallbackSpeakTimerRef.current) { clearTimeout(fallbackSpeakTimerRef.current); fallbackSpeakTimerRef.current = null; }
     if (connectTimeoutRef.current) { clearTimeout(connectTimeoutRef.current); connectTimeoutRef.current = null; }
+    if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null; }
     cancelAnimationFrame(animFrameRef.current);
 
     // 7. Cancel speech synthesis
@@ -387,8 +389,8 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     setAgentSpeaking(true);
 
     const blob = audioQueueRef.current.shift()!;
-    // ISSUE 5: Hint MIME type so browser picks correct decoder
-    const mimeHint = blob.type || 'audio/mpeg';
+    // ISSUE 5: Trust the blob type detected below, fallback to audio/wav for Sarvam
+    const mimeHint = blob.type || 'audio/wav';
     const typedBlob = new Blob([blob], { type: mimeHint });
     const url = URL.createObjectURL(typedBlob);
 
@@ -564,21 +566,37 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     }, 30000);
 
     ws.onmessage = async (event) => {
+      const detectMime = async (data: Blob | ArrayBuffer) => {
+        try {
+          const buf = data instanceof Blob ? await data.slice(0, 4).arrayBuffer() : data.slice(0, 4);
+          const view = new Uint8Array(buf);
+          if (view.length >= 4 && view[0] === 0x52 && view[1] === 0x49 && view[2] === 0x46 && view[3] === 0x46) return 'audio/wav';
+        } catch(e) {}
+        return 'audio/mpeg';
+      };
+
       // Handle Blob
       if (event.data instanceof Blob) {
-        // ISSUE 5: Try to detect MP3 (Sarvam returns base64-decoded MP3)
-        const audioBlob = event.data.type ? event.data : new Blob([event.data], { type: 'audio/mpeg' });
+        const type = event.data.type || await detectMime(event.data);
+        const audioBlob = new Blob([event.data], { type });
         enqueueAudio(audioBlob);
         return;
       }
       if (event.data instanceof ArrayBuffer) {
-        const audioBlob = new Blob([event.data], { type: 'audio/mpeg' });
+        const type = await detectMime(event.data);
+        const audioBlob = new Blob([event.data], { type });
         enqueueAudio(audioBlob);
         return;
       }
 
       try {
         const msg = JSON.parse(event.data);
+
+        // Handle server keepalive ping — reply with pong
+        if (msg.type === 'ping') {
+          try { wsRef.current?.send(JSON.stringify({ type: 'pong' })); } catch (_) {}
+          return;
+        }
 
         // ISSUE 1: Mark ready received to cancel connection timeout
         if (msg.type === 'ready') {
@@ -637,7 +655,14 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     };
 
     ws.onopen = () => {
-      // Connection opened — wait for "ready" message from backend (handled in onmessage)
+      // Connection opened — start client-side heartbeat to keep WS alive
+      heartbeatRef.current = setInterval(() => {
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          try { wsRef.current.send(JSON.stringify({ type: 'ping' })); } catch (_) {}
+        } else {
+          if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null; }
+        }
+      }, 15000); // every 15 seconds
     };
 
     ws.onerror = (e) => {
@@ -651,9 +676,10 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
 
     ws.onclose = (e) => {
       if (connectTimeoutRef.current) { clearTimeout(connectTimeoutRef.current); connectTimeoutRef.current = null; }
+      if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null; }
       // Only change state if not already ended (don't override summary)
       setStatus(prev => prev === 'ended' ? prev : 'idle');
-      if (!readyReceived && e.code !== 1000 && e.code !== 1001) {
+      if (!readyReceived.current && e.code !== 1000 && e.code !== 1001) {
         const reason = e.reason || `Code ${e.code}`;
         const errMsg = `⚠️ Connection closed before ready: ${reason}. Check backend logs for agent "${agentId}".`;
         setConnectError(errMsg);

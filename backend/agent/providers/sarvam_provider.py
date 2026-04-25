@@ -3,7 +3,7 @@ import base64
 from backend.config import settings
 
 class SarvamTTS:
-    def __init__(self, model="bulbul:v2", 
+    def __init__(self, model="bulbul:v3", 
                  voice="meera", language="hi-IN",
                  pitch=0.0, pace=1.0, loudness=1.0):
         self.model = model

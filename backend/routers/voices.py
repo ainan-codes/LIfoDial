@@ -30,17 +30,18 @@ class AssignVoiceRequest(BaseModel):
 
 @router.get("/")
 async def get_voices():
-    """Returns provider connection status. Voice fixtures are in the frontend."""
+    """Returns provider connection status."""
+    from backend.routers.providers import SARVAM_VOICES, GEMINI_MODELS
     return {
         "voices": [],
         "providers": {
             "sarvam": {
                 "connected": bool(settings.sarvam_api_key),
-                "voice_count": 6
+                "voice_count": len(SARVAM_VOICES)
             },
             "gemini": {
                 "connected": bool(settings.gemini_api_key),
-                "voice_count": 7
+                "voice_count": len(GEMINI_MODELS)
             },
             "elevenlabs": {
                 "connected": bool(settings.elevenlabs_api_key),
@@ -136,31 +137,35 @@ async def preview_voice(req: PreviewRequest):
                     raise HTTPException(status_code=response.status_code, detail=f"ElevenLabs error: {response.text[:200]}")
 
         elif req.provider == "gemini":
-            # Gemini doesn't have a direct raw REST TTS endpoint publicly available without heavy Google Cloud auth
-            # For the platform preview, we use Google Translate TTS as a lightweight fallback
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                lang = (req.language or "en").split("-")[0]
-                response = await client.get(
-                    "https://translate.google.com/translate_tts",
-                    params={
-                        "ie": "UTF-8",
-                        "tl": lang,
-                        "client": "tw-ob",
-                        "q": req.text
+            # Gemini native TTS requires heavy Google Cloud auth — use Sarvam as fallback for preview
+            api_key = settings.sarvam_api_key
+            if not api_key:
+                raise HTTPException(status_code=400, detail="No TTS API key configured for preview. Add SARVAM_API_KEY to .env")
+            lang = req.language or "en-IN"
+            if lang not in SARVAM_V3_SUPPORTED_LANGS:
+                lang = "en-IN"
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    "https://api.sarvam.ai/text-to-speech/stream",
+                    headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
+                    json={
+                        "text": req.text,
+                        "target_language_code": lang,
+                        "speaker": req.voice_id or "shreya",
+                        "model": "bulbul:v3",
+                        "pace": 1.0,
+                        "speech_sample_rate": 22050,
+                        "output_audio_codec": "mp3",
+                        "enable_preprocessing": True,
                     }
                 )
                 if response.status_code == 200:
                     audio_b64 = base64.b64encode(response.content).decode("utf-8")
-                    return {
-                        "audio_base64": f"data:audio/mpeg;base64,{audio_b64}",
-                        "format": "mp3",
-                        "latency_ms": 0
-                    }
+                    return {"audio_base64": f"data:audio/mpeg;base64,{audio_b64}", "format": "mp3", "latency_ms": 0}
                 else:
-                    raise HTTPException(status_code=500, detail="Failed to generate Gemini voice preview")
+                    raise HTTPException(status_code=response.status_code, detail=f"TTS preview error: {response.text[:200]}")
 
         else:
-            # Fallback to Sarvam for unknown providers
             raise HTTPException(status_code=400, detail=f"Unsupported provider: {req.provider}")
 
     except HTTPException:

@@ -29,6 +29,8 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   // Load real connectivity status from backend
+  const [localVoices, setLocalVoices] = useState<any[]>(VOICE_LIBRARY);
+
   useEffect(() => {
     const fetchStatus = async () => {
       try {
@@ -41,7 +43,44 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
         console.error("Failed to fetch provider status:", err);
       }
     };
+    
+    // Dynamically fetch ALL sarvam voices from backend instead of relying on the 12 hardcoded ones
+    const fetchSarvamVoices = async () => {
+      try {
+        const res = await fetch(`${API_URL}/platform/tts/voices/sarvam`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.voices && Array.isArray(data.voices)) {
+            const dynamicSarvam = data.voices.map((v: any) => ({
+               id: `sarvam-${v.id}`,
+               provider: 'sarvam',
+               provider_label: 'Sarvam AI',
+               name: v.name,
+               gender: v.gender?.toUpperCase() || 'NEUTRAL',
+               language: v.language || 'en-IN',
+               language_label: v.language || 'English',
+               accent: (v.language || '').substring(0, 5),
+               model: v.model || 'bulbul:v3',
+               voice_id: v.voice_id || v.id,
+               tags: [v.language, v.gender].filter(Boolean),
+               sample_text: v.description || 'Hello! I am your AI receptionist. How can I help you?',
+               recommended_for: [],
+               is_recommended: false
+            }));
+            
+            setLocalVoices(prev => {
+               const others = prev.filter(p => p.provider !== 'sarvam');
+               return [...dynamicSarvam, ...others];
+            });
+          }
+        }
+      } catch (err) {
+         console.error("Failed to fetch dynamic voices:", err);
+      }
+    };
+
     fetchStatus();
+    fetchSarvamVoices();
   }, []);
 
   // Stop currently playing audio on unmount or when playingId changes
@@ -148,7 +187,7 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
     setSyncing(false);
   };
 
-  const filtered = VOICE_LIBRARY.filter(voice => {
+  const filtered = localVoices.filter(voice => {
     const matchSearch = voice.name.toLowerCase().includes(search.toLowerCase());
     const matchProvider = !provider || voice.provider === provider;
     const matchGender = !gender || voice.gender === gender;
@@ -160,7 +199,7 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
     if (!acc[voice.provider]) acc[voice.provider] = [];
     acc[voice.provider].push(voice);
     return acc;
-  }, {} as Record<string, typeof VOICE_LIBRARY>);
+  }, {} as Record<string, typeof localVoices>);
 
   const getProviderInfo = (code: string) => {
     return [
@@ -285,7 +324,7 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
       </div>
 
       <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '24px' }}>
-        Showing {filtered.length} of {VOICE_LIBRARY.length} voices
+        Showing {filtered.length} of {localVoices.length} voices
       </div>
 
       {filtered.length === 0 ? (

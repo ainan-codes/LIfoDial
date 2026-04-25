@@ -32,6 +32,31 @@ class AssignNumberResponse(BaseModel):
 
 # ── Endpoints ────────────────────────────────────────────────────────
 
+@router.get("")
+async def list_tenants(db: AsyncSession = Depends(get_db)):
+    """List all tenants/clinics with has_agent flag for the CreateAgent wizard."""
+    from backend.models.agent_config import AgentConfig
+    result = await db.execute(select(Tenant).order_by(Tenant.clinic_name))
+    tenants = result.scalars().all()
+
+    # Get all tenant_ids that already have an agent
+    agent_res = await db.execute(select(AgentConfig.tenant_id))
+    has_agent_ids = {row[0] for row in agent_res.fetchall()}
+
+    return [
+        {
+            "id": str(t.id),
+            "clinic_name": t.clinic_name,
+            "admin_email": t.admin_email or "",
+            "admin_name": t.admin_name or "",
+            "language": t.language or "en-IN",
+            "status": t.status or "active",
+            "has_agent": str(t.id) in has_agent_ids,
+        }
+        for t in tenants
+    ]
+
+
 @router.post("", response_model=TenantResponse, status_code=status.HTTP_201_CREATED)
 async def create_tenant(payload: TenantCreate, db: AsyncSession = Depends(get_db)):
     tenant_uuid = uuid.uuid4()

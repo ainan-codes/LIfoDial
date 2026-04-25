@@ -93,12 +93,8 @@ const VOICES_HI = [
   { id: 'amartya',  label: 'amartya',  gender: 'Male' },
 ];
 
-const FIXTURE_CLINICS = [
-  { id: 'c1', name: 'Apollo Multispeciality Mumbai', email: 'admin@apollo.com', languages: 'Hindi + English', has_agent: false },
-  { id: 'c2', name: 'Aster Medicity Kochi',          email: 'admin@aster.com',  languages: 'Malayalam',       has_agent: true  },
-  { id: 'c3', name: 'Max Super Speciality Delhi',    email: 'admin@max.com',    languages: 'Hindi',            has_agent: false },
-  { id: 'c4', name: 'Al Zahra Hospital Dubai',       email: 'admin@alzahra.ae', languages: 'Arabic + English', has_agent: true  },
-];
+// Fixture clinics replaced with real API data (loaded in CreateAgent component)
+const FIXTURE_CLINICS: Array<{ id: string; name: string; email: string; languages: string; has_agent: boolean }> = [];
 
 // ── Shared components ─────────────────────────────────────────────────────────
 
@@ -189,7 +185,13 @@ function ProgressBar({ current }: { current: number }) {
 
 // ── Step 1 — Clinic ───────────────────────────────────────────────────────────
 
-function Step1({ state, onChange }: { state: WizardState; onChange: (k: keyof WizardState, v: string) => void }) {
+function Step1({ state, onChange, realClinics, clinicsLoading, clinicsError }: {
+  state: WizardState;
+  onChange: (k: keyof WizardState, v: string) => void;
+  realClinics: Array<{ id: string; name: string; email: string; language: string; has_agent: boolean }>;
+  clinicsLoading: boolean;
+  clinicsError: string;
+}) {
   return (
     <div>
       <h2 style={{ fontSize: '20px', fontWeight: 700, color: '#fff', marginBottom: '6px' }}>Which clinic is this agent for?</h2>
@@ -220,10 +222,17 @@ function Step1({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
       {state.clinic_selection === 'existing' ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
           <label style={{ fontSize: '12px', fontWeight: 500, color: '#A1A1A1' }}>Select Clinic</label>
-          {FIXTURE_CLINICS.map(c => (
+          {clinicsLoading && <div style={{ color: '#666', fontSize: '13px', padding: '12px 0' }}>⟳ Loading clinics…</div>}
+          {clinicsError && <div style={{ color: '#F87171', fontSize: '13px', padding: '8px 12px', background: 'rgba(248,113,113,0.08)', borderRadius: '8px' }}>⚠️ {clinicsError}</div>}
+          {!clinicsLoading && realClinics.length === 0 && !clinicsError && (
+            <div style={{ color: '#666', fontSize: '13px', padding: '12px', background: '#111', borderRadius: '8px', border: '1px solid #2E2E2E', textAlign: 'center' }}>
+              No clinics found. <a href="/superadmin/clinics" style={{ color: '#3ECF8E' }}>Create a clinic first</a> or choose "Create New Clinic" above.
+            </div>
+          )}
+          {realClinics.map(c => (
             <button
               key={c.id}
-              onClick={() => onChange('tenant_id', c.id)}
+              onClick={() => !c.has_agent && onChange('tenant_id', c.id)}
               style={{
                 display: 'flex', alignItems: 'center', justifyContent: 'space-between',
                 padding: '14px 16px', borderRadius: '10px', border: `1px solid ${state.tenant_id === c.id ? '#3ECF8E' : '#2E2E2E'}`,
@@ -233,7 +242,7 @@ function Step1({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
             >
               <div style={{ textAlign: 'left' }}>
                 <div style={{ fontSize: '14px', fontWeight: 500, color: '#fff' }}>{c.name}</div>
-                <div style={{ fontSize: '12px', color: '#666', marginTop: '2px' }}>{c.email} · {c.languages}</div>
+                <div style={{ fontSize: '12px', color: '#666', marginTop: '2px' }}>{c.email} · {c.language}</div>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 {c.has_agent && <span style={{ fontSize: '11px', color: '#FBBF24', background: 'rgba(251,191,36,0.1)', padding: '2px 8px', borderRadius: '20px' }}>Agent configured ⚠️</span>}
@@ -729,9 +738,33 @@ export default function CreateAgent() {
   const [state, setState] = useState<WizardState>(INITIAL_STATE);
   const [loading, setLoading] = useState(false);
   const [done, setDone] = useState(false);
-  const [createdId, setCreatedId] = useState('agent-new');
+  const [createdId, setCreatedId] = useState('');
+  const [createError, setCreateError] = useState('');
   const [showVoiceModal, setShowVoiceModal] = useState(false);
+  const [realClinics, setRealClinics] = useState<Array<{ id: string; name: string; email: string; language: string; has_agent: boolean }>>([]);
+  const [clinicsLoading, setClinicsLoading] = useState(false);
+  const [clinicsError, setClinicsError] = useState('');
   const tempPw = 'Lf8#mK2p';
+
+  // Load real tenants from the backend on mount
+  React.useEffect(() => {
+    setClinicsLoading(true);
+    fetch('/tenants')
+      .then(r => r.json())
+      .then(data => {
+        if (Array.isArray(data)) {
+          setRealClinics(data.map((t: any) => ({
+            id: t.id,
+            name: t.clinic_name,
+            email: t.admin_email || '',
+            language: t.language || 'en-IN',
+            has_agent: !!t.has_agent,
+          })));
+        }
+      })
+      .catch(() => setClinicsError('Failed to load clinics. Check backend connection.'))
+      .finally(() => setClinicsLoading(false));
+  }, []);
 
   const onChange = (key: keyof WizardState | 'open_voice_modal', value: any) => {
     if (key === 'open_voice_modal') {
@@ -759,6 +792,7 @@ export default function CreateAgent() {
 
   const handleCreate = async () => {
     setLoading(true);
+    setCreateError('');
     try {
       const res = await fetch('/agents', {
         method: 'POST',
@@ -779,16 +813,28 @@ export default function CreateAgent() {
         }),
       });
       const data = await res.json();
-      setCreatedId(data.agent_id || 'agent-new');
-    } catch {
-      setCreatedId('agent-new');
+      if (!res.ok) {
+        // Surface the real backend error (409 duplicate, 400 validation, etc.)
+        const msg = data?.detail || `Server error ${res.status}`;
+        setCreateError(msg);
+        setLoading(false);
+        return; // Stay on wizard, don't show success screen
+      }
+      if (!data.agent_id) {
+        setCreateError('Agent created but no ID returned. Check backend logs.');
+        setLoading(false);
+        return;
+      }
+      setCreatedId(data.agent_id);
+      setDone(true);
+    } catch (e: any) {
+      setCreateError(`Network error: ${e?.message || 'Cannot reach backend'}`);
     }
     setLoading(false);
-    setDone(true);
   };
 
   const STEP_COMPONENTS = [
-    <Step1 state={state} onChange={(k, v) => onChange(k, v)} />,
+    <Step1 state={state} onChange={(k, v) => onChange(k, v)} realClinics={realClinics} clinicsLoading={clinicsLoading} clinicsError={clinicsError} />,
     <Step2 state={state} onChange={(k, v) => onChange(k, v)} />,
     <Step3 state={state} onChange={(k, v) => onChange(k, v)} />,
     <Step4 state={state} onChange={(k, v) => onChange(k, v)} />,
@@ -801,11 +847,16 @@ export default function CreateAgent() {
         <ChevronLeft size={14} /> Back to Agents
       </button>
 
-      {done ? (
+      {done && createdId ? (
         <SuccessScreen agentId={createdId} password={tempPw} navigate={navigate} />
       ) : (
         <>
           <ProgressBar current={step} />
+          {createError && (
+            <div style={{ marginBottom: '16px', padding: '12px 16px', background: 'rgba(248,113,113,0.08)', border: '1px solid rgba(248,113,113,0.3)', borderRadius: '10px', color: '#F87171', fontSize: '13px' }}>
+              ⚠️ {createError}
+            </div>
+          )}
           <div style={{ minHeight: '400px' }}>{STEP_COMPONENTS[step]}</div>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '36px', paddingTop: '20px', borderTop: '1px solid #1A1A1A' }}>
             <button

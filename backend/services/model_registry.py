@@ -174,7 +174,7 @@ SARVAM_VOICES_DATA = {
             {"id": "sophia", "name": "Sophia", "style": "International, clear"},
         ]
     },
-    "bulbul:v2": {
+    "bulbul:v3": {
         "model_label": "Bulbul v2 (Stable — Pitch control)",
         "supports_pitch": True,
         "supports_loudness": True,
@@ -256,10 +256,10 @@ async def get_all_providers_summary(settings) -> dict:
                             "voices": SARVAM_VOICES_DATA["bulbul:v3"]
                         },
                         {
-                            "id": "bulbul:v2",
+                            "id": "bulbul:v3",
                             "name": "Bulbul v2",
                             "label": "Stable — pitch control",
-                            "voices": SARVAM_VOICES_DATA["bulbul:v2"]
+                            "voices": SARVAM_VOICES_DATA["bulbul:v3"]
                         }
                     ]
                 }

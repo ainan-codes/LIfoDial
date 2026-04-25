@@ -60,8 +60,56 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         logger.warning("Env key sync failed (non-fatal): %s", e)
 
+    # ── API Warmup — eliminate cold-start latency ───────────────────────────
+    # Run in background (non-blocking) so startup doesn't stall
+    import asyncio
+    asyncio.ensure_future(_warmup())
+
     yield
     logger.info("Lifodial shut down cleanly")
+
+
+async def _warmup() -> None:
+    """Pre-warm DB connection pool, Sarvam API, and Gemini API.
+    Failures are non-fatal — logged and swallowed.
+    """
+    import httpx
+    from backend.db import AsyncSessionLocal
+    from backend.config import settings as _s
+
+    # 1. DB pool
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(__import__("sqlalchemy", fromlist=["text"]).text("SELECT 1"))
+        logger.info("[WARMUP] DB connection pool: OK")
+    except Exception as e:
+        logger.warning("[WARMUP] DB warmup failed: %s", e)
+
+    # 2. Sarvam API (cheap OPTIONS call or real transcribe with silent audio)
+    sarvam_key = getattr(_s, "sarvam_api_key", None)
+    if sarvam_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    "https://api.sarvam.ai/",
+                    headers={"api-subscription-key": sarvam_key},
+                )
+            logger.info("[WARMUP] Sarvam API reachable: HTTP %s", r.status_code)
+        except Exception as e:
+            logger.warning("[WARMUP] Sarvam API warmup failed (non-fatal): %s", e)
+
+    # 3. Gemini API
+    gemini_key = getattr(_s, "gemini_api_key", None)
+    if gemini_key:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    f"https://generativelanguage.googleapis.com/v1beta/models?key={gemini_key}"
+                )
+            logger.info("[WARMUP] Gemini API reachable: HTTP %s", r.status_code)
+        except Exception as e:
+            logger.warning("[WARMUP] Gemini API warmup failed (non-fatal): %s", e)
+
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(

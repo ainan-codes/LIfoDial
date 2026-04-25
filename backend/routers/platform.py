@@ -46,7 +46,7 @@ PROVIDERS = {
         {"id": "assemblyai", "name": "AssemblyAI",     "env_var": "ASSEMBLYAI_API_KEY","models": ["best", "nano"],                  "key_label": "ASSEMBLYAI_API_KEY","key_url": "https://www.assemblyai.com",           "icon": "As"},
     ],
     "tts": [
-        {"id": "sarvam",     "name": "Sarvam AI",   "env_var": "SARVAM_API_KEY",     "models": ["bulbul:v3", "bulbul:v2"],                      "key_label": "SARVAM_API_KEY",     "key_url": "https://dashboard.sarvam.ai",        "icon": "S"},
+        {"id": "sarvam",     "name": "Sarvam AI",   "env_var": "SARVAM_API_KEY",     "models": ["bulbul:v3"],                      "key_label": "SARVAM_API_KEY",     "key_url": "https://dashboard.sarvam.ai",        "icon": "S"},
         {"id": "elevenlabs", "name": "ElevenLabs",  "env_var": "ELEVENLABS_API_KEY", "models": ["eleven_turbo_v2", "eleven_multilingual_v2"],   "key_label": "ELEVENLABS_API_KEY", "key_url": "https://elevenlabs.io",              "icon": "El"},
         {"id": "openai_tts", "name": "OpenAI TTS",  "env_var": "OPENAI_API_KEY",     "models": ["tts-1", "tts-1-hd"],                          "key_label": "OPENAI_API_KEY",     "key_url": "https://platform.openai.com/api-keys","icon": "O"},
     ],
@@ -68,19 +68,7 @@ ANTHROPIC_MODELS = [
     "claude-3-opus-20240229", "claude-3-sonnet-20240229", "claude-3-haiku-20240307"
 ]
 
-# ── Sarvam voices catalogue ────────────────────────────────────────────────────
-SARVAM_VOICES = [
-    {"id": "shreya",   "name": "Shreya",   "gender": "female", "language": "Hindi/English", "description": "Warm, professional"},
-    {"id": "kavitha",  "name": "Kavitha",  "gender": "female", "language": "Kannada/English","description": "Clear, friendly"},
-    {"id": "priya",    "name": "Priya",    "gender": "female", "language": "Hindi",          "description": "Soft, natural"},
-    {"id": "rahul",    "name": "Rahul",    "gender": "male",   "language": "Hindi/English", "description": "Professional, calm"},
-    {"id": "aditya",   "name": "Aditya",   "gender": "male",   "language": "Marathi/English","description": "Energetic, clear"},
-    {"id": "rohan",    "name": "Rohan",    "gender": "male",   "language": "Bengali/English","description": "Deep, calm"},
-    {"id": "ritu",     "name": "Ritu",     "gender": "female", "language": "Hindi",          "description": "Young, vibrant"},
-    {"id": "amit",     "name": "Amit",     "gender": "male",   "language": "Hindi",          "description": "Authoritative"},
-    {"id": "simran",   "name": "Simran",   "gender": "female", "language": "Hindi",          "description": "Cheerful"},
-    {"id": "shubh",    "name": "Shubh",    "gender": "male",   "language": "English",        "description": "Neutral, clear"},
-]
+# NOTE: SARVAM_VOICES is now imported from backend.routers.providers (authoritative, full list)
 
 OPENAI_TTS_VOICES = [
     {"id": "alloy",   "name": "Alloy",   "gender": "neutral", "language": "English", "description": "Well-rounded, neutral"},
@@ -420,34 +408,39 @@ async def fetch_provider_models(provider: str, db: AsyncSession = Depends(get_db
 
 # ── GET /platform/tts/voices/sarvam ──────────────────────────────────────────
 @router.get("/platform/tts/voices/sarvam")
-async def sarvam_voices():
+async def sarvam_voices(model: Optional[str] = Query(default=None)):
+    """Return Sarvam voices, optionally filtered by model (e.g. bulbul:v3)."""
+    from backend.routers.providers import SARVAM_VOICES as _SARVAM_V
+    voices = _SARVAM_V
+    if model:
+        voices = [v for v in voices if v.get("model") == model]
     return {
         "provider": "sarvam",
+        "model": model,
         "voices": [
-            {"id": "meera", "name": "Meera", "gender": "female", "language": "Hindi / English", "language_code": "hi-IN"},
-            {"id": "pavithra", "name": "Pavithra", "gender": "female", "language": "Kannada / English", "language_code": "kn-IN"},
-            {"id": "maitreyi", "name": "Maitreyi", "gender": "female", "language": "Hindi", "language_code": "hi-IN"},
-            {"id": "arvind", "name": "Arvind", "gender": "male", "language": "Hindi / English", "language_code": "hi-IN"},
-            {"id": "amol", "name": "Amol", "gender": "male", "language": "Marathi / English", "language_code": "mr-IN"},
-            {"id": "amartya", "name": "Amartya", "gender": "male", "language": "Bengali / English", "language_code": "bn-IN"},
-            {"id": "diya", "name": "Diya", "gender": "female", "language": "Hindi", "language_code": "hi-IN"},
-            {"id": "neel", "name": "Neel", "gender": "male", "language": "Hindi", "language_code": "hi-IN"},
-            {"id": "misha", "name": "Misha", "gender": "female", "language": "Hindi", "language_code": "hi-IN"},
-            {"id": "vian", "name": "Vian", "gender": "male", "language": "English (India)", "language_code": "en-IN"},
-            {"id": "arjun", "name": "Arjun", "gender": "male", "language": "Hindi", "language_code": "hi-IN"},
-            {"id": "maya", "name": "Maya", "gender": "female", "language": "Tamil / English", "language_code": "ta-IN"},
-            {"id": "shubh", "name": "Shubh", "gender": "male", "language": "Hindi", "language_code": "hi-IN"},
-            {"id": "anushka", "name": "Anushka", "gender": "female", "language": "Hindi", "language_code": "hi-IN"},
-            {"id": "karun", "name": "Karun", "gender": "male", "language": "Kannada", "language_code": "kn-IN"},
-            {"id": "hitesh", "name": "Hitesh", "gender": "male", "language": "Hindi", "language_code": "hi-IN"}
+            {
+                "id": v["id"],
+                "voice_id": v["id"],
+                "name": v["name"],
+                "gender": v["gender"],
+                "language": v["language"],
+                "language_code": v["language"],
+                "model": v.get("model", ""),
+                "description": v.get("description", ""),
+            } for v in voices
         ]
     }
 
-# KEEPING THE OLD list_voices endpoint for other providers (if needed)
+# ── GET /platform/tts/voices/{provider} ───────────────────────────────────────
 @router.get("/platform/tts/voices/{provider}")
-async def list_voices(provider: str, db: AsyncSession = Depends(get_db)):
+async def list_voices(
+    provider: str,
+    model: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db)
+):
+    """Return voices for a TTS provider, filtered by model if provided."""
     if provider == "sarvam":
-        return await sarvam_voices()
+        return await sarvam_voices(model=model)
 
     elif provider == "openai_tts":
         raw_key = await _get_raw_key("openai_tts", db)
@@ -467,6 +460,7 @@ async def list_voices(provider: str, db: AsyncSession = Depends(get_db)):
                 voices = [
                     {
                         "id": v["voice_id"],
+                        "voice_id": v["voice_id"],
                         "name": v["name"],
                         "gender": v.get("labels", {}).get("gender", "neutral"),
                         "language": v.get("labels", {}).get("accent", "English"),
@@ -507,16 +501,13 @@ async def tts_preview(
                     "Content-Type": "application/json"
                 },
                 json={
-                    "inputs": [text],
+                    "text": text,
                     "target_language_code": language,
                     "speaker": voice_id,
-                    "model": "bulbul:v2",
-                    "pitch": pitch,
+                    "model": "bulbul:v3",
                     "pace": pace,
-                    "loudness": loudness,
                     "speech_sample_rate": 22050,
                     "enable_preprocessing": True,
-                    "output_audio_codec": "mp3"
                 }
             )
             
@@ -658,3 +649,28 @@ async def env_status():
 
 # Note: POST /platform/sync-from-env is already defined above (trigger_env_sync)
 # which uses the well-tested sync_keys_from_env() helper.
+
+
+# ── GET /platform/sarvam/languages ───────────────────────────────────────────
+@router.get("/platform/sarvam/languages")
+async def sarvam_languages():
+    """Returns all Sarvam-supported Indian languages with auto-detect info.
+    Language codes are returned by the STT API in the `language_code` field.
+    Default speakers are optimised for bulbul:v3 model.
+    """
+    return {
+        "languages": [
+            {"code": "hi-IN", "name": "Hindi",            "script": "\u0939\u093f\u0928\u094d\u0926\u0940",       "default_speaker": "meera"},
+            {"code": "en-IN", "name": "English (India)",  "script": "English",        "default_speaker": "vian"},
+            {"code": "ta-IN", "name": "Tamil",            "script": "\u0ba4\u0bae\u0bbf\u0bb4\u0bcd",       "default_speaker": "pavithra"},
+            {"code": "te-IN", "name": "Telugu",           "script": "\u0c24\u0c46\u0c32\u0c41\u0c17\u0c41",       "default_speaker": "arvind"},
+            {"code": "kn-IN", "name": "Kannada",          "script": "\u0c95\u0ca8\u0ccd\u0ca8\u0ca1",       "default_speaker": "karun"},
+            {"code": "ml-IN", "name": "Malayalam",        "script": "\u0d2e\u0d32\u0d2f\u0d3e\u0d33\u0d02",     "default_speaker": "maya"},
+            {"code": "mr-IN", "name": "Marathi",          "script": "\u092e\u0930\u093e\u0920\u0940",       "default_speaker": "amol"},
+            {"code": "bn-IN", "name": "Bengali",          "script": "\u09ac\u09be\u0982\u09b2\u09be",       "default_speaker": "amartya"},
+            {"code": "gu-IN", "name": "Gujarati",         "script": "\u0a97\u0ac1\u0a9c\u0ab0\u0abe\u0aa4\u0ac0",     "default_speaker": "neel"},
+            {"code": "pa-IN", "name": "Punjabi",          "script": "\u0a2a\u0a70\u0a1c\u0a3e\u0a2c\u0a40",       "default_speaker": "arjun"},
+            {"code": "or-IN", "name": "Odia",             "script": "\u0b13\u0b21\u0b3c\u0b3f\u0b06",       "default_speaker": "diya"},
+            {"code": "unknown","name": "Auto-detect",     "script": "Auto",           "default_speaker": "meera"},
+        ]
+    }

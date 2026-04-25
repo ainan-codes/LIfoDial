@@ -202,8 +202,13 @@ function EmbedSection({ agent, agentId, updateField }: { agent: any; agentId: st
   const [showGuide, setShowGuide] = React.useState(false);
   const [guidePlatform, setGuidePlatform] = React.useState('wordpress');
 
+  // Derive API base from current browser origin for dynamic embed code generation.
+  // In production the admin dashboard is served from the same domain as the API.
+  // When developing locally (vite devserver on 5173 → backend on 8001), fall back.
   const apiBase = typeof window !== 'undefined'
-    ? (window.location.hostname === 'localhost' ? 'http://localhost:8001' : 'https://api.lifodial.com')
+    ? (window.location.port === '5173' || window.location.port === '5174'
+        ? 'http://localhost:8001'
+        : window.location.origin)
     : 'https://api.lifodial.com';
 
   const position   = agent.embed_position    || 'bottom-right';
@@ -390,7 +395,7 @@ function EmbedSection({ agent, agentId, updateField }: { agent: any; agentId: st
           <div>
             <div style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '12px', fontWeight: 600 }}>Live Preview</div>
             <iframe
-              src={`http://localhost:8001/embed/${agentId}/preview`}
+              src={`${apiBase}/embed/${agentId}/preview`}
               style={{ width: '100%', height: '280px', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '12px', background: '#0a0a0a' }}
               title="Widget Preview"
             />
@@ -591,6 +596,7 @@ export default function AgentDetail() {
   // Dynamic model lists
   const [llmModels, setLlmModels] = useState<string[]>([]);
   const [ttsModels, setTtsModels] = useState<string[]>([]);
+  const [ttsVoices, setTtsVoices] = useState<any[]>([]);
   const [sttModels, setSttModels] = useState<string[]>([]);
 
   const toFallbackAgent = useCallback((id?: string) => {
@@ -611,7 +617,7 @@ export default function AgentDetail() {
       tts_provider: found.tts_provider || 'sarvam',
       tts_voice: found.tts_voice || 'meera',
       tts_language: found.tts_language || 'en-IN',
-      tts_model: found.tts_model || 'bulbul:v2',
+      tts_model: found.tts_model || 'bulbul:v3',
       tts_pitch: 0,
       tts_pace: 1,
       tts_loudness: 1,
@@ -700,15 +706,36 @@ export default function AgentDetail() {
     fetch(`${API_URL}/platform/models/${agent.tts_provider}?category=tts`)
       .then(r => r.json())
       .then(d => {
-        const models = d.models?.length ? d.models : ['bulbul:v3', 'bulbul:v2'];
+        const models = d.models?.length ? d.models : ['bulbul:v3'];
         setTtsModels(models);
         // Only reset if current model is unknown for this TTS provider
         if (!agent.tts_model || !models.includes(agent.tts_model)) {
           updateField('tts_model', models[0]);
         }
       })
-      .catch(() => setTtsModels(['bulbul:v3', 'bulbul:v2']));
+      .catch(() => setTtsModels(['bulbul:v3']));
   }, [agent?.tts_provider]);
+
+  useEffect(() => {
+    if (!agent?.tts_provider) return;
+    // Pass model as a filter param so the dropdown only shows voices for the selected model
+    const modelParam = agent.tts_model ? `?model=${encodeURIComponent(agent.tts_model)}` : '';
+    fetch(`${API_URL}/platform/tts/voices/${agent.tts_provider}${modelParam}`)
+      .then(r => r.json())
+      .then(d => {
+        if (d.voices && Array.isArray(d.voices)) {
+          const mapped = d.voices.map((v: any) => ({
+            value: v.voice_id || v.id || v.name,
+            label: `${v.name} (${v.language || v.gender || 'Unknown'})`
+          }));
+          setTtsVoices(mapped);
+        } else {
+          setTtsVoices([]);
+        }
+      })
+      .catch(() => setTtsVoices([]));
+  // Re-fetch any time provider OR model changes
+  }, [agent?.tts_provider, agent?.tts_model]);
 
   useEffect(() => {
     if (!agent?.stt_provider) return;
@@ -1036,11 +1063,19 @@ export default function AgentDetail() {
                 </div>
                 <div>
                   <Label>Voice</Label>
-                  <Input value={agent.tts_voice} onChange={(v:any) => updateField('tts_voice', v)} />
+                  {ttsVoices.length > 0 ? (
+                    <Select 
+                       value={agent.tts_voice} 
+                       onChange={(v:any) => updateField('tts_voice', v)} 
+                       options={ttsVoices} 
+                    />
+                  ) : (
+                    <Input value={agent.tts_voice} onChange={(v:any) => updateField('tts_voice', v)} />
+                  )}
                 </div>
                 <div>
                   <Label>Voice Model</Label>
-                  <Select value={agent.tts_model} onChange={(v:any) => updateField('tts_model', v)} options={ttsModels.length ? ttsModels : [agent.tts_model || 'bulbul:v2']} />
+                  <Select value={agent.tts_model} onChange={(v:any) => updateField('tts_model', v)} options={ttsModels.length ? ttsModels : [agent.tts_model || 'bulbul:v3']} />
                 </div>
               </div>
 

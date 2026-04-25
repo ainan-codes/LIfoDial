@@ -15,15 +15,14 @@
   if (!script) return;
 
   const AGENT_ID = script.getAttribute('data-agent-id');
-  // Allow localhost override for dev; default = your prod API
-  const scriptSrc = script.getAttribute('data-api-url');
-  const API_BASE =
-    scriptSrc !== null
-      ? scriptSrc
-      : window.location.hostname === 'localhost' ||
-        window.location.hostname === '127.0.0.1'
-      ? 'http://localhost:8000'
-      : 'https://api.lifodial.com';
+  // Detect API base dynamically from the script's own src URL.
+  // Explicit data-api-url attribute takes priority.
+  const _explicit = script.getAttribute('data-api-url');
+  const _scriptSrc = script.src || '';
+  const _scriptOrigin = _scriptSrc
+    ? new URL(_scriptSrc).origin          // e.g. https://api.lifodial.com
+    : window.location.origin;             // same-origin dev fallback
+  const API_BASE = (_explicit !== null && _explicit !== '') ? _explicit : _scriptOrigin;
   const POSITION = script.getAttribute('data-position') || 'bottom-right';
   const THEME    = script.getAttribute('data-theme')    || 'dark';
 

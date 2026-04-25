@@ -34,9 +34,14 @@
   if (!script) return;
 
   const AGENT_ID  = script.getAttribute('data-agent-id');
-  const API_BASE  = script.getAttribute('data-api-url') ||
-    (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-      ? 'http://localhost:8001' : 'https://api.lifodial.com');
+  // Determine API base dynamically from script src (works in prod and dev)
+  // Falls back to explicit data-api-url attribute if set.
+  const _explicit = script.getAttribute('data-api-url');
+  const _scriptSrc = script.src || '';
+  const _scriptOrigin = _scriptSrc
+    ? new URL(_scriptSrc).origin          // e.g. https://api.lifodial.com
+    : window.location.origin;             // same-origin dev fallback
+  const API_BASE  = _explicit !== null && _explicit !== '' ? _explicit : _scriptOrigin;
   const WS_BASE   = API_BASE.replace(/^http/, 'ws');
   const POSITION  = script.getAttribute('data-position') || 'bottom-right';
   const THEME     = script.getAttribute('data-theme')    || 'dark';

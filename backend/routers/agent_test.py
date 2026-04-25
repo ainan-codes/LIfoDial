@@ -181,113 +181,212 @@ async def clear_agent_session(agent_id: str, session_id: str):
 
 @router.websocket("/ws/agent-call/{agent_id}")
 async def voice_websocket(websocket: WebSocket, agent_id: str):
+    """
+    Stable voice WebSocket handler.
+
+    Key design decisions:
+    - DB session opened for agent load only, then closed immediately.
+      Each turn (audio/text) opens its own fresh session → no pool exhaustion.
+    - asyncio.wait() with 20-second timeout drives the loop so it never
+      blocks forever on stale connections.
+    - Server sends JSON {"type":"pong"} every 20 s to keep TCP alive through
+      proxies/firewalls.
+    - 120-second idle timeout closes the connection gracefully.
+    - Every exception path is caught; greeting task is always cancelled.
+    """
     await websocket.accept()
     logger.info(f"Voice WebSocket connected for agent {agent_id}")
-    
-    # Unique session for language tracking
+
     ws_session_id = str(uuid.uuid4())
-    
-    # CORRECT: manually manage the DB session in WebSocket
-    async with AsyncSessionLocal() as db:
-        try:
-            # Query the agent
-            result = await db.execute(
+    greeting_task: asyncio.Task | None = None
+
+    # ── Load agent in a short-lived DB session ────────────────────────────────
+    agent: AgentConfig | None = None
+    try:
+        async with AsyncSessionLocal() as _db:
+            result = await _db.execute(
                 select(AgentConfig).where(AgentConfig.id == agent_id)
             )
             agent = result.scalar_one_or_none()
-            
-            if agent is None:
-                logger.warning(f"Agent {agent_id} not found in database")
-                await websocket.send_json({
-                    "error": "Agent not found",
-                    "agent_id": agent_id
-                })
-                await websocket.close(code=1008)
-                return
-            
-            logger.info(f"Agent loaded: {agent.agent_name}")
-            
-            # Send ready + connected status to frontend
-            first_msg = agent.first_message or "Hello, how can I help?"
-            await websocket.send_json({
-                "type": "ready",
-                "agent_name": agent.agent_name,
-                "first_message": first_msg,
-                "tts_provider": agent.tts_provider,
-                "stt_provider": agent.stt_provider
-            })
-            # Also send the status event the frontend expects
-            await websocket.send_json({
-                "type": "status",
-                "status": "connected"
-            })
-            
-            # Send greeting audio in background so call becomes interactive instantly.
-            greeting_task = asyncio.create_task(
-                _send_greeting_audio_fast(websocket, agent, first_msg)
-            )
-            
-            # Main message loop — keep connection alive
-            while True:
+    except Exception as db_err:
+        logger.error(f"DB error loading agent {agent_id}: {db_err}")
+        try:
+            await websocket.send_json({"type": "error", "message": "Database error", "code": "DB_ERROR"})
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        _language_tracker.pop(ws_session_id, None)
+        return
+
+    if agent is None:
+        logger.warning(f"Agent {agent_id} not found")
+        try:
+            await websocket.send_json({"error": "Agent not found", "agent_id": agent_id})
+            await websocket.close(code=1008)
+        except Exception:
+            pass
+        _language_tracker.pop(ws_session_id, None)
+        return
+
+    logger.info(f"Agent loaded: {agent.agent_name}")
+
+    # ── Send ready signal ─────────────────────────────────────────────────────
+    first_msg = agent.first_message or "Hello, how can I help?"
+    try:
+        await websocket.send_json({
+            "type": "ready",
+            "agent_name": agent.agent_name,
+            "first_message": first_msg,
+            "tts_provider": agent.tts_provider,
+            "stt_provider": agent.stt_provider,
+        })
+        await websocket.send_json({"type": "status", "status": "connected"})
+    except Exception as e:
+        logger.warning(f"Cannot send ready for {agent_id}: {e}")
+        _language_tracker.pop(ws_session_id, None)
+        return
+
+    # ── Kick off greeting audio in background ─────────────────────────────────
+    greeting_task = asyncio.create_task(
+        _send_greeting_audio_fast(websocket, agent, first_msg)
+    )
+
+    # ── Main stable message loop ──────────────────────────────────────────────
+    PING_INTERVAL = 20.0   # send keepalive every 20 s
+    IDLE_TIMEOUT  = 120.0  # close if no data for 120 s
+    loop          = asyncio.get_event_loop()
+    last_activity = loop.time()
+    next_ping_at  = last_activity + PING_INTERVAL
+
+    try:
+        while True:
+            now = loop.time()
+
+            # Send keepalive ping if PING_INTERVAL has elapsed
+            if now >= next_ping_at:
                 try:
-                    data = await websocket.receive()
-                    
-                    if data["type"] == "websocket.disconnect":
-                        logger.info(f"Client disconnected from agent {agent_id}")
-                        break
-                    
-                    if data["type"] == "websocket.receive":
-                        if "bytes" in data and data["bytes"]:
-                            # Audio data received — process it
-                            audio_bytes = data["bytes"]
-                            await handle_audio_turn(
-                                websocket, agent, audio_bytes, db, ws_session_id
-                            )
-                        elif "text" in data and data["text"]:
-                            # Text command received
-                            msg = json.loads(data["text"])
-                            if msg.get("type") == "end":
-                                await websocket.send_json({"type": "status", "status": "ended"})
-                                break
-                            elif msg.get("type") == "ping":
-                                await websocket.send_json({"type": "pong"})
-                            else:
-                                await handle_text_command(
-                                    websocket, agent, msg, db, ws_session_id
-                                )
-                            
-                except WebSocketDisconnect:
-                    logger.info(f"WebSocket disconnected for agent {agent_id}")
+                    await websocket.send_json({"type": "ping"})
+                    next_ping_at = now + PING_INTERVAL
+                except Exception:
+                    logger.info(f"Keepalive ping failed — client gone ({agent_id})")
                     break
+
+            # Enforce idle timeout
+            if now - last_activity > IDLE_TIMEOUT:
+                logger.info(f"WS idle timeout ({IDLE_TIMEOUT:.0f}s) for {agent_id}")
+                try:
+                    await websocket.send_json({"type": "status", "status": "ended", "reason": "idle_timeout"})
+                    await websocket.close(code=1000)
+                except Exception:
+                    pass
+                break
+
+            # Wait up to 5 s for next frame (short so ping fires on time)
+            wait_secs = min(5.0, max(0.5, next_ping_at - loop.time()))
+            recv_fut = asyncio.ensure_future(websocket.receive())
+            done, _ = await asyncio.wait({recv_fut}, timeout=wait_secs)
+
+            if not done:
+                recv_fut.cancel()
+                try:
+                    await recv_fut
+                except (asyncio.CancelledError, Exception):
+                    pass
+                continue
+
+            # Retrieve received frame
+            try:
+                data = recv_fut.result()
+            except WebSocketDisconnect:
+                logger.info(f"Client disconnected for {agent_id}")
+                break
+            except Exception as e:
+                e_s = str(e).lower()
+                if any(k in e_s for k in ("disconnect", "closed", "1000", "1001", "1005", "going away")):
+                    logger.info(f"Client closed WS for {agent_id}")
+                else:
+                    logger.warning(f"WS receive error for {agent_id}: {e}")
+                break
+
+            last_activity = loop.time()
+
+            if data.get("type") == "websocket.disconnect":
+                logger.info(f"Clean disconnect frame from {agent_id}")
+                break
+
+            if data.get("type") != "websocket.receive":
+                continue
+
+            raw_bytes = data.get("bytes")
+            raw_text  = data.get("text")
+
+            # ── Audio frame → STT → LLM → TTS ──
+            if raw_bytes:
+                try:
+                    async with AsyncSessionLocal() as db:
+                        await handle_audio_turn(websocket, agent, raw_bytes, db, ws_session_id)
                 except Exception as e:
-                    logger.error(f"Error in WebSocket loop: {e}", exc_info=True)
+                    logger.error(f"Audio turn error for {agent_id}: {e}", exc_info=True)
                     try:
-                        await websocket.send_json({
-                            "type": "error", 
-                            "message": str(e)
-                        })
-                    except RuntimeError:
-                        logger.info(f"WebSocket already closed for agent {agent_id}")
+                        await websocket.send_json({"type": "error", "message": f"Processing error: {e}"})
+                        await websocket.send_json({"type": "status", "status": "idle"})
+                    except Exception:
                         break
+                continue
+
+            # ── Text frame ──
+            if raw_text:
+                try:
+                    msg = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    logger.warning(f"Bad JSON from {agent_id}: {raw_text[:60]}")
+                    continue
+
+                msg_type = msg.get("type", "")
+
+                if msg_type == "end":
+                    try:
+                        await websocket.send_json({"type": "status", "status": "ended"})
                     except Exception:
                         pass
-                    
-        except Exception as e:
-            logger.error(f"Fatal WebSocket error: {e}", exc_info=True)
+                    break
+
+                elif msg_type in ("ping", "pong"):
+                    try:
+                        await websocket.send_json({"type": "pong"})
+                    except Exception:
+                        break
+
+                else:
+                    try:
+                        async with AsyncSessionLocal() as db:
+                            await handle_text_command(websocket, agent, msg, db, ws_session_id)
+                    except Exception as e:
+                        logger.error(f"Text command error for {agent_id}: {e}", exc_info=True)
+                        try:
+                            await websocket.send_json({"type": "error", "message": str(e)})
+                        except Exception:
+                            break
+
+    except WebSocketDisconnect:
+        logger.info(f"WS disconnected (outer) for {agent_id}")
+    except Exception as e:
+        logger.error(f"Fatal WS loop error for {agent_id}: {e}", exc_info=True)
+        try:
+            await websocket.send_json({"type": "error", "message": "Internal server error", "code": "INTERNAL_ERROR"})
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+    finally:
+        if greeting_task and not greeting_task.done():
+            greeting_task.cancel()
             try:
-                await websocket.send_json({
-                    "type": "error",
-                    "message": "Internal server error",
-                    "code": "INTERNAL_ERROR"
-                })
-                await websocket.close(code=1011)
-            except Exception:
+                await greeting_task
+            except (asyncio.CancelledError, Exception):
                 pass
-        finally:
-            if 'greeting_task' in locals() and not greeting_task.done():
-                greeting_task.cancel()
-            # Clean up language tracker for this session
-            _language_tracker.pop(ws_session_id, None)
+        _language_tracker.pop(ws_session_id, None)
+        logger.info(f"WS session ended cleanly for {agent_id}")
+
 
 
 # ── WS /ws/agent/{agent_id}/tts-stream ────────────────────────────────────────
@@ -1752,15 +1851,7 @@ async def sarvam_synthesize_with_retry(
         return None
 
     tts_language = language_override or agent.tts_language or "en-IN"
-
-    # Map legacy voice names to v3 set (same logic already in sarvam_synthesize)
-    raw_voice = (agent.tts_voice or "priya").strip().lower()
-    sarvam_voice_map = {
-        "meera": "shreya", "pavithra": "kavitha", "maitreyi": "priya",
-        "arvind": "rahul", "amol": "aditya", "amartya": "rohan",
-        "diya": "ritu", "neel": "amit", "misha": "simran", "vian": "shubh",
-    }
-    voice = sarvam_voice_map.get(raw_voice, raw_voice)
+    raw_voice = (agent.tts_voice or "meera").strip().lower()
 
     last_exc: Exception | None = None
     for attempt in range(1, max_retries + 1):
@@ -1768,15 +1859,14 @@ async def sarvam_synthesize_with_retry(
             audio = await sarvam_synthesize(
                 api_key=api_key,
                 text=text,
-                voice=voice,
+                voice=raw_voice,
                 model=agent.tts_model or "bulbul:v3",
                 language=tts_language,
                 pitch=agent.tts_pitch or 0.0,
-                pace=agent.tts_pace or 1.0,
-                loudness=agent.tts_loudness or 1.0,
+                pace=agent.tts_pace or 1.1,
+                loudness=agent.tts_loudness or 1.5,
             )
-            # Validate non-trivial response (corrupt / truncated payloads are < 512B)
-            if audio and len(audio) >= 512:
+            if audio and len(audio) >= 500:
                 if attempt > 1:
                     logger.info(f"Sarvam TTS succeeded on attempt {attempt}")
                 return audio
@@ -1785,16 +1875,16 @@ async def sarvam_synthesize_with_retry(
             last_exc = exc
             logger.warning(f"Sarvam TTS attempt {attempt}/{max_retries} failed: {exc}")
             if attempt < max_retries:
-                await asyncio.sleep(0.5 * attempt)  # brief backoff
+                await asyncio.sleep(0.5 * attempt)
 
     logger.error(f"Sarvam TTS failed after {max_retries} attempts. Last error: {last_exc}")
     return None
 
 
 async def sarvam_synthesize(api_key: str, text: str, voice: str,
-                              model: str, language: str,
-                              pitch: float, pace: float, 
-                              loudness: float) -> bytes:
+                               model: str, language: str,
+                               pitch: float, pace: float, 
+                               loudness: float) -> bytes:
     import httpx
 
     normalized_text = (text or "").strip()
@@ -1802,12 +1892,9 @@ async def sarvam_synthesize(api_key: str, text: str, voice: str,
         raise Exception("Sarvam TTS error: empty text payload")
 
     # Modern Sarvam voice set for bulbul:v3 (fallback to shubh for reliability)
-    v3_voices = {
-        "shubh", "aditya", "rahul", "rohan", "amit", "dev", "ratan", "varun", "manan", "sumit",
-        "kabir", "aayan", "ashutosh", "advait", "anand", "tarun", "sunny", "mani", "gokul", "vijay",
-        "mohit", "rehan", "soham", "ritu", "priya", "neha", "pooja", "simran", "kavya", "ishita",
-        "shreya", "roopa", "amelia", "sophia", "tanya", "shruti", "suhani", "kavitha", "rupali"
-    }
+    # Dynamically imported from authoritative list so new voices aren't stripped back to defaults
+    from backend.routers.providers import SARVAM_VOICES
+    v3_voices = {v["id"].lower() for v in SARVAM_VOICES if v.get("model", "").startswith("bulbul:v3")}
 
     # If selected legacy voice isn't in v3, pick natural female default
     normalized_model = model if model.startswith("bulbul:") else "bulbul:v3"
@@ -1882,6 +1969,8 @@ async def sarvam_synthesize(api_key: str, text: str, voice: str,
                 pass
             logger.error(f"Sarvam TTS API Error: {response.status_code} - {body}")
             raise Exception(f"Sarvam TTS error: {response.status_code} - {body}")
+
+
 
 
 async def elevenlabs_synthesize(api_key: str, text: str, 
