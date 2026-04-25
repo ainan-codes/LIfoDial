@@ -21,7 +21,7 @@ services:
     plan: starter              # upgrade to standard when load grows
     # rootDir intentionally NOT set — run from repo root so requirements.txt is found
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT --workers 2
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
 
     envVars:
