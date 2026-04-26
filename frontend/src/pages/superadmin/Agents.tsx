@@ -1,5 +1,6 @@
 import {
     AlertCircle,
+    Bot,
     Brain,
     CalendarCheck,
     CheckCircle,

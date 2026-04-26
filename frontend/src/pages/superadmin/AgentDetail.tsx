@@ -205,11 +205,7 @@ function EmbedSection({ agent, agentId, updateField }: { agent: any; agentId: st
   // Derive API base from current browser origin for dynamic embed code generation.
   // In production the admin dashboard is served from the same domain as the API.
   // When developing locally (vite devserver on 5173 → backend on 8001), fall back.
-  const apiBase = typeof window !== 'undefined'
-    ? (window.location.port === '5173' || window.location.port === '5174'
-        ? 'http://localhost:8001'
-        : window.location.origin)
-    : 'https://api.lifodial.com';
+  const apiBase = API_URL;
 
   const position   = agent.embed_position    || 'bottom-right';
   const theme      = agent.embed_theme       || 'dark';
