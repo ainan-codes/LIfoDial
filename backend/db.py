@@ -48,7 +48,7 @@ else:
         pool_size=5,
         max_overflow=10,
         pool_timeout=30,
-        connect_args={"server_settings": {"jit": "off"}},
+        connect_args={"server_settings": {"jit": "off"}, "statement_cache_size": 0},
     )
 
 AsyncSessionLocal = async_sessionmaker(
