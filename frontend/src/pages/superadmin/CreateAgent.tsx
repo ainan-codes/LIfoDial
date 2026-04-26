@@ -19,6 +19,7 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import VoiceLibrary from './VoiceLibrary';
 import { useProviders } from '../../hooks/useProviders';
+import { API_URL } from '../../api/client';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -405,7 +406,7 @@ function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
         "ar-SA": "مرحباً! أنا مساعدتك الذكية. كيف يمكنني مساعدتك؟",
       }
       
-      const res = await fetch('/models/voices/preview', {
+      const res = await fetch(`${API_URL}/models/voices/preview`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -749,7 +750,7 @@ export default function CreateAgent() {
   // Load real tenants from the backend on mount
   React.useEffect(() => {
     setClinicsLoading(true);
-    fetch('/tenants')
+    fetch(`${API_URL}/tenants`)
       .then(r => r.json())
       .then(data => {
         if (Array.isArray(data)) {
@@ -794,7 +795,7 @@ export default function CreateAgent() {
     setLoading(true);
     setCreateError('');
     try {
-      const res = await fetch('/agents', {
+      const res = await fetch(`${API_URL}/agents`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

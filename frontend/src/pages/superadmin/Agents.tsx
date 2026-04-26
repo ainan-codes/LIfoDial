@@ -560,7 +560,7 @@ export default function SAAgents() {
                   const num = phoneNumber.trim();
                   if (!num) return;
                   const fullNumber = num.startsWith('+') ? num : `+91${num.replace(/\s/g, '')}`;
-                  fetch(`/agents/${phoneCallTarget.id}/outbound-call`, {
+                  fetch(`${API_URL}/agents/${phoneCallTarget.id}/outbound-call`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ phone_number: fullNumber }),
