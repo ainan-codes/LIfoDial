@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 def _build_database_url() -> str:
     """Normalise DATABASE_URL to the correct async driver format."""
-    raw = os.getenv("DATABASE_URL", "")
+    raw = os.getenv("DATABASE_URL", "").strip()  # strip newlines/spaces from Render env UI
     if not raw:
         logger.warning("No DATABASE_URL set — using SQLite (development)")
         return "sqlite+aiosqlite:///./lifodial.db"
