@@ -52,9 +52,10 @@ else:
         pool_size=5,
         max_overflow=10,
         pool_timeout=30,
+        prepared_statement_cache_size=0,  # ← Disables SQLAlchemy's prepared statement cache (crucial for PgBouncer)
         connect_args={
             "server_settings": {"jit": "off"},
-            "statement_cache_size": 0,  # ← disables prepared statement caching
+            "statement_cache_size": 0,  # ← Disables asyncpg's internal statement caching
         },
     )
 
