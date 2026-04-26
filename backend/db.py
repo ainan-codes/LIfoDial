@@ -40,15 +40,22 @@ if IS_SQLITE:
         connect_args={"check_same_thread": False},
     )
 else:
-    # PostgreSQL (asyncpg) — tune pool for Render's single-worker setup
+    # PostgreSQL (asyncpg) via Supabase PgBouncer (Transaction mode)
+    # IMPORTANT:
+    # - pool_pre_ping MUST be False — it uses prepared statements internally
+    # - statement_cache_size=0 disables asyncpg prepared statement caching
+    # Both are required for PgBouncer transaction mode compatibility
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
-        pool_pre_ping=True,
+        pool_pre_ping=False,  # ← MUST be False for PgBouncer transaction mode
         pool_size=5,
         max_overflow=10,
         pool_timeout=30,
-        connect_args={"server_settings": {"jit": "off"}, "statement_cache_size": 0},
+        connect_args={
+            "server_settings": {"jit": "off"},
+            "statement_cache_size": 0,  # ← disables prepared statement caching
+        },
     )
 
 AsyncSessionLocal = async_sessionmaker(
