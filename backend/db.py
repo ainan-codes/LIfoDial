@@ -31,34 +31,21 @@ IS_SQLITE = "sqlite" in DATABASE_URL
 logger.info("Database driver: %s", "SQLite" if IS_SQLITE else "PostgreSQL (asyncpg)")
 
 if IS_SQLITE:
-    # SQLite: NullPool avoids StaticPool/pool_size conflicts; check_same_thread=False
-    # allows multiple async tasks to share connections safely.
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
-        pool_pre_ping=False,  # not supported by SQLite
-        poolclass=NullPool,
-        connect_args={"check_same_thread": False},
+        connect_args={"check_same_thread": False}
     )
 else:
-    # PostgreSQL (asyncpg) via Supabase PgBouncer (Transaction mode)
-    # IMPORTANT:
-    # - pool_pre_ping MUST be False — it uses prepared statements internally
-    # - statement_cache_size=0 disables asyncpg prepared statement caching
-    # Both are required for PgBouncer transaction mode compatibility
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
-        pool_pre_ping=False,  # ← MUST be False for PgBouncer transaction mode
+        pool_pre_ping=True,
         pool_size=5,
         max_overflow=10,
-        pool_timeout=30,
-        prepared_statement_cache_size=0,  # ← Disables SQLAlchemy's prepared statement cache (crucial for PgBouncer)
         connect_args={
-            "server_settings": {"jit": "off"},
-            "statement_cache_size": 0,  # ← Disables asyncpg's internal statement caching
-            "prepared_statement_name_func": lambda: f"__asyncpg_{uuid4()}__",
-        },
+            "statement_cache_size": 0,
+        }
     )
 
 AsyncSessionLocal = async_sessionmaker(
