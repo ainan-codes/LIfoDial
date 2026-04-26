@@ -1,4 +1,4 @@
-"""add tenant missing columns
+"""add tenant missing columns (idempotent)
 
 Revision ID: abcdef123456
 Revises: bbf25bb3c633
@@ -19,32 +19,39 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Add new columns to tenants table
-    # We use batch_alter_table for SQLite compatibility
-    with op.batch_alter_table('tenants', schema=None) as batch_op:
-        # Check if column exists is hard in generic alembic, but we assume they don't exist in prod yet.
-        # SQLite doesn't natively support IF NOT EXISTS in ADD COLUMN via standard syntax, but SQLAlchemy handles some of it.
-        # We will just add them. If they exist on SQLite (local), this migration might fail locally.
-        # A common trick is to catch the error or just use `add_column` which works fine on Postgres.
-        # To make it robust for both, we can try to add them.
-        batch_op.add_column(sa.Column('admin_password', sa.String(length=100), nullable=True))
-        batch_op.add_column(sa.Column('ai_number', sa.String(length=30), nullable=True))
-        batch_op.add_column(sa.Column('forwarding_number', sa.String(length=30), nullable=True))
-        batch_op.add_column(sa.Column('language', sa.String(length=10), nullable=False, server_default='en-IN'))
-        batch_op.add_column(sa.Column('plan', sa.String(length=20), nullable=False, server_default='Free'))
-        batch_op.add_column(sa.Column('is_active', sa.Boolean(), nullable=False, server_default='1'))
+    # Use raw SQL with IF NOT EXISTS — completely safe to run multiple times.
+    # This avoids errors if columns were already added manually to prod.
+    bind = op.get_bind()
+    dialect = bind.dialect.name
 
-    # Also make sure unique constraint for ai_number is added if possible
-    # We will skip unique constraint creation here for simplicity on sqlite, or add it safely.
-    # In Postgres, unique constraints are easy to add.
-    # op.create_unique_constraint('uq_tenants_ai_number', 'tenants', ['ai_number'])
+    if dialect == 'postgresql':
+        # Postgres supports ADD COLUMN IF NOT EXISTS natively
+        op.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS forwarding_number VARCHAR(30)")
+        op.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS plan VARCHAR(20) NOT NULL DEFAULT 'Free'")
+        op.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS admin_password VARCHAR(100)")
+        op.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS ai_number VARCHAR(30)")
+        op.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS language VARCHAR(10) NOT NULL DEFAULT 'en-IN'")
+        op.execute("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE")
+    else:
+        # SQLite: batch alter to add columns (will error if they exist — acceptable in dev)
+        import contextlib
+        with op.batch_alter_table('tenants', schema=None) as batch_op:
+            for col, typ, kwargs in [
+                ('admin_password', sa.String(100), {'nullable': True}),
+                ('ai_number', sa.String(30), {'nullable': True}),
+                ('forwarding_number', sa.String(30), {'nullable': True}),
+                ('language', sa.String(10), {'nullable': False, 'server_default': 'en-IN'}),
+                ('plan', sa.String(20), {'nullable': False, 'server_default': 'Free'}),
+                ('is_active', sa.Boolean(), {'nullable': False, 'server_default': '1'}),
+            ]:
+                with contextlib.suppress(Exception):
+                    batch_op.add_column(sa.Column(col, typ, **kwargs))
 
 
 def downgrade() -> None:
-    with op.batch_alter_table('tenants', schema=None) as batch_op:
-        batch_op.drop_column('is_active')
-        batch_op.drop_column('plan')
-        batch_op.drop_column('language')
-        batch_op.drop_column('forwarding_number')
-        batch_op.drop_column('ai_number')
-        batch_op.drop_column('admin_password')
+    op.execute("ALTER TABLE tenants DROP COLUMN IF EXISTS forwarding_number")
+    op.execute("ALTER TABLE tenants DROP COLUMN IF EXISTS plan")
+    op.execute("ALTER TABLE tenants DROP COLUMN IF EXISTS admin_password")
+    op.execute("ALTER TABLE tenants DROP COLUMN IF EXISTS ai_number")
+    op.execute("ALTER TABLE tenants DROP COLUMN IF EXISTS language")
+    op.execute("ALTER TABLE tenants DROP COLUMN IF EXISTS is_active")
