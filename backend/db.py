@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.pool import NullPool
+from uuid import uuid4
 import os
 import logging
 
@@ -56,6 +57,7 @@ else:
         connect_args={
             "server_settings": {"jit": "off"},
             "statement_cache_size": 0,  # ← Disables asyncpg's internal statement caching
+            "prepared_statement_name_func": lambda: f"__asyncpg_{uuid4()}__",
         },
     )
 
