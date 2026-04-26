@@ -128,13 +128,39 @@ async def create_clinic(data: ClinicCreate, db: AsyncSession = Depends(get_db)):
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/clinics", response_model=List[ClinicResponse])
+@router.get("/clinics")
 async def list_clinics(db: AsyncSession = Depends(get_db)):
     try:
-        result = await db.execute(select(Tenant).order_by(Tenant.created_at.desc()))
-        return result.scalars().all()
+        from sqlalchemy import select
+        from backend.models.tenant import Tenant
+        
+        result = await db.execute(
+            select(Tenant).order_by(Tenant.clinic_name)
+        )
+        tenants = result.scalars().all()
+        
+        return {
+            "clinics": [
+                {
+                    "id": str(t.id),
+                    "clinic_name": t.clinic_name,
+                    "admin_email": getattr(t, 'admin_email', ''),
+                    "ai_number": getattr(t, 'ai_number', ''),
+                    "language": getattr(t, 'language', 'hi-IN'),
+                    "plan": getattr(t, 'plan', 'free'),
+                    "status": getattr(t, 'status', 'ACTIVE'),
+                    "is_active": getattr(t, 'is_active', True),
+                    "created_at": str(t.created_at) if t.created_at else None,
+                }
+                for t in tenants
+            ],
+            "total": len(tenants)
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import logging
+        logging.getLogger(__name__).error(f"list_clinics error: {e}")
+        # Return empty instead of 500
+        return {"clinics": [], "total": 0, "error": str(e)[:100]}
 
 @router.patch("/clinics/{tenant_id}/status")
 async def update_clinic_status(tenant_id: str, data: StatusUpdate, db: AsyncSession = Depends(get_db)):

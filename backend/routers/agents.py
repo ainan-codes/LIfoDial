@@ -421,42 +421,32 @@ async def create_agent(payload: AgentCreatePayload) -> dict:
                 country_prefix = "+91" if payload.country_code == "IN" else "+971"
                 ai_number = f"{country_prefix} 90001 {str(uuid.uuid4().int)[:5]}"
 
-            # Fields that exist in the Pydantic payload but NOT in AgentConfig model.
-            # Must be excluded to prevent 'invalid keyword argument' errors.
-            _PAYLOAD_ONLY_FIELDS = {
-                "clinic_selection", "new_clinic", "tenant_id",
-                "livekit_url", "livekit_api_key", "livekit_api_secret",
-                "first_message", "system_prompt",
-                # VAPI-style fields not in the current AgentConfig model:
-                "first_message_mode",
-                "transcriber_keywords", "fallback_transcribers",
-                "tts_stability", "tts_clarity", "tts_speed", "tts_style",
-                "tts_use_speaker_boost", "tts_optimize_streaming_latency",
-                "tts_input_preprocessing", "tts_filler_injection",
-                "add_voice_manually", "fallback_voices",
-                "llm_max_tokens", "llm_emotion_recognition",
-                "background_sound", "background_denoising", "model_output_in_realtime",
-                "recording_consent_plan",
-                "voicemail_detection_enabled", "voicemail_message",
-                "summary_enabled", "success_evaluation_enabled", "structured_output_enabled",
-                "tools_enabled", "predefined_functions", "custom_functions",
-                "keypad_input_enabled", "keypad_timeout",
-                "sms_enabled", "sms_provider", "sms_message_template",
-                "hipaa_enabled", "pii_redaction_enabled",
+            # ── Dynamic Model Filtering (Bug 1 Fix) ──
+            # Only pass fields that exist in the AgentConfig model.
+            from sqlalchemy import inspect as sa_inspect
+            mapper = sa_inspect(AgentConfig)
+            valid_columns = {col.key for col in mapper.columns}
+            
+            # Start with the dumped payload, then inject manual overrides
+            raw_kwargs = payload.model_dump()
+            raw_kwargs.update({
+                "tenant_id": tenant_id,
+                "first_message": first_message,
+                "system_prompt": system_prompt,
+                "livekit_url": payload.livekit_url or settings.livekit_url,
+                "livekit_api_key": payload.livekit_api_key or settings.livekit_api_key,
+                "livekit_api_secret": payload.livekit_api_secret or settings.livekit_api_secret,
+                "status": "CONFIGURED",
+                "ai_number": ai_number,
+            })
+            
+            # Filter kwargs to only valid columns
+            safe_kwargs = {
+                k: v for k, v in raw_kwargs.items() 
+                if k in valid_columns
             }
-            args_dict = payload.model_dump(exclude=_PAYLOAD_ONLY_FIELDS)
 
-            agent = AgentConfig(
-                tenant_id=tenant_id,
-                first_message=first_message,
-                system_prompt=system_prompt,
-                livekit_url=payload.livekit_url or settings.livekit_url,
-                livekit_api_key=payload.livekit_api_key or settings.livekit_api_key,
-                livekit_api_secret=payload.livekit_api_secret or settings.livekit_api_secret,
-                status="CONFIGURED",
-                ai_number=ai_number,
-                **args_dict
-            )
+            agent = AgentConfig(**safe_kwargs)
             session.add(agent)
             await session.commit()
             await session.refresh(agent)
