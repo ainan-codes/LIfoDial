@@ -491,8 +491,11 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload) -> dict:
             if not agent:
                 raise HTTPException(status_code=404, detail="Agent not found")
 
+            # Only set fields that actually exist as DB columns on AgentConfig
+            _model_columns = {c.name for c in AgentConfig.__table__.columns}
             for field, value in payload.model_dump(exclude_none=True).items():
-                setattr(agent, field, value)
+                if field in _model_columns:
+                    setattr(agent, field, value)
 
             await session.commit()
             await session.refresh(agent)

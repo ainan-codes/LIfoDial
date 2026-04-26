@@ -172,6 +172,15 @@ async def _run_migrations():
             await add_col("agent_configs", "embed_primary_color", "TEXT DEFAULT '#3ECF8E'")
             await add_col("agent_configs", "embed_show_branding", "INTEGER DEFAULT 1")
 
+            # ── Capabilities columns ──────────────────────────────────────
+            await add_col("agent_configs", "can_book_appointments", "INTEGER DEFAULT 1")
+            await add_col("agent_configs", "can_cancel_appointments", "INTEGER DEFAULT 1")
+            await add_col("agent_configs", "can_check_availability", "INTEGER DEFAULT 1")
+            await add_col("agent_configs", "can_transfer_emergency", "INTEGER DEFAULT 1")
+            await add_col("agent_configs", "emergency_transfer_number", "TEXT")
+            await add_col("agent_configs", "auto_detect_language", "INTEGER DEFAULT 1")
+            await add_col("agent_configs", "clinic_info", "TEXT")
+
         # ── api_key_configs — deduplicate rows per (provider, category) ──────
         # If duplicate rows exist, keep only the most-recently created one.
         # Then enforce uniqueness so it can't happen again.

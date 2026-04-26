@@ -66,7 +66,7 @@ const INITIAL_STATE: WizardState = {
   new_phone: '', new_location: '', new_language: 'hi-IN',
   agent_name: 'Receptionist',
   template: 'clinic_receptionist',
-  first_message: 'Namaste! {clinic_name} mein aapka swagat hai. Main {agent_name} hoon. Aaj main aapki kaise madad kar sakti hoon?',
+  first_message: '',
   system_prompt: '',
   stt_provider: 'sarvam', stt_model: 'saaras:v3',
   tts_provider: 'sarvam', tts_model: 'bulbul:v3',
