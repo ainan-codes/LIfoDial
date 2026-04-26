@@ -7,6 +7,14 @@ interface HealthStatus {
   database?: { status: string; latency_ms?: number; type?: string; tenant_count?: number; appointment_count?: number; error?: string };
   environment?: string;
   timestamp?: string;
+  // Service key statuses — 'connected' | 'missing_key'
+  gemini?: string;
+  sarvam?: string;
+  livekit?: string;
+  vobiz?: string;
+  oxzygen?: string;
+  groq?: string;
+  elevenlabs?: string;
 }
 
 interface ConfigCheck {
@@ -102,14 +110,19 @@ export default function SASystemHealth() {
     : health.database?.status === 'error' ? 'error'
     : 'unknown';
 
+  // Helper: map backend 'connected'|'missing_key' → checklist status
+  const svcStatus = (v?: string): 'ok' | 'warn' => v === 'connected' ? 'ok' : 'warn';
+  const svcDesc   = (v?: string, label?: string) =>
+    v === 'connected' ? `${label ?? 'Key'} detected ✓` : `Set in environment`;
+
   const configChecks: ConfigCheck[] = [
     { label: 'Database', description: health.database?.status === 'healthy' ? `${health.database.type} — ${health.database.latency_ms}ms` : 'Not connected', status: dbStatus === 'healthy' ? 'ok' : 'error' },
     { label: 'Session Store', description: 'In-memory (Redis not required in dev)', status: 'ok' },
-    { label: 'Gemini LLM', description: 'Set GEMINI_API_KEY in .env · verified server-side', status: 'warn' },
-    { label: 'Sarvam STT/TTS', description: 'Check SARVAM_API_KEY in .env', status: 'warn' },
-    { label: 'LiveKit Voice', description: 'Check LIVEKIT_URL, LIVEKIT_API_KEY in .env', status: 'warn' },
-    { label: 'Telephony (Vobiz)', description: 'Check VOBIZ_* in .env', status: 'warn' },
-    { label: 'HIS Integration (Oxzygen)', description: 'Check OXZYGEN_* in .env', status: 'warn' },
+    { label: 'Gemini LLM',          description: svcDesc(health.gemini, 'GEMINI_API_KEY'),         status: svcStatus(health.gemini) },
+    { label: 'Sarvam STT/TTS',      description: svcDesc(health.sarvam, 'SARVAM_API_KEY'),         status: svcStatus(health.sarvam) },
+    { label: 'LiveKit Voice',        description: svcDesc(health.livekit, 'LIVEKIT_API_KEY'),       status: svcStatus(health.livekit) },
+    { label: 'Telephony (Vobiz)',    description: svcDesc(health.vobiz, 'VOBIZ_ACCOUNT_SID'),      status: svcStatus(health.vobiz) },
+    { label: 'HIS Integration (Oxzygen)', description: svcDesc(health.oxzygen, 'OXZYGEN_API_KEY'), status: svcStatus(health.oxzygen) },
   ];
 
   return (
@@ -155,12 +168,32 @@ export default function SASystemHealth() {
           latency={health.database?.latency_ms}
           extra={health.database?.tenant_count !== undefined ? `${health.database.tenant_count} tenants · ${health.database.appointment_count} appointments` : undefined}
         />
-        <ServiceCard label="Agent API" status="healthy" detail="FastAPI on :8001" latency={`~${Math.round(p50)}ms`} extra="Live latency (simulated)" />
+        <ServiceCard label="Agent API" status="healthy" detail={`FastAPI · ${health.environment ?? 'development'}`} latency={`~${Math.round(p50)}ms`} extra="Live latency (simulated)" />
         <ServiceCard label="Session Store" status="healthy" detail="In-memory (dev mode)" latency="<1ms" extra="No Redis needed locally" />
-        <ServiceCard label="LiveKit" status="unknown" detail="Not tested" extra="Set LIVEKIT_URL in .env" />
-        <ServiceCard label="Sarvam AI" status="unknown" detail="Not tested" extra="Set SARVAM_API_KEY in .env" />
-        <ServiceCard label="Gemini LLM" status="unknown" detail="Not tested" extra="Set GEMINI_API_KEY in .env" />
-        <ServiceCard label="Vobiz Telephony" status="unknown" detail="Not configured" extra="Set VOBIZ_* in .env" />
+        <ServiceCard
+          label="LiveKit"
+          status={health.livekit === 'connected' ? 'healthy' : loading ? 'unknown' : 'degraded'}
+          detail={health.livekit === 'connected' ? 'Keys configured ✓' : 'Set LIVEKIT_URL + KEY in env'}
+          extra="Voice infrastructure"
+        />
+        <ServiceCard
+          label="Sarvam AI"
+          status={health.sarvam === 'connected' ? 'healthy' : loading ? 'unknown' : 'degraded'}
+          detail={health.sarvam === 'connected' ? 'API key detected ✓' : 'Set SARVAM_API_KEY in env'}
+          extra="STT + TTS provider"
+        />
+        <ServiceCard
+          label="Gemini LLM"
+          status={health.gemini === 'connected' ? 'healthy' : loading ? 'unknown' : 'degraded'}
+          detail={health.gemini === 'connected' ? 'API key detected ✓' : 'Set GEMINI_API_KEY in env'}
+          extra="LLM backbone"
+        />
+        <ServiceCard
+          label="Vobiz Telephony"
+          status={health.vobiz === 'connected' ? 'healthy' : 'unknown'}
+          detail={health.vobiz === 'connected' ? 'Account SID detected ✓' : 'Set VOBIZ_* in env'}
+          extra="SIP telephony"
+        />
       </div>
 
       {/* Config Checklist + DB Stats side by side */}

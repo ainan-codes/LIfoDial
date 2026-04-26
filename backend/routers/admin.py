@@ -347,27 +347,46 @@ async def list_all_appointments(
 # ── System Health ────────────────────────────────────────────────────────────
 @router.get("/health-status")
 async def system_health_status(db: AsyncSession = Depends(get_db)):
-    """Real health check for all services."""
-    results = {}
+    """Real health check for all services — reads actual env vars."""
+    from backend.config import settings
+    from backend.db import IS_SQLITE
+    results: dict = {}
 
-    # Database ping
+    # ── Database ping ────────────────────────────────────────────────────────
     try:
         t0 = time.monotonic()
         await db.execute(text("SELECT 1"))
         db_latency = round((time.monotonic() - t0) * 1000, 1)
-        results["database"] = {"status": "healthy", "latency_ms": db_latency, "type": "SQLite"}
+        db_type = "SQLite" if IS_SQLITE else "PostgreSQL"
+        results["database"] = {
+            "status": "healthy",
+            "latency_ms": db_latency,
+            "type": db_type,
+        }
     except Exception as e:
-        results["database"] = {"status": "error", "error": str(e)}
+        results["database"] = {"status": "error", "error": str(e)[:120]}
 
-    # Count records
+    # ── Count records ────────────────────────────────────────────────────────
     try:
         tenant_count = (await db.execute(text("SELECT COUNT(*) FROM tenants"))).scalar()
-        appt_count = (await db.execute(text("SELECT COUNT(*) FROM appointments"))).scalar()
-        results["database"]["tenant_count"] = tenant_count
+        appt_count   = (await db.execute(text("SELECT COUNT(*) FROM appointments"))).scalar()
+        results["database"]["tenant_count"]      = tenant_count
         results["database"]["appointment_count"] = appt_count
-    except:
+    except Exception:
         pass
 
-    results["environment"] = "development"
-    results["timestamp"] = datetime.utcnow().isoformat()
+    # ── API key presence checks ──────────────────────────────────────────────
+    def _key_status(value: str) -> str:
+        return "connected" if value and value.strip() else "missing_key"
+
+    results["gemini"]    = _key_status(settings.gemini_api_key)
+    results["sarvam"]    = _key_status(settings.sarvam_api_key)
+    results["livekit"]   = _key_status(settings.livekit_api_key) if (settings.livekit_url and settings.livekit_api_key) else "missing_key"
+    results["vobiz"]     = _key_status(settings.vobiz_account_sid)
+    results["oxzygen"]   = _key_status(settings.oxzygen_api_key)
+    results["groq"]      = _key_status(settings.groq_api_key)
+    results["elevenlabs"] = _key_status(settings.elevenlabs_api_key)
+
+    results["environment"] = settings.environment
+    results["timestamp"]   = datetime.utcnow().isoformat()
     return results

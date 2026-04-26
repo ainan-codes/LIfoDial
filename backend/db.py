@@ -2,40 +2,54 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine, AsyncSession, async_sessionmaker
 )
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 import os
 import logging
 
 logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Auto-convert Supabase URL format to async format
-if DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace(
-        "postgresql://", "postgresql+asyncpg://", 1
-    )
-elif DATABASE_URL.startswith("postgresql+asyncpg://"):
-    pass  # already correct
-elif not DATABASE_URL:
-    DATABASE_URL = "sqlite+aiosqlite:///./lifodial.db"
-    logger.warning("No DATABASE_URL set — using SQLite (development)")
+def _build_database_url() -> str:
+    """Normalise DATABASE_URL to the correct async driver format."""
+    raw = os.getenv("DATABASE_URL", "")
+    if not raw:
+        logger.warning("No DATABASE_URL set — using SQLite (development)")
+        return "sqlite+aiosqlite:///./lifodial.db"
+    # Supabase / Heroku / Render ship postgresql:// or postgres://
+    if raw.startswith("postgres://"):
+        return raw.replace("postgres://", "postgresql+asyncpg://", 1)
+    if raw.startswith("postgresql://"):
+        return raw.replace("postgresql://", "postgresql+asyncpg://", 1)
+    # Already correct (postgresql+asyncpg:// or sqlite+aiosqlite://)
+    return raw
 
+
+DATABASE_URL = _build_database_url()
 IS_SQLITE = "sqlite" in DATABASE_URL
 
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
-    # SQLite dev mode still needs >1 pooled connections because a long-lived
-    # websocket can hold one session while admin PATCH/GET calls run in parallel.
-    pool_size=5 if not IS_SQLITE else 10,
-    max_overflow=10 if not IS_SQLITE else 20,
-    connect_args=(
-        {"check_same_thread": False} if IS_SQLITE
-        else {"server_settings": {"jit": "off"}} if "asyncpg" in DATABASE_URL
-        else {}
-    ),
-)
+logger.info("Database driver: %s", "SQLite" if IS_SQLITE else "PostgreSQL (asyncpg)")
+
+if IS_SQLITE:
+    # SQLite: NullPool avoids StaticPool/pool_size conflicts; check_same_thread=False
+    # allows multiple async tasks to share connections safely.
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_pre_ping=False,  # not supported by SQLite
+        poolclass=NullPool,
+        connect_args={"check_same_thread": False},
+    )
+else:
+    # PostgreSQL (asyncpg) — tune pool for Render's single-worker setup
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=10,
+        pool_timeout=30,
+        connect_args={"server_settings": {"jit": "off"}},
+    )
 
 AsyncSessionLocal = async_sessionmaker(
     engine,
