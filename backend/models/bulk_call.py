@@ -3,7 +3,8 @@ backend/models/bulk_call.py — Bulk Call Campaign model.
 Tracks outbound reminder/follow-up call campaigns per tenant.
 """
 import uuid
-from sqlalchemy import Column, String, Integer, DateTime, JSON, ForeignKey, Text
+from datetime import datetime, timezone
+from sqlalchemy import Column, String, Integer, DateTime, JSON, ForeignKey, Text, text
 from sqlalchemy.sql import func
 from backend.db import Base
 
@@ -46,7 +47,16 @@ class BulkCallCampaign(Base):
     # Notes / error summary
     notes = Column(Text, nullable=True)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=text("CURRENT_TIMESTAMP")
+    )
     updated_at = Column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=text("CURRENT_TIMESTAMP"),
+        onupdate=lambda: datetime.now(timezone.utc)
     )

@@ -3,8 +3,8 @@ backend/models/onboarding_request.py
 Database model for clinic onboarding (contact sales) submissions.
 """
 import uuid
-from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Text
+from datetime import datetime, timezone
+from sqlalchemy import Column, String, DateTime, Text, text
 from backend.db import Base
 
 
@@ -21,5 +21,16 @@ class OnboardingRequest(Base):
     message: str = Column(Text, nullable=True)         # free-form message from form
     status: str = Column(String, default="Pending")    # Pending | Approved | Rejected
     note: str = Column(Text, nullable=True)            # internal rejection/approval note
-    created_at: datetime = Column(DateTime, default=datetime.utcnow)
-    updated_at: datetime = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: datetime = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_at: datetime = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=text("CURRENT_TIMESTAMP"),
+        onupdate=lambda: datetime.now(timezone.utc)
+    )

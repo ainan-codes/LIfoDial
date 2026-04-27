@@ -3,8 +3,8 @@ backend/models/knowledge_base.py
 Per-clinic knowledge base: FAQs, working hours, docs, custom info.
 """
 import uuid
-from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Boolean
+from datetime import datetime, timezone
+from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Boolean, text
 from backend.db import Base
 
 
@@ -18,5 +18,16 @@ class KnowledgeBase(Base):
     title: str = Column(String(255), nullable=False)
     content: str = Column(Text, nullable=False)
     is_active: bool = Column(Boolean, default=True)
-    created_at: datetime = Column(DateTime, default=datetime.utcnow)
-    updated_at: datetime = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: datetime = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_at: datetime = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=text("CURRENT_TIMESTAMP"),
+        onupdate=lambda: datetime.now(timezone.utc)
+    )
