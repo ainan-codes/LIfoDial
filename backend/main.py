@@ -175,7 +175,7 @@ async def health() -> dict:
         "status": "ok" if db_status == "connected" else "degraded",
         "database": db_status,
         "database_type": db_type,
-        "version": "1.0.1",
+        "version": "1.0.2",
         "environment": settings.environment,
     }
 
