@@ -198,6 +198,15 @@ async def reset_db():
         await conn.run_sync(Base.metadata.create_all)
     return {"status": "ok", "message": "All tables recreated"}
 
+@app.post("/admin/seed", tags=["superadmin"])
+async def seed_db():
+    """
+    ONE TIME USE: Seeds the database with demo data.
+    """
+    from backend.scripts.seed_demo import seed
+    await seed()
+    return {"status": "ok", "message": "Database seeded successfully"}
+
 # ── Routers ───────────────────────────────────────────────────────────────────
 from backend.routers import admin, tenants, doctors, voice, appointments, ws, voice_upload, agents, agent_test, platform, knowledge_base, voices, web_calls, phone_numbers, embed, models, simulation, latency, providers, bulk_calls
 
