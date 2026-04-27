@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import DateTime, ForeignKey, String, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from backend.db import Base
 
@@ -29,7 +29,10 @@ class Doctor(Base):
     his_doctor_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_now
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=text("CURRENT_TIMESTAMP")
     )
 
     tenant: Mapped["Tenant"] = relationship("Tenant", back_populates="doctors")

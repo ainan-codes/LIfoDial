@@ -7,6 +7,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from datetime import datetime, timezone
 from backend.db import Base
 
 
@@ -161,9 +162,12 @@ class AgentConfig(Base):
     status = Column(String(20), default="CONFIGURED")
     created_at = Column(
         DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
         server_default=func.now()
     )
     updated_at = Column(
         DateTime(timezone=True),
-        onupdate=func.now()
+        nullable=True,
+        onupdate=lambda: datetime.now(timezone.utc)
     )

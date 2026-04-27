@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import DateTime, ForeignKey, Integer, String, JSON
+from sqlalchemy import DateTime, ForeignKey, Integer, String, JSON, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from backend.db import Base
 
@@ -41,7 +41,10 @@ class CallLog(Base):
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_now
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=text("CURRENT_TIMESTAMP")
     )
 
     tenant: Mapped["Tenant"] = relationship("Tenant", back_populates="call_logs")

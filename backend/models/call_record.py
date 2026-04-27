@@ -3,6 +3,7 @@ from sqlalchemy import (
     Column, String, Integer, Float, JSON,
     DateTime, Boolean, Text, ForeignKey
 )
+from datetime import datetime, timezone
 from sqlalchemy.sql import func
 from backend.db import Base
 
@@ -64,5 +65,9 @@ class CallRecord(Base):
     # Recording
     recording_url = Column(String(500), nullable=True)
 
-    created_at = Column(DateTime(timezone=True),
-                        server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now()
+    )

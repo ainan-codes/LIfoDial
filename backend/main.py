@@ -10,7 +10,7 @@ from fastapi.responses import Response, FileResponse
 import os as _os
 
 from backend.config import settings
-from backend.db import init_db
+from backend.db import init_db, engine, Base
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -182,6 +182,21 @@ async def health() -> dict:
 @app.get("/", tags=["meta"])
 async def root() -> dict[str, str]:
     return {"service": "Lifodial API", "docs": "/docs"}
+
+@app.post("/admin/reset-db", tags=["superadmin"])
+async def reset_db():
+    """
+    ONE TIME USE: Drops and recreates all tables.
+    Delete this endpoint after use.
+    """
+    # Import all models to ensure Base.metadata is fully populated
+    from backend.models import tenant, doctor, appointment, call_log, agent_config, onboarding_request, api_key_config, knowledge_base
+    from backend.models import phone_number, call_record, embed_analytics, bulk_call
+    
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    return {"status": "ok", "message": "All tables recreated"}
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 from backend.routers import admin, tenants, doctors, voice, appointments, ws, voice_upload, agents, agent_test, platform, knowledge_base, voices, web_calls, phone_numbers, embed, models, simulation, latency, providers, bulk_calls
