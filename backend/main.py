@@ -115,7 +115,7 @@ async def _warmup() -> None:
 app = FastAPI(
     title="Lifodial API",
     description="AI Voice Receptionist SaaS for clinics — India & Middle East (Lifodial)",
-    version="1.0.0",
+    version="1.0.2",
     docs_url="/docs" if settings.environment != "production" else None,
     redoc_url="/redoc" if settings.environment != "production" else None,
     lifespan=lifespan,
