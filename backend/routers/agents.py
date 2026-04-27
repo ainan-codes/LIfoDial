@@ -64,10 +64,10 @@ class AgentCreatePayload(BaseModel):
     tts_clarity: float = Field(0.75, ge=0.0, le=1.0)
     tts_speed: float = Field(1.0, ge=0.5, le=2.0)
     tts_style: float = Field(0.0, ge=0.0, le=1.0)
-    tts_use_speaker_boost: int = 0
+    tts_use_speaker_boost: bool = False
     tts_optimize_streaming_latency: int = 3
-    tts_input_preprocessing: int = 1
-    tts_filler_injection: int = 0
+    tts_input_preprocessing: bool = True
+    tts_filler_injection: bool = False
     add_voice_manually: str | None = None
     fallback_voices: str | None = None
 
@@ -76,35 +76,35 @@ class AgentCreatePayload(BaseModel):
     llm_temperature: float = Field(0.7, ge=0.0, le=1.0)
     max_response_tokens: int = Field(250, ge=50, le=4000)
     llm_max_tokens: int = Field(250, ge=50, le=4000)
-    llm_emotion_recognition: int = 0
+    llm_emotion_recognition: bool = False
 
     silence_timeout_seconds: int = 30
     max_duration_seconds: int = 600
     background_sound: str = "none"
-    background_denoising: int = 0
-    model_output_in_realtime: int = 0
-    record_calls: int = 0
+    background_denoising: bool = False
+    model_output_in_realtime: bool = False
+    record_calls: bool = False
     recording_consent_plan: str | None = None
 
-    voicemail_detection_enabled: int = 0
+    voicemail_detection_enabled: bool = False
     voicemail_message: str | None = None
     end_call_phrases: str | None = None
     end_call_message: str | None = None
-    summary_enabled: int = 1
-    success_evaluation_enabled: int = 1
-    structured_output_enabled: int = 0
+    summary_enabled: bool = True
+    success_evaluation_enabled: bool = True
+    structured_output_enabled: bool = False
 
     tools_enabled: str | None = None
     predefined_functions: str | None = None
     custom_functions: str | None = None
 
-    keypad_input_enabled: int = 0
+    keypad_input_enabled: bool = False
     keypad_timeout: int = 5
-    sms_enabled: int = 0
+    sms_enabled: bool = False
     sms_provider: str | None = None
     sms_message_template: str | None = None
-    hipaa_enabled: int = 0
-    pii_redaction_enabled: int = 0
+    hipaa_enabled: bool = False
+    pii_redaction_enabled: bool = False
 
     # Step 4 — Telephony
     telephony_option: str = "skip"  # "assign" | "existing" | "skip"
@@ -143,10 +143,10 @@ class AgentPatchPayload(BaseModel):
     tts_clarity: float | None = None
     tts_speed: float | None = None
     tts_style: float | None = None
-    tts_use_speaker_boost: int | None = None
+    tts_use_speaker_boost: bool | None = None
     tts_optimize_streaming_latency: int | None = None
-    tts_input_preprocessing: int | None = None
-    tts_filler_injection: int | None = None
+    tts_input_preprocessing: bool | None = None
+    tts_filler_injection: bool | None = None
     add_voice_manually: str | None = None
     fallback_voices: str | None = None
 
@@ -155,35 +155,35 @@ class AgentPatchPayload(BaseModel):
     llm_model: str | None = None
     max_response_tokens: int | None = None
     llm_max_tokens: int | None = None
-    llm_emotion_recognition: int | None = None
+    llm_emotion_recognition: bool | None = None
     
     silence_timeout_seconds: int | None = None
     max_duration_seconds: int | None = None
     background_sound: str | None = None
-    background_denoising: int | None = None
-    model_output_in_realtime: int | None = None
-    record_calls: int | None = None
+    background_denoising: bool | None = None
+    model_output_in_realtime: bool | None = None
+    record_calls: bool | None = None
     recording_consent_plan: str | None = None
 
-    voicemail_detection_enabled: int | None = None
+    voicemail_detection_enabled: bool | None = None
     voicemail_message: str | None = None
     end_call_phrases: str | None = None
     end_call_message: str | None = None
-    summary_enabled: int | None = None
-    success_evaluation_enabled: int | None = None
-    structured_output_enabled: int | None = None
+    summary_enabled: bool | None = None
+    success_evaluation_enabled: bool | None = None
+    structured_output_enabled: bool | None = None
 
     tools_enabled: str | None = None
     predefined_functions: str | None = None
     custom_functions: str | None = None
 
-    keypad_input_enabled: int | None = None
+    keypad_input_enabled: bool | None = None
     keypad_timeout: int | None = None
-    sms_enabled: int | None = None
+    sms_enabled: bool | None = None
     sms_provider: str | None = None
     sms_message_template: str | None = None
-    hipaa_enabled: int | None = None
-    pii_redaction_enabled: int | None = None
+    hipaa_enabled: bool | None = None
+    pii_redaction_enabled: bool | None = None
 
     telephony_option: str | None = None
     country_code: str | None = None
@@ -226,27 +226,27 @@ def _agent_to_dict(agent: AgentConfig, clinic_name: str = "") -> dict:
     _defaults = {
         "first_message_mode": "assistant-speaks-first",
         "background_sound": "none",
-        "background_denoising": 0,
-        "record_calls": 0,
-        "model_output_in_realtime": 0,
+        "background_denoising": False,
+        "record_calls": False,
+        "model_output_in_realtime": False,
         "tts_stability": 0.5,
         "tts_clarity": 0.75,
         "tts_style": 0.0,
         "tts_speed": 1.0,
-        "tts_use_speaker_boost": 0,
+        "tts_use_speaker_boost": False,
         "tts_optimize_streaming_latency": 3,
-        "tts_filler_injection": 0,
-        "tts_input_preprocessing": 1,
-        "voicemail_detection_enabled": 0,
+        "tts_filler_injection": False,
+        "tts_input_preprocessing": True,
+        "voicemail_detection_enabled": False,
         "voicemail_message": "",
-        "summary_enabled": 1,
-        "success_evaluation_enabled": 1,
-        "structured_output_enabled": 0,
+        "summary_enabled": True,
+        "success_evaluation_enabled": True,
+        "structured_output_enabled": False,
         "tools_enabled": "[]",
         "recording_consent_plan": "none",
-        "keypad_input_enabled": 0,
-        "hipaa_enabled": 0,
-        "pii_redaction_enabled": 0,
+        "keypad_input_enabled": False,
+        "hipaa_enabled": False,
+        "pii_redaction_enabled": False,
         "transcriber_keywords": "[]",
     }
     for key, default in _defaults.items():
