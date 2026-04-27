@@ -6,6 +6,8 @@ from sqlalchemy.pool import NullPool
 from uuid import uuid4
 import os
 import logging
+from alembic import command
+from alembic.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -63,17 +65,61 @@ async_session = AsyncSessionLocal
 
 async def init_db():
     """Creates all tables automatically. Import all models first so metadata is populated."""
-    # noqa: F401 — side-effect imports to register all ORM models
-    from backend.models import tenant, doctor, appointment, call_log, agent_config, onboarding_request, api_key_config, knowledge_base  # type: ignore
-    from backend.models import phone_number, call_record, embed_analytics, bulk_call  # type: ignore
+    logger.info("Initializing database...")
+    
+    # Import all models to register them with Base.metadata
+    # Importing classes directly to ensure they are defined and registered
+    try:
+        from backend.models.tenant import Tenant
+        from backend.models.doctor import Doctor
+        from backend.models.appointment import Appointment
+        from backend.models.call_log import CallLog
+        from backend.models.agent_config import AgentConfig
+        from backend.models.onboarding_request import OnboardingRequest
+        from backend.models.api_key_config import ApiKeyConfig
+        from backend.models.knowledge_base import KnowledgeBase
+        from backend.models.phone_number import PhoneNumber
+        from backend.models.call_record import CallRecord
+        from backend.models.embed_analytics import EmbedAnalytics
+        from backend.models.bulk_call import BulkCallCampaign
+        
+        logger.info(f"Registered models: {list(Base.metadata.tables.keys())}")
+    except ImportError as e:
+        logger.error(f"Failed to import models for DB init: {e}")
+        raise
+
+    if not Base.metadata.tables:
+        logger.warning("No tables found in metadata! Check model imports.")
+
     async with engine.begin() as conn:
+        logger.info("Running Base.metadata.create_all...")
         await conn.run_sync(Base.metadata.create_all)
 
-    db_type = "SQLite" if IS_SQLITE else "PostgreSQL (Supabase)"
+    db_type = "SQLite" if IS_SQLITE else "PostgreSQL"
     logger.info(f"Database ready ({db_type})")
     print(f"[OK] Database ready ({db_type})")
 
-    # Always run safe migrations after create_all
+    # Run Alembic migrations for PostgreSQL
+    if not IS_SQLITE:
+        logger.info("PostgreSQL detected — running Alembic migrations...")
+        try:
+            # alembic.ini is in the same directory as db.py
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            ini_path = os.path.join(base_dir, "alembic.ini")
+            alembic_cfg = Config(ini_path)
+            
+            # Ensure Alembic uses the correct DATABASE_URL
+            alembic_cfg.set_main_option("sqlalchemy.url", DATABASE_URL)
+            
+            # Run upgrade head
+            command.upgrade(alembic_cfg, "head")
+            logger.info("Alembic migrations applied successfully.")
+        except Exception as e:
+            logger.error(f"Alembic migration failed: {e}")
+            # Non-fatal if create_all worked, but we should log it
+            print(f"  [WARN] Alembic migration failed (non-fatal): {e}")
+
+    # Always run safe migrations after create_all (mostly for SQLite column adds)
     await _run_migrations()
 
 

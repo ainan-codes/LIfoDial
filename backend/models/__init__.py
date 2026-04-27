@@ -9,6 +9,8 @@ from backend.models.onboarding_request import OnboardingRequest
 from backend.models.knowledge_base import KnowledgeBase
 from backend.models.phone_number import PhoneNumber
 from backend.models.call_record import CallRecord
+from backend.models.embed_analytics import EmbedAnalytics
+from backend.models.bulk_call import BulkCallCampaign
 
 __all__ = [
     "Tenant",
@@ -19,4 +21,8 @@ __all__ = [
     "ApiKeyConfig",
     "OnboardingRequest",
     "KnowledgeBase",
+    "PhoneNumber",
+    "CallRecord",
+    "EmbedAnalytics",
+    "BulkCallCampaign",
 ]
