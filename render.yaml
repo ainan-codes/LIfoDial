@@ -20,7 +20,7 @@ services:
     region: singapore          # closest to India / Middle East
     plan: starter              # upgrade to standard when load grows
     # rootDir intentionally NOT set — run from repo root so requirements.txt is found
-    buildCommand: pip install -r requirements.txt && PYTHONPATH=. alembic -c backend/alembic.ini upgrade head
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
 
