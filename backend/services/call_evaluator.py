@@ -7,7 +7,10 @@ import json
 import logging
 import re
 
-import google.generativeai as genai
+import asyncio
+import functools
+
+from google import genai as google_genai
 
 from backend.config import settings
 
@@ -56,8 +59,24 @@ async def evaluate_call(call_record_id: str, db) -> dict:
     duration = call.duration_seconds or 0
     turn_count = len(transcript)
 
-    genai.configure(api_key=settings.gemini_api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    google_genai_client = google_genai.Client(api_key=settings.gemini_api_key)
+
+    loop = asyncio.get_event_loop()
+
+    async def _generate_eval(prompt: str) -> str:
+        try:
+            resp = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    google_genai_client.models.generate_content,
+                    model="gemini-2.0-flash",
+                    contents=prompt,
+                )
+            )
+            return resp.text.strip() if resp.text else ""
+        except Exception as e:
+            logger.error(f"evaluate_call: Gemini API error for {call_record_id}: {e}")
+            return ""
 
     prompt = f"""
 Evaluate this AI clinic receptionist call transcript.
@@ -85,11 +104,13 @@ Transcript:
 """
 
     try:
-        response = await model.generate_content_async(prompt)
-        raw = response.text.strip()
-        # Strip any accidental markdown fences
-        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
-        evaluation = json.loads(raw)
+        raw = await _generate_eval(prompt)
+        if not raw:
+            evaluation = _fallback_evaluation()
+        else:
+            # Strip any accidental markdown fences
+            raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+            evaluation = json.loads(raw)
     except json.JSONDecodeError as e:
         logger.warning(f"evaluate_call: JSON parse error for {call_record_id}: {e}")
         evaluation = _fallback_evaluation()

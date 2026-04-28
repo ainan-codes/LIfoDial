@@ -48,14 +48,14 @@ class AgentCreatePayload(BaseModel):
 
     # Step 3 — Voice
     stt_provider: str = "sarvam"
-    stt_model: str = "saaras:v3"
+    stt_model: str = "saarika:v2"
     stt_language: str = "en-IN"
     transcriber_keywords: str | None = None
     fallback_transcribers: str | None = None
 
     tts_provider: str = "sarvam"
     tts_model: str = "bulbul:v3"
-    tts_voice: str = "anushka"
+    tts_voice: str = "priya"
     tts_language: str = "hi-IN"
     tts_pitch: float = Field(0.0, ge=-1.0, le=1.0)
     tts_pace: float = Field(1.0, ge=0.5, le=2.0)

@@ -22,54 +22,50 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# ── Sarvam voices catalogue (full 35+ voices) ─────────────────────────────────
+# ── Sarvam voices catalogue — bulbul:v3 authoritative list (from API) ──────────
+# Source: Sarvam API error response listing ALL valid speakers for bulbul:v3.
+# DO NOT add voices not in this list — Sarvam will reject them with a 400 error.
 
 SARVAM_VOICES = [
-    # ── bulbul:v3 (Strictly Audited from API endpoint) ──
-    {"id": "anushka",  "name": "Anushka",  "model": "bulbul:v3", "language": "te-IN", "gender": "female", "description": "Telugu & Hindi female"},
-    {"id": "abhilash", "name": "Abhilash", "model": "bulbul:v3", "language": "te-IN", "gender": "male",   "description": "Telugu male"},
-    {"id": "manisha",  "name": "Manisha",  "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Clear Hindi female"},
-    {"id": "vidya",    "name": "Vidya",    "model": "bulbul:v3", "language": "ta-IN", "gender": "female", "description": "Tamil & Hindi female"},
-    {"id": "arya",     "name": "Arya",     "model": "bulbul:v3", "language": "en-IN", "gender": "female", "description": "Crisp Indian English"},
-    {"id": "karun",    "name": "Karun",    "model": "bulbul:v3", "language": "kn-IN", "gender": "male",   "description": "Kannada male"},
-    {"id": "hitesh",   "name": "Hitesh",   "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Hindi male"},
-    {"id": "aditya",   "name": "Aditya",   "model": "bulbul:v3", "language": "mr-IN", "gender": "male",   "description": "Marathi & Hindi male"},
-    {"id": "ritu",     "name": "Ritu",     "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Premium Hindi female (Recommended)"},
-    {"id": "priya",    "name": "Priya",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Soft Hindi female"},
+    # ── bulbul:v3 — 38 officially confirmed speakers ──
+    {"id": "priya",    "name": "Priya",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Soft Hindi female (Recommended)", "recommended": True},
+    {"id": "ritu",     "name": "Ritu",     "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Premium Hindi female"},
     {"id": "neha",     "name": "Neha",     "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Young Hindi female"},
-    {"id": "rahul",    "name": "Rahul",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Deep Hindi male"},
-    {"id": "pooja",    "name": "Pooja",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Sweet Hindi female"},
-    {"id": "rohan",    "name": "Rohan",    "model": "bulbul:v3", "language": "bn-IN", "gender": "male",   "description": "Bengali & Hindi male"},
-    {"id": "simran",   "name": "Simran",   "model": "bulbul:v3", "language": "en-IN", "gender": "female", "description": "Professional English & Hindi"},
-    {"id": "kavya",    "name": "Kavya",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Friendly Hindi female"},
-    {"id": "amit",     "name": "Amit",     "model": "bulbul:v3", "language": "en-IN", "gender": "male",   "description": "Neutral Indian English male"},
-    {"id": "dev",      "name": "Dev",      "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Bold Hindi male"},
+    {"id": "simran",   "name": "Simran",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Hindi / Punjabi female"},
+    {"id": "kavya",    "name": "Kavya",    "model": "bulbul:v3", "language": "kn-IN", "gender": "female", "description": "Kannada / Hindi female"},
     {"id": "ishita",   "name": "Ishita",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Polite Hindi female"},
     {"id": "shreya",   "name": "Shreya",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Warm professional Hindi"},
+    {"id": "tanya",    "name": "Tanya",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Modern Hindi female"},
+    {"id": "pooja",    "name": "Pooja",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Sweet Hindi female"},
+    {"id": "roopa",    "name": "Roopa",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Kannada / Hindi female"},
+    {"id": "kavitha",  "name": "Kavitha",  "model": "bulbul:v3", "language": "ta-IN", "gender": "female", "description": "Tamil / Telugu female"},
+    {"id": "suhani",   "name": "Suhani",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Soft Hindi female"},
+    {"id": "shruti",   "name": "Shruti",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Clear Hindi female"},
+    {"id": "niharika", "name": "Niharika", "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Hindi female"},
+    {"id": "rupali",   "name": "Rupali",   "model": "bulbul:v3", "language": "mr-IN", "gender": "female", "description": "Marathi / Hindi female"},
+    {"id": "rahul",    "name": "Rahul",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Hindi / English male"},
+    {"id": "aditya",   "name": "Aditya",   "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Hindi male"},
+    {"id": "ashutosh", "name": "Ashutosh", "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Deep resonant Hindi male"},
+    {"id": "rohan",    "name": "Rohan",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Hindi male"},
+    {"id": "amit",     "name": "Amit",     "model": "bulbul:v3", "language": "en-IN", "gender": "male",   "description": "Neutral Indian English male"},
+    {"id": "dev",      "name": "Dev",      "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Hindi / English male"},
     {"id": "ratan",    "name": "Ratan",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Mature Hindi male"},
     {"id": "varun",    "name": "Varun",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Confident Hindi male"},
     {"id": "manan",    "name": "Manan",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Calm Hindi male"},
     {"id": "sumit",    "name": "Sumit",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Friendly Hindi male"},
-    {"id": "roopa",    "name": "Roopa",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Gentle Hindi female"},
     {"id": "kabir",    "name": "Kabir",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Authoritative Hindi male"},
     {"id": "aayan",    "name": "Aayan",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Youthful Hindi male"},
     {"id": "shubh",    "name": "Shubh",    "model": "bulbul:v3", "language": "en-IN", "gender": "male",   "description": "Professional English male"},
-    {"id": "ashutosh", "name": "Ashutosh", "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Deep resonant Hindi male"},
     {"id": "advait",   "name": "Advait",   "model": "bulbul:v3", "language": "mr-IN", "gender": "male",   "description": "Marathi male"},
     {"id": "anand",    "name": "Anand",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Classic Hindi male"},
-    {"id": "tanya",    "name": "Tanya",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Modern Hindi female"},
     {"id": "tarun",    "name": "Tarun",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Energetic Hindi male"},
     {"id": "sunny",    "name": "Sunny",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Casual Hindi male"},
-    {"id": "mani",     "name": "Mani",     "model": "bulbul:v3", "language": "ta-IN", "gender": "male",   "description": "Tamil male"},
-    {"id": "gokul",    "name": "Gokul",    "model": "bulbul:v3", "language": "ta-IN", "gender": "male",   "description": "Tamil & Hindi male"},
-    {"id": "vijay",    "name": "Vijay",    "model": "bulbul:v3", "language": "te-IN", "gender": "male",   "description": "Telugu male"},
-    {"id": "shruti",   "name": "Shruti",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Sweet clear Hindi female"},
-    {"id": "suhani",   "name": "Suhani",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Soft clinical Hindi female"},
+    {"id": "mani",     "name": "Mani",     "model": "bulbul:v3", "language": "ta-IN", "gender": "male",   "description": "Tamil / Hindi male"},
+    {"id": "gokul",    "name": "Gokul",    "model": "bulbul:v3", "language": "ta-IN", "gender": "male",   "description": "Tamil / Kannada male"},
+    {"id": "vijay",    "name": "Vijay",    "model": "bulbul:v3", "language": "te-IN", "gender": "male",   "description": "Tamil / Telugu male"},
     {"id": "mohit",    "name": "Mohit",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Standard Hindi male"},
-    {"id": "kavitha",  "name": "Kavitha",  "model": "bulbul:v3", "language": "ta-IN", "gender": "female", "description": "Tamil female"},
-    {"id": "rehan",    "name": "Rehan",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Clear Hindi male"},
-    {"id": "soham",    "name": "Soham",    "model": "bulbul:v3", "language": "mr-IN", "gender": "male",   "description": "Marathi male"},
-    {"id": "rupali",   "name": "Rupali",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Warm Hindi female"},
+    {"id": "rehan",    "name": "Rehan",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Hindi / Urdu male"},
+    {"id": "soham",    "name": "Soham",    "model": "bulbul:v3", "language": "bn-IN", "gender": "male",   "description": "Bengali / Hindi male"},
 ]
 
 GEMINI_MODELS = [
@@ -273,10 +269,12 @@ async def test_connection(req: TestConnectionRequest) -> dict:
 
     if req.provider == "gemini":
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=req.api_key)
-            model = genai.GenerativeModel("gemini-2.0-flash")
-            resp = await model.generate_content_async("Say: OK")
+            from google import genai
+            client = genai.Client(api_key=req.api_key)
+            resp = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents="Say: OK",
+            )
             latency_ms = int((time.time() - t0) * 1000)
             return {
                 "provider": "gemini",
@@ -291,19 +289,18 @@ async def test_connection(req: TestConnectionRequest) -> dict:
     elif req.provider == "sarvam":
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
+                # Use 'priya' — a confirmed valid bulbul:v3 speaker
                 resp = await client.post(
                     "https://api.sarvam.ai/text-to-speech",
                     headers={"api-subscription-key": req.api_key, "Content-Type": "application/json"},
                     json={
-                        "inputs": ["test"],
+                        "text": "test",
                         "target_language_code": "hi-IN",
-                        "speaker": "meera",
+                        "speaker": "priya",
                         "model": "bulbul:v3",
                         "speech_sample_rate": 16000,
                         "enable_preprocessing": False,
                         "pace": 1.0,
-                        "pitch": 0.0,
-                        "loudness": 1.0,
                     },
                 )
                 latency_ms = int((time.time() - t0) * 1000)
@@ -315,7 +312,7 @@ async def test_connection(req: TestConnectionRequest) -> dict:
                         "voices_count": len(SARVAM_VOICES),
                     }
                 else:
-                    return {"provider": "sarvam", "connected": False, "error": f"HTTP {resp.status_code}"}
+                    return {"provider": "sarvam", "connected": False, "error": f"HTTP {resp.status_code}: {resp.text[:100]}"}
         except Exception as e:
             return {"provider": "sarvam", "connected": False, "error": str(e)[:100]}
 

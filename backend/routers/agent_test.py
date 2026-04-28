@@ -1230,7 +1230,7 @@ async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint
     
     if stt_provider == "sarvam":
         return await sarvam_transcribe(api_key, audio_bytes, 
-                                        agent.stt_model or "saaras:v3",
+                                        agent.stt_model or "saarika:v2",
                                         lang)
     
     elif stt_provider == "deepgram":
@@ -1342,7 +1342,7 @@ async def sarvam_transcribe(api_key: str, audio_bytes: bytes,
     import io
 
     # Sarvam docs recommend multipart upload with file + model + mode
-    normalized_model = model if model and model.startswith("saaras") else "saaras:v3"
+    normalized_model = model if model and model.startswith("saarika") else "saarika:v2"
     upload_name, upload_mime = _detect_audio_upload_format(audio_bytes)
     files = {
         "file": (upload_name, io.BytesIO(audio_bytes), upload_mime)
@@ -1787,7 +1787,7 @@ async def synthesize_speech(agent: AgentConfig, text: str, language_override: st
     
     try:
         if tts_provider == "sarvam":
-            raw_voice = (agent.tts_voice or "anushka").strip()
+            raw_voice = (agent.tts_voice or "priya").strip()
             sarvam_voice_map = {
                 "meera": "shreya",
                 "pavithra": "kavitha",
@@ -1851,7 +1851,7 @@ async def sarvam_synthesize_with_retry(
         return None
 
     tts_language = language_override or agent.tts_language or "en-IN"
-    raw_voice = (agent.tts_voice or "meera").strip().lower()
+    raw_voice = (agent.tts_voice or "priya").strip().lower()
 
     last_exc: Exception | None = None
     for attempt in range(1, max_retries + 1):
@@ -1881,6 +1881,62 @@ async def sarvam_synthesize_with_retry(
     return None
 
 
+# ── Speaker compatibility map ──────────────────────────────────────────────────────
+
+# Complete, authoritative speaker list for each Sarvam TTS model.
+# Source: Sarvam API error message for bulbul:v3 (April 2026).
+SARVAM_MODEL_SPEAKERS: dict[str, list[str]] = {
+    "bulbul:v3": [
+        "aditya", "ritu", "ashutosh", "priya", "neha", "rahul",
+        "pooja", "rohan", "simran", "kavya", "amit", "dev",
+        "ishita", "shreya", "ratan", "varun", "manan", "sumit",
+        "roopa", "kabir", "aayan", "shubh", "advait", "anand",
+        "tanya", "tarun", "sunny", "mani", "gokul", "vijay",
+        "shruti", "suhani", "mohit", "kavitha", "rehan", "soham",
+        "rupali", "niharika",
+    ],
+    "bulbul:v2": [
+        "meera", "pavithra", "maitreyi", "arvind", "amol",
+        "amartya", "diya", "neel", "misha", "vian", "arjun",
+        "maya", "anushka", "karun", "hitesh", "shubh",
+    ],
+    "bulbul:v1": [
+        "meera", "pavithra", "maitreyi", "arvind", "amol", "amartya",
+    ],
+}
+
+# Default speaker per model — female, clear voice, confirmed working
+SARVAM_MODEL_DEFAULT_SPEAKER: dict[str, str] = {
+    "bulbul:v3": "priya",
+    "bulbul:v2": "meera",
+    "bulbul:v1": "meera",
+}
+
+
+def get_compatible_speaker(model: str, requested_speaker: str) -> str:
+    """
+    Returns requested_speaker if it is valid for the given model.
+    Falls back to the model's default speaker when not compatible.
+    Logs a warning whenever a fallback is used so the issue is visible in logs.
+    """
+    valid_speakers = SARVAM_MODEL_SPEAKERS.get(model, [])
+
+    if not valid_speakers:
+        # Unknown model — pass the speaker through and let the API decide
+        return requested_speaker
+
+    if requested_speaker in valid_speakers:
+        return requested_speaker
+
+    fallback = SARVAM_MODEL_DEFAULT_SPEAKER.get(model, valid_speakers[0])
+    logger.warning(
+        "Speaker '%s' is not compatible with model '%s'. "
+        "Falling back to '%s'. Valid speakers: %s",
+        requested_speaker, model, fallback, ", ".join(valid_speakers),
+    )
+    return fallback
+
+
 async def sarvam_synthesize(api_key: str, text: str, voice: str,
                                model: str, language: str,
                                pitch: float, pace: float, 
@@ -1891,39 +1947,16 @@ async def sarvam_synthesize(api_key: str, text: str, voice: str,
     if not normalized_text:
         raise Exception("Sarvam TTS error: empty text payload")
 
-    # Modern Sarvam voice set for bulbul:v3 (fallback to shubh for reliability)
-    # Dynamically imported from authoritative list so new voices aren't stripped back to defaults
-    from backend.routers.providers import SARVAM_VOICES
-    v3_voices = {v["id"].lower() for v in SARVAM_VOICES if v.get("model", "").startswith("bulbul:v3")}
+    # Normalise model — must start with 'bulbul:'
+    normalized_model = model if model and model.startswith("bulbul:") else "bulbul:v3"
 
-    # If selected legacy voice isn't in v3, pick natural female default
-    normalized_model = model if model.startswith("bulbul:") else "bulbul:v3"
-    normalized_voice = voice.lower().strip() if voice else "shubh"
-
-    # If a v3 voice (e.g., priya/shreya/etc.) is selected with bulbul:v2,
-    # Sarvam may ignore the voice and use provider defaults. Force v3 model.
-    if normalized_voice in v3_voices and normalized_model != "bulbul:v3":
-        logger.info(
-            "Selected voice '%s' requires bulbul:v3; overriding model '%s' -> 'bulbul:v3'",
-            normalized_voice,
-            normalized_model,
-        )
-        normalized_model = "bulbul:v3"
-
-    if normalized_model == "bulbul:v3" and normalized_voice not in v3_voices:
-        legacy_to_v3 = {
-            "meera": "shreya",
-            "pavithra": "kavitha",
-            "maitreyi": "priya",
-            "diya": "ritu",
-            "misha": "simran",
-            "arvind": "rahul",
-            "amol": "aditya",
-            "amartya": "rohan",
-            "neel": "amit",
-            "vian": "shubh",
-        }
-        normalized_voice = legacy_to_v3.get(normalized_voice, "priya")
+    # FIX: Ensure the speaker is actually valid for this model version.
+    # This is the authoritative compatibility check — prevents the
+    # 'Speaker X is not compatible with model bulbul:v3' 400 error.
+    normalized_voice = get_compatible_speaker(
+        normalized_model,
+        (voice or "priya").lower().strip(),
+    )
     
     # Build payload based on model capabilities.
     payload = {

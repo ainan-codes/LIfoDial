@@ -11,7 +11,7 @@ import time
 import uuid
 from datetime import datetime
 
-import google.generativeai as genai
+from google import genai as google_genai
 
 from backend.config import settings
 
@@ -158,24 +158,28 @@ async def run_simulation(agent_id: str, scenario_name: str, db) -> dict:
         "Answer patient queries concisely in 2 sentences max."
     )
 
-    genai.configure(api_key=settings.gemini_api_key)
+    google_genai_client = google_genai.Client(api_key=settings.gemini_api_key)
     model_id = agent.llm_model or "gemini-2.0-flash"
 
-    try:
-        model = genai.GenerativeModel(
-            model_id,
-            system_instruction=system_prompt,
-            generation_config={"temperature": 0.3, "max_output_tokens": 120},
-        )
-    except Exception as e:
-        logger.warning(f"Could not init Gemini model {model_id}: {e}. Falling back to gemini-2.0-flash")
-        model = genai.GenerativeModel(
-            "gemini-2.0-flash",
-            system_instruction=system_prompt,
-            generation_config={"temperature": 0.3, "max_output_tokens": 120},
-        )
+    # We use the synchronous generate_content via run_in_executor to avoid
+    # blocking the event loop for each patient turn.
+    import functools
 
-    chat = model.start_chat()
+    async def _generate(prompt_or_contents) -> str:
+        loop = asyncio.get_event_loop()
+        try:
+            resp = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    google_genai_client.models.generate_content,
+                    model=model_id,
+                    contents=prompt_or_contents,
+                )
+            )
+            return resp.text.strip() if resp.text else ""
+        except Exception as e:
+            logger.warning(f"Gemini generate error in simulation: {e}")
+            return "I apologize, could you please repeat that?"
     conversation: list[dict] = []
     booking_made = False
     emergency_detected = False
@@ -185,14 +189,19 @@ async def run_simulation(agent_id: str, scenario_name: str, db) -> dict:
     first_msg = agent.first_message or f"Namaste! {clinic_name} mein aapka swagat hai."
     conversation.append({"role": "ai", "text": first_msg})
 
-    # Run through each patient message
+    # Build system-augmented prompt for each turn
     for patient_msg in scenario["messages"]:
         conversation.append({"role": "patient", "text": patient_msg})
-        try:
-            ai_response = await chat.send_message_async(patient_msg)
-            ai_text = ai_response.text.strip()
-        except Exception as e:
-            logger.warning(f"Gemini chat error in simulation: {e}")
+        # Build simple turn prompt (include system prompt for context)
+        turn_prompt = (
+            f"System: {system_prompt}\n\n"
+            + "\n".join(
+                f"{m['role'].upper()}: {m['text']}" for m in conversation
+            )
+            + "\nAI:"
+        )
+        ai_text = await _generate(turn_prompt)
+        if not ai_text:
             ai_text = "I apologize, could you please repeat that?"
         conversation.append({"role": "ai", "text": ai_text})
 
@@ -211,7 +220,6 @@ async def run_simulation(agent_id: str, scenario_name: str, db) -> dict:
     transcript_text = "\n".join(
         f"{m['role'].upper()}: {m['text']}" for m in conversation
     )
-    scoring_model = genai.GenerativeModel("gemini-2.0-flash")
     score_prompt = f"""
 Score this AI clinic receptionist conversation on these dimensions (0-100 each).
 Return ONLY valid JSON, no markdown fences.
@@ -241,8 +249,8 @@ Conversation:
 {transcript_text}
 """
     try:
-        score_resp = await scoring_model.generate_content_async(score_prompt)
-        raw = score_resp.text.strip()
+        score_resp_text = await _generate(score_prompt)
+        raw = score_resp_text.strip()
         # Strip markdown fences if present
         raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("```").strip()
         scores = json.loads(raw)

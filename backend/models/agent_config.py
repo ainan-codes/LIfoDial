@@ -39,7 +39,7 @@ class AgentConfig(Base):
 
     # ── STT (Speech to Text) ─────────────────────
     stt_provider = Column(String(30), default="sarvam")
-    stt_model = Column(String(50), default="saaras:v3")
+    stt_model = Column(String(50), default="saarika:v2")
     stt_language = Column(String(10), default="hi-IN")
     transcriber_keywords = Column(Text, nullable=True)
     fallback_transcribers = Column(Text, nullable=True)
@@ -47,7 +47,7 @@ class AgentConfig(Base):
     # ── TTS (Text to Speech) ─────────────────────
     tts_provider = Column(String(30), default="sarvam")
     tts_model = Column(String(50), default="bulbul:v3")
-    tts_voice = Column(String(50), default="meera")
+    tts_voice = Column(String(50), default="priya")
     tts_language = Column(String(10), default="hi-IN")
     tts_pitch = Column(Float, default=0.0)
     tts_pace = Column(Float, default=1.0)

@@ -28,7 +28,7 @@ class SarvamStreamingSTT:
         self,
         mode: str = "transcribe",
         language_code: str = "en-IN",
-        model: str = "saaras:v3",
+        model: str = "saarika:v2",
         high_vad_sensitivity: bool = True,
         vad_signals: bool = True,
         flush_signal: bool = False,
@@ -40,7 +40,7 @@ class SarvamStreamingSTT:
         Args:
             mode: 'transcribe', 'translate', 'verbatim', 'translit', 'codemix'
             language_code: Language code (e.g., 'en-IN', 'hi-IN', 'kn-IN')
-            model: Model version (e.g., 'saaras:v3', 'saarika:v2.5')
+            model: Model version (e.g., 'saarika:v2', 'saarika:v2.5')
             high_vad_sensitivity: Enhanced voice activity detection
             vad_signals: Receive speech_start/speech_end events
             flush_signal: Enable manual buffer flushing
@@ -77,8 +77,8 @@ class SarvamStreamingSTT:
                 "flush_signal": str(self.flush_signal).lower(),
             }
 
-            # Add mode for saaras:v3 (transcribe, translate, verbatim, translit, codemix)
-            if self.model == "saaras:v3" and self.mode != "translate":
+            # Add mode for saarika models (transcribe, translate, verbatim, translit, codemix)
+            if self.model.startswith("saarika") and self.mode != "translate":
                 params["mode"] = self.mode
 
             # Build query string
@@ -237,7 +237,7 @@ async def create_streaming_stt(
     client = SarvamStreamingSTT(
         mode=mode,
         language_code=language_code,
-        model="saaras:v3",
+        model="saarika:v2",
         high_vad_sensitivity=True,
         vad_signals=True,
         flush_signal=False,
