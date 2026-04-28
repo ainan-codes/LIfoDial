@@ -9,7 +9,7 @@ from backend.models.onboarding_request import OnboardingRequest
 from backend.models.knowledge_base import KnowledgeBase
 from backend.models.phone_number import PhoneNumber
 from backend.models.call_record import CallRecord
-from backend.models.embed_analytics import EmbedAnalytics
+from backend.models.embed_analytics import EmbedEvent
 from backend.models.bulk_call import BulkCallCampaign
 
 __all__ = [
@@ -23,6 +23,6 @@ __all__ = [
     "KnowledgeBase",
     "PhoneNumber",
     "CallRecord",
-    "EmbedAnalytics",
+    "EmbedEvent",
     "BulkCallCampaign",
 ]
