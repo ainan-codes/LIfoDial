@@ -48,7 +48,7 @@ class AgentCreatePayload(BaseModel):
 
     # Step 3 — Voice
     stt_provider: str = "sarvam"
-    stt_model: str = "saarika:v2"
+    stt_model: str = "saaras:v3"
     stt_language: str = "en-IN"
     transcriber_keywords: str | None = None
     fallback_transcribers: str | None = None

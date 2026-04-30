@@ -39,7 +39,7 @@ class AgentConfig(Base):
 
     # ── STT (Speech to Text) ─────────────────────
     stt_provider = Column(String(30), default="sarvam")
-    stt_model = Column(String(50), default="saarika:v2")
+    stt_model = Column(String(50), default="saaras:v3")
     stt_language = Column(String(10), default="hi-IN")
     transcriber_keywords = Column(Text, nullable=True)
     fallback_transcribers = Column(Text, nullable=True)

@@ -1,6 +1,9 @@
 import httpx
 import base64
+import logging
 from backend.config import settings
+
+logger = logging.getLogger(__name__)
 
 class SarvamTTS:
     def __init__(self, model="bulbul:v3", 
@@ -52,13 +55,13 @@ class SarvamTTS:
             )
             
             if response.status_code != 200:
-                print(f"Sarvam TTS error: {response.status_code}")
-                print(f"Response: {response.text}")
+                logger.warning("Sarvam TTS error: %d", response.status_code)
+                logger.warning("Response: %s", response.text[:200])
                 return b""
             
             data = response.json()
             if "audios" not in data or not data["audios"]:
-                print("Sarvam TTS: no audio in response")
+                logger.warning("Sarvam TTS: no audio in response")
                 return b""
                 
             audio_b64 = data["audios"][0]

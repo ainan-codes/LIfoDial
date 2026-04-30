@@ -174,7 +174,7 @@ SARVAM_VOICES_DATA = {
             {"id": "sophia", "name": "Sophia", "style": "International, clear"},
         ]
     },
-    "bulbul:v3": {
+    "bulbul:v2": {
         "model_label": "Bulbul v2 (Stable — Pitch control)",
         "supports_pitch": True,
         "supports_loudness": True,
@@ -215,7 +215,8 @@ async def get_all_providers_summary(settings) -> dict:
                     "connected": bool(settings.sarvam_api_key),
                     "best_for": "Indian languages — Hindi, Tamil, Telugu, Malayalam",
                     "models": [
-                        {"id": "saarika:v2", "name": "Saarika v2", "label": "Best for Indian accents", "recommended": True},
+                        {"id": "saaras:v3", "name": "Saaras v3", "label": "State-of-the-Art — Recommended", "recommended": True},
+                        {"id": "saarika:v2", "name": "Saarika v2", "label": "Best for Indian accents"},
                         {"id": "saarika:v1", "name": "Saarika v1", "label": "Stable"},
                     ]
                 },
@@ -256,10 +257,10 @@ async def get_all_providers_summary(settings) -> dict:
                             "voices": SARVAM_VOICES_DATA["bulbul:v3"]
                         },
                         {
-                            "id": "bulbul:v3",
+                            "id": "bulbul:v2",
                             "name": "Bulbul v2",
                             "label": "Stable — pitch control",
-                            "voices": SARVAM_VOICES_DATA["bulbul:v3"]
+                            "voices": SARVAM_VOICES_DATA["bulbul:v2"]
                         }
                     ]
                 }

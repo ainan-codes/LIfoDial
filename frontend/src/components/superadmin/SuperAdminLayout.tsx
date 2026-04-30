@@ -7,6 +7,7 @@ import {
     ClipboardList,
     CreditCard,
     Headphones,
+    IndianRupee,
     Key,
     LayoutDashboard,
     LogOut,
@@ -26,6 +27,7 @@ const SA_NAV = [
   { path: '/superadmin/calls',        label: 'All Calls',        icon: Phone,           section: 'ORG SETTINGS' },
   { path: '/superadmin/phone-numbers',label: 'Phone Numbers',    icon: Phone,           section: 'ORG SETTINGS' },
   { path: '/superadmin/billing',      label: 'Billing',          icon: CreditCard,      section: 'ORG SETTINGS' },
+  { path: '/superadmin/credits',      label: 'Credits',          icon: IndianRupee,     section: 'ORG SETTINGS' },
   // ─── COMMUNITY ───
   { path: '/superadmin/voice-library',label: 'Voice Library',    icon: Music,           section: 'COMMUNITY' },
   { path: '/superadmin/appointments', label: 'All Appointments', icon: CalendarCheck,   section: 'COMMUNITY' },

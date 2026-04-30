@@ -130,6 +130,7 @@ _CORS_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:3000",
+    "https://lifodial.vercel.app",
 ]
 # Also pull any extra origin from env (for production deployment)
 _extra = getattr(settings, "cors_origin", None) or getattr(settings, "frontend_url", None)
@@ -191,7 +192,7 @@ async def reset_db():
     """
     # Import all models to ensure Base.metadata is fully populated
     from backend.models import tenant, doctor, appointment, call_log, agent_config, onboarding_request, api_key_config, knowledge_base
-    from backend.models import phone_number, call_record, embed_analytics, bulk_call
+    from backend.models import phone_number, call_record, embed_analytics, bulk_call, clinic_credits
     
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
@@ -208,7 +209,7 @@ async def seed_db():
     return {"status": "ok", "message": "Database seeded successfully"}
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-from backend.routers import admin, tenants, doctors, voice, appointments, ws, voice_upload, agents, agent_test, platform, knowledge_base, voices, web_calls, phone_numbers, embed, models, simulation, latency, providers, bulk_calls
+from backend.routers import admin, tenants, doctors, voice, appointments, ws, voice_upload, agents, agent_test, platform, knowledge_base, voices, web_calls, phone_numbers, embed, models, simulation, latency, providers, bulk_calls, credits
 
 app.include_router(admin.router,          prefix="/admin",    tags=["superadmin"])
 app.include_router(voice.router,          prefix="/voice",    tags=["voice"])
@@ -230,6 +231,7 @@ app.include_router(simulation.router,     prefix="",          tags=["simulation"
 app.include_router(latency.router,        prefix="",          tags=["latency"])
 app.include_router(providers.router,      prefix="",          tags=["providers"])
 app.include_router(bulk_calls.router,     prefix="",          tags=["bulk-calls"])
+app.include_router(credits.router,        prefix="",          tags=["credits"])
 
 
 # ── Serve widget.js publicly ────────────────────────────────────────────────────

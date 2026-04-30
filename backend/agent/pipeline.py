@@ -201,7 +201,7 @@ async def entrypoint(ctx):
         # Sarvam STT — best for Indian languages
         stt=SarvamSTTPlugin(
             api_key=settings.sarvam_api_key,
-            model=agent_config.get("stt_model", "saarika:v2"),
+            model=agent_config.get("stt_model", "saaras:v3"),
             language=agent_config.get("tts_language", "hi-IN"),
         ),
         # Gemini LLM — streaming
@@ -246,6 +246,45 @@ async def entrypoint(ctx):
     
     await session.say(first_msg, allow_interruptions=True)
 
+    # ── Post-call credit deduction ─────────────────────────────────
+    # When the room participant disconnects, deduct credits based on
+    # call duration. We register a shutdown callback.
+    async def _on_call_end():
+        """Deduct credits after call ends."""
+        try:
+            duration = int(time.time() - agent.call_start)
+            if duration <= 0 or not tenant_id:
+                return
+
+            from backend.db import AsyncSessionLocal
+            from backend.services.credit_service import CreditService
+
+            call_id = metadata.get("call_record_id")
+
+            async with AsyncSessionLocal() as db:
+                result = await CreditService.deduct_call_credits(
+                    db,
+                    tenant_id=tenant_id,
+                    duration_seconds=duration,
+                    call_id=call_id,
+                )
+                await db.commit()
+
+            logger.info(
+                "Call billing: tenant=%s duration=%ds deducted=₹%.2f balance=₹%.2f",
+                tenant_id,
+                duration,
+                result["deducted"],
+                result["balance_after"],
+            )
+        except Exception as exc:
+            logger.error("Credit deduction failed: %s", exc, exc_info=True)
+
+    # Wait for room disconnect, then deduct
+    @ctx.room.on("disconnected")
+    def _handle_disconnect():
+        asyncio.ensure_future(_on_call_end())
+
 
 # ── Sarvam STT Plugin ──────────────────────────────────────────
 class SarvamSTTPlugin:
@@ -259,13 +298,41 @@ class SarvamSTTPlugin:
         self.language = language
     
     async def transcribe(self, audio: bytes) -> str:
+        """
+        Transcribe audio bytes via Sarvam STT.
+        
+        LiveKit sends raw PCM frames (16-bit, 16kHz, mono).
+        Sarvam API requires a valid WAV file, so we wrap PCM
+        in a WAV header if needed.
+        """
+        import io
+        import wave
+
+        if not audio or len(audio) < 44:
+            return ""
+
+        # Detect if already WAV (starts with RIFF header)
+        is_wav = audio[:4] == b"RIFF" and audio[8:12] == b"WAVE"
+
+        if is_wav:
+            wav_bytes = audio
+        else:
+            # Raw PCM → WAV conversion (16-bit, 16kHz, mono)
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(16000)
+                wf.writeframes(audio)
+            wav_bytes = wav_buffer.getvalue()
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
                 "https://api.sarvam.ai/speech-to-text",
                 headers={
                     "api-subscription-key": self.api_key
                 },
-                files={"file": ("audio.wav", audio, "audio/wav")},
+                files={"file": ("audio.wav", wav_bytes, "audio/wav")},
                 data={
                     "language_code": self.language,
                     "model": self.model,
@@ -273,7 +340,13 @@ class SarvamSTTPlugin:
                     "with_disfluencies": "false",
                 }
             )
-            response.raise_for_status()
+            if response.status_code != 200:
+                logger.warning(
+                    "Sarvam STT error %d: %s",
+                    response.status_code,
+                    response.text[:200],
+                )
+                return ""
             return response.json().get("transcript", "")
 
 

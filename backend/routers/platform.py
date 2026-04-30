@@ -579,7 +579,7 @@ async def transcribe_audio(
                 "file": (audio_file.filename, audio_bytes, "audio/wav")
             },
             data={
-                "model": "saarika:v2",
+                "model": "saaras:v3",
                 "language_code": language,
                 "with_timestamps": "false",
                 "debug": "false"

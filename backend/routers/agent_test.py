@@ -1229,8 +1229,8 @@ async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint
     lang = language_hint or agent.tts_language or "en-IN"
     
     if stt_provider == "sarvam":
-        return await sarvam_transcribe(api_key, audio_bytes, 
-                                        agent.stt_model or "saarika:v2",
+        return await sarvam_transcribe(api_key, audio_bytes,
+                                        agent.stt_model or "saaras:v3",
                                         lang)
     
     elif stt_provider == "deepgram":
@@ -1342,7 +1342,7 @@ async def sarvam_transcribe(api_key: str, audio_bytes: bytes,
     import io
 
     # Sarvam docs recommend multipart upload with file + model + mode
-    normalized_model = model if model and model.startswith("saarika") else "saarika:v2"
+    normalized_model = model if model and (model.startswith("saarika") or model.startswith("saaras")) else "saaras:v3"
     upload_name, upload_mime = _detect_audio_upload_format(audio_bytes)
     files = {
         "file": (upload_name, io.BytesIO(audio_bytes), upload_mime)

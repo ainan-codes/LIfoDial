@@ -36,13 +36,21 @@ def _build_database_url() -> str:
     if not raw:
         logger.warning("No DATABASE_URL set — using SQLite (development)")
         return "sqlite+aiosqlite:///./lifodial.db"
+    
+    url = raw
     # Supabase / Heroku / Render ship postgresql:// or postgres://
-    if raw.startswith("postgres://"):
-        return raw.replace("postgres://", "postgresql+asyncpg://", 1)
-    if raw.startswith("postgresql://"):
-        return raw.replace("postgresql://", "postgresql+asyncpg://", 1)
-    # Already correct (postgresql+asyncpg:// or sqlite+aiosqlite://)
-    return raw
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        
+    if "postgresql+asyncpg" in url:
+        # Disable SQLAlchemy's prepared statement cache for PgBouncer compatibility
+        sep = "&" if "?" in url else "?"
+        if "prepared_statement_cache_size" not in url:
+            url = f"{url}{sep}prepared_statement_cache_size=0"
+            
+    return url
 
 
 DATABASE_URL = _build_database_url()
@@ -151,6 +159,8 @@ def _import_all_models() -> None:
         from backend.models.call_record import CallRecord               # noqa: F401
         from backend.models.embed_analytics import EmbedEvent           # noqa: F401
         from backend.models.bulk_call import BulkCallCampaign           # noqa: F401
+        from backend.models.clinic_credits import ClinicCredits          # noqa: F401
+        from backend.models.clinic_credits import CreditTransaction      # noqa: F401
     except ImportError as exc:
         logger.error("init_db: model import failed → %s", exc)
         raise
@@ -177,6 +187,8 @@ def _run_alembic_migrations() -> None:
 
         # Build a sync URL for Alembic (it doesn't use asyncpg)
         sync_url = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1)
+        if "?" in sync_url:
+            sync_url = sync_url.split("?")[0]
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
         ini_path = os.path.join(base_dir, "alembic.ini")

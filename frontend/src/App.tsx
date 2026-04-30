@@ -14,6 +14,7 @@ import Appointments from './pages/Appointments';
 import CallLogs from './pages/CallLogs';
 import Dashboard from './pages/Dashboard';
 import Doctors from './pages/Doctors';
+import MyAgent from './pages/MyAgent';
 import Settings from './pages/Settings';
 import VoiceRecorder from './pages/VoiceRecorder';
 
@@ -39,6 +40,7 @@ import PhoneNumbers from './pages/superadmin/PhoneNumbers';
 import SuperAdminLogin from './pages/superadmin/SuperAdminLogin';
 import SASystemHealth from './pages/superadmin/SystemHealth';
 import VoiceLibrary from './pages/superadmin/VoiceLibrary';
+import SACredits from './pages/superadmin/Credits';
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: false } },
@@ -122,6 +124,14 @@ function App() {
               <Route index element={<AgentRouteGuard />} />
             </Route>
 
+            {/* ── Clinic Admin: My Agent (read-only dashboard) ── */}
+            <Route
+              path="/my-agent"
+              element={<RequireAuth><Layout /></RequireAuth>}
+            >
+              <Route index element={<MyAgent />} />
+            </Route>
+
             {/* Super Admin Routes */}
             <Route path="/superadmin/login" element={<SuperAdminLogin />} />
             
@@ -141,6 +151,7 @@ function App() {
                 <Route path="/superadmin/billing" element={<SABilling />} />
                 <Route path="/superadmin/voice-library" element={<VoiceLibrary />} />
                 <Route path="/superadmin/phone-numbers" element={<PhoneNumbers />} />
+                <Route path="/superadmin/credits" element={<SACredits />} />
               </Route>
             </Route>
 

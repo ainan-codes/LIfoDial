@@ -1,7 +1,9 @@
 import {
     BarChart2,
+    Bot,
     CalendarCheck,
     Headphones,
+    IndianRupee,
     LayoutDashboard,
     LogOut, Mic,
     Music,
@@ -18,6 +20,7 @@ const CLINIC_AGENT_NAV_ENABLED = false;
 
 const nav = [
   { label: 'Dashboard',    icon: LayoutDashboard, to: '/dashboard',    hidden: false },
+  { label: 'My Agent',     icon: Bot,             to: '/my-agent',     hidden: false },
   { label: 'Agents',       icon: Headphones,      to: '/agents',       hidden: !CLINIC_AGENT_NAV_ENABLED },
   { label: 'Call Logs',    icon: PhoneCall,        to: '/calls',        hidden: false },
   { label: 'Appointments', icon: CalendarCheck,    to: '/appointments', hidden: false },

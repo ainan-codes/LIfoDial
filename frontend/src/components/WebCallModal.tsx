@@ -48,6 +48,25 @@ export function WebCallModal({
   useEffect(() => {
     const getToken = async () => {
       try {
+        // ── CRITICAL: Request microphone BEFORE connecting ──
+        // Without this, LiveKit connects but no audio track is published,
+        // causing STT to silently fail.
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+          // Release the stream immediately — LiveKit will re-acquire it
+          stream.getTracks().forEach(t => t.stop())
+        } catch (micErr: any) {
+          setError(
+            micErr.name === 'NotAllowedError'
+              ? 'Microphone permission denied. Please allow mic access and try again.'
+              : micErr.name === 'NotFoundError'
+              ? 'No microphone found. Please connect a microphone.'
+              : `Microphone error: ${micErr.message}`
+          )
+          setIsConnecting(false)
+          return
+        }
+
         const res = await fetch(
           `${API_URL}/agents/${agent.id}/web-call-token`,
           { method: 'POST' }
