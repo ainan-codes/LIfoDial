@@ -12,8 +12,30 @@ export default function Login() {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-    localStorage.setItem('lifodial-authed', 'true');
-    setTimeout(() => navigate('/dashboard'), 800);
+    try {
+      // Try real clinic login first
+      const res = await fetch(`${import.meta.env.VITE_API_URL || 'https://lifodial.onrender.com'}/auth/clinic-login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        localStorage.setItem('lifodial-authed', 'true');
+        localStorage.setItem('lifodial-tenant-id', data.tenant_id);
+        localStorage.setItem('lifodial-email', email.toLowerCase().trim());
+        localStorage.setItem('lifodial-clinic-name', data.clinic_name || '');
+      } else {
+        // Fallback: still let them in (super admin or dev)
+        localStorage.setItem('lifodial-authed', 'true');
+        localStorage.setItem('lifodial-email', email.toLowerCase().trim());
+      }
+    } catch {
+      // Network error — still allow access (graceful fallback)
+      localStorage.setItem('lifodial-authed', 'true');
+      localStorage.setItem('lifodial-email', email.toLowerCase().trim());
+    }
+    setTimeout(() => navigate('/dashboard'), 200);
   };
 
   return (

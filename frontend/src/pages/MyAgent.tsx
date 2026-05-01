@@ -60,43 +60,68 @@ export default function MyAgent() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
-  // For demo, get tenant_id from localStorage or default
-  const tenantId = localStorage.getItem('lifodial-tenant-id') || '';
-
   useEffect(() => {
     loadData();
   }, []);
 
   const loadData = async () => {
     setLoading(true);
+    setError('');
     try {
-      // Load agent for this tenant
-      const agentsRes = await fetch(`${API_URL}/agents`);
-      if (agentsRes.ok) {
-        const agents = await agentsRes.json();
-        // Find agent for this tenant, or show first one
-        const myAgent = tenantId
-          ? agents.find((a: any) => a.tenant_id === tenantId)
-          : agents[0];
-        if (myAgent) {
-          setAgent(myAgent);
-          // Load credits
-          try {
-            const creditsRes = await fetch(`${API_URL}/credits/my-balance?tenant_id=${myAgent.tenant_id}`);
-            if (creditsRes.ok) setCredits(await creditsRes.json());
-          } catch {}
-          // Load recent calls
-          try {
-            const callsRes = await fetch(`${API_URL}/agents/${myAgent.id}/call-logs?limit=10`);
-            if (callsRes.ok) setCalls(await callsRes.json());
-          } catch {}
+      const email = localStorage.getItem('lifodial-email') || '';
+      const tenantId = localStorage.getItem('lifodial-tenant-id') || '';
+
+      let myAgent: AgentInfo | null = null;
+
+      // Primary: look up by email (most reliable — ties to clinic's admin_email)
+      if (email) {
+        const res = await fetch(`${API_URL}/agents/mine?email=${encodeURIComponent(email)}`);
+        if (res.ok) {
+          myAgent = await res.json();
+        } else if (res.status !== 404) {
+          console.warn('agents/mine error', res.status);
         }
+      }
+
+      // Fallback: search by tenant_id in full list
+      if (!myAgent && tenantId) {
+        const res = await fetch(`${API_URL}/agents`);
+        if (res.ok) {
+          const agents = await res.json();
+          myAgent = agents.find((a: any) => a.tenant_id === tenantId) || null;
+        }
+      }
+
+      // Last resort: show first agent (dev / demo mode)
+      if (!myAgent && !email && !tenantId) {
+        const res = await fetch(`${API_URL}/agents`);
+        if (res.ok) {
+          const agents = await res.json();
+          myAgent = agents[0] || null;
+        }
+      }
+
+      if (myAgent) {
+        setAgent(myAgent);
+        // Load credits
+        try {
+          const creditsRes = await fetch(`${API_URL}/credits/my-balance?tenant_id=${myAgent.tenant_id}`);
+          if (creditsRes.ok) setCredits(await creditsRes.json());
+        } catch {}
+        // Load recent calls
+        try {
+          const callsRes = await fetch(`${API_URL}/agents/${myAgent.id}/call-logs?limit=10`);
+          if (callsRes.ok) setCalls(await callsRes.json());
+        } catch {}
+      } else {
+        setError(email ? `No agent configured for ${email}` : 'No agent found for your clinic.');
       }
     } catch (e: any) {
       setError(e.message);
     }
     setLoading(false);
   };
+
 
   if (loading) {
     return (

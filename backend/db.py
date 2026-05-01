@@ -43,13 +43,10 @@ def _build_database_url() -> str:
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
     elif url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-        
-    if "postgresql+asyncpg" in url:
-        # Disable SQLAlchemy's prepared statement cache for PgBouncer compatibility
-        sep = "&" if "?" in url else "?"
-        if "prepared_statement_cache_size" not in url:
-            url = f"{url}{sep}prepared_statement_cache_size=0"
-            
+
+    # NOTE: Do NOT append prepared_statement_cache_size to the URL.
+    # asyncpg ignores URL query parameters for this setting.
+    # It MUST be set in connect_args={"statement_cache_size": 0} on the engine.
     return url
 
 
@@ -75,11 +72,15 @@ else:
         # NullPool: don't keep a connection pool inside the app process.
         # PgBouncer is the pool; we ask for a connection, use it, return it.
         poolclass=NullPool,
-        # Disable prepared-statement cache: PgBouncer (transaction mode)
-        # routes each statement to a different backend connection, so cached
-        # prepared statements are invisible to subsequent calls.
+        # statement_cache_size=0 is the CRITICAL fix for pgbouncer transaction
+        # mode. asyncpg reads this from connect_args — NOT from the URL.
+        # NullPool ensures each request gets a fresh connection, preventing
+        # "prepared statement already exists" on reconnection.
         connect_args={
-            "statement_cache_size": 0,
+            "statement_cache_size": 0,  # ← THE fix: asyncpg level, not URL param
+            "server_settings": {
+                "jit": "off",           # pgbouncer stability
+            },
         },
     )
 

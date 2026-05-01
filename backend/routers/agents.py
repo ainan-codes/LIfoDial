@@ -274,6 +274,82 @@ async def list_agents() -> list[dict]:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── GET /agents/mine — clinic admin self-lookup by email ─────────────────────
+# Called by MyAgent.tsx after login. Returns the single agent for the clinic
+# whose admin_email matches the logged-in user.
+
+@router.get("/agents/mine")
+async def get_my_agent(email: str) -> dict:
+    """
+    Clinic-admin endpoint: given an email, return that clinic's agent.
+    No auth token required (email-based lookup for now).
+    Returns 404 if no clinic/agent found for that email.
+    """
+    if not email:
+        raise HTTPException(status_code=400, detail="email query param required")
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(AgentConfig, Tenant.clinic_name)
+                .join(Tenant, AgentConfig.tenant_id == Tenant.id)
+                .where(Tenant.admin_email == email.strip().lower())
+            )
+            row = result.first()
+            if not row:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No agent found for email: {email}"
+                )
+            agent, clinic_name = row
+            data = _agent_to_dict(agent, clinic_name)
+            data["system_prompt"] = agent.system_prompt
+            data["first_message"] = agent.first_message
+            return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error fetching agent for email %s: %s", email, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── POST /auth/clinic-login ────────────────────────────────────────────────────
+# Simple email-based login for clinic admin portal.
+# Returns tenant_id so frontend can store it in localStorage.
+
+class ClinicLoginPayload(BaseModel):
+    email: str
+    password: str  # Not verified yet — just looked up
+
+
+@router.post("/auth/clinic-login")
+async def clinic_login(payload: ClinicLoginPayload) -> dict:
+    """
+    Clinic admin login. Looks up tenant by email.
+    Returns tenant_id + clinic_name so the frontend knows who is logged in.
+    """
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(Tenant).where(
+                    Tenant.admin_email == payload.email.strip().lower()
+                )
+            )
+            tenant = result.scalar_one_or_none()
+            if not tenant:
+                raise HTTPException(status_code=401, detail="No clinic found for that email")
+            return {
+                "tenant_id": tenant.id,
+                "clinic_name": tenant.clinic_name,
+                "admin_name": tenant.admin_name,
+                "email": tenant.admin_email,
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Clinic login error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── GET /agents/templates ─────────────────────────────────────────────────────
 
 @router.get("/agents/templates")
