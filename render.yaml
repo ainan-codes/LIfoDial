@@ -29,7 +29,7 @@ services:
       - key: ENVIRONMENT
         value: production
       - key: FORCE_REDEPLOY_ID
-        value: "v1.0.2-recovery-1"
+        value: "v1.0.3-audit-fix"
 
       - key: PORT
         value: "10000"        # Render uses 10000 by default for web services
