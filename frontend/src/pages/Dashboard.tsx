@@ -189,20 +189,22 @@ export default function Dashboard() {
   return (
     <div data-testid="dashboard-page" className="h-full flex flex-col">
 
-      {/* ── Agent status banner ── */}
+      {/* Agent status banner */}
       <div
-        className="flex items-center gap-2.5 px-8 py-2.5 flex-shrink-0"
+        className="flex items-center gap-2.5 flex-shrink-0"
         style={{
+          padding: '10px 16px',
           backgroundColor: isAgentOnline ? 'var(--accent-dim)' : 'var(--destructive-dim)',
           borderBottom: `1px solid ${isAgentOnline ? 'var(--accent-border)' : 'rgba(248,113,113,0.25)'}`,
+          flexWrap: 'wrap',
         }}
       >
         <div
           className="w-1.5 h-1.5 rounded-full dot-pulse"
-          style={{ backgroundColor: isAgentOnline ? 'var(--accent)' : 'var(--destructive)' }}
+          style={{ backgroundColor: isAgentOnline ? 'var(--accent)' : 'var(--destructive)', flexShrink: 0 }}
         />
         <span style={{
-          fontSize: '13px', fontWeight: 500,
+          fontSize: '12px', fontWeight: 500,
           color: isAgentOnline ? 'var(--accent)' : 'var(--destructive)',
         }}>
           {isAgentOnline
@@ -213,14 +215,14 @@ export default function Dashboard() {
 
       {/* ── Top bar ── */}
       <div
-        className="px-8 py-5 flex items-center justify-between flex-shrink-0"
-        style={{ borderBottom: '1px solid var(--border)', backgroundColor: 'var(--bg-surface)' }}
+        className="flex items-center justify-between flex-shrink-0"
+        style={{ padding: '16px', borderBottom: '1px solid var(--border)', backgroundColor: 'var(--bg-surface)', flexWrap: 'wrap', gap: '8px' }}
       >
         <div>
-          <h1 style={{ fontSize: '20px', fontWeight: 600, color: 'var(--text-primary)', letterSpacing: '-0.01em', margin: 0 }}>
+          <h1 style={{ fontSize: '18px', fontWeight: 600, color: 'var(--text-primary)', letterSpacing: '-0.01em', margin: 0 }}>
             Dashboard
           </h1>
-          <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '2px' }}>
+          <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '2px' }}>
             Real-time receptionist overview
           </p>
         </div>
@@ -229,17 +231,18 @@ export default function Dashboard() {
           backgroundColor: 'var(--accent-dim)', border: '1px solid var(--accent-border)',
         }}>
           <div className="w-1.5 h-1.5 rounded-full dot-pulse" style={{ backgroundColor: 'var(--accent)' }} />
-          <span style={{ fontSize: '12px', fontWeight: 500, color: 'var(--accent)' }}>Live monitoring</span>
+          <span style={{ fontSize: '12px', fontWeight: 500, color: 'var(--accent)' }}>Live</span>
         </div>
       </div>
 
-      <div className="flex-1 p-8 space-y-5 overflow-y-auto" style={{ backgroundColor: 'var(--bg-page)' }}>
+      <div className="flex-1 overflow-y-auto" style={{ backgroundColor: 'var(--bg-page)', padding: '16px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', maxWidth: '1400px', margin: '0 auto' }}>
 
         {/* ── Quick setup card (hides when complete) ── */}
         <QuickSetupCard />
 
         {/* ── KPI row ── */}
-        <div className="grid grid-cols-4 gap-4">
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '12px' }}>
           {statsLoading
             ? KPI_DEFS.map(k => <StatSkeleton key={k.key} />)
             : KPI_DEFS.map(({ key, label, icon: Icon }) => {
@@ -268,8 +271,8 @@ export default function Dashboard() {
               })}
         </div>
 
-        {/* ── 70/30 split: recent calls + live queue ── */}
-        <div className="grid gap-4" style={{ gridTemplateColumns: '1fr 0.43fr' }}>
+        {/* ── calls + queue, stacks on mobile ── */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '16px' }}>
           {/* Recent calls */}
           <div className="rounded-xl overflow-hidden" style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border)', boxShadow: 'var(--shadow-card)' }}>
             <div className="px-6 py-4 flex items-center justify-between" style={{ borderBottom: '1px solid var(--border)' }}>
@@ -288,6 +291,7 @@ export default function Dashboard() {
             ) : recentCalls.length === 0 ? (
               <EmptyState icon={PhoneMissed} title="No calls yet" subtitle="Calls appear here once your number receives traffic" />
             ) : (
+              <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
               <table className="w-full" style={{ borderCollapse: 'collapse' }}>
                 <thead>
                   <tr>
@@ -328,6 +332,7 @@ export default function Dashboard() {
                   ))}
                 </tbody>
               </table>
+              </div>
             )}
           </div>
 
@@ -389,6 +394,7 @@ export default function Dashboard() {
           {recentApts.length === 0 ? (
             <EmptyState icon={CalendarCheck} title="No appointments yet" subtitle="Bookings will appear here." />
           ) : (
+            <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
             <table className="w-full" style={{ borderCollapse: 'collapse' }}>
               <thead>
                 <tr>
@@ -426,9 +432,10 @@ export default function Dashboard() {
                 ))}
               </tbody>
             </table>
+            </div>
           )}
         </div>
-
+        </div>
       </div>
     </div>
   );

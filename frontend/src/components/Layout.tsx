@@ -5,13 +5,14 @@ import {
     Headphones,
     IndianRupee,
     LayoutDashboard,
-    LogOut, Mic,
+    LogOut, Menu, Mic,
     Music,
     PhoneCall,
     Settings,
-    Users
+    Users,
+    X
 } from 'lucide-react';
-import React from 'react';
+import React, { useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 
 // Agent setup pending — will be enabled later
@@ -31,30 +32,67 @@ const nav = [
   { label: 'Settings',     icon: Settings,         to: '/settings',     hidden: false },
 ];
 
+// Bottom nav items shown on mobile (most important ones)
+const bottomNav = [
+  { label: 'Dashboard', icon: LayoutDashboard, to: '/dashboard' },
+  { label: 'My Agent',  icon: Bot,             to: '/my-agent' },
+  { label: 'Calls',     icon: PhoneCall,        to: '/calls' },
+  { label: 'Analytics', icon: BarChart2,        to: '/analytics' },
+  { label: 'Settings',  icon: Settings,         to: '/settings' },
+];
+
 export default function Layout() {
   const navigate = useNavigate();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  const closeSidebar = () => setSidebarOpen(false);
 
   return (
     <div
       className="flex h-screen overflow-hidden"
       style={{ backgroundColor: 'var(--bg-page)' }}
     >
+      {/* ── Mobile overlay backdrop ── */}
+      {sidebarOpen && (
+        <div
+          onClick={closeSidebar}
+          style={{
+            position: 'fixed', inset: 0,
+            background: 'rgba(0,0,0,0.6)',
+            backdropFilter: 'blur(4px)',
+            zIndex: 40,
+          }}
+        />
+      )}
+
       {/* ── Sidebar ── */}
       <aside
-        className="flex-shrink-0 flex flex-col"
         style={{
           width: '220px',
+          flexShrink: 0,
+          display: 'flex',
+          flexDirection: 'column',
           backgroundColor: 'var(--bg-surface)',
           borderRight: '1px solid var(--border)',
+          // On mobile: fixed overlay that slides in
+          position: 'fixed' as const,
+          top: 0,
+          left: 0,
+          height: '100%',
+          zIndex: 50,
+          transform: sidebarOpen ? 'translateX(0)' : 'translateX(-100%)',
+          transition: 'transform 0.28s cubic-bezier(0.4,0,0.2,1)',
         }}
+        // On desktop: show always via media query override in CSS
+        className="layout-sidebar"
       >
         {/* Brand */}
         <div
-          className="px-4 py-4 flex items-center"
+          className="px-4 py-4 flex items-center justify-between"
           style={{ borderBottom: '1px solid var(--border)' }}
         >
           <div className="sidebar-logo">
-            <img 
+            <img
               src="/assets/lifodial-logo.png"
               alt="Lifodial"
               style={{
@@ -64,6 +102,18 @@ export default function Layout() {
               }}
             />
           </div>
+          {/* Close button only on mobile */}
+          <button
+            onClick={closeSidebar}
+            className="sidebar-close-btn"
+            style={{
+              background: 'none', border: 'none', color: 'var(--text-muted)',
+              cursor: 'pointer', padding: '4px', borderRadius: '6px',
+              display: 'flex', alignItems: 'center',
+            }}
+          >
+            <X size={18} />
+          </button>
         </div>
 
         {/* AI Agent status */}
@@ -86,6 +136,7 @@ export default function Layout() {
               )}
               <NavLink
                 to={to}
+                onClick={closeSidebar}
                 className="flex items-center gap-3 mx-2 my-0.5 px-3 py-2 rounded-lg transition-all"
                 style={({ isActive }) => ({
                   display: hidden ? 'none' : 'flex',
@@ -140,10 +191,125 @@ export default function Layout() {
         </div>
       </aside>
 
-      {/* ── Main content ── */}
-      <main className="flex-1 overflow-y-auto" style={{ backgroundColor: 'var(--bg-page)' }}>
-        <Outlet />
-      </main>
+      {/* ── Main content area ── */}
+      <div className="flex-1 flex flex-col min-w-0 layout-main">
+        {/* ── Mobile top bar ── */}
+        <header
+          className="layout-mobile-header"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            padding: '0 16px',
+            height: '56px',
+            flexShrink: 0,
+            backgroundColor: 'var(--bg-surface)',
+            borderBottom: '1px solid var(--border)',
+            zIndex: 30,
+          }}
+        >
+          <button
+            onClick={() => setSidebarOpen(true)}
+            style={{
+              background: 'none', border: '1px solid var(--border)',
+              color: 'var(--text-secondary)', cursor: 'pointer',
+              padding: '8px', borderRadius: '8px',
+              display: 'flex', alignItems: 'center',
+            }}
+          >
+            <Menu size={20} />
+          </button>
+          <img
+            src="/assets/lifodial-logo.png"
+            alt="Lifodial"
+            style={{ height: '24px', width: 'auto', mixBlendMode: 'lighten' }}
+          />
+          <div style={{ width: '36px' }} /> {/* spacer */}
+        </header>
+
+        {/* ── Page content ── */}
+        <main
+          className="flex-1 overflow-y-auto layout-page-content"
+          style={{ backgroundColor: 'var(--bg-page)' }}
+        >
+          <Outlet />
+        </main>
+
+        {/* ── Mobile bottom navigation ── */}
+        <nav
+          className="layout-bottom-nav"
+          style={{
+            display: 'flex',
+            backgroundColor: 'var(--bg-surface)',
+            borderTop: '1px solid var(--border)',
+            flexShrink: 0,
+            paddingBottom: 'env(safe-area-inset-bottom, 0px)',
+          }}
+        >
+          {bottomNav.map(({ label, icon: Icon, to }) => (
+            <NavLink
+              key={to}
+              to={to}
+              style={({ isActive }) => ({
+                flex: 1,
+                display: 'flex',
+                flexDirection: 'column' as const,
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '3px',
+                padding: '10px 4px 8px',
+                color: isActive ? 'var(--accent)' : 'var(--text-muted)',
+                textDecoration: 'none',
+                fontSize: '10px',
+                fontWeight: 600,
+                transition: 'color 0.2s',
+                borderTop: isActive ? '2px solid var(--accent)' : '2px solid transparent',
+                marginTop: '-1px',
+              })}
+            >
+              <Icon size={20} />
+              {label}
+            </NavLink>
+          ))}
+        </nav>
+      </div>
+
+      <style>{`
+        /* ── Desktop: sidebar is always visible, static ── */
+        @media (min-width: 768px) {
+          .layout-sidebar {
+            position: static !important;
+            transform: none !important;
+            flex-shrink: 0;
+          }
+          .sidebar-close-btn {
+            display: none !important;
+          }
+          .layout-mobile-header {
+            display: none !important;
+          }
+          .layout-bottom-nav {
+            display: none !important;
+          }
+          .layout-main {
+            /* On desktop, sidebar is static so main fills the rest */
+          }
+          .layout-page-content {
+            /* normal scroll on desktop */
+          }
+        }
+
+        /* ── Mobile: sidebar hidden by default (transform -100%) ── */
+        @media (max-width: 767px) {
+          .layout-sidebar {
+            width: 260px !important;
+          }
+          .layout-page-content {
+            /* Add bottom padding for the bottom nav */
+            padding-bottom: 0;
+          }
+        }
+      `}</style>
     </div>
   );
 }

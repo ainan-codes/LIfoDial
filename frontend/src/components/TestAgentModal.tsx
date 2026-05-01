@@ -544,9 +544,11 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
       setStream(ms);
     } catch (e: any) {
       console.warn('Mic unavailable — proceeding without mic:', e.name, e.message);
-      addMessage('agent', e.name === 'NotAllowedError'
-        ? '⚠️ Microphone permission denied. Click the 🔒 icon → Site Settings → Allow Microphone, then retry.'
-        : '⚠️ Microphone not detected. You can still hear the agent.');
+      // Only show error for explicit permission denial — not for "no device" on mobile
+      if (e.name === 'NotAllowedError') {
+        addMessage('agent', '⚠️ Microphone permission denied. Tap the 🔒 icon → Site Settings → Allow Microphone, then retry.');
+      }
+      // Otherwise proceed silently — agent will still speak; user can hear
     }
 
     // ISSUE 1: Connect WebSocket with 15-second connection timeout
@@ -833,7 +835,17 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
       {/* Status pill */}
       <div style={{ padding: '6px 16px', display: 'flex', justifyContent: 'center' }}>
         <span style={{ fontSize: '11px', fontWeight: 600, padding: '3px 12px', borderRadius: '20px', background: agentSpeaking ? 'rgba(62,207,142,0.1)' : isSpeaking ? 'rgba(96,165,250,0.1)' : 'rgba(255,255,255,0.03)', color: agentSpeaking ? '#3ECF8E' : isSpeaking ? '#60A5FA' : '#555', border: `1px solid ${agentSpeaking ? '#3ECF8E20' : isSpeaking ? '#60A5FA20' : '#1A1A1A'}` }}>
-          {agentSpeaking ? '🗣 Agent speaking...' : isSpeaking ? '🎤 Listening...' : currentTranscript ? `⏳ ${currentTranscript}` : '● Ready — speak to begin'}
+          {agentSpeaking
+            ? '🗣 Agent speaking...'
+            : isSpeaking
+            ? '🎤 Listening...'
+            : currentTranscript && currentTranscript !== 'Processing...'
+            ? `⏳ ${currentTranscript}`
+            : currentTranscript === 'Processing...'
+            ? '⏳ Processing...'
+            : stream
+            ? '● Speak when ready'
+            : '● Starting...'}
         </span>
       </div>
 
@@ -1094,8 +1106,8 @@ export default function TestAgentModal({ agent, agentId: directId, agentName: di
           position: 'fixed',
           right: 0,
           top: 0,
-          width: '420px',
-          height: '100vh',
+          width: 'min(420px, 100vw)',
+          height: '100dvh',
           background: '#0f0f0f',
           borderLeft: '1px solid rgba(255,255,255,0.08)',
           zIndex: 50,
@@ -1104,6 +1116,7 @@ export default function TestAgentModal({ agent, agentId: directId, agentName: di
           transform: isOpen ? 'translateX(0)' : 'translateX(100%)',
           transition: 'transform 0.3s ease',
           boxShadow: '-8px 0 32px rgba(0,0,0,0.5)',
+          overflowY: 'hidden',
         }}
       >
         {/* HEADER — sticky 64px */}
