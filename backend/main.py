@@ -115,7 +115,7 @@ async def _warmup() -> None:
 app = FastAPI(
     title="Lifodial API",
     description="AI Voice Receptionist SaaS for clinics — India & Middle East (Lifodial)",
-    version="1.0.3",
+    version="1.0.4",
     docs_url="/docs",     # temporarily enabled in production for audit
     redoc_url="/redoc",   # temporarily enabled in production for audit
     lifespan=lifespan,
@@ -176,7 +176,7 @@ async def health() -> dict:
         "status": "ok" if db_status == "connected" else "degraded",
         "database": db_status,
         "database_type": db_type,
-        "version": "1.0.3",
+        "version": "1.0.4",
         "environment": settings.environment,
     }
 

@@ -36,25 +36,31 @@ class AssignNumberResponse(BaseModel):
 async def list_tenants(db: AsyncSession = Depends(get_db)):
     """List all tenants/clinics with has_agent flag for the CreateAgent wizard."""
     from backend.models.agent_config import AgentConfig
-    result = await db.execute(select(Tenant).order_by(Tenant.clinic_name))
-    tenants = result.scalars().all()
+    try:
+        result = await db.execute(select(Tenant).order_by(Tenant.clinic_name))
+        tenants = result.scalars().all()
 
-    # Get all tenant_ids that already have an agent
-    agent_res = await db.execute(select(AgentConfig.tenant_id))
-    has_agent_ids = {row[0] for row in agent_res.fetchall()}
+        # Get all tenant_ids that already have an agent — normalize to str
+        agent_res = await db.execute(select(AgentConfig.tenant_id))
+        has_agent_ids = {str(row[0]) for row in agent_res.fetchall()}
 
-    return [
-        {
-            "id": str(t.id),
-            "clinic_name": t.clinic_name,
-            "admin_email": t.admin_email or "",
-            "admin_name": t.admin_name or "",
-            "language": t.language or "en-IN",
-            "status": t.status or "active",
-            "has_agent": str(t.id) in has_agent_ids,
-        }
-        for t in tenants
-    ]
+        return [
+            {
+                "id": str(t.id),
+                "clinic_name": getattr(t, "clinic_name", "") or "",
+                "admin_email": getattr(t, "admin_email", "") or "",
+                "admin_name": getattr(t, "admin_name", "") or "",
+                "language": getattr(t, "language", "en-IN") or "en-IN",
+                "status": getattr(t, "status", "active") or "active",
+                "has_agent": str(t.id) in has_agent_ids,
+            }
+            for t in tenants
+        ]
+    except Exception as e:
+        import logging as _log
+        _log.getLogger(__name__).error("list_tenants error: %s", e, exc_info=True)
+        # Return empty list instead of 500 so the UI doesn't crash
+        return []
 
 
 @router.post("", response_model=TenantResponse, status_code=status.HTTP_201_CREATED)
