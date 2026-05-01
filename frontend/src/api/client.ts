@@ -4,7 +4,7 @@
  * For Vercel: set VITE_API_URL in your Vercel env vars (e.g. https://your-ngrok-url.ngrok.io)
  */
 
-export const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8001';
+export const API_URL = import.meta.env.VITE_API_URL || 'https://lifodial.onrender.com';
 
 // Derive WebSocket URL from API URL
 const _wsBase = API_URL.replace(/^http/, 'ws');
