@@ -186,8 +186,9 @@ def _run_alembic_migrations() -> None:
         from alembic.runtime.migration import MigrationContext
         from sqlalchemy import create_engine, text
 
-        # Build a sync URL for Alembic (it doesn't use asyncpg)
-        sync_url = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1)
+        # Build a sync URL for Alembic (uses psycopg3, not psycopg2)
+        # postgresql+asyncpg:// → postgresql+psycopg:// (psycopg3 sync driver)
+        sync_url = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql+psycopg://", 1)
         if "?" in sync_url:
             sync_url = sync_url.split("?")[0]
 
