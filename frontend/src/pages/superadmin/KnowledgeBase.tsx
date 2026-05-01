@@ -190,11 +190,12 @@ export default function KnowledgeBasePage() {
 
   // Load clinics
   useEffect(() => {
-    fetch(`${API}/admin/clinics`)
-      .then(r => r.json())
+    fetch(`${API}/tenants`)
+      .then(r => r.ok ? r.json() : [])
       .then(data => {
-        setClinics(data);
-        if (data.length > 0) setSelectedClinic(data[0].id);
+        const list = Array.isArray(data) ? data : [];
+        setClinics(list);
+        if (list.length > 0) setSelectedClinic(list[0].id);
       })
       .catch(() => setClinics([]));
   }, []);
@@ -223,7 +224,7 @@ export default function KnowledgeBasePage() {
 
   const handleUpdate = async (id: string, data: Partial<KBEntry>) => {
     const original = entries.find(e => e.id === id)!;
-    const res = await fetch(`${API}/kb/${id}`, {
+    const res = await fetch(`${API}/tenants/${selectedClinic}/kb/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...original, ...data }),
@@ -232,7 +233,7 @@ export default function KnowledgeBasePage() {
   };
 
   const handleDelete = async (id: string) => {
-    const res = await fetch(`${API}/kb/${id}`, { method: 'DELETE' });
+    const res = await fetch(`${API}/tenants/${selectedClinic}/kb/${id}`, { method: 'DELETE' });
     if (res.ok) { showToast('Entry removed'); setEntries(prev => prev.filter(e => e.id !== id)); }
   };
 
