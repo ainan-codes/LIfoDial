@@ -28,8 +28,15 @@ interface Transaction {
   created_at: string;
 }
 
+// Simple clinic entry for dropdown when no credits exist yet
+interface ClinicEntry {
+  tenant_id: string;
+  clinic_name: string;
+}
+
 export default function Credits() {
   const [balances, setBalances] = useState<ClinicBalance[]>([]);
+  const [allClinics, setAllClinics] = useState<ClinicEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [showTopUp, setShowTopUp] = useState(false);
@@ -47,7 +54,24 @@ export default function Credits() {
   const [rateTenant, setRateTenant] = useState('');
   const [rateValue, setRateValue] = useState('');
 
-  useEffect(() => { loadBalances(); }, []);
+  useEffect(() => { loadBalances(); loadAllClinics(); }, []);
+
+  // Always fetch the clinic list so dropdowns have options even before credits exist
+  const loadAllClinics = async () => {
+    try {
+      const res = await fetch(`${API_URL}/admin/clinics`);
+      if (res.ok) {
+        const data = await res.json();
+        const clinicList = Array.isArray(data) ? data : (data.clinics || []);
+        setAllClinics(clinicList.map((c: any) => ({
+          tenant_id: c.id,
+          clinic_name: c.clinic_name || c.name || 'Unknown',
+        })));
+      }
+    } catch (e) {
+      console.error('Failed to load clinics for dropdown:', e);
+    }
+  };
 
   const loadBalances = async () => {
     setLoading(true);
@@ -269,9 +293,9 @@ export default function Credits() {
               style={formSelect}
             >
               <option value="">Select clinic...</option>
-              {balances.map(b => (
+              {(balances.length > 0 ? balances : allClinics).map((b: any) => (
                 <option key={b.tenant_id} value={b.tenant_id}>
-                  {b.clinic_name} (₹{b.balance.toFixed(2)})
+                  {b.clinic_name} {b.balance !== undefined ? `(₹${b.balance.toFixed(2)})` : ''}
                 </option>
               ))}
             </select>
@@ -313,9 +337,9 @@ export default function Credits() {
               style={formSelect}
             >
               <option value="">Select clinic...</option>
-              {balances.map(b => (
+              {(balances.length > 0 ? balances : allClinics).map((b: any) => (
                 <option key={b.tenant_id} value={b.tenant_id}>
-                  {b.clinic_name} (current: ₹{b.rate_per_minute.toFixed(2)}/min)
+                  {b.clinic_name} {b.rate_per_minute !== undefined ? `(current: ₹${b.rate_per_minute.toFixed(2)}/min)` : ''}
                 </option>
               ))}
             </select>

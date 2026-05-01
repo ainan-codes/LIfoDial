@@ -22,9 +22,12 @@ export default function Login() {
       if (res.ok) {
         const data = await res.json();
         localStorage.setItem('lifodial-authed', 'true');
-        localStorage.setItem('lifodial-tenant-id', data.tenant_id);
+        localStorage.setItem('lifodial-tenant-id', data.tenant_id || '');
         localStorage.setItem('lifodial-email', email.toLowerCase().trim());
         localStorage.setItem('lifodial-clinic-name', data.clinic_name || '');
+        // Clinic admin goes to /my-agent
+        setTimeout(() => navigate('/my-agent'), 200);
+        return;
       } else {
         // Fallback: still let them in (super admin or dev)
         localStorage.setItem('lifodial-authed', 'true');

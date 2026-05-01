@@ -73,18 +73,8 @@ export default function MyAgent() {
 
       let myAgent: AgentInfo | null = null;
 
-      // Primary: look up by email (most reliable — ties to clinic's admin_email)
-      if (email) {
-        const res = await fetch(`${API_URL}/agents/mine?email=${encodeURIComponent(email)}`);
-        if (res.ok) {
-          myAgent = await res.json();
-        } else if (res.status !== 404) {
-          console.warn('agents/mine error', res.status);
-        }
-      }
-
-      // Fallback: search by tenant_id in full list
-      if (!myAgent && tenantId) {
+      // Priority 1: look up by tenant_id if we have it from login
+      if (tenantId) {
         const res = await fetch(`${API_URL}/agents`);
         if (res.ok) {
           const agents = await res.json();
@@ -92,12 +82,26 @@ export default function MyAgent() {
         }
       }
 
-      // Last resort: show first agent (dev / demo mode)
-      if (!myAgent && !email && !tenantId) {
+      // Priority 2: look up by email (ties to clinic's admin_email)
+      if (!myAgent && email) {
+        try {
+          const res = await fetch(`${API_URL}/agents/mine?email=${encodeURIComponent(email)}`);
+          if (res.ok) {
+            myAgent = await res.json();
+          }
+        } catch {
+          // email lookup failed — continue to fallback
+        }
+      }
+
+      // Priority 3: show first agent (dev / demo mode)
+      if (!myAgent) {
         const res = await fetch(`${API_URL}/agents`);
         if (res.ok) {
           const agents = await res.json();
-          myAgent = agents[0] || null;
+          if (agents.length > 0) {
+            myAgent = agents[0];
+          }
         }
       }
 
@@ -105,8 +109,11 @@ export default function MyAgent() {
         setAgent(myAgent);
         // Load credits
         try {
-          const creditsRes = await fetch(`${API_URL}/credits/my-balance?tenant_id=${myAgent.tenant_id}`);
-          if (creditsRes.ok) setCredits(await creditsRes.json());
+          const tid = (myAgent as any).tenant_id || tenantId;
+          if (tid) {
+            const creditsRes = await fetch(`${API_URL}/credits/my-balance?tenant_id=${tid}`);
+            if (creditsRes.ok) setCredits(await creditsRes.json());
+          }
         } catch {}
         // Load recent calls
         try {

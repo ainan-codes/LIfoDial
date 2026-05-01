@@ -309,13 +309,15 @@ export default function SAClinics() {
     fetch(`${API_URL}/admin/clinics`)
       .then(r => r.json())
       .then(data => {
-        const mapped = data.map((c: any) => ({
+        // Backend returns {clinics: [...], total: N} — extract the array
+        const clinicList = Array.isArray(data) ? data : (data.clinics || []);
+        const mapped = clinicList.map((c: any) => ({
           id: c.id,
           name: c.clinic_name,
           location: c.location || '—',
           plan: c.plan || 'Pro',
-          joined: new Date(c.created_at).toLocaleDateString(),
-          status: c.is_active ? 'Active' : 'Suspended',
+          joined: c.created_at ? new Date(c.created_at).toLocaleDateString() : '—',
+          status: c.is_active === false ? 'Suspended' : 'Active',
           // Real stats: use 0/— until a stats table exists (no fake random data)
           calls_month: c.calls_month || 0,
           bookings: c.bookings || 0,
@@ -326,7 +328,10 @@ export default function SAClinics() {
         }));
         setClinics(mapped);
       })
-      .catch(() => setClinics([]))
+      .catch((err) => {
+        console.error('Failed to load clinics:', err);
+        setClinics([]);
+      })
       .finally(() => setLoading(false));
   }, []);
 

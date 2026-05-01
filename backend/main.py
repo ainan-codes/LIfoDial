@@ -115,9 +115,9 @@ async def _warmup() -> None:
 app = FastAPI(
     title="Lifodial API",
     description="AI Voice Receptionist SaaS for clinics — India & Middle East (Lifodial)",
-    version="1.0.2",
-    docs_url="/docs" if settings.environment != "production" else None,
-    redoc_url="/redoc" if settings.environment != "production" else None,
+    version="1.0.3",
+    docs_url="/docs",     # temporarily enabled in production for audit
+    redoc_url="/redoc",   # temporarily enabled in production for audit
     lifespan=lifespan,
 )
 
@@ -176,7 +176,7 @@ async def health() -> dict:
         "status": "ok" if db_status == "connected" else "degraded",
         "database": db_status,
         "database_type": db_type,
-        "version": "1.0.2",
+        "version": "1.0.3",
         "environment": settings.environment,
     }
 
@@ -207,6 +207,100 @@ async def seed_db():
     from backend.scripts.seed_demo import seed
     await seed()
     return {"status": "ok", "message": "Database seeded successfully"}
+
+
+# ── Debug / Audit Endpoint ────────────────────────────────────────────────────
+@app.get("/debug/audit", tags=["debug"])
+async def audit_database():
+    """Complete database audit — shows row counts and sample data. Remove after fixing."""
+    from backend.db import AsyncSessionLocal
+    from sqlalchemy import text
+
+    results = {}
+
+    async with AsyncSessionLocal() as db:
+        tables = [
+            "tenants", "agent_configs", "doctors",
+            "clinic_credits", "credit_transactions",
+            "appointments", "call_logs", "call_records",
+        ]
+
+        for table in tables:
+            try:
+                count = await db.scalar(
+                    text(f"SELECT COUNT(*) FROM {table}")
+                )
+                results[table] = {"count": count}
+
+                # Show first 3 rows of key tables
+                if table in ["tenants", "agent_configs"] and count > 0:
+                    rows = await db.execute(
+                        text(f"SELECT * FROM {table} LIMIT 3")
+                    )
+                    cols = list(rows.keys())
+                    data = [dict(zip(cols, row)) for row in rows]
+                    results[table]["sample"] = [
+                        {k: str(v)[:50] for k, v in row.items()}
+                        for row in data
+                    ]
+            except Exception as e:
+                results[table] = {"error": str(e)[:100]}
+
+    return results
+
+
+@app.post("/admin/sync-tenants-from-agents", tags=["superadmin"])
+async def sync_tenants_from_agents():
+    """
+    Finds agents that have tenant_ids with no matching tenant.
+    Creates missing tenant records.
+    """
+    from backend.db import AsyncSessionLocal
+    from backend.models.agent_config import AgentConfig
+    from backend.models.tenant import Tenant
+    from sqlalchemy import select
+    from datetime import datetime, timezone
+
+    fixed = []
+
+    async with AsyncSessionLocal() as db:
+        # Get all agents
+        agents = (await db.execute(select(AgentConfig))).scalars().all()
+
+        for agent in agents:
+            # Check if tenant exists
+            tenant = (await db.execute(
+                select(Tenant).where(Tenant.id == agent.tenant_id)
+            )).scalar_one_or_none()
+
+            if not tenant:
+                # Create missing tenant
+                name = agent.agent_name or "Clinic"
+                new_tenant = Tenant(
+                    id=str(agent.tenant_id),
+                    clinic_name=f"{name} Clinic",
+                    admin_email=f"admin@{name.lower().replace(' ', '')}.com",
+                    admin_password="changeme123",
+                    language=agent.tts_language or "hi-IN",
+                    status="active",
+                    is_active=True,
+                    plan="Free",
+                    created_at=datetime.now(timezone.utc),
+                )
+                db.add(new_tenant)
+                fixed.append({
+                    "tenant_id": str(agent.tenant_id),
+                    "created": f"{name} Clinic",
+                })
+
+        if fixed:
+            await db.commit()
+
+    return {
+        "fixed": len(fixed),
+        "details": fixed,
+        "message": f"Created {len(fixed)} missing tenant records",
+    }
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 from backend.routers import admin, tenants, doctors, voice, appointments, ws, voice_upload, agents, agent_test, platform, knowledge_base, voices, web_calls, phone_numbers, embed, models, simulation, latency, providers, bulk_calls, credits
