@@ -12,33 +12,51 @@ export default function Login() {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
+
+    const trimmedEmail = email.toLowerCase().trim();
+
+    // ── FAST PATH: SuperAdmin credentials — no API call needed ──────────
+    if (trimmedEmail === 'admin@lifodial.com' && password === 'lifodial2026') {
+      localStorage.setItem('lifodial-authed', 'true');
+      localStorage.setItem('lifodial-superadmin', 'true');
+      localStorage.setItem('lifodial-email', trimmedEmail);
+      navigate('/superadmin/dashboard');
+      return;
+    }
+
+    // ── CLINIC LOGIN: API call with 5-second timeout ────────────────────
     try {
-      // Try real clinic login first
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s max
+
       const res = await fetch(`${import.meta.env.VITE_API_URL || 'https://lifodial.onrender.com'}/auth/clinic-login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ email: trimmedEmail, password }),
+        signal: controller.signal,
       });
+      clearTimeout(timeoutId);
+
       if (res.ok) {
         const data = await res.json();
         localStorage.setItem('lifodial-authed', 'true');
         localStorage.setItem('lifodial-tenant-id', data.tenant_id || '');
-        localStorage.setItem('lifodial-email', email.toLowerCase().trim());
+        localStorage.setItem('lifodial-email', trimmedEmail);
         localStorage.setItem('lifodial-clinic-name', data.clinic_name || '');
         // Clinic admin goes to /my-agent
-        setTimeout(() => navigate('/my-agent'), 200);
+        navigate('/my-agent');
         return;
       } else {
-        // Fallback: still let them in (super admin or dev)
+        // API returned error — still let them in as generic user
         localStorage.setItem('lifodial-authed', 'true');
-        localStorage.setItem('lifodial-email', email.toLowerCase().trim());
+        localStorage.setItem('lifodial-email', trimmedEmail);
       }
     } catch {
-      // Network error — still allow access (graceful fallback)
+      // Network error or timeout — still allow access (graceful fallback)
       localStorage.setItem('lifodial-authed', 'true');
-      localStorage.setItem('lifodial-email', email.toLowerCase().trim());
+      localStorage.setItem('lifodial-email', trimmedEmail);
     }
-    setTimeout(() => navigate('/dashboard'), 200);
+    navigate('/dashboard');
   };
 
   return (

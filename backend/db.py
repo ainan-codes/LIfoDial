@@ -78,6 +78,8 @@ else:
         # "prepared statement already exists" on reconnection.
         connect_args={
             "statement_cache_size": 0,  # ← THE fix: asyncpg level, not URL param
+            "timeout": 10,              # connection timeout: fail fast (10s)
+            "command_timeout": 30,      # query timeout: 30s max per query
             "server_settings": {
                 "jit": "off",           # pgbouncer stability
             },
@@ -116,7 +118,12 @@ async def init_db() -> None:
       3. For PostgreSQL: stamp the Alembic version table so that 'upgrade head'
          is a no-op on a freshly created schema, then run upgrade head so that
          any real Alembic-only migrations (ALTER TABLE etc.) are applied.
+
+    Resilience: retries up to 3 times with backoff on network errors.
+    If all retries fail, the app still starts (degraded mode).
     """
+    import asyncio
+
     logger.info("init_db: starting…")
 
     # ── 1. Register all models with Base.metadata ──────────────────────────
@@ -127,14 +134,52 @@ async def init_db() -> None:
         logger.error("init_db: no tables in metadata — check model imports!")
         return
 
-    # ── 2. CREATE TABLE IF NOT EXISTS (idempotent, race-safe) ─────────────
-    async with engine.begin() as conn:
-        logger.info("init_db: running create_all (checkfirst=True)…")
-        await conn.run_sync(lambda sync_conn: Base.metadata.create_all(
-            sync_conn, checkfirst=True
-        ))
-    logger.info("init_db: create_all complete")
-    print(f"[OK] Database ready ({'SQLite' if IS_SQLITE else 'PostgreSQL'})")
+    # ── 2. CREATE TABLE IF NOT EXISTS (with retry for network issues) ──────
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with engine.begin() as conn:
+                logger.info("init_db: running create_all (attempt %d/%d)…", attempt, max_retries)
+                await conn.run_sync(lambda sync_conn: Base.metadata.create_all(
+                    sync_conn, checkfirst=True
+                ))
+            logger.info("init_db: create_all complete")
+            print(f"[OK] Database ready ({'SQLite' if IS_SQLITE else 'PostgreSQL'})")
+            break  # success — exit retry loop
+        except OSError as e:
+            # Network unreachable, connection refused, etc.
+            logger.warning(
+                "init_db: network error on attempt %d/%d: %s",
+                attempt, max_retries, e
+            )
+            if attempt < max_retries:
+                wait = 2 ** attempt  # 2s, 4s, 8s
+                logger.info("init_db: retrying in %ds…", wait)
+                await asyncio.sleep(wait)
+            else:
+                logger.critical(
+                    "init_db: all %d attempts failed — starting in DEGRADED mode. "
+                    "DB tables may not exist. Error: %s", max_retries, e
+                )
+                print(f"[WARN] Database NOT ready — starting in degraded mode")
+                return  # don't crash — let app start
+        except Exception as e:
+            # Any other DB error (auth, SSL, etc.)
+            logger.warning(
+                "init_db: DB error on attempt %d/%d: %s",
+                attempt, max_retries, e
+            )
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                logger.info("init_db: retrying in %ds…", wait)
+                await asyncio.sleep(wait)
+            else:
+                logger.critical(
+                    "init_db: all %d attempts failed — starting in DEGRADED mode. "
+                    "Error: %s", max_retries, e
+                )
+                print(f"[WARN] Database NOT ready — starting in degraded mode")
+                return
 
     # ── 3. Alembic: stamp + upgrade (PostgreSQL only) ──────────────────────
     if not IS_SQLITE:
