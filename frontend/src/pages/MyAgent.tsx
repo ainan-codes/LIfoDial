@@ -223,7 +223,7 @@ export default function MyAgent() {
             <ConfigRow icon={<Mic size={16} />} label="STT Model" value={agent.stt_model || 'saaras:v3'} />
             <ConfigRow icon={<Volume2 size={16} />} label="TTS Voice" value={agent.tts_voice || 'meera'} />
             <ConfigRow icon={<Volume2 size={16} />} label="TTS Model" value={agent.tts_model || 'bulbul:v3'} />
-            <ConfigRow icon={<Brain size={16} />} label="LLM" value={agent.llm_model || 'gemini-2.0-flash'} />
+            <ConfigRow icon={<Brain size={16} />} label="LLM" value={agent.llm_model || 'gemini-2.5-flash'} />
           </div>
 
           {agent.first_message && (

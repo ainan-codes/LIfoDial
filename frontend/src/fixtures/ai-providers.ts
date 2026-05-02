@@ -16,8 +16,8 @@ export const AI_PROVIDERS = {
   ],
   LLM: [
     { id: 'google', name: 'Google Gemini', recommended: true, models: [
-      { id: 'gemini-2.0-flash', name: 'gemini-2.0-flash', tags: ['Fastest', 'Recommended'] },
-      { id: 'gemini-2.0-pro', name: 'gemini-2.0-pro', tags: ['Best Quality'] },
+      { id: 'gemini-2.5-flash', name: 'gemini-2.5-flash', tags: ['Fastest', 'Recommended'] },
+      { id: 'gemini-2.5-pro', name: 'gemini-2.5-pro', tags: ['Best Quality'] },
       { id: 'gemini-1.5-flash', name: 'gemini-1.5-flash', tags: ['Cheapest'] },
       { id: 'gemini-1.5-pro', name: 'gemini-1.5-pro', tags: [] }
     ]},

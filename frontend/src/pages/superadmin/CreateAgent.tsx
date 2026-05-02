@@ -72,7 +72,7 @@ const INITIAL_STATE: WizardState = {
   tts_provider: 'sarvam', tts_model: 'bulbul:v3',
   tts_voice: 'anushka', tts_language: 'hi-IN',
   tts_pitch: 0, tts_pace: 1.0, tts_loudness: 1.0,
-  llm_model: 'gemini-2.0-flash', llm_temperature: 0.3, max_tokens: 150,
+  llm_model: 'gemini-2.5-flash', llm_temperature: 0.3, max_tokens: 150,
   telephony_option: 'skip',
   country_code: 'IN', sip_account_sid: '', sip_auth_token: '', sip_domain: '',
 };

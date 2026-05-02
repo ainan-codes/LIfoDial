@@ -213,7 +213,7 @@ function AgentCard({ agent, onEdit, onTest, onDelete, onWebCall, onPhoneCall }: 
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           {/* LLM model — show exact provider + model from DB */}
-          <InfoPill icon={<Brain size={11} />} text={`${agent.llm_provider || 'gemini'} · ${agent.llm_model || agent.model || 'gemini-2.0-flash'}`} />
+          <InfoPill icon={<Brain size={11} />} text={`${agent.llm_provider || 'gemini'} · ${agent.llm_model || agent.model || 'gemini-2.5-flash'}`} />
         </div>
       </div>
 

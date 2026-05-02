@@ -75,6 +75,108 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         logger.warning("Model migration failed (non-fatal): %s", e)
 
+    # ── Fix agent names: rename voice-like names to professional clinic names ──
+    try:
+        from backend.db import AsyncSessionLocal
+        from sqlalchemy import text
+        # Mapping: old voice-like name → new professional name (keyed by agent ID)
+        AGENT_NAME_FIXES = {
+            "agent-001": ("Priya",  "Apollo Receptionist"),
+            "agent-002": ("Kavya",  "Aster Receptionist"),
+            "agent-003": ("Riya",   "Max Receptionist"),
+            "agent-004": ("Shreya", "Manipal Receptionist"),
+            "agent-005": ("Layla",  "Al Zahra Receptionist"),
+        }
+        async with AsyncSessionLocal() as db:
+            fixed = 0
+            for agent_id, (old_name, new_name) in AGENT_NAME_FIXES.items():
+                result = await db.execute(
+                    text(
+                        "UPDATE agent_configs SET agent_name = :new_name "
+                        "WHERE id = :id AND agent_name = :old_name"
+                    ),
+                    {"new_name": new_name, "id": agent_id, "old_name": old_name},
+                )
+                fixed += result.rowcount
+
+                # Also update system_prompt to remove "You are <VoiceName>," phrasing
+                await db.execute(
+                    text(
+                        "UPDATE agent_configs SET system_prompt = REPLACE(system_prompt, "
+                        "'You are ' || :old_name || ',', "
+                        "'You are') "
+                        "WHERE id = :id AND system_prompt LIKE '%You are ' || :old_name || ',%'"
+                    ),
+                    {"old_name": old_name, "id": agent_id},
+                )
+
+                # Also fix first_message references like "Main Priya hoon" or "I am Riya"
+                await db.execute(
+                    text(
+                        "UPDATE agent_configs SET first_message = REPLACE(first_message, "
+                        ":old_phrase, :new_phrase) "
+                        "WHERE id = :id AND first_message LIKE :like_pattern"
+                    ),
+                    {
+                        "old_phrase": f"Main {old_name} hoon",
+                        "new_phrase": "Main aapki AI receptionist hoon",
+                        "id": agent_id,
+                        "like_pattern": f"%Main {old_name} hoon%",
+                    },
+                )
+                await db.execute(
+                    text(
+                        "UPDATE agent_configs SET first_message = REPLACE(first_message, "
+                        ":old_phrase, :new_phrase) "
+                        "WHERE id = :id AND first_message LIKE :like_pattern"
+                    ),
+                    {
+                        "old_phrase": f"I am {old_name}",
+                        "new_phrase": "I am your AI receptionist",
+                        "id": agent_id,
+                        "like_pattern": f"%I am {old_name}%",
+                    },
+                )
+                # Fix "Naanu <Name>" (Kannada)
+                await db.execute(
+                    text(
+                        "UPDATE agent_configs SET first_message = REPLACE(first_message, "
+                        ":old_phrase, :new_phrase) "
+                        "WHERE id = :id AND first_message LIKE :like_pattern"
+                    ),
+                    {
+                        "old_phrase": f"Naanu {old_name}",
+                        "new_phrase": "Naanu nimma AI receptionist",
+                        "id": agent_id,
+                        "like_pattern": f"%Naanu {old_name}%",
+                    },
+                )
+                # Fix Arabic "أنا ليلى" → "أنا موظفة الاستقبال الذكية"
+                if old_name == "Layla":
+                    await db.execute(
+                        text(
+                            "UPDATE agent_configs SET first_message = REPLACE(first_message, "
+                            "'أنا ليلى،', 'أنا موظفة الاستقبال الذكية.') "
+                            "WHERE id = :id AND first_message LIKE '%أنا ليلى،%'"
+                        ),
+                        {"id": agent_id},
+                    )
+                # Fix Malayalam "ഞാൻ Kavya ആണ്" → "ഞാൻ നിങ്ങളുടെ AI റിസപ്ഷനിസ്റ്റ് ആണ്"
+                if old_name == "Kavya":
+                    await db.execute(
+                        text(
+                            "UPDATE agent_configs SET first_message = REPLACE(first_message, "
+                            "'ഞാൻ Kavya ആണ്', 'ഞാൻ നിങ്ങളുടെ AI റിസപ്ഷനിസ്റ്റ് ആണ്') "
+                            "WHERE id = :id AND first_message LIKE '%ഞാൻ Kavya ആണ്%'"
+                        ),
+                        {"id": agent_id},
+                    )
+            if fixed:
+                await db.commit()
+                logger.info("[STARTUP] Renamed %d agent(s) from voice-like names to professional names", fixed)
+    except Exception as e:
+        logger.warning("Agent name migration failed (non-fatal): %s", e)
+
     # ── API Warmup — eliminate cold-start latency ───────────────────────────
     # Run in background (non-blocking) so startup doesn't stall
     import asyncio

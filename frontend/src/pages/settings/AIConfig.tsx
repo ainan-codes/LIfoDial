@@ -21,7 +21,7 @@ export default function AIConfig() {
   const [sttModel, setSttModel] = useState('saarika:v2');
   
   const [llmProvider, setLlmProvider] = useState('google');
-  const [llmModel, setLlmModel] = useState('gemini-2.0-flash');
+  const [llmModel, setLlmModel] = useState('gemini-2.5-flash');
   
   const [ttsProvider, setTtsProvider] = useState('sarvam');
   const [ttsModel, setTtsModel] = useState('bulbul:v1');

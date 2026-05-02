@@ -561,14 +561,14 @@ data-language="ta-IN"         → Force Tamil language`}
 
 function getLlmFallbackModels(provider: string): string[] {
   const map: Record<string, string[]> = {
-    gemini: ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'],
+    gemini: ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'],
     openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo'],
     anthropic: ['claude-3-5-sonnet-20241022', 'claude-3-haiku-20240307'],
     groq: ['llama-3.3-70b-versatile', 'mixtral-8x7b-32768'],
     deepseek: ['deepseek-chat', 'deepseek-reasoner'],
     mistral: ['mistral-large-latest', 'mistral-small-latest'],
   };
-  return map[provider] || ['gemini-2.0-flash'];
+  return map[provider] || ['gemini-2.5-flash'];
 }
 
 export default function AgentDetail() {
@@ -605,7 +605,7 @@ export default function AgentDetail() {
       clinic_name: found.clinic_name,
       status: found.status,
       llm_provider: found.llm_provider || 'gemini',
-      llm_model: found.llm_model || 'gemini-2.0-flash',
+      llm_model: found.llm_model || 'gemini-2.5-flash',
       first_message_mode: 'assistant-speaks-first',
       first_message: found.first_message || 'Hello, how can I help you today?',
       system_prompt: 'You are a helpful AI clinic receptionist.',
@@ -982,7 +982,7 @@ export default function AgentDetail() {
                   </div>
                   <div>
                     <Label>Model</Label>
-                    <Select value={agent.llm_model} onChange={(v:any) => updateField('llm_model', v)} options={llmModels.length ? llmModels : [agent.llm_model || 'gemini-2.0-flash']} />
+                    <Select value={agent.llm_model} onChange={(v:any) => updateField('llm_model', v)} options={llmModels.length ? llmModels : [agent.llm_model || 'gemini-2.5-flash']} />
                     <Helper>Models are auto-fetched from your API key. <span style={{color: ACCENT, cursor:'pointer', fontSize:'11px'}} onClick={() => { fetch(`${API_URL}/platform/providers/${agent.llm_provider}/fetch-models`, {method:'POST'}).then(r=>r.json()).then(d=>{if(d.models?.length) setLlmModels(d.models)}); }}>⟳ Refresh Models</span></Helper>
                   </div>
                 </div>
