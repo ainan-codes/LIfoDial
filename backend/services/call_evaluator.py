@@ -69,7 +69,7 @@ async def evaluate_call(call_record_id: str, db) -> dict:
                 None,
                 functools.partial(
                     google_genai_client.models.generate_content,
-                    model="gemini-2.0-flash",
+                    model="gemini-2.5-flash",
                     contents=prompt,
                 )
             )

@@ -60,6 +60,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         logger.warning("Env key sync failed (non-fatal): %s", e)
 
+    # ── Migrate deprecated Gemini model references in existing agents ──────────
+    try:
+        from backend.db import AsyncSessionLocal
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                text("UPDATE agent_configs SET llm_model = 'gemini-2.5-flash' WHERE llm_model = 'gemini-2.0-flash'")
+            )
+            migrated = result.rowcount
+            if migrated:
+                await db.commit()
+                logger.info("[STARTUP] Migrated %d agent(s) from gemini-2.0-flash → gemini-2.5-flash", migrated)
+    except Exception as e:
+        logger.warning("Model migration failed (non-fatal): %s", e)
+
     # ── API Warmup — eliminate cold-start latency ───────────────────────────
     # Run in background (non-blocking) so startup doesn't stall
     import asyncio

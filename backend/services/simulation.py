@@ -159,7 +159,7 @@ async def run_simulation(agent_id: str, scenario_name: str, db) -> dict:
     )
 
     google_genai_client = google_genai.Client(api_key=settings.gemini_api_key)
-    model_id = agent.llm_model or "gemini-2.0-flash"
+    model_id = agent.llm_model or "gemini-2.5-flash"
 
     # We use the synchronous generate_content via run_in_executor to avoid
     # blocking the event loop for each patient turn.

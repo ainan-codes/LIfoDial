@@ -65,7 +65,7 @@ class AgentConfig(Base):
 
     # ── LLM ──────────────────────────────────────
     llm_provider = Column(String(30), default="gemini")
-    llm_model = Column(String(100), default="gemini-2.0-flash")
+    llm_model = Column(String(100), default="gemini-2.5-flash")
     llm_temperature = Column(Float, default=0.3)
     max_response_tokens = Column(Integer, default=150)
     llm_max_tokens = Column(Integer, default=250)

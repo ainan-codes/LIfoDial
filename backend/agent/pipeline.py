@@ -207,7 +207,7 @@ async def entrypoint(ctx):
         # Gemini LLM — streaming
         llm=GeminiLLMPlugin(
             api_key=settings.gemini_api_key,
-            model=agent_config.get("llm_model", "gemini-2.0-flash"),
+            model=agent_config.get("llm_model", "gemini-2.5-flash"),
             temperature=float(
                 agent_config.get("llm_temperature", 0.3) if agent_config.get("llm_temperature") is not None else 0.3
             ),

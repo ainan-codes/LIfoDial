@@ -31,7 +31,7 @@ async def get_db():
 # ── Provider catalogue ────────────────────────────────────────────────────────
 PROVIDERS = {
     "llm": [
-        {"id": "gemini",    "name": "Google Gemini",    "env_var": "GEMINI_API_KEY",    "models": ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.0-pro"], "key_label": "GEMINI_API_KEY",    "key_url": "https://aistudio.google.com/app/apikey",   "icon": "G"},
+        {"id": "gemini",    "name": "Google Gemini",    "env_var": "GEMINI_API_KEY",    "models": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-pro"], "key_label": "GEMINI_API_KEY",    "key_url": "https://aistudio.google.com/app/apikey",   "icon": "G"},
         {"id": "openai",    "name": "OpenAI",           "env_var": "OPENAI_API_KEY",    "models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"],                 "key_label": "OPENAI_API_KEY",    "key_url": "https://platform.openai.com/api-keys",     "icon": "O"},
         {"id": "anthropic", "name": "Anthropic Claude", "env_var": "ANTHROPIC_API_KEY", "models": ["claude-3-5-sonnet-20241022", "claude-3-haiku-20240307"],"key_label": "ANTHROPIC_API_KEY", "key_url": "https://console.anthropic.com/settings/keys","icon": "A"},
         {"id": "deepseek",  "name": "DeepSeek",         "env_var": "DEEPSEEK_API_KEY",  "models": ["deepseek-chat", "deepseek-reasoner"],                   "key_label": "DEEPSEEK_API_KEY",  "key_url": "https://platform.deepseek.com",            "icon": "DS"},

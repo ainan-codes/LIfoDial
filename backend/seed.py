@@ -58,7 +58,7 @@ async def main():
                 greeting="Hello, this is Lifodial Demo Clinic. How can I help you today?",
                 prompt="You are a professional medical receptionist. You help patients book appointments with Dr. Smith.",
                 provider="gemini",
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 voice_provider="sarvam",
                 voice_id="meera",
                 language="hi-IN",

@@ -390,7 +390,7 @@ async def preview_prompt(payload: PreviewPromptPayload) -> dict:
             client = genai.Client(api_key=settings.gemini_api_key)
             full_prompt = f"{rendered_system}\n\nPatient: {payload.patient_message}\nAgent:"
             response = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 contents=full_prompt,
             )
             ai_text = response.text.strip()

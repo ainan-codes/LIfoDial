@@ -27,7 +27,7 @@ class GeminiSTT(STTProvider):
             # but sticking to newer Client approach.
             audio_upload = client.files.upload(path=tmp_path)
             response = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 contents=[
                     audio_upload,
                     f"Transcribe this audio. Speaker is likely speaking {lang_name}. Return ONLY the transcript, nothing else."

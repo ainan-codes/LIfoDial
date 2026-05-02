@@ -28,7 +28,7 @@ class GeminiLLM:
     def __init__(self, api_key: str):
         from google import genai
         self.client = genai.Client(api_key=api_key)
-        self.model_id = "gemini-2.0-flash"
+        self.model_id = "gemini-2.5-flash"
 
     async def chat(self, messages: list[llm.ChatMessage]) -> str:
         prompt = "\n".join([f"{m.role}: {m.content}" for m in messages])

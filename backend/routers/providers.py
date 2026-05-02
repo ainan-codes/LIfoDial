@@ -69,13 +69,11 @@ SARVAM_VOICES = [
 ]
 
 GEMINI_MODELS = [
-    {"id": "gemini-2.5-flash-preview-04-17", "name": "Gemini 2.5 Flash (Preview)", "tier": "fast",    "context": 1048576, "recommended": True},
-    {"id": "gemini-2.0-flash",               "name": "Gemini 2.0 Flash",            "tier": "fast",    "context": 1048576, "recommended": True},
+    {"id": "gemini-2.5-flash",               "name": "Gemini 2.5 Flash",            "tier": "fast",    "context": 1048576, "recommended": True},
+    {"id": "gemini-2.5-pro",                 "name": "Gemini 2.5 Pro",              "tier": "pro",     "context": 2097152, "recommended": False},
     {"id": "gemini-2.0-flash-lite",          "name": "Gemini 2.0 Flash Lite",       "tier": "fastest", "context": 1048576, "recommended": False},
     {"id": "gemini-1.5-flash",               "name": "Gemini 1.5 Flash",            "tier": "fast",    "context": 1048576, "recommended": False},
-    {"id": "gemini-1.5-flash-8b",            "name": "Gemini 1.5 Flash 8B",         "tier": "fastest", "context": 1048576, "recommended": False},
     {"id": "gemini-1.5-pro",                 "name": "Gemini 1.5 Pro",              "tier": "pro",     "context": 2097152, "recommended": False},
-    {"id": "gemini-2.0-pro-exp",             "name": "Gemini 2.0 Pro (Exp)",        "tier": "pro",     "context": 2097152, "recommended": False},
 ]
 
 STT_MODELS = [
@@ -112,7 +110,7 @@ async def get_providers() -> dict:
                 "type": ["llm"],
                 "connected": gemini_ok,
                 "model_count": len(GEMINI_MODELS),
-                "description": "Default LLM. Gemini 2.0 Flash is recommended for voice.",
+                "description": "Default LLM. Gemini 2.5 Flash is recommended for voice.",
                 "website": "https://ai.google.dev",
             },
             {
@@ -187,7 +185,7 @@ async def list_llms() -> dict:
                 {"id": "gpt-4-turbo",  "name": "GPT-4 Turbo",      "tier": "pro",     "recommended": False},
             ] if settings.openai_api_key else [],
         },
-        "recommended_for_voice": "gemini-2.0-flash",
+        "recommended_for_voice": "gemini-2.5-flash",
     }
 
 
@@ -272,7 +270,7 @@ async def test_connection(req: TestConnectionRequest) -> dict:
             from google import genai
             client = genai.Client(api_key=req.api_key)
             resp = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash",
                 contents="Say: OK",
             )
             latency_ms = int((time.time() - t0) * 1000)

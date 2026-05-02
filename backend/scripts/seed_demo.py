@@ -35,7 +35,7 @@ DEMO_CLINICS = [
             "tts_voice": "meera",
             "tts_language": "hi-IN",
             "llm_provider": "gemini",
-            "llm_model": "gemini-2.0-flash",
+            "llm_model": "gemini-2.5-flash",
             "status": "ACTIVE",
         },
         "doctors": [
@@ -67,7 +67,7 @@ DEMO_CLINICS = [
             "tts_voice": "pavithra",
             "tts_language": "ml-IN",
             "llm_provider": "gemini",
-            "llm_model": "gemini-2.0-flash",
+            "llm_model": "gemini-2.5-flash",
             "status": "ACTIVE",
         },
         "doctors": [
@@ -98,7 +98,7 @@ DEMO_CLINICS = [
             "tts_voice": "priya",
             "tts_language": "hi-IN",
             "llm_provider": "gemini",
-            "llm_model": "gemini-2.0-flash",
+            "llm_model": "gemini-2.5-flash",
             "status": "ACTIVE",
         },
         "doctors": [
@@ -130,7 +130,7 @@ DEMO_CLINICS = [
             "tts_voice": "meera",
             "tts_language": "kn-IN",
             "llm_provider": "gemini",
-            "llm_model": "gemini-2.0-flash",
+            "llm_model": "gemini-2.5-flash",
             "status": "CONFIGURED",
         },
         "doctors": [
@@ -161,7 +161,7 @@ DEMO_CLINICS = [
             "tts_voice": "amol",
             "tts_language": "ar-SA",
             "llm_provider": "gemini",
-            "llm_model": "gemini-2.0-flash",
+            "llm_model": "gemini-2.5-flash",
             "status": "ACTIVE",
         },
         "doctors": [

@@ -1539,7 +1539,7 @@ async def generate_llm_response(
     
     # Provider-specific default models (safety net if wrong model is stored)
     PROVIDER_DEFAULTS = {
-        "gemini": "gemini-2.0-flash",
+        "gemini": "gemini-2.5-flash",
         "openai": "gpt-4o-mini",
         "anthropic": "claude-haiku-4-5",
         "groq": "llama-3.3-70b-versatile",
@@ -1555,7 +1555,7 @@ async def generate_llm_response(
         "mistral": ["mistral"],
     }
     
-    agent_model = agent.llm_model or PROVIDER_DEFAULTS.get(llm_provider, "gemini-2.0-flash")
+    agent_model = agent.llm_model or PROVIDER_DEFAULTS.get(llm_provider, "gemini-2.5-flash")
     # Check if stored model actually belongs to this provider
     valid_prefixes = PROVIDER_MODEL_PREFIXES.get(llm_provider, [])
     model_matches_provider = any(agent_model.lower().startswith(p) for p in valid_prefixes)
@@ -1632,6 +1632,16 @@ async def call_gemini(api_key: str, system_prompt: str,
             })
             last_role = role
     
+    # ── Auto-remap deprecated models ───────────────────────────────────────────
+    DEPRECATED_GEMINI_MODELS = {
+        "gemini-2.0-flash": "gemini-2.5-flash",
+        "gemini-1.0-pro": "gemini-1.5-pro",
+    }
+    if model in DEPRECATED_GEMINI_MODELS:
+        new_model = DEPRECATED_GEMINI_MODELS[model]
+        logger.warning("Remapping deprecated model '%s' → '%s'", model, new_model)
+        model = new_model
+
     # Ensure model starts with 'models/' if it's a standard model name
     gemini_model = model
     if not gemini_model.startswith("models/"):

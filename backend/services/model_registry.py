@@ -91,7 +91,6 @@ async def fetch_gemini_models(api_key: str) -> list:
             # Recommended for voice AI
             recommended = model_id in [
                 "gemini-2.5-flash",
-                "gemini-2.0-flash",
                 "gemini-2.5-flash-lite-preview",
             ]
             
@@ -131,11 +130,11 @@ GEMINI_FALLBACK_MODELS = [
     {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash",
      "tags": ["⚡ Fast", "💰 Low cost"], "is_recommended": True,
      "is_preview": False},
-    {"id": "gemini-2.0-flash", "name": "Gemini 2.0 Flash",
-     "tags": ["⚡ Fast", "💰 Low cost"], "is_recommended": False,
-     "is_preview": False},
     {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro",
      "tags": ["🎯 High quality"], "is_recommended": False,
+     "is_preview": False},
+    {"id": "gemini-2.0-flash-lite", "name": "Gemini 2.0 Flash Lite",
+     "tags": ["🚀 Fastest", "💰 Cheapest"], "is_recommended": False,
      "is_preview": False},
 ]
 
@@ -227,7 +226,7 @@ async def get_all_providers_summary(settings) -> dict:
                     "connected": bool(settings.gemini_api_key),
                     "best_for": "Multilingual — same key as LLM",
                     "models": [
-                        {"id": "gemini-2.0-flash", "name": "Gemini Flash STT", "recommended": True}
+                        {"id": "gemini-2.5-flash", "name": "Gemini Flash STT", "recommended": True}
                     ]
                 }
             ],
