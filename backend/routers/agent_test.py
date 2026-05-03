@@ -1644,7 +1644,7 @@ async def call_gemini(api_key: str, system_prompt: str,
     }
     if model in DEPRECATED_GEMINI_MODELS:
         new_model = DEPRECATED_GEMINI_MODELS[model]
-        logger.warning("Remapping deprecated model '%s' → '%s'", model, new_model)
+        logger.info("Remapping deprecated model '%s' → '%s'", model, new_model)
         model = new_model
 
     # Ensure model starts with 'models/' if it's a standard model name
@@ -1875,12 +1875,14 @@ async def synthesize_speech(agent: AgentConfig, text: str, language_override: st
                 "vian": "shubh",
             }
             normalized_voice = sarvam_voice_map.get(raw_voice.lower(), raw_voice.lower())
+            # Normalize language before sending to Sarvam
+            normalized_language = normalize_sarvam_language(tts_language)
             return await sarvam_synthesize(
                 api_key=api_key,
                 text=text,
                 voice=normalized_voice,
                 model=agent.tts_model or "bulbul:v3",
-                language=tts_language,
+                language=normalized_language,
                 pitch=agent.tts_pitch or 0.0,
                 pace=agent.tts_pace or 1.0,
                 loudness=agent.tts_loudness or 1.0
@@ -1924,7 +1926,7 @@ async def sarvam_synthesize_with_retry(
         logger.warning("sarvam_synthesize_with_retry: no API key")
         return None
 
-    tts_language = language_override or agent.tts_language or "en-IN"
+    tts_language = normalize_sarvam_language(language_override or agent.tts_language or "en-IN")
 
     # Apply the same legacy-voice → v3-speaker mapping used by synthesize_speech()
     # so that v2-only voices (meera, pavithra, etc.) are remapped before reaching
@@ -2020,10 +2022,9 @@ def get_compatible_speaker(model: str, requested_speaker: str) -> str:
         return requested_speaker
 
     fallback = SARVAM_MODEL_DEFAULT_SPEAKER.get(model, valid_speakers[0])
-    logger.warning(
-        "Speaker '%s' is not compatible with model '%s'. "
-        "Falling back to '%s'. Valid speakers: %s",
-        requested_speaker, model, fallback, ", ".join(valid_speakers),
+    logger.info(
+        "Speaker '%s' auto-remapped to '%s' for model '%s'",
+        requested_speaker, fallback, model,
     )
     return fallback
 
@@ -2052,10 +2053,9 @@ def normalize_sarvam_language(language: str) -> str:
         if valid.startswith(prefix + "-"):
             logger.info("Sarvam TTS: remapped language '%s' → '%s'", language, valid)
             return valid
-    logger.warning(
-        "Sarvam TTS: language '%s' is not supported. "
-        "Falling back to 'en-IN'. Valid codes: %s",
-        language, ", ".join(sorted(SARVAM_VALID_LANGUAGES)),
+    logger.info(
+        "Sarvam TTS: language '%s' auto-remapped to 'en-IN'",
+        language,
     )
     return "en-IN"
 

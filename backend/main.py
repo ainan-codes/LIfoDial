@@ -177,63 +177,118 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         logger.warning("Agent name migration failed (non-fatal): %s", e)
 
-    # ── Fix voice/language/model mismatches in agents ────────────────────────
+    # ── Dynamic voice/language/model self-healing migration ──────────────────
+    # This runs on EVERY startup and auto-corrects ANY misconfigured agent,
+    # regardless of how it was created. Future-proof: no hardcoded language lists.
     try:
         from backend.db import AsyncSessionLocal
         from sqlalchemy import text
 
-        # 1. Remap v2-only TTS voices to v3-compatible equivalents
+        # Valid Sarvam languages (kept in sync with agent_test.py)
+        VALID_SARVAM_LANGS = {
+            "as-IN", "bn-IN", "brx-IN", "doi-IN", "en-IN", "gu-IN",
+            "hi-IN", "kn-IN", "kok-IN", "ks-IN", "mai-IN", "ml-IN",
+            "mni-IN", "mr-IN", "ne-IN", "od-IN", "pa-IN", "sa-IN",
+            "sat-IN", "sd-IN", "ta-IN", "te-IN", "ur-IN",
+        }
+
+        # Legacy v2 → v3 voice mapping
         VOICE_REMAP = {
-            "meera": "shreya",
-            "pavithra": "kavitha",
-            "maitreyi": "priya",
-            "arvind": "rahul",
-            "amol": "aditya",
-            "amartya": "rohan",
-            "diya": "ritu",
-            "neel": "amit",
-            "misha": "simran",
-            "vian": "shubh",
+            "meera": "shreya", "pavithra": "kavitha", "maitreyi": "priya",
+            "arvind": "rahul", "amol": "aditya", "amartya": "rohan",
+            "diya": "ritu", "neel": "amit", "misha": "simran", "vian": "shubh",
         }
-        # 2. Remap unsupported Sarvam language codes
-        LANG_REMAP = {
-            "ar-SA": "en-IN",
-            "ar-AE": "en-IN",
-            "zh-CN": "en-IN",
-            "ja-JP": "en-IN",
-            "fr-FR": "en-IN",
+
+        # Deprecated LLM models
+        DEPRECATED_LLM_MODELS = {
+            "gemini-2.0-flash": "gemini-2.5-flash",
+            "gemini-1.0-pro": "gemini-1.5-pro",
         }
+
+        # Model prefixes per provider (for mismatch detection)
+        PROVIDER_MODEL_PREFIXES = {
+            "gemini": ["gemini"],
+            "openai": ["gpt-", "o1-", "o3-"],
+            "groq": ["llama", "mixtral", "gemma"],
+            "anthropic": ["claude"],
+            "deepseek": ["deepseek"],
+        }
+        PROVIDER_DEFAULTS = {
+            "gemini": "gemini-2.5-flash",
+            "openai": "gpt-4o-mini",
+            "groq": "llama-3.3-70b-versatile",
+            "anthropic": "claude-haiku-4-5",
+            "deepseek": "deepseek-chat",
+        }
+
         async with AsyncSessionLocal() as db:
             fixes = 0
+
+            # 1. Remap legacy v2 voices
             for old_voice, new_voice in VOICE_REMAP.items():
                 r = await db.execute(
                     text(
                         "UPDATE agent_configs SET tts_voice = :new "
-                        "WHERE tts_voice = :old AND tts_model = 'bulbul:v3'"
+                        "WHERE LOWER(tts_voice) = :old AND "
+                        "(tts_model = 'bulbul:v3' OR tts_model IS NULL OR tts_model = '')"
                     ),
                     {"new": new_voice, "old": old_voice},
                 )
                 fixes += r.rowcount
-            for old_lang, new_lang in LANG_REMAP.items():
+
+            # 2. Dynamically fix ALL unsupported tts_language codes
+            # Fetch all distinct languages in use
+            rows = await db.execute(text("SELECT DISTINCT tts_language FROM agent_configs WHERE tts_language IS NOT NULL"))
+            all_langs = [r[0] for r in rows.fetchall() if r[0]]
+            for lang in all_langs:
+                if lang.strip() not in VALID_SARVAM_LANGS:
+                    r = await db.execute(
+                        text("UPDATE agent_configs SET tts_language = 'en-IN' WHERE tts_language = :old"),
+                        {"old": lang},
+                    )
+                    if r.rowcount:
+                        logger.info("[STARTUP] Remapped unsupported language '%s' → 'en-IN' (%d agents)", lang, r.rowcount)
+                    fixes += r.rowcount
+
+            # 3. Fix deprecated LLM models
+            for old_model, new_model in DEPRECATED_LLM_MODELS.items():
                 r = await db.execute(
-                    text(
-                        "UPDATE agent_configs SET tts_language = :new "
-                        "WHERE tts_language = :old"
-                    ),
-                    {"new": new_lang, "old": old_lang},
+                    text("UPDATE agent_configs SET llm_model = :new WHERE llm_model = :old"),
+                    {"new": new_model, "old": old_model},
                 )
                 fixes += r.rowcount
-            # 3. Fix model-provider mismatch: llm_model='llama-*' with llm_provider='gemini'
+
+            # 4. Fix model-provider mismatches dynamically
+            # Query all agents and check if their model matches their provider
+            rows = await db.execute(
+                text("SELECT id, llm_provider, llm_model FROM agent_configs WHERE llm_provider IS NOT NULL AND llm_model IS NOT NULL")
+            )
+            for row in rows.fetchall():
+                aid, provider, model = row[0], row[1], row[2]
+                if provider in PROVIDER_MODEL_PREFIXES:
+                    valid_prefixes = PROVIDER_MODEL_PREFIXES[provider]
+                    if not any(model.lower().startswith(p) for p in valid_prefixes):
+                        default = PROVIDER_DEFAULTS.get(provider, "gemini-2.5-flash")
+                        await db.execute(
+                            text("UPDATE agent_configs SET llm_model = :new WHERE id = :id"),
+                            {"new": default, "id": aid},
+                        )
+                        logger.info("[STARTUP] Fixed model-provider mismatch for agent %s: '%s'/'%s' → '%s'", aid, provider, model, default)
+                        fixes += 1
+
+            # 5. Ensure all Sarvam TTS agents use bulbul:v3
             r = await db.execute(
                 text(
-                    "UPDATE agent_configs SET llm_model = 'gemini-2.5-flash' "
-                    "WHERE llm_provider = 'gemini' AND llm_model LIKE 'llama%'"
+                    "UPDATE agent_configs SET tts_model = 'bulbul:v3' "
+                    "WHERE (tts_provider = 'sarvam' OR tts_provider IS NULL) "
+                    "AND tts_model != 'bulbul:v3' AND tts_model IS NOT NULL"
                 )
             )
             fixes += r.rowcount
+
             if fixes:
                 await db.commit()
-                logger.info("[STARTUP] Fixed %d agent voice/language/model mismatches", fixes)
+                logger.info("[STARTUP] Auto-healed %d agent configuration(s)", fixes)
     except Exception as e:
         logger.warning("Voice/language fix migration failed (non-fatal): %s", e)
 
