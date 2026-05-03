@@ -177,6 +177,66 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         logger.warning("Agent name migration failed (non-fatal): %s", e)
 
+    # ── Fix voice/language/model mismatches in agents ────────────────────────
+    try:
+        from backend.db import AsyncSessionLocal
+        from sqlalchemy import text
+
+        # 1. Remap v2-only TTS voices to v3-compatible equivalents
+        VOICE_REMAP = {
+            "meera": "shreya",
+            "pavithra": "kavitha",
+            "maitreyi": "priya",
+            "arvind": "rahul",
+            "amol": "aditya",
+            "amartya": "rohan",
+            "diya": "ritu",
+            "neel": "amit",
+            "misha": "simran",
+            "vian": "shubh",
+        }
+        # 2. Remap unsupported Sarvam language codes
+        LANG_REMAP = {
+            "ar-SA": "en-IN",
+            "ar-AE": "en-IN",
+            "zh-CN": "en-IN",
+            "ja-JP": "en-IN",
+            "fr-FR": "en-IN",
+        }
+        async with AsyncSessionLocal() as db:
+            fixes = 0
+            for old_voice, new_voice in VOICE_REMAP.items():
+                r = await db.execute(
+                    text(
+                        "UPDATE agent_configs SET tts_voice = :new "
+                        "WHERE tts_voice = :old AND tts_model = 'bulbul:v3'"
+                    ),
+                    {"new": new_voice, "old": old_voice},
+                )
+                fixes += r.rowcount
+            for old_lang, new_lang in LANG_REMAP.items():
+                r = await db.execute(
+                    text(
+                        "UPDATE agent_configs SET tts_language = :new "
+                        "WHERE tts_language = :old"
+                    ),
+                    {"new": new_lang, "old": old_lang},
+                )
+                fixes += r.rowcount
+            # 3. Fix model-provider mismatch: llm_model='llama-*' with llm_provider='gemini'
+            r = await db.execute(
+                text(
+                    "UPDATE agent_configs SET llm_model = 'gemini-2.5-flash' "
+                    "WHERE llm_provider = 'gemini' AND llm_model LIKE 'llama%'"
+                )
+            )
+            fixes += r.rowcount
+            if fixes:
+                await db.commit()
+                logger.info("[STARTUP] Fixed %d agent voice/language/model mismatches", fixes)
+    except Exception as e:
+        logger.warning("Voice/language fix migration failed (non-fatal): %s", e)
+
     # ── API Warmup — eliminate cold-start latency ───────────────────────────
     # Run in background (non-blocking) so startup doesn't stall
     import asyncio

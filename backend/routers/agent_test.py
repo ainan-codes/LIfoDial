@@ -1358,12 +1358,13 @@ async def sarvam_transcribe(api_key: str, audio_bytes: bytes,
     # Convert to 16kHz mono WAV (Sarvam's preferred format).
     processed_bytes = audio_bytes
     if upload_mime in ("audio/webm", "audio/ogg"):
+        original_mime = upload_mime
         try:
             processed_bytes = _convert_to_wav_pcm(audio_bytes)
             upload_name = "audio.wav"
             upload_mime = "audio/wav"
             logger.info("STT: Converted %s → WAV (%d → %d bytes)", 
-                       upload_mime, len(audio_bytes), len(processed_bytes))
+                       original_mime, len(audio_bytes), len(processed_bytes))
         except Exception as conv_err:
             logger.warning("STT: WebM→WAV conversion failed (%s), sending raw", conv_err)
             # Fall through with original bytes — Sarvam may still handle it
@@ -1560,8 +1561,12 @@ async def generate_llm_response(
     valid_prefixes = PROVIDER_MODEL_PREFIXES.get(llm_provider, [])
     model_matches_provider = any(agent_model.lower().startswith(p) for p in valid_prefixes)
     if not model_matches_provider:
-        logger.warning(f"Model '{agent_model}' doesn't match provider '{llm_provider}', using default")
+        old_model = agent_model
         agent_model = PROVIDER_DEFAULTS.get(llm_provider, agent_model)
+        logger.info(
+            "LLM model '%s' doesn't match provider '%s' — auto-corrected to '%s'",
+            old_model, llm_provider, agent_model,
+        )
 
     try:
         if llm_provider == "gemini":
@@ -1920,7 +1925,24 @@ async def sarvam_synthesize_with_retry(
         return None
 
     tts_language = language_override or agent.tts_language or "en-IN"
+
+    # Apply the same legacy-voice → v3-speaker mapping used by synthesize_speech()
+    # so that v2-only voices (meera, pavithra, etc.) are remapped before reaching
+    # sarvam_synthesize(), eliminating the compatibility warning at the source.
+    sarvam_voice_map = {
+        "meera": "shreya",
+        "pavithra": "kavitha",
+        "maitreyi": "priya",
+        "arvind": "rahul",
+        "amol": "aditya",
+        "amartya": "rohan",
+        "diya": "ritu",
+        "neel": "amit",
+        "misha": "simran",
+        "vian": "shubh",
+    }
     raw_voice = (agent.tts_voice or "priya").strip().lower()
+    normalized_voice = sarvam_voice_map.get(raw_voice, raw_voice)
 
     last_exc: Exception | None = None
     for attempt in range(1, max_retries + 1):
@@ -1928,7 +1950,7 @@ async def sarvam_synthesize_with_retry(
             audio = await sarvam_synthesize(
                 api_key=api_key,
                 text=text,
-                voice=raw_voice,
+                voice=normalized_voice,
                 model=agent.tts_model or "bulbul:v3",
                 language=tts_language,
                 pitch=agent.tts_pitch or 0.0,
@@ -2006,6 +2028,38 @@ def get_compatible_speaker(model: str, requested_speaker: str) -> str:
     return fallback
 
 
+# ── Valid Sarvam TTS language codes ─────────────────────────────────────────────
+# Authoritative list from Sarvam API validation (May 2026).
+SARVAM_VALID_LANGUAGES: set[str] = {
+    "as-IN", "bn-IN", "brx-IN", "doi-IN", "en-IN", "gu-IN",
+    "hi-IN", "kn-IN", "kok-IN", "ks-IN", "mai-IN", "ml-IN",
+    "mni-IN", "mr-IN", "ne-IN", "od-IN", "pa-IN", "sa-IN",
+    "sat-IN", "sd-IN", "ta-IN", "te-IN", "ur-IN",
+}
+
+def normalize_sarvam_language(language: str) -> str:
+    """Return a valid Sarvam target_language_code.
+    If the code is not supported (e.g. ar-SA for Arabic), fall back to en-IN.
+    """
+    if not language:
+        return "en-IN"
+    lang = language.strip()
+    if lang in SARVAM_VALID_LANGUAGES:
+        return lang
+    # Try common prefix match (e.g. 'hi' → 'hi-IN')
+    prefix = lang.split("-")[0].lower()
+    for valid in SARVAM_VALID_LANGUAGES:
+        if valid.startswith(prefix + "-"):
+            logger.info("Sarvam TTS: remapped language '%s' → '%s'", language, valid)
+            return valid
+    logger.warning(
+        "Sarvam TTS: language '%s' is not supported. "
+        "Falling back to 'en-IN'. Valid codes: %s",
+        language, ", ".join(sorted(SARVAM_VALID_LANGUAGES)),
+    )
+    return "en-IN"
+
+
 async def sarvam_synthesize(api_key: str, text: str, voice: str,
                                model: str, language: str,
                                pitch: float, pace: float, 
@@ -2026,12 +2080,16 @@ async def sarvam_synthesize(api_key: str, text: str, voice: str,
         normalized_model,
         (voice or "priya").lower().strip(),
     )
+
+    # FIX: Validate language code — Sarvam only supports Indian languages.
+    # Unsupported codes like 'ar-SA' would cause a 400 validation error.
+    normalized_language = normalize_sarvam_language(language)
     
     # Build payload based on model capabilities.
     payload = {
         # Sarvam REST v3 expects `text` for synchronous synthesis.
         "text": normalized_text,
-        "target_language_code": language,
+        "target_language_code": normalized_language,
         "speaker": normalized_voice,
         "model": normalized_model,
         "pace": pace,
