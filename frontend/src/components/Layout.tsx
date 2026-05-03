@@ -178,6 +178,10 @@ export default function Layout() {
           <button
             onClick={() => {
               localStorage.removeItem('lifodial-authed');
+              localStorage.removeItem('lifodial-superadmin');
+              localStorage.removeItem('lifodial-tenant-id');
+              localStorage.removeItem('lifodial-email');
+              localStorage.removeItem('lifodial-clinic-name');
               navigate('/');
             }}
             className="flex items-center gap-2 w-full transition-colors"

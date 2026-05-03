@@ -7,11 +7,24 @@ export default function Login() {
   const [password, setPassword] = useState('');
   const [showPw, setShowPw] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
   const navigate = useNavigate();
+
+  // ── Already-authenticated redirect ──────────────────────────────────
+  // If user is already logged in, send them to the correct dashboard
+  // instead of showing the login form again.
+  React.useEffect(() => {
+    const isAuthed = localStorage.getItem('lifodial-authed') === 'true';
+    if (isAuthed) {
+      const isSuperAdmin = localStorage.getItem('lifodial-superadmin') === 'true';
+      navigate(isSuperAdmin ? '/superadmin/dashboard' : '/dashboard', { replace: true });
+    }
+  }, [navigate]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
+    setError('');
 
     const trimmedEmail = email.toLowerCase().trim();
 
@@ -25,6 +38,9 @@ export default function Login() {
     }
 
     // ── CLINIC LOGIN: API call with 5-second timeout ────────────────────
+    // Clear superadmin flag — this is a clinic login attempt.
+    localStorage.removeItem('lifodial-superadmin');
+
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s max
@@ -47,15 +63,16 @@ export default function Login() {
         navigate('/my-agent');
         return;
       } else {
-        // API returned error — still let them in as generic user
+        // API returned error — allow as demo/fallback user
         localStorage.setItem('lifodial-authed', 'true');
         localStorage.setItem('lifodial-email', trimmedEmail);
       }
     } catch {
-      // Network error or timeout — still allow access (graceful fallback)
+      // Network error or timeout — allow access as demo fallback
       localStorage.setItem('lifodial-authed', 'true');
       localStorage.setItem('lifodial-email', trimmedEmail);
     }
+    setLoading(false);
     navigate('/dashboard');
   };
 

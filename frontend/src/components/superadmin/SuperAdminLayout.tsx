@@ -62,8 +62,12 @@ export default function SuperAdminLayout() {
   const crumbs = useBreadcrumbs();
 
   const handleLogout = () => {
+    localStorage.removeItem('lifodial-authed');
     localStorage.removeItem('lifodial-superadmin');
-    navigate('/superadmin/login');
+    localStorage.removeItem('lifodial-tenant-id');
+    localStorage.removeItem('lifodial-email');
+    localStorage.removeItem('lifodial-clinic-name');
+    navigate('/');
   };
 
   const sidebarW = collapsed ? 56 : 220;

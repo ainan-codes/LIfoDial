@@ -23,4 +23,8 @@ export function isAuthenticated(): boolean {
 
 export function signOut(): void {
   localStorage.removeItem('lifodial-authed');
+  localStorage.removeItem('lifodial-superadmin');
+  localStorage.removeItem('lifodial-tenant-id');
+  localStorage.removeItem('lifodial-email');
+  localStorage.removeItem('lifodial-clinic-name');
 }
