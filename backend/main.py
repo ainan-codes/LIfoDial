@@ -377,6 +377,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Embed CORS — allow ANY origin for /embed/ endpoints (public widget) ──────
+# The CORSMiddleware above only allows listed origins, but embed widgets load
+# from arbitrary clinic websites. This middleware runs BEFORE CORSMiddleware
+# (middleware stack is LIFO) and handles preflight + response headers for embed paths.
+@app.middleware("http")
+async def embed_cors_middleware(request: Request, call_next):
+    """Inject permissive CORS for all /embed/ and /widget.js paths."""
+    path = request.url.path
+    if path.startswith("/embed/") or path == "/widget.js":
+        if request.method == "OPTIONS":
+            return Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                    "Access-Control-Max-Age": "86400",
+                },
+            )
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return response
+    return await call_next(request)
+
 # ── Block noise from other projects (LeadScout etc.) ──────────────────────────
 _FOREIGN_PATHS = ("/api/leads", "/api/dashboard", "/api/scrape", "/api/countries",
                   "/api/directories", "/api/categories")

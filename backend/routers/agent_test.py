@@ -1197,11 +1197,19 @@ async def handle_audio_turn(
         except RuntimeError:
             pass
 
+    except (WebSocketDisconnect, RuntimeError):
+        # Client disconnected mid-turn — this is normal (user closed tab/navigated away)
+        logger.info("Client disconnected during audio turn for agent %s", agent.id)
     except Exception as e:
-        logger.error(f"Error in audio turn: {e}", exc_info=True)
+        # Only log as error if it's a genuine processing failure, not a disconnect
+        err_str = str(e).lower()
+        if any(k in err_str for k in ("disconnect", "closed", "1005", "1006", "1000")):
+            logger.info("Client disconnected during audio turn for agent %s", agent.id)
+        else:
+            logger.error(f"Error in audio turn: {e}", exc_info=True)
         try:
             await websocket.send_json({"type": "error", "message": f"Processing error: {str(e)}"})
-        except RuntimeError:
+        except (RuntimeError, WebSocketDisconnect, Exception):
             pass
 
 
@@ -1359,6 +1367,7 @@ async def sarvam_transcribe(api_key: str, audio_bytes: bytes,
     processed_bytes = audio_bytes
     if upload_mime in ("audio/webm", "audio/ogg"):
         original_mime = upload_mime
+        original_name = upload_name
         try:
             processed_bytes = _convert_to_wav_pcm(audio_bytes)
             upload_name = "audio.wav"
@@ -1366,8 +1375,11 @@ async def sarvam_transcribe(api_key: str, audio_bytes: bytes,
             logger.info("STT: Converted %s → WAV (%d → %d bytes)", 
                        original_mime, len(audio_bytes), len(processed_bytes))
         except Exception as conv_err:
-            logger.warning("STT: WebM→WAV conversion failed (%s), sending raw", conv_err)
-            # Fall through with original bytes — Sarvam may still handle it
+            logger.info("STT: ffmpeg conversion unavailable (%s), sending raw %s", conv_err, original_mime)
+            # CRITICAL: Keep original mime type — do NOT relabel as WAV
+            processed_bytes = audio_bytes
+            upload_name = original_name
+            upload_mime = original_mime
 
     max_retries = 2
     last_err = None
@@ -1421,25 +1433,64 @@ async def sarvam_transcribe(api_key: str, audio_bytes: bytes,
 
 
 def _convert_to_wav_pcm(audio_bytes: bytes) -> bytes:
-    """Best-effort conversion of browser audio (WebM/Opus/OGG) to 16kHz mono WAV.
-    Uses raw PCM extraction where possible; falls through gracefully.
-    """
-    import io
-    import wave
-    import struct
+    """Convert browser audio (WebM/Opus/OGG) to 16kHz mono 16-bit PCM WAV.
     
+    Uses ffmpeg subprocess (available on Render/Linux).
+    Falls back to returning original bytes if ffmpeg is unavailable.
+    """
+    import subprocess
+    import tempfile
+    import os
+
     # If already WAV, return as-is
     if audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE":
         return audio_bytes
-    
-    # For WebM/OGG: create a minimal valid WAV with the raw bytes
-    # (Sarvam's API is fairly tolerant of format quirks — the key is
-    #  sending the correct Content-Type header which we now do)
-    # 
-    # True transcoding would require ffmpeg/pydub which aren't in requirements.
-    # Instead, we send the raw bytes with correct mime type and let Sarvam handle it.
-    # The caller already sets the mime type, so just return the original.
-    return audio_bytes
+
+    # Use ffmpeg for real transcoding
+    tmp_in = None
+    tmp_out = None
+    try:
+        # Write input to temp file
+        tmp_in = tempfile.NamedTemporaryFile(suffix=".webm", delete=False)
+        tmp_in.write(audio_bytes)
+        tmp_in.flush()
+        tmp_in.close()
+
+        tmp_out_path = tmp_in.name.replace(".webm", ".wav")
+
+        # ffmpeg: convert to 16kHz mono 16-bit PCM WAV (Sarvam's preferred format)
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", tmp_in.name,
+                "-ar", "16000",      # 16kHz sample rate
+                "-ac", "1",          # Mono
+                "-sample_fmt", "s16", # 16-bit signed PCM
+                "-f", "wav",
+                tmp_out_path,
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+
+        if result.returncode == 0 and os.path.exists(tmp_out_path):
+            with open(tmp_out_path, "rb") as f:
+                wav_bytes = f.read()
+            if len(wav_bytes) > 44:  # Valid WAV must be > 44 bytes (header)
+                return wav_bytes
+
+        # ffmpeg failed — log and raise so caller falls back
+        stderr = result.stderr.decode("utf-8", errors="replace")[:200] if result.stderr else "unknown"
+        raise RuntimeError(f"ffmpeg returned {result.returncode}: {stderr}")
+
+    finally:
+        # Cleanup temp files
+        for path in [tmp_in.name if tmp_in else None, tmp_out_path if 'tmp_out_path' in dir() else None]:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 async def deepgram_transcribe(api_key: str, audio_bytes: bytes, model: str) -> str:

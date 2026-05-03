@@ -241,6 +241,9 @@ def _run_alembic_migrations() -> None:
         ini_path = os.path.join(base_dir, "alembic.ini")
         alembic_cfg = Config(ini_path)
         alembic_cfg.set_main_option("sqlalchemy.url", sync_url)
+        # Fix: set script_location to absolute path (Render CWD is project root,
+        # but alembic.ini lives in backend/ so relative "alembic" resolves wrong)
+        alembic_cfg.set_main_option("script_location", os.path.join(base_dir, "alembic"))
 
         # Check if alembic_version is already stamped
         sync_engine = create_engine(sync_url)
