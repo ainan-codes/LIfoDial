@@ -232,11 +232,13 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
 
     # ── Send ready signal ─────────────────────────────────────────────────────
     first_msg = agent.first_message or "Hello, how can I help?"
+    first_msg_mode = getattr(agent, 'first_message_mode', 'assistant-speaks-first') or 'assistant-speaks-first'
     try:
         await websocket.send_json({
             "type": "ready",
             "agent_name": agent.agent_name,
             "first_message": first_msg,
+            "first_message_mode": first_msg_mode,
             "tts_provider": agent.tts_provider,
             "stt_provider": agent.stt_provider,
         })
@@ -246,10 +248,11 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
         _language_tracker.pop(ws_session_id, None)
         return
 
-    # ── Kick off greeting audio in background ─────────────────────────────────
-    greeting_task = asyncio.create_task(
-        _send_greeting_audio_fast(websocket, agent, first_msg)
-    )
+    # ── Kick off greeting audio in background (only if agent speaks first) ────
+    if first_msg_mode == 'assistant-speaks-first':
+        greeting_task = asyncio.create_task(
+            _send_greeting_audio_fast(websocket, agent, first_msg)
+        )
 
     # ── Main stable message loop ──────────────────────────────────────────────
     PING_INTERVAL = 20.0   # send keepalive every 20 s
@@ -387,6 +390,43 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
         _language_tracker.pop(ws_session_id, None)
         logger.info(f"WS session ended cleanly for {agent_id}")
 
+
+async def _send_greeting_audio_fast(websocket: WebSocket, agent: AgentConfig, text: str):
+    """Synthesize the first_message greeting and send it as audio over the WebSocket.
+    Runs as a background task immediately after connection — gives the agent the
+    'speaks first' behaviour."""
+    try:
+        tts_provider = agent.tts_provider or "sarvam"
+        if tts_provider == "sarvam":
+            audio_bytes = await sarvam_synthesize_with_retry(
+                agent, text, language_override=agent.tts_language or "en-IN"
+            )
+        else:
+            audio_bytes = await synthesize_speech(
+                agent, text, language_override=agent.tts_language or "en-IN"
+            )
+
+        if audio_bytes and len(audio_bytes) >= 512:
+            # Send as base64-encoded audio JSON message (matches widget expectation)
+            audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+            await websocket.send_json({
+                "type": "greeting_audio",
+                "data": audio_b64,
+                "text": text,
+            })
+            # Also send the transcript so the widget can display it
+            await websocket.send_json({
+                "type": "transcript",
+                "text": text,
+                "role": "assistant",
+            })
+            logger.info("Greeting audio sent (%d bytes) for agent %s", len(audio_bytes), agent.id)
+        else:
+            logger.info("Greeting TTS returned empty/small response — skipping audio")
+    except (WebSocketDisconnect, RuntimeError):
+        logger.info("Client disconnected before greeting audio could be sent")
+    except Exception as e:
+        logger.warning("Greeting audio synthesis failed (non-fatal): %s", e)
 
 
 # ── WS /ws/agent/{agent_id}/tts-stream ────────────────────────────────────────

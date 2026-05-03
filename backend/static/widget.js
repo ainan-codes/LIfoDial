@@ -315,8 +315,8 @@
   // ── Build full panel (chat + voice tabs) ───────────────────────────────────
   function buildPanel() {
     const C    = getColors();
-    const name = (config && config.clinic_name) || 'AI Receptionist';
-    const sub  = (config && config.greeting)    || 'Online · Instant Reply';
+    const name = (config && config.agent_name) || (config && config.clinic_name) || 'AI Receptionist';
+    const sub  = 'Online · Instant Reply';
 
     const panel = document.createElement('div');
     panel.id = 'lfd-panel';
@@ -402,8 +402,8 @@
     });
     panel.querySelector('#lfd-end-call').addEventListener('click', endVoiceCall);
 
-    // Initial greeting message
-    const greeting = (config && config.first_message) || `Hello! I\'m your AI receptionist from ${name}. How can I help you today?`;
+    // Initial greeting message (chat pane only — voice greeting is handled by WebSocket)
+    const greeting = (config && config.first_message) || (config && config.greeting) || 'Hello! How can I help you today?';
     appendMessage('ai', greeting);
   }
 
@@ -548,38 +548,85 @@
 
     // Audio context for playback
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    let greetingPlaying = false;
+    const firstMsgMode = (config && config.first_message_mode) || 'assistant-speaks-first';
 
     ws.onopen = () => {
-      setCallStatus('🎙 Listening… speak now');
+      if (firstMsgMode === 'assistant-speaks-first') {
+        setCallStatus('Agent is connecting…');
+      } else {
+        setCallStatus('🎙 Listening… speak now');
+        startRecording(stream);
+      }
       startTimer();
-      startRecording(stream);
     };
 
     ws.onmessage = async (event) => {
-      const msg = JSON.parse(event.data);
-
-      if (msg.type === 'ready') {
-        setCallStatus('🎙 Listening… speak now');
-      } else if (msg.type === 'transcript') {
-        setCallStatus('You: ' + msg.text);
-      } else if (msg.type === 'llm_response') {
-        setCallStatus('Agent: ' + msg.text.slice(0, 80) + (msg.text.length > 80 ? '…' : ''));
-      } else if (msg.type === 'audio') {
-        // Play base64 audio from TTS
+      // Handle raw binary audio (backend sends bytes for TTS during audio turns)
+      if (event.data instanceof Blob || event.data instanceof ArrayBuffer) {
         try {
-          const bytes = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
-          const buffer = await audioCtx.decodeAudioData(bytes.buffer);
+          const buf = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+          const buffer = await audioCtx.decodeAudioData(buf.slice(0));
           const src = audioCtx.createBufferSource();
           src.buffer = buffer;
           src.connect(audioCtx.destination);
+          setCallStatus('🔊 Agent speaking…');
           src.start(0);
           src.onended = () => setCallStatus('🎙 Listening… speak now');
-        } catch (_) {}
+        } catch (_) { setCallStatus('🎙 Listening… speak now'); }
+        return;
+      }
+
+      // Handle JSON messages
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (_) { return; }
+
+      if (msg.type === 'ready') {
+        if (firstMsgMode === 'assistant-speaks-first') {
+          setCallStatus('🔊 Agent is greeting you…');
+        } else {
+          setCallStatus('🎙 Listening… speak now');
+          if (!mediaRecorder) startRecording(stream);
+        }
+      } else if (msg.type === 'greeting_audio' || msg.type === 'audio') {
+        // Play base64 audio (greeting or turn-based TTS)
+        try {
+          greetingPlaying = true;
+          const bytes = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
+          const buffer = await audioCtx.decodeAudioData(bytes.buffer.slice(0));
+          const src = audioCtx.createBufferSource();
+          src.buffer = buffer;
+          src.connect(audioCtx.destination);
+          setCallStatus('🔊 Agent speaking…');
+          src.start(0);
+          src.onended = () => {
+            greetingPlaying = false;
+            setCallStatus('🎙 Listening… speak now');
+            // Start recording AFTER greeting finishes (agent-speaks-first)
+            if (!mediaRecorder && stream.active) startRecording(stream);
+          };
+        } catch (_) {
+          greetingPlaying = false;
+          setCallStatus('🎙 Listening… speak now');
+          if (!mediaRecorder && stream.active) startRecording(stream);
+        }
+      } else if (msg.type === 'transcript') {
+        const who = msg.role === 'assistant' ? 'Agent' : 'You';
+        const txt = msg.text || '';
+        setCallStatus(who + ': ' + txt.slice(0, 80) + (txt.length > 80 ? '…' : ''));
+      } else if (msg.type === 'status') {
+        if (msg.status === 'processing') setCallStatus('⏳ Processing…');
+        else if (msg.status === 'thinking') setCallStatus('💭 Agent thinking…');
+        else if (msg.status === 'speaking') setCallStatus('🔊 Agent speaking…');
+        else if (msg.status === 'idle') setCallStatus('🎙 Listening… speak now');
+      } else if (msg.type === 'tts_failed') {
+        setCallStatus('Agent: ' + (msg.message || '').slice(0, 80));
       } else if (msg.type === 'error') {
         setCallStatus('⚠️ ' + (msg.message || 'Call error'));
-      } else if (msg.type === 'end') {
+      } else if (msg.type === 'end' || (msg.type === 'status' && msg.status === 'ended')) {
         endVoiceCall();
       }
+      // Silently ignore ping/pong/timing
     };
 
     ws.onerror = () => { setCallStatus('⚠️ Connection error'); endVoiceCall(); };

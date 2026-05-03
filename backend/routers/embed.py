@@ -110,6 +110,8 @@ async def embed_config(agent_id: str, request: Request) -> JSONResponse:
         "agent_name": agent.agent_name,
         "clinic_name": getattr(agent, "clinic_name", "") or agent.agent_name,
         "greeting": agent.first_message or "Hello! How can I help you today?",
+        "first_message": agent.first_message or "Hello! How can I help you today?",
+        "first_message_mode": getattr(agent, "first_message_mode", "assistant-speaks-first") or "assistant-speaks-first",
         "language": agent.stt_language or "en-IN",
         "theme": {
             "primary_color": getattr(agent, "embed_primary_color", "#3ECF8E"),
