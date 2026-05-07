@@ -511,6 +511,15 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
       const unlockCtx = new AudioContext();
       if (unlockCtx.state === 'suspended') await unlockCtx.resume();
       audioContextRef.current = unlockCtx;
+
+      // CRITICAL: Also unlock HTML Audio element autoplay during the user gesture.
+      // Browsers block audio.play() if there's been no prior user-gesture audio.
+      // Playing a silent 0.1s WAV now whitelists <audio> for the greeting audio
+      // that arrives asynchronously via WebSocket.
+      const silentWav = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+      const silentAudio = new Audio(silentWav);
+      silentAudio.volume = 0;
+      await silentAudio.play().catch(() => {}); // ignore errors — this is just an unlock
     } catch { /* ignore */ }
 
     setStatus('connecting');
@@ -845,7 +854,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
             ? '⏳ Processing...'
             : stream
             ? '● Speak when ready'
-            : '● Starting...'}
+            : '● Listening...'}
         </span>
       </div>
 

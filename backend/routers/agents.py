@@ -673,6 +673,9 @@ async def generate_web_call_token(agent_id: str) -> dict:
 
         if not lk_key or not lk_secret:
             raise HTTPException(status_code=500, detail="LiveKit credentials not configured")
+
+        if not lk_url:
+            raise HTTPException(status_code=500, detail="LIVEKIT_URL is not configured — set it in Render env vars")
         
         token = api.AccessToken(lk_key, lk_secret)
         token.with_identity(participant_identity)
@@ -682,10 +685,18 @@ async def generate_web_call_token(agent_id: str) -> dict:
             room=room_name,
         ))
         jwt_token = token.to_jwt()
-        
+
+        logger.info(
+            "web-call-token: agent=%s room=%s lk_url=%s",
+            agent_id, room_name, lk_url,
+        )
+
+        # CRITICAL FIX: frontend reads data.wsUrl (WebCallModal.tsx line 80)
+        # The old code returned "url" — LiveKitRoom got serverUrl=undefined
+        # and the WebSocket never connected, so state stayed "Starting..."
         return {
             "token": jwt_token,
-            "url": lk_url,
+            "wsUrl": lk_url,   # ← was "url", must be "wsUrl" to match frontend
             "room": room_name,
         }
     except HTTPException:

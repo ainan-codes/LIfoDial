@@ -383,23 +383,65 @@ class SarvamTTSPlugin:
         return b"".join(parts)
     
     async def _call_tts(self, text: str) -> bytes:
+        # ── Validate model, speaker, and language (prevents 400 errors) ───────
+        normalized_model = self.model if self.model and self.model.startswith("bulbul:") else "bulbul:v3"
+
+        # Speaker compatibility (bulbul:v3 speaker list — authoritative from Sarvam docs)
+        _V3_SPEAKERS = {
+            "aditya", "ritu", "ashutosh", "priya", "neha", "rahul",
+            "pooja", "rohan", "simran", "kavya", "amit", "dev",
+            "ishita", "shreya", "ratan", "varun", "manan", "sumit",
+            "roopa", "kabir", "aayan", "shubh", "advait", "anand",
+            "tanya", "tarun", "sunny", "mani", "gokul", "vijay",
+            "shruti", "suhani", "mohit", "kavitha", "rehan", "soham",
+            "rupali", "niharika",
+        }
+        # Legacy v2 voice → v3 speaker remap
+        _VOICE_REMAP = {
+            "meera": "shreya", "pavithra": "kavitha", "maitreyi": "priya",
+            "arvind": "rahul", "amol": "aditya", "amartya": "rohan",
+            "diya": "ritu", "neel": "amit", "misha": "simran", "vian": "shubh",
+            # Also handle "bulbul:v3 kavitha" style compound values
+        }
+        req_speaker = (self.voice or "priya").lower().strip()
+        # Strip any model prefix if user stored "bulbul:v3 kavitha"
+        if " " in req_speaker:
+            req_speaker = req_speaker.split(" ", 1)[-1].strip()
+        req_speaker = _VOICE_REMAP.get(req_speaker, req_speaker)
+        normalized_voice = req_speaker if req_speaker in _V3_SPEAKERS else "priya"
+        if normalized_voice != req_speaker:
+            logger.info("pipeline TTS: remapped speaker '%s' → '%s'", self.voice, normalized_voice)
+
+        # Language validation — Sarvam only supports Indian languages
+        _VALID_LANGS = {
+            "as-IN", "bn-IN", "brx-IN", "doi-IN", "en-IN", "gu-IN",
+            "hi-IN", "kn-IN", "kok-IN", "ks-IN", "mai-IN", "ml-IN",
+            "mni-IN", "mr-IN", "ne-IN", "od-IN", "pa-IN", "sa-IN",
+            "sat-IN", "sd-IN", "ta-IN", "te-IN", "ur-IN",
+        }
+        lang = (self.language or "en-IN").strip()
+        if lang not in _VALID_LANGS:
+            prefix = lang.split("-")[0].lower()
+            lang = next((v for v in _VALID_LANGS if v.startswith(prefix + "-")), "en-IN")
+        normalized_language = lang
+
+        # FIX: Sarvam REST API uses 'text' (not 'inputs') for the current endpoint
         payload = {
-            "inputs": [text],
-            "target_language_code": self.language,
-            "speaker": self.voice,
-            "model": self.model,
+            "text": text,
+            "target_language_code": normalized_language,
+            "speaker": normalized_voice,
+            "model": normalized_model,
             "speech_sample_rate": 16000,
             "enable_preprocessing": True,
             "pace": 1.0,
         }
-        
-        # v3 uses temperature, v2 uses pitch/loudness
-        if "v3" in self.model:
-            payload["temperature"] = 0.6
-        else:
+
+        # FIX: bulbul:v3 does NOT support pitch/loudness/temperature via REST
+        # Those cause 400 validation errors
+        if normalized_model != "bulbul:v3":
             payload["pitch"] = 0.0
             payload["loudness"] = 1.5
-        
+
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(
                 "https://api.sarvam.ai/text-to-speech",
@@ -409,19 +451,19 @@ class SarvamTTSPlugin:
                 },
                 json=payload
             )
-            
+
             if response.status_code != 200:
                 logger.error(
                     f"Sarvam TTS error {response.status_code}: "
-                    f"{response.text[:100]}"
+                    f"{response.text[:200]}"
                 )
                 return b""
-            
+
             data = response.json()
             audios = data.get("audios", [])
             if not audios:
                 return b""
-            
+
             return base64.b64decode(audios[0])
     
     def _chunk_text(self, text: str, max_len: int) -> list:
