@@ -1,18 +1,36 @@
-# Dockerfile.backend
+# Dockerfile.backend — Production image for Render.com (and any Linux host)
+#
+# Includes:
+#   - ffmpeg (required for audio format conversion in WebSocket voice pipeline)
+#   - libpq-dev (required for asyncpg PostgreSQL driver)
+#   - curl (required for HEALTHCHECK)
+
 FROM python:3.11-slim
 
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq-dev gcc curl ffmpeg \
+    libpq-dev \
+    gcc \
+    curl \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Install Python dependencies first (layer caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy application code
 COPY backend/ ./backend/
-COPY uploads/ ./uploads/
 
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-  CMD curl -f http://localhost:8000/health || exit 1
+# Create uploads directory (writable at runtime)
+RUN mkdir -p uploads && chmod 777 uploads
 
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# Health check — Render pings /health
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-10000}/health || exit 1
+
+# Render injects $PORT at runtime (default 10000).
+# Use shell form so the variable is expanded at container start.
+CMD uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1

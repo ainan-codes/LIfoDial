@@ -1,78 +1,141 @@
 ##############################################################################
-# Lifodial — Render.com deployment configuration (Force Deploy 1)
+# Lifodial — Render.com deployment configuration
 # https://render.com/docs/yaml-spec
 #
 # Services:
-#   1. lifodial-api  — FastAPI backend (Python web service)
+#   1. lifodial-api      — FastAPI backend  (Docker, python:3.11-slim + ffmpeg)
+#   2. lifodial-frontend — React frontend   (Render Static Site, Vite build)
 #
-# Usage:
+# One-time setup:
 #   1. Push this file to the root of your repo.
-#   2. In the Render dashboard: New → Blueprint → select your repo.
-#   3. Fill in the required secret env vars in the Render dashboard.
+#   2. Render dashboard → New → Blueprint → select your repo.
+#   3. Fill in the required "sync: false" env vars in the Render dashboard.
 ##############################################################################
 
 services:
 
-  # ── Backend API ─────────────────────────────────────────────────────────────
+  # ── Backend API (Docker runtime so we get ffmpeg + libpq) ──────────────────
   - type: web
     name: lifodial-api
-    runtime: python
+    runtime: docker
+    dockerfilePath: ./Dockerfile.backend
     region: singapore          # closest to India / Middle East
     plan: starter              # upgrade to standard when load grows
-    # rootDir intentionally NOT set — run from repo root so requirements.txt is found
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
 
     envVars:
       # ── Runtime ─────────────────────────────────────────────────────────────
       - key: ENVIRONMENT
         value: production
-      - key: FORCE_REDEPLOY_ID
-        value: "v1.0.3-audit-fix"
+      - key: FORCE_REDEPLOY
+        value: "v1.1.0-full-voice-pipeline"   # bump this to force a redeploy
 
       - key: PORT
-        value: "10000"        # Render uses 10000 by default for web services
+        value: "10000"          # Render injects $PORT; Dockerfile CMD uses 8000 → overridden
 
-      # ── Database — set this in Render dashboard (Supabase PostgreSQL URL) ────
+      # ── Database — paste your Supabase/Neon/Render Postgres URL ─────────────
       - key: DATABASE_URL
-        sync: false           # mark secret — paste postgresql://... in dashboard
-
-      # ── AI API Keys — set in Render dashboard ────────────────────────────────
-      - key: SARVAM_API_KEY
-        sync: false
-
-      - key: GEMINI_API_KEY
-        sync: false
-
-      - key: OPENAI_API_KEY
-        sync: false
-
-      - key: ANTHROPIC_API_KEY
-        sync: false
-
-      - key: GROQ_API_KEY
-        sync: false
-
-      - key: ELEVENLABS_API_KEY
-        sync: false
+        sync: false             # postgresql+asyncpg://user:pass@host/db
 
       # ── App secrets ──────────────────────────────────────────────────────────
       - key: SECRET_KEY
-        generateValue: true   # Render auto-generates on first deploy
-
+        generateValue: true     # Render auto-generates on first deploy
       - key: ENCRYPTION_KEY
-        sync: false           # 32-byte base64 key — set in dashboard (optional)
+        sync: false             # optional 32-byte base64 key
 
-      # ── CORS: MUST match your Vercel frontend domain exactly ─────────────────
-      # Example: https://lifodial.vercel.app  OR  https://app.lifodial.com
+      # ── CORS: add your Vercel frontend URL here ───────────────────────────────
+      # Example: https://lifodial.vercel.app
       - key: CORS_ORIGIN
-        sync: false           # set this manually in Render → Environment
+        sync: false
 
-      # ── Sentry (optional) ────────────────────────────────────────────────────
+      # ── Sarvam AI ─────────────────────────────────────────────────────────────
+      - key: SARVAM_API_KEY
+        sync: false
+
+      # ── Google Gemini ─────────────────────────────────────────────────────────
+      - key: GEMINI_API_KEY
+        sync: false
+
+      # ── OpenAI (LLM + Whisper STT + OpenAI TTS) ──────────────────────────────
+      - key: OPENAI_API_KEY
+        sync: false
+
+      # ── Anthropic Claude ──────────────────────────────────────────────────────
+      - key: ANTHROPIC_API_KEY
+        sync: false
+
+      # ── Groq ──────────────────────────────────────────────────────────────────
+      - key: GROQ_API_KEY
+        sync: false
+
+      # ── DeepSeek ──────────────────────────────────────────────────────────────
+      - key: DEEPSEEK_API_KEY
+        sync: false
+
+      # ── Mistral ───────────────────────────────────────────────────────────────
+      - key: MISTRAL_API_KEY
+        sync: false
+
+      # ── ElevenLabs TTS ────────────────────────────────────────────────────────
+      - key: ELEVENLABS_API_KEY
+        sync: false
+
+      # ── Deepgram STT ──────────────────────────────────────────────────────────
+      - key: DEEPGRAM_API_KEY
+        sync: false
+
+      # ── AssemblyAI STT ────────────────────────────────────────────────────────
+      - key: ASSEMBLYAI_API_KEY
+        sync: false
+
+      # ── LiveKit (optional telephony) ──────────────────────────────────────────
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+
+      # ── Vobiz (optional telephony — India PSTN) ───────────────────────────────
+      - key: VOBIZ_ACCOUNT_SID
+        sync: false
+      - key: VOBIZ_AUTH_TOKEN
+        sync: false
+      - key: VOBIZ_VIRTUAL_NUMBER
+        sync: false
+
+      # ── Sentry (optional error tracking) ─────────────────────────────────────
       - key: SENTRY_DSN
         sync: false
 
-    # Render provides free TLS automatically
-    # Add a custom domain: Render dashboard → Custom Domains
+  # ── Frontend (React / Vite — built as static site) ────────────────────────
+  - type: web
+    name: lifodial-frontend
+    runtime: static
+    buildCommand: cd frontend && npm ci && npm run build
+    staticPublishPath: ./frontend/dist
+    region: singapore
+    plan: starter
+    pullRequestPreviewsEnabled: true
 
+    routes:
+      # SPA fallback — serve index.html for all paths so React Router works
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+    headers:
+      # Security headers for the SPA
+      - path: /*
+        name: X-Frame-Options
+        value: SAMEORIGIN
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+
+    envVars:
+      - key: VITE_API_URL
+        value: https://lifodial-api.onrender.com

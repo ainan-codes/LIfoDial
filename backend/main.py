@@ -362,7 +362,10 @@ _CORS_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:3000",
+    # Production — Vercel frontend
     "https://lifodial.vercel.app",
+    # Production — Render static frontend (if deployed on Render)
+    "https://lifodial-frontend.onrender.com",
 ]
 # Also pull any extra origin from env (for production deployment)
 _extra = getattr(settings, "cors_origin", None) or getattr(settings, "frontend_url", None)
