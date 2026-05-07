@@ -17,9 +17,9 @@ def _obfuscate(value: str) -> str:
 
 def _deobfuscate(value: str) -> str:
     try:
-        return base64.b64decode(value.encode()).decode()
+        return base64.b64decode(value.encode()).decode().strip()
     except Exception:
-        return value
+        return str(value).strip() if value else ""
 
 
 class ApiKeyConfig(Base):
@@ -36,7 +36,7 @@ class ApiKeyConfig(Base):
     updated_at: datetime = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     def set_key(self, raw_key: str):
-        self.api_key_enc = _obfuscate(raw_key) if raw_key else None
+        self.api_key_enc = _obfuscate(raw_key.strip()) if raw_key else None
 
     def get_key_masked(self) -> str:
         """Returns masked key for display: sk-...xxxx"""

@@ -1655,7 +1655,7 @@ async def generate_llm_response(
     if key_config and key_config.api_key_enc:
         api_key = key_config.get_key_raw()
     if not api_key and env_key:
-        api_key = env_key
+        api_key = env_key.strip()
     
     if not api_key:
         return generate_demo_response(agent, user_message, history)
@@ -1842,7 +1842,11 @@ async def call_gemini(api_key: str, system_prompt: str,
                 continue
             else:
                 logger.error(f"Gemini API Error: {response.status_code} - {response.text}")
-                raise Exception(f"Gemini error: {response.status_code}")
+                try:
+                    error_msg = response.json().get("error", {}).get("message", "Unknown error")
+                except Exception:
+                    error_msg = response.text
+                raise Exception(f"Gemini error: {response.status_code} - {error_msg}")
         
         raise Exception("Gemini error: 429 — rate limit exceeded after retries")
 
