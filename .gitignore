@@ -71,3 +71,6 @@ logs/
 
 # SQLite dev database
 *.db
+
+# Temporary developer scripts
+scratch/
