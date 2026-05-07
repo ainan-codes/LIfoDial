@@ -183,7 +183,7 @@ async def init_db() -> None:
 
     # ── 3. Alembic: stamp + upgrade (PostgreSQL only) ──────────────────────
     if not IS_SQLITE:
-        _run_alembic_migrations()
+        await asyncio.to_thread(_run_alembic_migrations)
 
     # ── 4. SQLite-only column backfills ───────────────────────────────────
     if IS_SQLITE:

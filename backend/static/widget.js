@@ -65,8 +65,10 @@
   let ws            = null;
   let mediaRecorder = null;
   let audioCtx      = null;
+  let globalStream  = null;
   let callActive    = false;
   let callTimer     = null;
+  let recordInterval = null;
   let callSeconds   = 0;
 
   // ── Fetch config ───────────────────────────────────────────────────────────
@@ -518,6 +520,7 @@
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      globalStream = stream;
     } catch (err) {
       setCallStatus('⚠️ Microphone access denied. Please allow mic access and try again.');
       return;
@@ -637,35 +640,55 @@
 
   function startRecording(stream) {
     const mimeType = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm'].find(t => MediaRecorder.isTypeSupported(t)) || '';
-    try {
-      mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
-    } catch (_) {
-      mediaRecorder = new MediaRecorder(stream);
+    
+    function recordChunk() {
+      if (!callActive) return;
+      
+      try {
+        mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+      } catch (_) {
+        mediaRecorder = new MediaRecorder(stream);
+      }
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
+          // Send audio chunk as binary
+          e.data.arrayBuffer().then(buf => {
+            if (ws && ws.readyState === WebSocket.OPEN) ws.send(buf);
+          });
+        }
+      };
+
+      mediaRecorder.start();
+      
+      // Stop the recorder and immediately start the next chunk to minimize gap
+      recordInterval = setTimeout(() => {
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          mediaRecorder.stop();
+        }
+        recordChunk();
+      }, 2500);
     }
 
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
-        // Send audio chunk as binary
-        e.data.arrayBuffer().then(buf => {
-          if (ws && ws.readyState === WebSocket.OPEN) ws.send(buf);
-        });
-      }
-    };
-
-    // Send chunks every 2.5 seconds (matches VAD window)
-    mediaRecorder.start(2500);
+    recordChunk();
   }
 
   function endVoiceCall() {
     callActive = false;
     clearInterval(callTimer);
+    clearTimeout(recordInterval);
     callTimer = null;
+    recordInterval = null;
 
     // Stop recording
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {
       mediaRecorder.stop();
-      mediaRecorder.stream.getTracks().forEach(t => t.stop());
       mediaRecorder = null;
+    }
+
+    if (globalStream) {
+      globalStream.getTracks().forEach(t => t.stop());
+      globalStream = null;
     }
 
     // Close WebSocket
