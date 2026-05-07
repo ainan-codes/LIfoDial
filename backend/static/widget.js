@@ -62,14 +62,29 @@
   let activeTab = STYLE === 'call-only' ? 'voice' : 'chat';
 
   // Voice call state
-  let ws            = null;
-  let mediaRecorder = null;
-  let audioCtx      = null;
-  let globalStream  = null;
-  let callActive    = false;
-  let callTimer     = null;
+  let ws             = null;
+  let mediaRecorder  = null;
+  let audioCtx       = null;
+  let globalStream   = null;
+  let callActive     = false;
+  let callTimer      = null;
   let recordInterval = null;
-  let callSeconds   = 0;
+  let callSeconds    = 0;
+  let wsRetryCount   = 0;
+  const WS_MAX_RETRIES = 3;
+
+  // Barge-in / interrupt
+  let activeSrc = null;  // the current AudioBufferSourceNode the agent is playing
+
+  // VAD state
+  let vadAnalyser   = null;
+  let vadFrameId    = null;
+  let silenceMs     = 0;
+  let speechDetected = false;
+  const SILENCE_THRESHOLD = 0.012;  // RMS level below which is silence
+  const SILENCE_CUTOFF_MS = 800;    // ms of silence before chunk sent
+  const MIN_CHUNK_RMS     = 0.008;  // chunks below this RMS are discarded
+
 
   // ── Fetch config ───────────────────────────────────────────────────────────
   async function loadConfig() {
@@ -281,7 +296,7 @@
   // ── Build trigger button based on style ────────────────────────────────────
   function buildTrigger() {
     const C = getColors();
-    const label = LABEL_OVERRIDE || (config && config.embed_label) || 'Talk to Receptionist';
+    const label = LABEL_OVERRIDE || (config && config.embed_button_text) || (config && config.embed_label) || 'Talk to Receptionist';
     const btn   = document.createElement('button');
     btn.id = 'lfd-trigger';
     btn.setAttribute('aria-label', 'Open AI Receptionist');
@@ -513,8 +528,39 @@
     if (trigger)  trigger.classList.toggle('calling', active);
   }
 
-  async function startVoiceCall() {
-    if (callActive) return;
+  // Plays a 0.1s silent WAV to unlock browser autoplay policy before WebSocket audio
+  function unlockAudioAutoplay() {
+    return new Promise((resolve) => {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const buf = ctx.createBuffer(1, ctx.sampleRate * 0.1, ctx.sampleRate);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        src.start(0);
+        src.onended = () => { ctx.close(); resolve(); };
+        setTimeout(resolve, 300); // safety fallback
+      } catch (_) { resolve(); }
+    });
+  }
+
+  // Stop any currently playing agent audio and notify backend (barge-in)
+  function bargeIn() {
+    if (activeSrc) {
+      try { activeSrc.stop(); } catch (_) {}
+      activeSrc = null;
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'interrupt' }));
+    }
+    setCallStatus('🎙 Listening… speak now');
+  }
+
+  async function startVoiceCall(isRetry) {
+    if (callActive && !isRetry) return;
+
+    // ── Autoplay unlock on first user gesture ──────────────────────────────
+    if (!isRetry) await unlockAudioAutoplay();
 
     // Request mic permission
     let stream;
@@ -537,7 +583,7 @@
     }
 
     callActive = true;
-    callSeconds = 0;
+    if (!isRetry) { callSeconds = 0; wsRetryCount = 0; }
     setCallRingState(true);
     setCallStatus('Connecting…');
     setCallTimer(0);
@@ -550,9 +596,14 @@
     if (STYLE !== 'call-only') togglePanel(true);
 
     // Audio context for playback
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!audioCtx || audioCtx.state === 'closed') {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
     let greetingPlaying = false;
     const firstMsgMode = (config && config.first_message_mode) || 'assistant-speaks-first';
+    let lastDetectedLang = null;
 
     ws.onopen = () => {
       if (firstMsgMode === 'assistant-speaks-first') {
@@ -561,7 +612,7 @@
         setCallStatus('🎙 Listening… speak now');
         startRecording(stream);
       }
-      startTimer();
+      if (!isRetry) startTimer();
     };
 
     ws.onmessage = async (event) => {
@@ -569,13 +620,15 @@
       if (event.data instanceof Blob || event.data instanceof ArrayBuffer) {
         try {
           const buf = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+          if (!audioCtx || audioCtx.state === 'closed') return;
           const buffer = await audioCtx.decodeAudioData(buf.slice(0));
           const src = audioCtx.createBufferSource();
           src.buffer = buffer;
           src.connect(audioCtx.destination);
+          activeSrc = src;
           setCallStatus('🔊 Agent speaking…');
           src.start(0);
-          src.onended = () => setCallStatus('🎙 Listening… speak now');
+          src.onended = () => { activeSrc = null; setCallStatus('🎙 Listening… speak now'); };
         } catch (_) { setCallStatus('🎙 Listening… speak now'); }
         return;
       }
@@ -596,19 +649,23 @@
         try {
           greetingPlaying = true;
           const bytes = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
+          if (!audioCtx || audioCtx.state === 'closed') return;
           const buffer = await audioCtx.decodeAudioData(bytes.buffer.slice(0));
           const src = audioCtx.createBufferSource();
           src.buffer = buffer;
           src.connect(audioCtx.destination);
+          activeSrc = src;
           setCallStatus('🔊 Agent speaking…');
           src.start(0);
           src.onended = () => {
+            activeSrc = null;
             greetingPlaying = false;
             setCallStatus('🎙 Listening… speak now');
             // Start recording AFTER greeting finishes (agent-speaks-first)
             if (!mediaRecorder && stream.active) startRecording(stream);
           };
         } catch (_) {
+          activeSrc = null;
           greetingPlaying = false;
           setCallStatus('🎙 Listening… speak now');
           if (!mediaRecorder && stream.active) startRecording(stream);
@@ -617,6 +674,23 @@
         const who = msg.role === 'assistant' ? 'Agent' : 'You';
         const txt = msg.text || '';
         setCallStatus(who + ': ' + txt.slice(0, 80) + (txt.length > 80 ? '…' : ''));
+        // Language switch indicator
+        if (msg.detected_language && msg.detected_language !== lastDetectedLang) {
+          lastDetectedLang = msg.detected_language;
+          const langNames = {
+            'hi-IN':'Hindi','en-IN':'English','ta-IN':'Tamil','te-IN':'Telugu',
+            'kn-IN':'Kannada','ml-IN':'Malayalam','mr-IN':'Marathi','bn-IN':'Bengali',
+            'gu-IN':'Gujarati','pa-IN':'Punjabi','or-IN':'Odia'
+          };
+          const langName = langNames[msg.detected_language] || msg.detected_language;
+          if (msg.role !== 'assistant') {
+            const toast = document.createElement('div');
+            toast.style.cssText = 'position:fixed;bottom:100px;left:50%;transform:translateX(-50%);background:#1a1a1a;color:#3ECF8E;padding:6px 14px;border-radius:20px;font-size:12px;z-index:9999999;pointer-events:none';
+            toast.textContent = '🌐 Switched to ' + langName;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 2000);
+          }
+        }
       } else if (msg.type === 'status') {
         if (msg.status === 'processing') setCallStatus('⏳ Processing…');
         else if (msg.status === 'thinking') setCallStatus('💭 Agent thinking…');
@@ -632,18 +706,81 @@
       // Silently ignore ping/pong/timing
     };
 
-    ws.onerror = () => { setCallStatus('⚠️ Connection error'); endVoiceCall(); };
-    ws.onclose = () => { if (callActive) { setCallStatus('Call ended'); endVoiceCall(); } };
+    ws.onerror = () => {
+      if (callActive && wsRetryCount < WS_MAX_RETRIES) {
+        wsRetryCount++;
+        const delay = Math.pow(2, wsRetryCount - 1) * 1000;
+        setCallStatus(`⚠️ Reconnecting… (attempt ${wsRetryCount}/${WS_MAX_RETRIES})`);
+        setTimeout(() => startVoiceCall(true), delay);
+      } else {
+        setCallStatus('⚠️ Connection error'); endVoiceCall();
+      }
+    };
+    ws.onclose = (ev) => {
+      if (callActive && ev.code !== 1000 && ev.code !== 1008 && wsRetryCount < WS_MAX_RETRIES) {
+        wsRetryCount++;
+        const delay = Math.pow(2, wsRetryCount - 1) * 1000;
+        setCallStatus(`⚠️ Reconnecting… (attempt ${wsRetryCount}/${WS_MAX_RETRIES})`);
+        setTimeout(() => startVoiceCall(true), delay);
+      } else if (callActive) {
+        setCallStatus('Call ended'); endVoiceCall();
+      }
+    };
 
     track('voice_call_start');
   }
 
+
   function startRecording(stream) {
     const mimeType = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm'].find(t => MediaRecorder.isTypeSupported(t)) || '';
-    
+    let chunks = [];
+    let chunkStart = Date.now();
+
+    // ── Voice Activity Detection via AudioContext Analyser ─────────────────
+    vadAnalyser = audioCtx ? audioCtx.createAnalyser() : null;
+    if (vadAnalyser) {
+      vadAnalyser.fftSize = 512;
+      const srcNode = audioCtx.createMediaStreamSource(stream);
+      srcNode.connect(vadAnalyser);
+      const data = new Float32Array(vadAnalyser.fftSize);
+      const lastChunkTime = { t: Date.now() };
+
+      function checkVAD() {
+        if (!callActive || !vadAnalyser) return;
+        vadAnalyser.getFloatTimeDomainData(data);
+        let rms = 0;
+        for (let i = 0; i < data.length; i++) rms += data[i] * data[i];
+        rms = Math.sqrt(rms / data.length);
+
+        const isAgentSpeaking = !!activeSrc;
+
+        if (rms > SILENCE_THRESHOLD) {
+          // ── User is speaking ──
+          silenceMs = 0;
+          if (!speechDetected) speechDetected = true;
+          // If agent is playing audio, barge-in!
+          if (isAgentSpeaking) bargeIn();
+        } else {
+          // ── Silence detected ──
+          silenceMs += 16; // ~16ms per frame at 60fps
+          if (speechDetected && silenceMs >= SILENCE_CUTOFF_MS) {
+            // 800ms of silence after speech — flush chunk immediately
+            speechDetected = false;
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+              mediaRecorder.stop();
+            }
+          }
+        }
+        vadFrameId = requestAnimationFrame(checkVAD);
+      }
+      vadFrameId = requestAnimationFrame(checkVAD);
+    }
+
     function recordChunk() {
       if (!callActive) return;
-      
+      chunks = [];
+      chunkStart = Date.now();
+
       try {
         mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
       } catch (_) {
@@ -651,27 +788,41 @@
       }
 
       mediaRecorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
-          // Send audio chunk as binary
-          e.data.arrayBuffer().then(buf => {
-            if (ws && ws.readyState === WebSocket.OPEN) ws.send(buf);
-          });
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
+
+      mediaRecorder.onstop = () => {
+        if (!callActive || !ws || ws.readyState !== WebSocket.OPEN) return;
+        // Merge chunks and do RMS check before sending
+        const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+        blob.arrayBuffer().then(buf => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          // Only send if chunk is substantial (> 1kB) and not during agent speech
+          if (buf.byteLength > 1024 && !activeSrc) {
+            ws.send(buf);
+          } else if (buf.byteLength <= 1024) {
+            // too small — silence-only chunk, skip
+          }
+        });
+        // Start next chunk
+        if (callActive) {
+          recordInterval = setTimeout(recordChunk, 50);
         }
       };
 
       mediaRecorder.start();
-      
-      // Stop the recorder and immediately start the next chunk to minimize gap
+
+      // Fallback: force-stop after 2500ms even without silence detection
       recordInterval = setTimeout(() => {
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
           mediaRecorder.stop();
         }
-        recordChunk();
       }, 2500);
     }
 
     recordChunk();
   }
+
 
   function endVoiceCall() {
     callActive = false;
@@ -679,6 +830,15 @@
     clearTimeout(recordInterval);
     callTimer = null;
     recordInterval = null;
+
+    // Stop VAD loop
+    if (vadFrameId) { cancelAnimationFrame(vadFrameId); vadFrameId = null; }
+    vadAnalyser = null;
+    silenceMs = 0;
+    speechDetected = false;
+
+    // Stop any playing agent audio
+    if (activeSrc) { try { activeSrc.stop(); } catch (_) {} activeSrc = null; }
 
     // Stop recording
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {
@@ -692,7 +852,7 @@
     }
 
     // Close WebSocket
-    if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+    if (ws) { try { ws.close(1000, 'call_ended'); } catch (_) {} ws = null; }
 
     // Close audio context
     if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; }
@@ -702,6 +862,7 @@
     setCallTimer(-1);
     track('voice_call_end');
   }
+
 
   function startTimer() {
     callTimer = setInterval(() => {

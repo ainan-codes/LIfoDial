@@ -177,6 +177,10 @@ async def clear_agent_session(agent_id: str, session_id: str):
     return {"status": "cleared"}
 
 
+# ── Per-session barge-in / interrupt state ────────────────────────────────────
+# Maps ws_session_id → asyncio.Event. When set, in-flight TTS send aborts.
+_agent_speaking: dict[str, asyncio.Event] = {}
+
 # ── WS /ws/agent-call/{agent_id} ──────────────────────────────────────────────
 
 @router.websocket("/ws/agent-call/{agent_id}")
@@ -193,12 +197,16 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
       proxies/firewalls.
     - 120-second idle timeout closes the connection gracefully.
     - Every exception path is caught; greeting task is always cancelled.
+    - Interrupt message: client sends {"type":"interrupt"} to stop agent speech.
     """
     await websocket.accept()
     logger.info(f"Voice WebSocket connected for agent {agent_id}")
 
     ws_session_id = str(uuid.uuid4())
     greeting_task: asyncio.Task | None = None
+    # Create a per-session interrupt event for barge-in
+    interrupt_event = asyncio.Event()
+    _agent_speaking[ws_session_id] = interrupt_event
 
     # ── Load agent in a short-lived DB session ────────────────────────────────
     agent: AgentConfig | None = None
@@ -354,6 +362,26 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
                         pass
                     break
 
+                elif msg_type == "interrupt":
+                    # ── Barge-in: user spoke while agent was playing audio ──
+                    logger.info(f"Interrupt received from client for {agent_id}")
+                    # Signal any in-flight TTS/greeting to abort
+                    interrupt_event.set()
+                    # Cancel greeting task if still running
+                    if greeting_task and not greeting_task.done():
+                        greeting_task.cancel()
+                        try:
+                            await greeting_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        greeting_task = None
+                    try:
+                        await websocket.send_json({"type": "status", "status": "idle"})
+                    except Exception:
+                        break
+                    # Reset event so next TTS turn works normally
+                    interrupt_event.clear()
+
                 elif msg_type in ("ping", "pong"):
                     try:
                         await websocket.send_json({"type": "pong"})
@@ -388,6 +416,7 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
             except (asyncio.CancelledError, Exception):
                 pass
         _language_tracker.pop(ws_session_id, None)
+        _agent_speaking.pop(ws_session_id, None)
         logger.info(f"WS session ended cleanly for {agent_id}")
 
 
@@ -1188,9 +1217,13 @@ async def handle_audio_turn(
 
         tts_ms = 0
         tts_ok = False
+        # Get the interrupt event for this session (barge-in support)
+        _interrupt = _agent_speaking.get(session_id)
+        if _interrupt:
+            _interrupt.clear()  # reset before starting new TTS
         try:
             tts_start = time.monotonic()
-            # ISSUE 5: use retry-capable TTS wrapper
+            # Use retry-capable TTS wrapper for sarvam, else generic
             audio_response = await sarvam_synthesize_with_retry(
                 agent, response_text, language_override=current_dominant
             ) if (agent.tts_provider or "sarvam") == "sarvam" else await synthesize_speech(
@@ -1200,8 +1233,13 @@ async def handle_audio_turn(
             logger.info(f"[TIMING] TTS: {tts_ms}ms ({len(audio_response) if audio_response else 0} bytes)")
 
             if audio_response and len(audio_response) >= 512:  # sanity-check non-empty
-                tts_ok = True
-                await websocket.send_bytes(audio_response)
+                # Check if user interrupted BEFORE we send
+                if _interrupt and _interrupt.is_set():
+                    logger.info("TTS send aborted — interrupt received for session %s", session_id)
+                    tts_ok = False
+                else:
+                    tts_ok = True
+                    await websocket.send_bytes(audio_response)
             else:
                 logger.warning(f"TTS returned empty/tiny response ({len(audio_response) if audio_response else 0}B) — sending tts_failed")
         except Exception as tts_err:
@@ -1538,9 +1576,36 @@ async def deepgram_transcribe(api_key: str, audio_bytes: bytes, model: str) -> s
     return ""
 
 async def openai_transcribe(api_key: str, audio_bytes: bytes) -> tuple[str, str]:
-    """OpenAI Whisper transcription - returns (transcript, detected_language)"""
-    # Placeholder — returns empty
-    return "", ""
+    """OpenAI Whisper transcription via OpenAI API — returns (transcript, detected_language)."""
+    import httpx
+    import io
+    try:
+        filename, mime = _detect_audio_upload_format(audio_bytes)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                files={"file": (filename, io.BytesIO(audio_bytes), mime)},
+                data={"model": "whisper-1", "response_format": "verbose_json"},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                transcript = data.get("text", "")
+                lang = data.get("language", "")  # returns ISO 639-1, e.g. "hi"
+                # Map ISO 639-1 → BCP-47 region codes for Indian langs
+                lang_map = {
+                    "hi": "hi-IN", "en": "en-IN", "ta": "ta-IN", "te": "te-IN",
+                    "kn": "kn-IN", "ml": "ml-IN", "mr": "mr-IN", "bn": "bn-IN",
+                    "gu": "gu-IN", "pa": "pa-IN", "or": "or-IN",
+                }
+                detected = lang_map.get(lang, lang + "-IN" if lang else "")
+                return transcript, detected
+            else:
+                logger.error("OpenAI Whisper STT error %s: %s", resp.status_code, resp.text[:200])
+                return "", ""
+    except Exception as exc:
+        logger.error("OpenAI Whisper STT exception: %s", exc)
+        return "", ""
 
 
 # ── LLM Logic ─────────────────────────────────────────────────────────────────
