@@ -495,7 +495,13 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
   }, [status]);
 
   const addMessage = useCallback((role: 'agent' | 'user', text: string, extra?: Partial<Message>) => {
-    setMessages(prev => [...prev, { id: Date.now().toString() + Math.random(), role, text, time: nowTime(), ...extra }]);
+    setMessages(prev => {
+      // Prevent consecutive identical messages from the same role (e.g., initial greeting via 'ready' and 'transcript')
+      if (prev.length > 0 && prev[prev.length - 1].role === role && prev[prev.length - 1].text === text) {
+        return prev;
+      }
+      return [...prev, { id: Date.now().toString() + Math.random(), role, text, time: nowTime(), ...extra }];
+    });
   }, []);
 
   const startCall = async () => {

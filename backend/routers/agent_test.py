@@ -443,12 +443,9 @@ async def _send_greeting_audio_fast(websocket: WebSocket, agent: AgentConfig, te
                 "data": audio_b64,
                 "text": text,
             })
-            # Also send the transcript so the widget can display it
-            await websocket.send_json({
-                "type": "transcript",
-                "text": text,
-                "role": "assistant",
-            })
+            # NOTE: Do NOT send a separate 'transcript' here.
+            # The 'ready' event already delivers first_message text to the UI.
+            # Sending 'transcript' again caused the duplicate message bug.
             logger.info("Greeting audio sent (%d bytes) for agent %s", len(audio_bytes), agent.id)
         else:
             logger.info("Greeting TTS returned empty/small response — skipping audio")
