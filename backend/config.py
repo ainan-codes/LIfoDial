@@ -4,6 +4,7 @@ All secrets loaded from .env. Never access os.environ directly;
 always import and use `settings` from this module.
 """
 
+import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,7 +21,7 @@ class Settings(BaseSettings):
     secret_key: str = "change_me"
 
     # ── Database ───────────────────────────────────────────────────────────
-    database_url: str = "sqlite+aiosqlite:///./lifodial.db"
+    database_url: str = os.getenv("DATABASE_URL", "")
     postgres_user: str = "lifodial"
     postgres_password: str = "change_this_strong_password"
 
