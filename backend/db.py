@@ -19,7 +19,7 @@ def get_database_url() -> str:
     raw = os.getenv("DATABASE_URL", "")
 
     if not raw:
-        logger.warning("No DATABASE_URL — using SQLite fallback")
+        logger.warning("No DATABASE_URL - using SQLite fallback")
         return "sqlite+aiosqlite:///./lifodial.db"
 
     # Convert sync URL to async driver format
@@ -67,7 +67,7 @@ else:
     #   Required even for Session Pooler as safety measure.
     #
     # WHY jit=off:
-    #   Supabase recommendation — improves query plan stability.
+    #   Supabase recommendation - improves query plan stability.
     #
     engine = create_async_engine(
         DATABASE_URL,
@@ -86,13 +86,16 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False,
 )
 
+# Backwards-compat alias: several routers import 'async_session' from backend.db
+async_session = AsyncSessionLocal
+
 
 class Base(DeclarativeBase):
     pass
 
 
 async def get_db():
-    """FastAPI dependency — yields DB session per request."""
+    """FastAPI dependency - yields DB session per request."""
     async with AsyncSessionLocal() as session:
         try:
             yield session
@@ -124,10 +127,10 @@ async def init_db():
         logger.info("? init_db: complete")
         print(f"? Database ready ({db_label})")
     except Exception as e:
-        # Non-fatal — tables likely already exist in Supabase
+        # Non-fatal - tables likely already exist in Supabase
         logger.warning(f"init_db non-fatal warning: {str(e)[:120]}")
         print(f"??  DB init warning (non-fatal): {str(e)[:80]}")
-        print("    Tables likely already exist in Supabase — continuing...")
+        print("    Tables likely already exist in Supabase - continuing...")
 
 
 def _import_all_models():
@@ -135,7 +138,7 @@ def _import_all_models():
     Import every model so SQLAlchemy's metadata knows about them.
     Must run before create_all or any table inspection.
     """
-    # Core models — always required
+    # Core models - always required
     try:
         from backend.models.tenant import Tenant        # noqa: F401
         from backend.models.doctor import Doctor        # noqa: F401
@@ -144,7 +147,7 @@ def _import_all_models():
         logger.error(f"CRITICAL: Core model import failed: {e}")
         raise
 
-    # Optional models — import safely, skip if not yet created
+    # Optional models - import safely, skip if not yet created
     optional = [
         "backend.models.appointment",
         "backend.models.call_log",
@@ -163,6 +166,6 @@ def _import_all_models():
         try:
             __import__(module_path)
         except ImportError:
-            pass  # Model file doesn't exist yet — safe to skip
+            pass  # Model file doesn't exist yet - safe to skip
         except Exception as e:
             logger.warning(f"Model import warning [{module_path}]: {e}")
