@@ -209,10 +209,9 @@ function CallUI({ agent, duration, formatTime, onClose }: { agent: Agent, durati
       </div>
       
       {/* Controls */}
-      <div className="call-controls">
+      <div className="call-controls" onClick={onClose}>
         <VoiceAssistantControlBar
           controls={{ leave: true, microphone: true }}
-          onLeaveClick={onClose}
           saveUserChoices={false}
         />
       </div>

@@ -397,7 +397,7 @@ export default function SAClinics() {
           )}
         </div>
       </div>
-      {selected && <ClinicDrawer clinic={selected} onClose={() => setSelected(null)} onDeleted={(id) => setClinics(prev => prev.filter(c => c.id !== id))} />}
+      {selected && <ClinicDrawer clinic={selected} onClose={() => setSelected(null)} onDeleted={(id) => setClinics(clinics.filter(c => c.id !== id))} />}
       {showAdd && <AddClinicModal onClose={() => setShowAdd(false)} />}
     </div>
   );

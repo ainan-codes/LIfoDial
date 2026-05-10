@@ -35,7 +35,7 @@ interface Message {
   audioUnavailable?: boolean;
 }
 
-interface TestAgentModalProps {
+interface TestAgentInnerProps {
   agent?: any;
   agentId?: string;
   agentName?: string;

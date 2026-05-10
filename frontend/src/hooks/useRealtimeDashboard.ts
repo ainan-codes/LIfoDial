@@ -4,6 +4,8 @@ import { WS_URL } from '../api/client';
 interface Booking {
   id: string;
   patient_phone: string;
+  patient_name?: string;
+  phone?: string;
   doctor: string;
   slot_time: string;
 }
@@ -14,7 +16,7 @@ export function useRealtimeDashboard(tenantId: string) {
   const [agentStatus, setAgentStatus] = useState<'online' | 'offline' | 'unknown'>('unknown');
   const [isConnected, setIsConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
-  const reconnectRef = useRef<ReturnType<typeof setTimeout>>();
+  const reconnectRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => {
     if (!tenantId) return;

@@ -153,13 +153,12 @@ def _import_all_models():
         "backend.models.call_log",
         "backend.models.call_record",
         "backend.models.phone_number",
-        "backend.models.clinic_credits",
+        "backend.models.clinic_credits",   # contains ClinicCredits + CreditTransaction
         "backend.models.knowledge_base",
-        "backend.models.bulk_call_campaign",
-        "backend.models.embed_event",
+        "backend.models.bulk_call",        # was bulk_call_campaign
+        "backend.models.embed_analytics",  # was embed_event
         "backend.models.onboarding_request",
         "backend.models.api_key_config",
-        "backend.models.credit_transaction",
     ]
 
     for module_path in optional:

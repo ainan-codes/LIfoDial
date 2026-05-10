@@ -239,6 +239,7 @@ export interface FixtureAgent {
   avg_latency_ms: number;
   resolution_rate: number;
   languages: string[];
+  model?: string;       // optional fallback alias for llm_model
 }
 
 export const FIXTURE_AGENTS: FixtureAgent[] = [
