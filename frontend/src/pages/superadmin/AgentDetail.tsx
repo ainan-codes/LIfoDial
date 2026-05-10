@@ -366,8 +366,8 @@ function EmbedSection({ agent, agentId, updateField }: { agent: any; agentId: st
                 </div>
               </div>
               <div>
-                <Label>Show Lifodial Branding</Label>
-                <Toggle checked={agent.embed_show_branding !== false && agent.embed_show_branding !== 0} onChange={(v: any) => updateField('embed_show_branding', v ? 1 : 0)} label="Powered by Lifodial" />
+                <Label>Show Lifosys Branding</Label>
+                <Toggle checked={agent.embed_show_branding !== false && agent.embed_show_branding !== 0} onChange={(v: any) => updateField('embed_show_branding', v ? 1 : 0)} label="Powered by Lifosys" />
               </div>
             </div>
           </div>

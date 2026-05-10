@@ -276,7 +276,7 @@
           </button>
         </div>
 
-        ${showBranding ? '<div id="lfd-brand">Powered by <a href="https://lifodial.com" target="_blank">Lifodial</a></div>' : ''}
+        ${showBranding ? '<div id="lfd-brand">Powered by <a href="https://lifosys.ai" target="_blank" rel="noopener">Lifosys</a></div>' : ''}
       </div>
     `;
     document.body.appendChild(wrapper);
