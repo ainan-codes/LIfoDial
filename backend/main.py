@@ -612,6 +612,78 @@ async def serve_widget():
     return PlainTextResponse("// widget.js not found", status_code=404, media_type="application/javascript")
 
 
+# ── Public widget test page (HTTPS-served so mic permission works on any device) ──
+@app.get("/test", tags=["embed"])
+@app.get("/test/", tags=["embed"])
+async def widget_test_page(agent: str = "agent-001"):
+    """Public test page for the embed widget. Reachable from any device:
+       https://lifodial.onrender.com/test?agent=agent-001
+    Defaults to agent-001 (Apollo Clinic Hindi receptionist).
+    """
+    from fastapi.responses import HTMLResponse
+    html = f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Lifodial Widget Test — {agent}</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#f0faf6 0%,#e8f4fd 100%);min-height:100vh;color:#1a1a2e}}
+  nav{{background:#fff;padding:18px 32px;box-shadow:0 2px 8px rgba(0,0,0,.05);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}}
+  nav .brand{{font-weight:800;font-size:20px;color:#0f5fa8}}
+  nav .links a{{margin-left:18px;color:#555;text-decoration:none;font-size:14px}}
+  .hero{{padding:60px 32px;max-width:900px;margin:0 auto;text-align:center}}
+  .hero h1{{font-size:38px;line-height:1.2;margin-bottom:14px}}
+  .hero p{{font-size:17px;color:#555;margin-bottom:22px}}
+  .badge{{display:inline-block;background:#3ECF8E22;color:#0a8a5d;padding:6px 14px;border-radius:20px;font-size:13px;font-weight:600}}
+  .panel{{max-width:560px;margin:24px auto;padding:18px 22px;background:#fff;border-radius:14px;box-shadow:0 4px 20px rgba(0,0,0,.06);font-size:14px}}
+  .panel h3{{font-size:15px;margin-bottom:10px;color:#0f5fa8}}
+  .panel ol{{margin-left:20px;color:#444;line-height:1.7}}
+  .panel code{{background:#f4f4f8;padding:2px 6px;border-radius:4px;font-size:12px}}
+  .switcher{{margin-top:12px;display:flex;gap:8px;flex-wrap:wrap}}
+  .switcher a{{padding:6px 12px;background:#0f5fa8;color:#fff;text-decoration:none;border-radius:6px;font-size:12px}}
+  .switcher a.active{{background:#3ECF8E;color:#0a3d2a}}
+</style>
+</head><body>
+  <nav>
+    <div class="brand">🏥 Apollo Multispeciality</div>
+    <div class="links"><a href="#">Services</a><a href="#">Doctors</a><a href="#">Book</a></div>
+  </nav>
+  <div class="hero">
+    <h1>World-class healthcare,<br/>at your doorstep</h1>
+    <p>Click the floating call button to speak with our AI receptionist.</p>
+    <div class="badge">📍 Open 24/7 · Andheri West, Mumbai</div>
+  </div>
+  <div class="panel">
+    <h3>Widget tester</h3>
+    <p>Currently loaded agent: <code>{agent}</code></p>
+    <div class="switcher">
+      <a href="?agent=agent-001" class="{'active' if agent=='agent-001' else ''}">agent-001 (Apollo Hindi)</a>
+      <a href="?agent=agent-002" class="{'active' if agent=='agent-002' else ''}">agent-002 (Aster Malayalam)</a>
+      <a href="?agent=agent-004" class="{'active' if agent=='agent-004' else ''}">agent-004 (Max English)</a>
+      <a href="?agent=agent-005" class="{'active' if agent=='agent-005' else ''}">agent-005 (Aster Mixed)</a>
+    </div>
+    <h3 style="margin-top:18px">📋 To embed on any clinic site</h3>
+    <ol>
+      <li>Site must be served over <strong>HTTPS</strong> (browsers block mic on plain HTTP).</li>
+      <li>Paste this single line before <code>&lt;/body&gt;</code>:</li>
+    </ol>
+    <pre style="background:#1a1a1a;color:#3ECF8E;padding:12px;border-radius:6px;overflow:auto;font-size:11px;margin-top:8px">&lt;script src="https://lifodial.onrender.com/widget.js" data-agent-id="{agent}"&gt;&lt;/script&gt;</pre>
+  </div>
+
+  <!-- The actual embed -->
+  <script
+    src="/widget.js"
+    data-agent-id="{agent}"
+    data-api-url="https://lifodial.onrender.com"
+    data-position="bottom-right"
+    data-theme="dark"
+    data-style="full"
+  ></script>
+</body></html>"""
+    return HTMLResponse(html)
+
+
 # ── Catch-all WebSocket handlers ───────────────────────────────────────────────
 # Silently absorb unknown WebSocket connections (e.g. LeadScout on same port).
 #
