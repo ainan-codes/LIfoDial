@@ -436,23 +436,26 @@ async def _send_greeting_audio_fast(websocket: WebSocket, agent: AgentConfig, te
             )
 
         if audio_bytes and len(audio_bytes) >= 512:
-            # Send as base64-encoded audio JSON message (matches widget expectation)
-            audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
-            await websocket.send_json({
-                "type": "greeting_audio",
-                "data": audio_b64,
-                "text": text,
-            })
+            # Send as raw binary bytes — both widget.js (browser embed) and
+            # TestAgentModal.tsx (in-app tester) handle binary blobs uniformly
+            # via their WS onmessage Blob path. Sending as JSON `greeting_audio`
+            # was silently ignored by TestAgentModal.tsx (audio never played).
+            try:
+                await websocket.send_bytes(audio_bytes)
+            except RuntimeError:
+                return
             # NOTE: Do NOT send a separate 'transcript' here.
             # The 'ready' event already delivers first_message text to the UI.
-            # Sending 'transcript' again caused the duplicate message bug.
             logger.info("Greeting audio sent (%d bytes) for agent %s", len(audio_bytes), agent.id)
         else:
-            logger.info("Greeting TTS returned empty/small response — skipping audio")
+            logger.warning(
+                "Greeting TTS returned empty/small response (len=%s) for agent %s — skipping audio",
+                (len(audio_bytes) if audio_bytes else 0), agent.id,
+            )
     except (WebSocketDisconnect, RuntimeError):
         logger.info("Client disconnected before greeting audio could be sent")
     except Exception as e:
-        logger.warning("Greeting audio synthesis failed (non-fatal): %s", e)
+        logger.exception("Greeting audio synthesis failed for agent %s: %s", agent.id, e)
 
 
 # ── WS /ws/agent/{agent_id}/tts-stream ────────────────────────────────────────

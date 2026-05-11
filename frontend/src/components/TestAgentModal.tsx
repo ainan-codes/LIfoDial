@@ -690,6 +690,19 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
           setCurrentTranscript('');
           addMessage('agent', msg.message || 'Response received', { audioUnavailable: true });
         }
+        // Backwards-compat: some backends send greeting/turn audio as base64 JSON
+        if (msg.type === 'greeting_audio' || msg.type === 'audio') {
+          try {
+            const b64: string = msg.data || '';
+            const binStr = atob(b64);
+            const buf = new Uint8Array(binStr.length);
+            for (let i = 0; i < binStr.length; i++) buf[i] = binStr.charCodeAt(i);
+            const blob = new Blob([buf], { type: 'audio/wav' });
+            enqueueAudio(blob);
+          } catch (err) {
+            console.error('[TestAgent] failed to decode greeting_audio JSON:', err);
+          }
+        }
       } catch { /* ignore parse errors */ }
     };
 
@@ -707,7 +720,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     ws.onerror = (e) => {
       console.error('WebSocket error:', e);
       if (connectTimeoutRef.current) { clearTimeout(connectTimeoutRef.current); connectTimeoutRef.current = null; }
-      const errMsg = '⚠️ Connection error. Make sure the backend is running on port 8001 and try again.';
+      const errMsg = '⚠️ Connection error reaching the agent backend. Check your network and try again.';
       setConnectError(errMsg);
       addMessage('agent', errMsg);
       setStatus('idle');
