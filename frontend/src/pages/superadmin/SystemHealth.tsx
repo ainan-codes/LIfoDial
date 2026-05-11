@@ -4,7 +4,7 @@ import { API_URL } from '../../api/client';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface HealthStatus {
-  database?: { status: string; latency_ms?: number; type?: string; tenant_count?: number; appointment_count?: number; error?: string };
+  database?: { status: string; latency_ms?: number; type?: string; tenant_count?: number; appointment_count?: number; error?: string; host?: string; hint?: string };
   environment?: string;
   timestamp?: string;
   // Service key statuses — 'connected' | 'missing_key'
@@ -158,6 +158,43 @@ export default function SASystemHealth() {
           </button>
         </div>
       </div>
+
+      {/* Diagnostic banner — visible only when DB is unhealthy */}
+      {health.database?.status === 'error' && (
+        <div style={{
+          backgroundColor: '#2A1414',
+          border: '1px solid #EF444455',
+          borderRadius: '12px',
+          padding: '16px 20px',
+          marginBottom: '20px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '8px',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <AlertTriangle size={18} color="#EF4444" />
+            <span style={{ color: '#EF4444', fontWeight: 700, fontSize: '14px' }}>
+              Database connection failed
+            </span>
+          </div>
+          <div style={{ color: '#FCA5A5', fontSize: '12px', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+            {health.database.error}
+          </div>
+          {health.database.host && (
+            <div style={{ color: '#888', fontSize: '12px' }}>
+              <span style={{ color: '#666' }}>DATABASE_URL in use: </span>
+              <code style={{ backgroundColor: '#0F0F0F', color: '#fbbf24', padding: '2px 6px', borderRadius: '4px' }}>
+                {health.database.host}
+              </code>
+            </div>
+          )}
+          {health.database.hint && (
+            <div style={{ color: '#fde68a', fontSize: '12px', lineHeight: 1.5 }}>
+              💡 {health.database.hint}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Service Cards */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '16px', marginBottom: '28px' }}>

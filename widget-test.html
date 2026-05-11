@@ -85,19 +85,47 @@
     <div class="badge">📍 Andheri West, Mumbai · Open 24/7</div>
   </div>
 
-  <!--
-    ═══════════════════════════════════════════════════
-    LIFODIAL WIDGET EMBED — This is the ONLY code
-    a clinic developer needs to paste!
-    ═══════════════════════════════════════════════════
-  -->
-  <script
-    src="http://localhost:8000/widget.js"
-    data-agent-id="REPLACE_WITH_YOUR_AGENT_ID"
-    data-api-url="http://localhost:8000"
-    data-position="bottom-right"
-    data-theme="dark"
-  ></script>
+  <!-- Dev controls (NOT shipped to clinics) -->
+  <div style="position:fixed;top:80px;right:20px;z-index:9999;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px;box-shadow:0 4px 16px rgba(0,0,0,.08);width:300px;font-size:13px">
+    <div style="font-weight:700;margin-bottom:8px;color:#1a1a2e">Lifodial Widget Tester</div>
+    <label style="display:block;margin-bottom:6px;color:#555">Backend URL</label>
+    <input id="api-url" value="https://lifodial.onrender.com" style="width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:12px;margin-bottom:8px"/>
+    <label style="display:block;margin-bottom:6px;color:#555">Agent ID</label>
+    <input id="agent-id" placeholder="paste agent UUID from agent_configs.id" style="width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:12px;font-family:monospace;margin-bottom:10px"/>
+    <button onclick="loadWidget()" style="width:100%;padding:8px;background:#0f5fa8;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600">Load Widget</button>
+    <div style="margin-top:10px;font-size:11px;color:#888">Tip: pre-fill via <code>?agent=&lt;id&gt;</code></div>
+  </div>
+
+  <script>
+    // ═══════════════════════════════════════════════════
+    // LIFODIAL WIDGET LOADER — for end clinics this becomes
+    // a single <script src=".../widget.js" data-agent-id="...">
+    // ═══════════════════════════════════════════════════
+    function loadWidget() {
+      const apiUrl  = document.getElementById('api-url').value.trim().replace(/\/+$/, '');
+      const agentId = document.getElementById('agent-id').value.trim();
+      if (!agentId) { alert('Paste an agent UUID first'); return; }
+
+      // Tear down previous widget if any
+      ['lfd-widget','lifodial-styles','lfd-panel','lfd-trigger','lfd-err-badge']
+        .forEach(id => { const el = document.getElementById(id); if (el) el.remove(); });
+      document.querySelectorAll('script[data-agent-id]').forEach(s => s.remove());
+
+      const s = document.createElement('script');
+      s.src = apiUrl + '/widget.js?ts=' + Date.now();   // cache-bust
+      s.setAttribute('data-agent-id', agentId);
+      s.setAttribute('data-api-url', apiUrl);
+      s.setAttribute('data-position', 'bottom-right');
+      s.setAttribute('data-theme', 'dark');
+      document.body.appendChild(s);
+    }
+
+    // Auto-load from ?agent=<id>&api=<url>
+    const params = new URLSearchParams(location.search);
+    if (params.get('api'))   document.getElementById('api-url').value   = params.get('api');
+    if (params.get('agent')) document.getElementById('agent-id').value  = params.get('agent');
+    if (params.get('agent')) loadWidget();
+  </script>
 
 </body>
 </html>

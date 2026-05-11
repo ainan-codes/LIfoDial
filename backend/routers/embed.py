@@ -121,7 +121,9 @@ async def embed_config(agent_id: str, request: Request) -> JSONResponse:
         },
         "modes": ["chat", "voice"],
         "allowed_domains": allowed_domains,
-        "is_active": agent.status == "ACTIVE",
+        # An agent is callable if it's not explicitly disabled. CONFIGURED, ACTIVE,
+        # and (None) all count as "ready". Only "INACTIVE" / "DISABLED" exclude it.
+        "is_active": (agent.status or "").upper() not in ("INACTIVE", "DISABLED", "ARCHIVED"),
         # Public embed settings
         "embed_primary_color": getattr(agent, "embed_primary_color", "#3ECF8E"),
         "embed_position": getattr(agent, "embed_position", "bottom-right"),

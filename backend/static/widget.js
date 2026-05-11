@@ -90,14 +90,37 @@
   async function loadConfig() {
     try {
       const res = await fetch(API_BASE + '/embed/' + AGENT_ID + '/config');
-      if (!res.ok) return;
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        console.error('[Lifodial] Config load failed: HTTP ' + res.status + ' from ' + API_BASE + '/embed/' + AGENT_ID + '/config', errText);
+        injectErrorBadge('Receptionist unavailable (HTTP ' + res.status + ')');
+        return;
+      }
       config = await res.json();
-      if (config.is_active === false) return;
+      if (config.is_active === false) {
+        console.warn('[Lifodial] Agent ' + AGENT_ID + ' is not active');
+        return;
+      }
       injectWidget();
       track('widget_view');
       // If call-only: open mic automatically after 400ms (give DOM time to render)
       if (STYLE === 'call-only') setTimeout(() => startVoiceCall(), 400);
-    } catch (_) {}
+    } catch (err) {
+      console.error('[Lifodial] Config fetch error — is API_BASE reachable?', API_BASE, err);
+      injectErrorBadge('Receptionist offline (network)');
+    }
+  }
+
+  // ── Minimal fallback badge so devs see the widget tried to load ───────────
+  function injectErrorBadge(msg) {
+    if (document.getElementById('lfd-err-badge')) return;
+    const el = document.createElement('div');
+    el.id = 'lfd-err-badge';
+    el.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:999998;background:#1a1a1a;color:#ef4444;padding:10px 16px;border-radius:8px;font:13px -apple-system,sans-serif;border:1px solid rgba(239,68,68,.3);box-shadow:0 4px 20px rgba(0,0,0,.3);max-width:300px';
+    el.textContent = '⚠ ' + msg;
+    document.body.appendChild(el);
+    // Auto-hide after 8s — devs see it in console anyway
+    setTimeout(() => { try { el.remove(); } catch (_) {} }, 8000);
   }
 
   // ── Analytics ──────────────────────────────────────────────────────────────

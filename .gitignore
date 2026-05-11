@@ -74,3 +74,5 @@ logs/
 
 # Temporary developer scripts
 scratch/
+test_db_conn.py
+push_render_env.ps1

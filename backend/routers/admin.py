@@ -379,6 +379,21 @@ async def system_health_status(db: AsyncSession = Depends(get_db)):
     results: dict = {}
 
     # ── Database ping ────────────────────────────────────────────────────────
+    # Masked host extraction (no password leak) — helps diagnose wrong DATABASE_URL.
+    from backend.db import DATABASE_URL
+    def _mask_db_url(url: str) -> str:
+        try:
+            if "@" not in url:
+                return url.split("://", 1)[-1][:60]
+            scheme, rest = url.split("://", 1)
+            creds, host = rest.split("@", 1)
+            user = creds.split(":", 1)[0]
+            return f"{scheme}://{user}:***@{host}"
+        except Exception:
+            return "unparseable"
+
+    masked_db = _mask_db_url(DATABASE_URL) if DATABASE_URL else "<empty>"
+
     try:
         t0 = time.monotonic()
         await db.execute(text("SELECT 1"))
@@ -388,9 +403,20 @@ async def system_health_status(db: AsyncSession = Depends(get_db)):
             "status": "healthy",
             "latency_ms": db_latency,
             "type": db_type,
+            "host": masked_db,
         }
     except Exception as e:
-        results["database"] = {"status": "error", "error": str(e)[:120]}
+        results["database"] = {
+            "status": "error",
+            "error": str(e)[:200],
+            "host": masked_db,
+            "hint": (
+                "Supabase pooler requires username 'postgres.<project_ref>' "
+                "(not just 'postgres'). Use the Session Pooler URL from "
+                "Supabase → Project Settings → Database → Connection string → "
+                "Session pooler."
+            ) if "Tenant or user not found" in str(e) else None,
+        }
 
     # ── Count records ────────────────────────────────────────────────────────
     try:
