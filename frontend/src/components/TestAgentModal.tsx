@@ -377,8 +377,9 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     }
   };
 
-  // ISSUE 4: Play audio with proper ref tracking for cleanup
-  const playNextAudio = () => {
+  // Play audio chunk. Uses AudioContext FIRST (most reliable since it's
+  // unlocked during the user-gesture click), falls back to <audio> element.
+  const playNextAudio = async () => {
     if (audioQueueRef.current.length === 0) {
       isPlayingRef.current = false;
       setAgentSpeaking(false);
@@ -389,20 +390,39 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     setAgentSpeaking(true);
 
     const blob = audioQueueRef.current.shift()!;
-    // ISSUE 5: Trust the blob type detected below, fallback to audio/wav for Sarvam
+    console.log('[TestAgent] playing audio chunk:', blob.size, 'bytes,', blob.type || '(no mime)');
+
+    // ── PRIMARY: AudioContext (works through autoplay restrictions) ──
+    try {
+      let ctx = audioContextRef.current;
+      if (!ctx || ctx.state === 'closed') {
+        ctx = new AudioContext();
+        audioContextRef.current = ctx;
+      }
+      if (ctx.state === 'suspended') await ctx.resume();
+
+      const buf = await blob.arrayBuffer();
+      const decoded = await ctx.decodeAudioData(buf.slice(0));
+      const source = ctx.createBufferSource();
+      source.buffer = decoded;
+      source.connect(ctx.destination);
+      source.onended = () => { playNextAudio(); };
+      currentAudioRef.current = source as any;
+      source.start(0);
+      return;
+    } catch (e) {
+      console.warn('[TestAgent] AudioContext playback failed, falling back to <audio>:', e);
+    }
+
+    // ── FALLBACK: <audio> element ──
     const mimeHint = blob.type || 'audio/wav';
     const typedBlob = new Blob([blob], { type: mimeHint });
     const url = URL.createObjectURL(typedBlob);
-
-    // ISSUE 4: Track current URL for cleanup
-    if (currentAudioUrlRef.current) {
-      URL.revokeObjectURL(currentAudioUrlRef.current);
-    }
+    if (currentAudioUrlRef.current) URL.revokeObjectURL(currentAudioUrlRef.current);
     currentAudioUrlRef.current = url;
 
     const audio = new Audio();
-    currentAudioRef.current = audio; // ISSUE 4
-
+    currentAudioRef.current = audio;
     audio.onended = () => {
       if (currentAudioUrlRef.current === url) {
         URL.revokeObjectURL(url);
@@ -411,32 +431,17 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
       currentAudioRef.current = null;
       playNextAudio();
     };
-    audio.onerror = (e) => {
-      console.error('Audio element error:', e);
-      if (currentAudioUrlRef.current === url) {
-        URL.revokeObjectURL(url);
-        currentAudioUrlRef.current = null;
-      }
+    audio.onerror = (err) => {
+      console.error('[TestAgent] <audio> element error:', err);
+      if (currentAudioUrlRef.current === url) URL.revokeObjectURL(url);
       currentAudioRef.current = null;
       playNextAudio();
     };
     audio.src = url;
-    audio.play().catch((e) => {
-      console.error('Audio play error:', e);
-      blob.arrayBuffer().then(buf => {
-        const ctx = new AudioContext();
-        return ctx.decodeAudioData(buf).then(decoded => {
-          const source = ctx.createBufferSource();
-          source.buffer = decoded;
-          source.connect(ctx.destination);
-          source.onended = () => { ctx.close(); playNextAudio(); };
-          source.start();
-        });
-      }).catch((e2) => {
-        console.error('AudioContext fallback also failed:', e2);
-        if (currentAudioUrlRef.current === url) URL.revokeObjectURL(url);
-        playNextAudio();
-      });
+    audio.play().catch((err) => {
+      console.error('[TestAgent] <audio>.play() rejected:', err);
+      if (currentAudioUrlRef.current === url) URL.revokeObjectURL(url);
+      playNextAudio();
     });
   };
 
@@ -512,21 +517,22 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     setTiming(null);
     lastAudioAtRef.current = 0;
 
-    // Unlock audio playback AND pre-create AudioContext for VAD in user gesture context
-    try {
-      const unlockCtx = new AudioContext();
-      if (unlockCtx.state === 'suspended') await unlockCtx.resume();
-      audioContextRef.current = unlockCtx;
+    const t0 = performance.now();
 
-      // CRITICAL: Also unlock HTML Audio element autoplay during the user gesture.
-      // Browsers block audio.play() if there's been no prior user-gesture audio.
-      // Playing a silent 0.1s WAV now whitelists <audio> for the greeting audio
-      // that arrives asynchronously via WebSocket.
-      const silentWav = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
-      const silentAudio = new Audio(silentWav);
-      silentAudio.volume = 0;
-      await silentAudio.play().catch(() => {}); // ignore errors — this is just an unlock
-    } catch { /* ignore */ }
+    // ── Audio autoplay unlock — runs in PARALLEL, never awaited before mic ──
+    // The click event itself satisfies the user-gesture requirement for both
+    // getUserMedia and audio.play(), so we don't have to await this first.
+    (async () => {
+      try {
+        const unlockCtx = new AudioContext();
+        if (unlockCtx.state === 'suspended') await unlockCtx.resume();
+        audioContextRef.current = unlockCtx;
+        const silentWav = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+        const silentAudio = new Audio(silentWav);
+        silentAudio.volume = 0;
+        silentAudio.play().catch(() => {});
+      } catch { /* ignore */ }
+    })();
 
     setStatus('connecting');
     let ms: MediaStream | null = null;
@@ -557,6 +563,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
       // ISSUE 4: Store stream in ref for cleanup
       streamRef.current = ms;
       setStream(ms);
+      console.log('[TestAgent] mic granted in', Math.round(performance.now() - t0), 'ms');
     } catch (e: any) {
       console.warn('Mic unavailable — proceeding without mic:', e.name, e.message);
       // Only show error for explicit permission denial — not for "no device" on mobile
