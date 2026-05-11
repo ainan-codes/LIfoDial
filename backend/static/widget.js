@@ -582,14 +582,18 @@
   async function startVoiceCall(isRetry) {
     if (callActive && !isRetry) return;
 
-    // ── Autoplay unlock on first user gesture ──────────────────────────────
-    if (!isRetry) await unlockAudioAutoplay();
+    const t0 = performance.now();
 
-    // Request mic permission
+    // ── Request mic FIRST so browser prompt shows instantly. ───────────────
+    // Autoplay unlock runs in parallel; we don't await it before the mic prompt.
+    if (!isRetry) { unlockAudioAutoplay().catch(() => {}); }
+
+    setCallStatus('Requesting microphone…');
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       globalStream = stream;
+      console.log('[Lifodial] mic granted in', Math.round(performance.now() - t0), 'ms');
     } catch (err) {
       setCallStatus('⚠️ Microphone access denied. Please allow mic access and try again.');
       return;
