@@ -215,8 +215,7 @@ async def get_all_providers_summary(settings) -> dict:
                     "best_for": "Indian languages — Hindi, Tamil, Telugu, Malayalam",
                     "models": [
                         {"id": "saaras:v3", "name": "Saaras v3", "label": "State-of-the-Art — Recommended", "recommended": True},
-                        {"id": "saarika:v2", "name": "Saarika v2", "label": "Best for Indian accents"},
-                        {"id": "saarika:v1", "name": "Saarika v1", "label": "Stable"},
+                        {"id": "saarika:v2.5", "name": "Saarika v2.5", "label": "Best for Indian accents"},
                     ]
                 },
                 {

@@ -77,7 +77,7 @@ GEMINI_MODELS = [
 ]
 
 STT_MODELS = [
-    {"id": "saarika:v2",  "name": "Saarika v2",  "provider": "sarvam", "languages": ["hi-IN","en-IN","ta-IN","te-IN","bn-IN","mr-IN","gu-IN","kn-IN","ml-IN","pa-IN","or-IN"], "recommended": False},
+    {"id": "saarika:v2.5",  "name": "Saarika v2.5",  "provider": "sarvam", "languages": ["hi-IN","en-IN","ta-IN","te-IN","bn-IN","mr-IN","gu-IN","kn-IN","ml-IN","pa-IN","or-IN"], "recommended": False},
     {"id": "saaras:v3",   "name": "Saaras v3",   "provider": "sarvam", "languages": ["hi-IN","en-IN","ta-IN","te-IN","bn-IN","mr-IN","gu-IN","kn-IN","ml-IN","pa-IN","or-IN","ar-SA"], "recommended": True},
 ]
 

@@ -55,7 +55,7 @@ PROVIDERS = {
     ],
     "stt": [
         {"id": "sarvam",     "name": "Sarvam AI",      "env_var": "SARVAM_API_KEY",
-         "models": ["saaras:v3", "saarika:v2", "saaras:v2"],
+         "models": ["saaras:v3", "saarika:v2.5"],
          "key_label": "SARVAM_API_KEY",    "key_url": "https://dashboard.sarvam.ai",         "icon": "S"},
         {"id": "deepgram",   "name": "Deepgram",       "env_var": "DEEPGRAM_API_KEY",
          "models": ["nova-2", "nova-2-medical", "nova-2-meeting", "nova-2-phonecall"],

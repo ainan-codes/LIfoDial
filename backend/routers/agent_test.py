@@ -1437,6 +1437,21 @@ async def sarvam_transcribe(api_key: str, audio_bytes: bytes,
 
     # Sarvam docs recommend multipart upload with file + model + mode
     normalized_model = model if model and (model.startswith("saarika") or model.startswith("saaras")) else "saaras:v3"
+
+    # ── Auto-remap deprecated Sarvam STT models ──────────────────────────────
+    # Sarvam returns HTTP 400 "Model 'saarika:v2' has been deprecated. Please
+    # use 'saarika:v2.5' instead." for older model IDs. Silently upgrade so
+    # legacy agent configs keep working without manual intervention.
+    DEPRECATED_SARVAM_STT_MODELS = {
+        "saarika:v1": "saarika:v2.5",
+        "saarika:v2": "saarika:v2.5",
+        "saaras:v1": "saaras:v3",
+        "saaras:v2": "saaras:v3",
+    }
+    if normalized_model in DEPRECATED_SARVAM_STT_MODELS:
+        new_stt = DEPRECATED_SARVAM_STT_MODELS[normalized_model]
+        logger.info("Sarvam STT: remapping deprecated model '%s' → '%s'", normalized_model, new_stt)
+        normalized_model = new_stt
     upload_name, upload_mime = _detect_audio_upload_format(audio_bytes)
     
     # ── Convert WebM/Opus to WAV for Sarvam compatibility ──────────────────
