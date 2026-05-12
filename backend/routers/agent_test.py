@@ -1242,8 +1242,18 @@ async def handle_audio_turn(
                     await websocket.send_bytes(audio_response)
             else:
                 logger.warning(f"TTS returned empty/tiny response ({len(audio_response) if audio_response else 0}B) — sending tts_failed")
+        except WebSocketDisconnect:
+            # Client hung up mid-TTS — normal on mobile when user closes tab,
+            # navigates away, or backgrounds Safari. Bubble up to outer except
+            # which handles it as an info-level event (no traceback spam).
+            raise
         except Exception as tts_err:
             tts_ms = int((time.monotonic() - tts_start) * 1000)  # type: ignore[possibly-unbound]
+            err_low = str(tts_err).lower()
+            if any(k in err_low for k in ("disconnect", "clientdisconnected", "closed", "1005", "1006", "1000")):
+                # Treat send-side disconnects as a normal hangup, not an error.
+                logger.info("Client disconnected during TTS send for agent %s after %dms", agent.id, tts_ms)
+                raise WebSocketDisconnect(code=1006)
             logger.error(f"[TIMING] TTS FAILED in {tts_ms}ms: {tts_err}", exc_info=True)
 
         # ISSUE 5: If TTS failed, tell frontend so it shows the badge + keeps transcript visible
