@@ -1120,7 +1120,9 @@ export default function TestAgentModal({ agent, agentId: directId, agentName: di
   }, [onClose, inline]);
 
   // Badge pills for agent config info
-  const language = agent?.tts_language || agent?.language || '';
+  // Show the conversation language (what the user speaks) — STT is the source
+  // of truth. Fall back to tts_language / generic language for older configs.
+  const language = agent?.stt_language || agent?.tts_language || agent?.language || '';
   const llmModel = agent?.llm_model || '';
   const ttsVoice = agent?.tts_voice || '';
 
