@@ -1756,14 +1756,100 @@ async def generate_llm_response(
     except Exception as e:
         logger.error(f"LLM call failed (Provider: {llm_provider}, Model: {agent_model}): {type(e).__name__}: {e}", exc_info=True)
         error_msg = str(e) or type(e).__name__
+        err_low = error_msg.lower()
+
+        # ── Auto-fallback to another provider on geo/region/auth/quota errors ──
+        # e.g. Gemini returns 400 "User location is not supported for the API use"
+        # when the backend is hosted in an unsupported region (Render free-tier
+        # often runs in such regions). Transparently retry with the next
+        # available provider so the user never sees a broken reply.
+        should_fallback = (
+            "user location is not supported" in err_low
+            or "location is not supported" in err_low
+            or "unsupported_country" in err_low
+            or "permission_denied" in err_low
+            or "failed_precondition" in err_low
+            or " 400" in err_msg_pad(error_msg)  # see helper
+            or " 401" in err_msg_pad(error_msg)
+            or " 403" in err_msg_pad(error_msg)
+            or " 404" in err_msg_pad(error_msg)
+        )
+
+        if should_fallback:
+            fallback_order = [p for p in ("groq", "openai", "anthropic", "deepseek", "gemini")
+                              if p != llm_provider]
+            for fb_provider in fallback_order:
+                fb_env = {
+                    "groq": settings.groq_api_key or os.getenv("GROQ_API_KEY"),
+                    "openai": settings.openai_api_key or os.getenv("OPENAI_API_KEY"),
+                    "anthropic": settings.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY"),
+                    "deepseek": settings.deepseek_api_key or os.getenv("DEEPSEEK_API_KEY"),
+                    "gemini": settings.gemini_api_key or os.getenv("GEMINI_API_KEY"),
+                }.get(fb_provider)
+
+                # Prefer DB key if present
+                try:
+                    res_fb = await db.execute(
+                        select(ApiKeyConfig).where(
+                            ApiKeyConfig.provider == fb_provider,
+                            ApiKeyConfig.is_active == True,
+                        ).limit(1)
+                    )
+                    fb_cfg = res_fb.scalars().first()
+                    if fb_cfg and fb_cfg.api_key_enc:
+                        fb_env = fb_cfg.get_key_raw()
+                except Exception:
+                    pass
+
+                if not fb_env:
+                    continue
+                fb_key = fb_env.strip()
+                fb_model = PROVIDER_DEFAULTS.get(fb_provider, "")
+                try:
+                    logger.warning(
+                        "Falling back from %s → %s (model=%s) due to error: %s",
+                        llm_provider, fb_provider, fb_model, error_msg[:200],
+                    )
+                    if fb_provider == "gemini":
+                        response = await call_gemini(fb_key, system_prompt, history, fb_model)
+                    elif fb_provider == "openai":
+                        response = await call_openai(fb_key, system_prompt, history, fb_model)
+                    elif fb_provider == "anthropic":
+                        response = await call_anthropic(fb_key, system_prompt, history, fb_model)
+                    elif fb_provider == "groq":
+                        response = await call_groq(fb_key, system_prompt, history, fb_model)
+                    elif fb_provider == "deepseek":
+                        response = await call_openai(
+                            fb_key, system_prompt, history, fb_model,
+                            base_url="https://api.deepseek.com/v1",
+                        )
+                    else:
+                        continue
+
+                    history.append({"role": "assistant", "content": response})
+                    if len(history) > 20:
+                        _conversation_history[session_key] = history[-20:]
+                    return response
+                except Exception as fb_e:
+                    logger.error(
+                        "Fallback provider %s also failed: %s",
+                        fb_provider, fb_e,
+                    )
+                    continue
+
         if "429" in error_msg:
              return "I'm currently receiving too many requests. Please wait a moment before speaking again."
-        if "safety" in error_msg.lower():
+        if "safety" in err_low:
              return "I'm sorry, I cannot respond to that prompt due to safety guidelines. How else can I help?"
-        if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+        if "timeout" in err_low or "timed out" in err_low:
              return "The AI service took too long to respond. Please try again."
-        
-        return f"I'm sorry, I'm having trouble processing that right now. Could you please repeat? (Error: {error_msg})"
+
+        return "I'm sorry, I'm having trouble processing that right now. Could you please repeat?"
+
+
+def err_msg_pad(s: str) -> str:
+    """Pad error string with spaces so HTTP status code substring matches reliably."""
+    return f" {s} "
 
 
 async def call_gemini(api_key: str, system_prompt: str, 
