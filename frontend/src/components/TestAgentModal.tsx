@@ -537,21 +537,9 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     setStatus('connecting');
     let ms: MediaStream | null = null;
 
-    // ── Pre-flight: detect already-denied permission so we tell user exactly why ──
-    try {
-      // @ts-ignore — Permissions API microphone is widely supported
-      const perm = await navigator.permissions?.query?.({ name: 'microphone' as PermissionName });
-      if (perm && perm.state === 'denied') {
-        addMessage('agent',
-          '⚠️ Microphone is BLOCKED for this site in your browser. ' +
-          'No website can re-prompt once blocked. To fix: click the 🔒 padlock ' +
-          'left of the URL → Site settings → Microphone → Allow → reload page.'
-        );
-        setStatus('idle');
-        return;
-      }
-    } catch { /* Permissions API not available — proceed anyway */ }
-
+    // CRITICAL for iOS Safari: getUserMedia MUST be the first awaited call inside
+    // the click handler. Any prior `await` (e.g. Permissions.query) breaks the
+    // user-gesture chain and Safari silently rejects without prompting.
     try {
       try {
         ms = await navigator.mediaDevices.getUserMedia({
