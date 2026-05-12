@@ -643,20 +643,39 @@
     };
 
     ws.onmessage = async (event) => {
-      // Handle raw binary audio (backend sends bytes for TTS during audio turns)
+      // Handle raw binary audio (backend sends bytes for greeting + every TTS turn)
       if (event.data instanceof Blob || event.data instanceof ArrayBuffer) {
         try {
           const buf = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
           if (!audioCtx || audioCtx.state === 'closed') return;
+          if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch (_) {} }
           const buffer = await audioCtx.decodeAudioData(buf.slice(0));
           const src = audioCtx.createBufferSource();
           src.buffer = buffer;
           src.connect(audioCtx.destination);
           activeSrc = src;
+          greetingPlaying = !mediaRecorder; // first binary = greeting if mic loop not yet running
           setCallStatus('🔊 Agent speaking…');
           src.start(0);
-          src.onended = () => { activeSrc = null; setCallStatus('🎙 Listening… speak now'); };
-        } catch (_) { setCallStatus('🎙 Listening… speak now'); }
+          src.onended = () => {
+            activeSrc = null;
+            greetingPlaying = false;
+            setCallStatus('🎙 Listening… speak now');
+            // CRITICAL: kick off mic capture after the very first audio chunk
+            // (greeting). Without this the user hears the agent but can never
+            // be heard back, and the WS sits idle until the client gives up
+            // and disconnects.
+            if (!mediaRecorder && stream && stream.active) {
+              try { startRecording(stream); } catch (e) { console.error('[Lifodial] startRecording failed:', e); }
+            }
+          };
+        } catch (e) {
+          console.warn('[Lifodial] audio decode/play failed:', e);
+          setCallStatus('🎙 Listening… speak now');
+          if (!mediaRecorder && stream && stream.active) {
+            try { startRecording(stream); } catch (_) {}
+          }
+        }
         return;
       }
 
