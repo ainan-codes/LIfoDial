@@ -1,0 +1,30 @@
+name: Keep Render Backend Awake
+
+# Pings the Render free-tier backend every ~5 minutes to prevent it from
+# sleeping. Render sleeps the service after 15 min of inactivity.
+
+on:
+  schedule:
+    # GitHub cron minimum is 5 minutes. */5 means every 5 minutes.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:  # also allow manual run from Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping /health
+        run: |
+          echo "Pinging https://lifodial.onrender.com/health"
+          for i in 1 2 3; do
+            if curl -fsSL --max-time 30 https://lifodial.onrender.com/health; then
+              echo ""
+              echo "Ping OK on attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "All 3 attempts failed."
+          exit 1
