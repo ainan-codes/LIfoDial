@@ -1189,12 +1189,54 @@ async def handle_audio_turn(
                 pass
             return
 
-        # ── Post-STT text verification ────────────────────────────────────────
+        # ── Post-STT text verification + smart retry ─────────────────────────
         # Always use detect_text_language() as ground truth — Sarvam's
         # language_code return can disagree with the actual script.
         text_lang = detect_text_language(transcript)
         if text_lang:
             detected_lang = text_lang  # trust script detection over STT header
+
+        # SMART RETRY: If the text script contradicts the session's established
+        # language history, Sarvam likely misdetected. Retry with the dominant
+        # language explicitly (force_language=True bypasses "unknown").
+        # This only fires when we have enough history (≥2 utterances) to be
+        # confident about the user's language, so latency impact is minimal.
+        session_langs = _language_tracker.get(session_id, [])
+        if (
+            text_lang
+            and len(session_langs) >= 2
+            and text_lang != dominant_lang
+        ):
+            logger.info(
+                "STT misdetection suspected: transcript in %s but session dominant is %s — retrying with explicit %s",
+                text_lang, dominant_lang, dominant_lang,
+            )
+            try:
+                retry_transcript, retry_detected = await transcribe_audio(
+                    agent, audio_bytes,
+                    language_hint=dominant_lang,
+                    force_language=True,  # bypass "unknown", send dominant_lang explicitly
+                )
+                if retry_transcript and retry_transcript.strip():
+                    retry_text_lang = detect_text_language(retry_transcript)
+                    # Use the retry result if it matches the dominant language
+                    if retry_text_lang == dominant_lang:
+                        logger.info(
+                            "STT retry succeeded: '%s' (%s) → using retry result",
+                            retry_transcript[:60], retry_text_lang,
+                        )
+                        transcript = retry_transcript
+                        detected_lang = retry_text_lang
+                        text_lang = retry_text_lang
+                    else:
+                        # Retry also produced different script — it's a genuine
+                        # language switch, not a misdetection. Keep original.
+                        logger.info(
+                            "STT retry also produced %s — accepting language switch",
+                            retry_text_lang,
+                        )
+            except Exception as retry_err:
+                logger.warning("STT retry failed (non-fatal): %s", retry_err)
 
         # Track detected language for ratio-based switching
         if detected_lang and session_id:
@@ -1382,9 +1424,13 @@ async def handle_audio_turn(
 
 # ── STT Logic ─────────────────────────────────────────────────────────────────
 
-async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint: str = "") -> tuple[str, str]:
+async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint: str = "", force_language: bool = False) -> tuple[str, str]:
     """Transcribe audio bytes to text using configured STT provider.
-    Returns (transcript, detected_language_code)."""
+    Returns (transcript, detected_language_code).
+    
+    When force_language=True, the language_hint is sent as-is to STT
+    (used for retry calls when auto-detect misidentified the language).
+    """
     
     stt_provider = agent.stt_provider or "sarvam"
     
@@ -1405,27 +1451,22 @@ async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint
 
     if stt_provider == "sarvam":
         stt_model = agent.stt_model or "saaras:v3"
-        # LANGUAGE STRATEGY: Use the tracked dominant language (from language_hint)
-        # as the explicit language_code for STT. This prevents Sarvam's unreliable
-        # auto-detect from misidentifying English speech as Tamil/Hindi.
-        #
-        # Only use "unknown" for the very FIRST utterance when we have zero
-        # language history — language_hint equals the agent default in that case.
-        # After the first utterance, detect_text_language() establishes the real
-        # language and subsequent calls use it explicitly.
         if (
             getattr(agent, "auto_detect_language", True)
             and stt_model.startswith("saaras")
+            and not force_language
         ):
-            # Always use the tracked dominant language (via language_hint)
-            # instead of "unknown". This prevents Sarvam's auto-detect from
-            # misidentifying English speech as Tamil/Hindi/etc.
-            #
-            # - First utterance: language_hint = agent default (e.g. en-IN)
-            #   → sends "en-IN" explicitly (safe, no misdetection)
-            # - Subsequent: language_hint = tracked dominant from text detection
-            #   → sends the real language (accurate, prevents snowball)
-            lang = language_hint
+            # Use "unknown" for Sarvam auto-detect. This lets the STT model
+            # identify the spoken language from the audio itself, instead of
+            # forcing the agent's configured language (which would transcribe
+            # English speech as Malayalam/Hindi/Tamil if the agent is set up
+            # for those languages).
+            # 
+            # Misdetections are caught by the post-STT smart retry in
+            # handle_audio_turn() which re-calls with force_language=True.
+            lang = "unknown"
+        # When force_language=True, 'lang' keeps the explicit language_hint
+        # value — used for retry calls after misdetection.
         return await sarvam_transcribe(api_key, audio_bytes, stt_model, lang)
     
     elif stt_provider == "deepgram":
