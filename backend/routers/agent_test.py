@@ -1078,7 +1078,7 @@ async def handle_text_command(
         
         dominant_lang = get_dominant_language(session_id, agent.tts_language or "en-IN")
         
-        response_text = await generate_llm_response(agent, user_text, db)
+        response_text = await generate_llm_response(agent, user_text, db, session_id=session_id, user_language=dominant_lang)
         
         await websocket.send_json({
             "type": "agent_text", 
@@ -1087,13 +1087,17 @@ async def handle_text_command(
         })
         
         # Step 3: TTS - synthesize response for voice mode
+        # Use the response text's actual script to pick TTS language
+        # so TTS never speaks English text in Hindi voice or vice-versa
+        response_lang = detect_text_language(response_text) or dominant_lang
+        tts_lang = normalize_sarvam_language(response_lang) if (agent.tts_provider or "sarvam") == "sarvam" else response_lang
         try:
             await websocket.send_json({"type": "status", "status": "speaking"})
         except RuntimeError:
             return  # connection closed
             
         try:
-            audio_response = await synthesize_speech(agent, response_text, language_override=dominant_lang)
+            audio_response = await synthesize_speech(agent, response_text, language_override=tts_lang)
             if audio_response:
                 try:
                     await websocket.send_bytes(audio_response)
@@ -1194,9 +1198,14 @@ async def handle_audio_turn(
             return
 
         llm_start = time.monotonic()
-        response_text = await generate_llm_response(agent, transcript, db)
+        response_text = await generate_llm_response(agent, transcript, db, session_id=session_id, user_language=current_dominant)
         llm_ms = int((time.monotonic() - llm_start) * 1000)
         logger.info(f"[TIMING] LLM: {llm_ms}ms — '{response_text[:80]}'")
+
+        # ── Detect response language from actual script for TTS ──────────────────
+        # This ensures TTS never speaks English text in Hindi voice or vice-versa.
+        response_lang = detect_text_language(response_text) or current_dominant
+        tts_lang_for_turn = normalize_sarvam_language(response_lang) if (agent.tts_provider or "sarvam") == "sarvam" else response_lang
 
         # Send agent transcript back
         try:
@@ -1204,7 +1213,7 @@ async def handle_audio_turn(
                 "type": "transcript",
                 "text": response_text,
                 "role": "assistant",
-                "detected_language": current_dominant,
+                "detected_language": response_lang,
             })
         except RuntimeError:
             return
@@ -1225,9 +1234,9 @@ async def handle_audio_turn(
             tts_start = time.monotonic()
             # Use retry-capable TTS wrapper for sarvam, else generic
             audio_response = await sarvam_synthesize_with_retry(
-                agent, response_text, language_override=current_dominant
+                agent, response_text, language_override=tts_lang_for_turn
             ) if (agent.tts_provider or "sarvam") == "sarvam" else await synthesize_speech(
-                agent, response_text, language_override=current_dominant
+                agent, response_text, language_override=tts_lang_for_turn
             )
             tts_ms = int((time.monotonic() - tts_start) * 1000)
             logger.info(f"[TIMING] TTS: {tts_ms}ms ({len(audio_response) if audio_response else 0} bytes)")
@@ -1323,11 +1332,20 @@ async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint
         return "", ""
     
     lang = language_hint or agent.tts_language or "en-IN"
-    
+
     if stt_provider == "sarvam":
-        return await sarvam_transcribe(api_key, audio_bytes,
-                                        agent.stt_model or "saaras:v3",
-                                        lang)
+        stt_model = agent.stt_model or "saaras:v3"
+        # Sarvam `saaras` family supports `language_code="unknown"` for auto
+        # language detection. When the agent allows auto-detect (default), send
+        # "unknown" so the user can speak ANY supported language and we won't
+        # force-transcribe English speech as Hindi (or vice-versa). `saarika`
+        # models still need an explicit language code.
+        if (
+            getattr(agent, "auto_detect_language", True)
+            and stt_model.startswith("saaras")
+        ):
+            lang = "unknown"
+        return await sarvam_transcribe(api_key, audio_bytes, stt_model, lang)
     
     elif stt_provider == "deepgram":
         transcript = await deepgram_transcribe(api_key, audio_bytes,
@@ -1642,9 +1660,14 @@ async def generate_llm_response(
     agent: AgentConfig, 
     user_message: str,
     db: AsyncSession,
-    session_id: str = None
+    session_id: str = None,
+    user_language: str = "",
 ) -> str:
-    """Generate LLM response using configured provider, system prompt, and knowledge base."""
+    """Generate LLM response using configured provider, system prompt, and knowledge base.
+    
+    `user_language` is the BCP-47 code detected from the user's latest utterance
+    (e.g. 'en-IN', 'hi-IN'). When provided, the LLM is instructed to mirror it.
+    """
     
     llm_provider = agent.llm_provider or "gemini"
     session_key = session_id or agent.id
@@ -1714,7 +1737,45 @@ async def generate_llm_response(
     except Exception as e:
         logger.warning(f"Could not load knowledge base: {e}")
     
-    system_prompt = base_prompt + kb_context
+    # ── LANGUAGE MIRRORING + GROUNDING GUARDRAIL ─────────────────────────────
+    # Map BCP-47 codes to human-readable language names for the LLM
+    _LANG_NAMES = {
+        "en-IN": "English", "hi-IN": "Hindi", "ta-IN": "Tamil",
+        "te-IN": "Telugu", "kn-IN": "Kannada", "ml-IN": "Malayalam",
+        "bn-IN": "Bengali", "gu-IN": "Gujarati", "mr-IN": "Marathi",
+        "pa-IN": "Punjabi", "ur-IN": "Urdu", "od-IN": "Odia",
+        "as-IN": "Assamese", "ne-IN": "Nepali", "ar-SA": "Arabic",
+    }
+    detected_lang_name = _LANG_NAMES.get(user_language, "")
+    if not detected_lang_name and user_language:
+        detected_lang_name = user_language.split("-")[0].capitalize()
+    
+    guardrail = "\n\n--- MANDATORY INSTRUCTIONS (OVERRIDE ALL ABOVE IF CONFLICTING) ---\n"
+    guardrail += "1. LANGUAGE RULE: "
+    if detected_lang_name:
+        guardrail += (
+            f"The user is speaking in {detected_lang_name}. "
+            f"You MUST reply ONLY in {detected_lang_name}. "
+            f"Do NOT switch to any other language unless the user explicitly switches first. "
+            f"If the user speaks English, reply in English. If the user speaks Hindi, reply in Hindi. "
+            f"NEVER mix languages or reply in a different language than the user spoke in.\n"
+        )
+    else:
+        guardrail += (
+            "Mirror the user's language exactly. If they speak English, reply in English. "
+            "If they speak Hindi, reply in Hindi. Match their language precisely.\n"
+        )
+    guardrail += (
+        "2. GROUNDING RULE: You MUST answer ONLY based on the system prompt above and the CLINIC KNOWLEDGE BASE. "
+        "Do NOT invent information, make up doctor names, services, prices, or clinic details that are not explicitly mentioned above. "
+        "If you don't know the answer, say so honestly and offer to transfer to a human staff member.\n"
+        "3. STAY ON TOPIC: You are a clinic receptionist. Do NOT discuss topics unrelated to the clinic, "
+        "appointments, doctors, or healthcare services. Politely redirect off-topic conversations.\n"
+        "4. CONCISENESS: Keep every response under 2 sentences for voice conversations.\n"
+        "--- END MANDATORY INSTRUCTIONS ---\n"
+    )
+    
+    system_prompt = base_prompt + kb_context + guardrail
     
     # Add user message to history
     history.append({"role": "user", "content": user_message})
