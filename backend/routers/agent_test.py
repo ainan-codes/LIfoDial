@@ -181,6 +181,10 @@ async def clear_agent_session(agent_id: str, session_id: str):
 # Maps ws_session_id → asyncio.Event. When set, in-flight TTS send aborts.
 _agent_speaking: dict[str, asyncio.Event] = {}
 
+# ── Per-session cancellation — set when the user closes the widget ────────────
+# Checked at key points in handle_audio_turn to abort in-flight work instantly.
+_session_cancelled: dict[str, asyncio.Event] = {}
+
 # ── WS /ws/agent-call/{agent_id} ──────────────────────────────────────────────
 
 @router.websocket("/ws/agent-call/{agent_id}")
@@ -207,6 +211,9 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
     # Create a per-session interrupt event for barge-in
     interrupt_event = asyncio.Event()
     _agent_speaking[ws_session_id] = interrupt_event
+    # Create cancellation event — set when user closes widget
+    cancel_event = asyncio.Event()
+    _session_cancelled[ws_session_id] = cancel_event
 
     # ── Load agent in a short-lived DB session ────────────────────────────────
     agent: AgentConfig | None = None
@@ -333,6 +340,9 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
 
             # ── Audio frame → STT → LLM → TTS ──
             if raw_bytes:
+                # Skip if session is already cancelled (user closed widget)
+                if cancel_event.is_set():
+                    break
                 try:
                     async with AsyncSessionLocal() as db:
                         await handle_audio_turn(websocket, agent, raw_bytes, db, ws_session_id)
@@ -409,6 +419,8 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
         except Exception:
             pass
     finally:
+        # Signal cancellation so any in-flight handle_audio_turn aborts
+        cancel_event.set()
         if greeting_task and not greeting_task.done():
             greeting_task.cancel()
             try:
@@ -417,6 +429,9 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
                 pass
         _language_tracker.pop(ws_session_id, None)
         _agent_speaking.pop(ws_session_id, None)
+        _session_cancelled.pop(ws_session_id, None)
+        # Clean up conversation history for this session
+        _conversation_history.pop(ws_session_id, None)
         logger.info(f"WS session ended cleanly for {agent_id}")
 
 
@@ -1147,6 +1162,12 @@ async def handle_audio_turn(
     turn_start = time.monotonic()
 
     try:
+        # ── Check for session cancellation (user closed widget) ────────────────
+        _cancel = _session_cancelled.get(session_id)
+        if _cancel and _cancel.is_set():
+            logger.info("Session %s cancelled, aborting audio turn", session_id)
+            return
+
         # Determine which language to use for STT based on ratio tracking
         dominant_lang = get_dominant_language(session_id, agent.tts_language or "en-IN")
 
@@ -1168,13 +1189,16 @@ async def handle_audio_turn(
                 pass
             return
 
+        # ── Post-STT text verification ────────────────────────────────────────
+        # Always use detect_text_language() as ground truth — Sarvam's
+        # language_code return can disagree with the actual script.
+        text_lang = detect_text_language(transcript)
+        if text_lang:
+            detected_lang = text_lang  # trust script detection over STT header
+
         # Track detected language for ratio-based switching
         if detected_lang and session_id:
             track_language(session_id, detected_lang)
-        elif session_id:
-            text_lang = detect_text_language(transcript)
-            if text_lang:
-                track_language(session_id, text_lang)
 
         current_dominant = get_dominant_language(session_id, agent.tts_language or "en-IN")
 
@@ -1190,6 +1214,52 @@ async def handle_audio_turn(
             return
 
         logger.info(f"Transcribed: '{transcript[:80]}' (lang: {detected_lang}, dominant: {current_dominant})")
+
+        # ── End-call phrase detection ──────────────────────────────────────────
+        # Check if the user said a goodbye/end phrase configured on the agent.
+        end_phrases = agent.end_call_phrases or ["bye", "goodbye", "thank you", "dhanyavaad", "shukriya", "alvida"]
+        transcript_lower = transcript.lower().strip()
+        # Match: transcript IS an end phrase, or ends with one, or contains one
+        # as a standalone segment. Use word-level matching to avoid false positives
+        # (e.g. "goodbye" should match but "good" alone shouldn't).
+        is_end_phrase = any(
+            phrase.lower() in transcript_lower
+            for phrase in end_phrases
+            if phrase and len(phrase.strip()) >= 2
+        )
+        if is_end_phrase:
+            logger.info("End-call phrase detected in transcript: '%s'", transcript[:60])
+            end_msg = agent.end_call_message or "Thank you for calling. Have a great day!"
+            # Send the farewell transcript
+            try:
+                await websocket.send_json({
+                    "type": "transcript",
+                    "text": end_msg,
+                    "role": "assistant",
+                    "detected_language": current_dominant,
+                })
+            except RuntimeError:
+                return
+            # Synthesize farewell audio
+            try:
+                farewell_lang = detect_text_language(end_msg) or current_dominant
+                farewell_tts_lang = normalize_sarvam_language(farewell_lang) if (agent.tts_provider or "sarvam") == "sarvam" else farewell_lang
+                farewell_audio = await synthesize_speech(agent, end_msg, language_override=farewell_tts_lang)
+                if farewell_audio:
+                    await websocket.send_bytes(farewell_audio)
+            except Exception as e:
+                logger.warning("Farewell TTS failed (non-fatal): %s", e)
+            # Signal the call has ended
+            try:
+                await websocket.send_json({"type": "status", "status": "ended", "reason": "end_phrase_detected"})
+            except RuntimeError:
+                pass
+            return  # exit the turn — the main loop will see the 'ended' status
+
+        # ── Check cancellation before LLM (most expensive step) ────────────────
+        if _cancel and _cancel.is_set():
+            logger.info("Session %s cancelled before LLM, aborting", session_id)
+            return
 
         # ── Step 2: LLM ──────────────────────────────────────────────────────────
         try:
@@ -1335,16 +1405,27 @@ async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint
 
     if stt_provider == "sarvam":
         stt_model = agent.stt_model or "saaras:v3"
-        # Sarvam `saaras` family supports `language_code="unknown"` for auto
-        # language detection. When the agent allows auto-detect (default), send
-        # "unknown" so the user can speak ANY supported language and we won't
-        # force-transcribe English speech as Hindi (or vice-versa). `saarika`
-        # models still need an explicit language code.
+        # LANGUAGE STRATEGY: Use the tracked dominant language (from language_hint)
+        # as the explicit language_code for STT. This prevents Sarvam's unreliable
+        # auto-detect from misidentifying English speech as Tamil/Hindi.
+        #
+        # Only use "unknown" for the very FIRST utterance when we have zero
+        # language history — language_hint equals the agent default in that case.
+        # After the first utterance, detect_text_language() establishes the real
+        # language and subsequent calls use it explicitly.
         if (
             getattr(agent, "auto_detect_language", True)
             and stt_model.startswith("saaras")
         ):
-            lang = "unknown"
+            # Always use the tracked dominant language (via language_hint)
+            # instead of "unknown". This prevents Sarvam's auto-detect from
+            # misidentifying English speech as Tamil/Hindi/etc.
+            #
+            # - First utterance: language_hint = agent default (e.g. en-IN)
+            #   → sends "en-IN" explicitly (safe, no misdetection)
+            # - Subsequent: language_hint = tracked dominant from text detection
+            #   → sends the real language (accurate, prevents snowball)
+            lang = language_hint
         return await sarvam_transcribe(api_key, audio_bytes, stt_model, lang)
     
     elif stt_provider == "deepgram":
@@ -1515,7 +1596,7 @@ async def sarvam_transcribe(api_key: str, audio_bytes: bytes,
                 "language_code": language,
             }
 
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.post(
                     "https://api.sarvam.ai/speech-to-text",
                     headers={"api-subscription-key": api_key},
