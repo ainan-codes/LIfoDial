@@ -276,8 +276,6 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
     _agent_speaking_until[ws_session_id] = 0.0
     # BUG 4: duplicate greeting prevention
     _session_turn_count[ws_session_id] = 0
-    # BUG 2: language override per session
-    _session_language_override[ws_session_id] = agent.tts_language or "en-IN"
 
     # ── Load agent in a short-lived DB session ────────────────────────────────
     agent: AgentConfig | None = None
@@ -308,6 +306,8 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
         return
 
     logger.info(f"Agent loaded: {agent.agent_name}")
+    # BUG 2: language override per session (must be AFTER agent is loaded from DB)
+    _session_language_override[ws_session_id] = agent.tts_language or "en-IN"
 
     # ── Send ready signal ─────────────────────────────────────────────────────
     first_msg = agent.first_message or "Hello, how can I help?"
