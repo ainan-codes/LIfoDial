@@ -6,11 +6,12 @@ No phone required — pure browser-based.
 import asyncio
 import json
 import logging
+import time
 import uuid
 import base64
 import os
 from collections import defaultdict
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import StreamingResponse, HTMLResponse
@@ -34,6 +35,62 @@ LANGUAGE_SWITCH_THRESHOLD = 0.6  # 60% of recent utterances must be in new langu
 
 # Cache synthesized greeting clips to avoid repeating cold-start latency
 _greeting_audio_cache: dict[str, bytes] = {}
+
+# ── Per-session agent-speaking timestamp for echo suppression ──────────────────
+# When agent sends TTS audio, this records the wall-clock time at which the
+# agent's speech (plus a buffer) is expected to finish.  Any user mic audio
+# arriving before that timestamp is silently discarded to prevent the STT from
+# transcribing the agent's own voice.
+_agent_speaking_until: dict[str, float] = {}
+
+# ── Per-session turn counter for duplicate-greeting prevention ────────────────
+_session_turn_count: dict[str, int] = {}
+
+# ── Per-session explicit language override (set by language-switch keywords) ──
+_session_language_override: dict[str, str] = {}
+
+# ── Simple greetings that should NOT trigger an LLM call on turn 0 ────────────
+SIMPLE_GREETINGS = {
+    "hello", "hi", "hey", "halo", "helo",
+    "namaste", "namaskar", "vanakkam", "salam",
+    "namasthe", "namaskara", "salaam",
+}
+
+# ── Explicit language-switch keywords ─────────────────────────────────────────
+LANGUAGE_SWITCH_KEYWORDS: dict[str, list[str]] = {
+    "en-IN": ["english", "in english", "speak english", "talk english", "talk in english", "speak in english"],
+    "hi-IN": ["hindi", "in hindi", "speak hindi", "talk hindi", "talk in hindi", "speak in hindi"],
+    "ml-IN": ["malayalam", "in malayalam", "speak malayalam", "talk in malayalam"],
+    "ta-IN": ["tamil", "in tamil", "speak tamil", "talk in tamil"],
+    "te-IN": ["telugu", "in telugu", "speak telugu", "talk in telugu"],
+    "kn-IN": ["kannada", "in kannada", "speak kannada", "talk in kannada"],
+    "bn-IN": ["bengali", "in bengali", "speak bengali", "talk in bengali"],
+    "gu-IN": ["gujarati", "in gujarati", "speak gujarati", "talk in gujarati"],
+    "ar-SA": ["arabic", "in arabic", "speak arabic", "talk in arabic"],
+}
+
+# ── Per-language system prompt enforcement ────────────────────────────────────
+LANGUAGE_INSTRUCTIONS: dict[str, str] = {
+    "hi-IN": "ALWAYS respond in Hindi. Never switch languages unless user explicitly requests.",
+    "ml-IN": "ALWAYS respond in Malayalam. Never switch languages unless user explicitly requests.",
+    "ta-IN": "ALWAYS respond in Tamil. Never switch languages unless user explicitly requests.",
+    "en-IN": "ALWAYS respond in English. Never switch languages unless user explicitly requests.",
+    "te-IN": "ALWAYS respond in Telugu. Never switch languages unless user explicitly requests.",
+    "kn-IN": "ALWAYS respond in Kannada. Never switch languages unless user explicitly requests.",
+    "bn-IN": "ALWAYS respond in Bengali. Never switch languages unless user explicitly requests.",
+    "gu-IN": "ALWAYS respond in Gujarati. Never switch languages unless user explicitly requests.",
+    "ar-SA": "ALWAYS respond in Arabic. Never switch languages unless user explicitly requests.",
+}
+
+
+def detect_language_switch(transcript: str) -> Optional[str]:
+    """Check if user explicitly asked to switch language via keywords.
+    Returns the target language code, or None if no switch detected."""
+    t = transcript.lower().strip()
+    for lang_code, keywords in LANGUAGE_SWITCH_KEYWORDS.items():
+        if any(kw in t for kw in keywords):
+            return lang_code
+    return None
 
 def get_dominant_language(session_id: str, default: str = "en-IN") -> str:
     """Get the dominant language based on ratio of recent detections."""
@@ -208,12 +265,19 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
 
     ws_session_id = str(uuid.uuid4())
     greeting_task: asyncio.Task | None = None
+    call_active = True  # BUG 3: graceful disconnect flag
     # Create a per-session interrupt event for barge-in
     interrupt_event = asyncio.Event()
     _agent_speaking[ws_session_id] = interrupt_event
     # Create cancellation event — set when user closes widget
     cancel_event = asyncio.Event()
     _session_cancelled[ws_session_id] = cancel_event
+    # BUG 1: echo suppression — initialise speaking-until timestamp
+    _agent_speaking_until[ws_session_id] = 0.0
+    # BUG 4: duplicate greeting prevention
+    _session_turn_count[ws_session_id] = 0
+    # BUG 2: language override per session
+    _session_language_override[ws_session_id] = agent.tts_language or "en-IN"
 
     # ── Load agent in a short-lived DB session ────────────────────────────────
     agent: AgentConfig | None = None
@@ -277,7 +341,7 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
     next_ping_at  = last_activity + PING_INTERVAL
 
     try:
-        while True:
+        while call_active:
             now = loop.time()
 
             # Send keepalive ping if PING_INTERVAL has elapsed
@@ -329,7 +393,8 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
             last_activity = loop.time()
 
             if data.get("type") == "websocket.disconnect":
-                logger.info(f"Clean disconnect frame from {agent_id}")
+                call_active = False
+                logger.info(f"Client disconnected — stopping pipeline for {agent_id}")
                 break
 
             if data.get("type") != "websocket.receive":
@@ -341,8 +406,18 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
             # ── Audio frame → STT → LLM → TTS ──
             if raw_bytes:
                 # Skip if session is already cancelled (user closed widget)
-                if cancel_event.is_set():
+                if cancel_event.is_set() or not call_active:
                     break
+
+                # BUG 1: Echo suppression — discard mic audio while agent is speaking
+                speaking_until = _agent_speaking_until.get(ws_session_id, 0.0)
+                if time.time() < speaking_until:
+                    logger.info(
+                        "Discarding audio — agent speaking for %.1fs more",
+                        speaking_until - time.time(),
+                    )
+                    continue  # Skip STT for this chunk
+
                 try:
                     async with AsyncSessionLocal() as db:
                         await handle_audio_turn(websocket, agent, raw_bytes, db, ws_session_id)
@@ -352,6 +427,7 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
                         await websocket.send_json({"type": "error", "message": f"Processing error: {e}"})
                         await websocket.send_json({"type": "status", "status": "idle"})
                     except Exception:
+                        call_active = False
                         break
                 continue
 
@@ -410,8 +486,10 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
                             break
 
     except WebSocketDisconnect:
+        call_active = False
         logger.info(f"WS disconnected (outer) for {agent_id}")
     except Exception as e:
+        call_active = False
         logger.error(f"Fatal WS loop error for {agent_id}: {e}", exc_info=True)
         try:
             await websocket.send_json({"type": "error", "message": "Internal server error", "code": "INTERNAL_ERROR"})
@@ -420,6 +498,7 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
             pass
     finally:
         # Signal cancellation so any in-flight handle_audio_turn aborts
+        call_active = False
         cancel_event.set()
         if greeting_task and not greeting_task.done():
             greeting_task.cancel()
@@ -429,10 +508,13 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
                 pass
         _language_tracker.pop(ws_session_id, None)
         _agent_speaking.pop(ws_session_id, None)
+        _agent_speaking_until.pop(ws_session_id, None)
         _session_cancelled.pop(ws_session_id, None)
+        _session_turn_count.pop(ws_session_id, None)
+        _session_language_override.pop(ws_session_id, None)
         # Clean up conversation history for this session
         _conversation_history.pop(ws_session_id, None)
-        logger.info(f"WS session ended cleanly for {agent_id}")
+        logger.info(f"Voice call ended cleanly for {agent_id}")
 
 
 async def _send_greeting_audio_fast(websocket: WebSocket, agent: AgentConfig, text: str):
@@ -1151,7 +1233,6 @@ async def handle_audio_turn(
 ):
     """Process one turn of audio: STT -> LLM -> TTS -> send back.
     Issues 3+5: adds per-stage timing, tts_failed event, and graceful fallback."""
-    import time
 
     # Send "processing" status
     try:
@@ -1242,7 +1323,17 @@ async def handle_audio_turn(
         if detected_lang and session_id:
             track_language(session_id, detected_lang)
 
-        current_dominant = get_dominant_language(session_id, agent.tts_language or "en-IN")
+        # ── BUG 2: Explicit language switch detection ──────────────────────────
+        switched = detect_language_switch(transcript)
+        if switched:
+            _session_language_override[session_id] = switched
+            logger.info("Language explicitly switched to: %s", switched)
+
+        # Use explicit override if set, else fall back to ratio-based dominant
+        current_dominant = _session_language_override.get(
+            session_id,
+            get_dominant_language(session_id, agent.tts_language or "en-IN"),
+        )
 
         # Send user transcript back
         try:
@@ -1309,10 +1400,27 @@ async def handle_audio_turn(
         except RuntimeError:
             return
 
-        llm_start = time.monotonic()
-        response_text = await generate_llm_response(agent, transcript, db, session_id=session_id, user_language=current_dominant)
-        llm_ms = int((time.monotonic() - llm_start) * 1000)
-        logger.info(f"[TIMING] LLM: {llm_ms}ms — '{response_text[:80]}'")
+        # ── BUG 4: Duplicate greeting prevention ─────────────────────────────
+        turn_count = _session_turn_count.get(session_id, 0)
+        if turn_count == 0 and transcript.lower().strip() in SIMPLE_GREETINGS:
+            response_text = "How can I help you today?"
+            llm_ms = 0
+            logger.info("[TIMING] LLM: skipped (simple greeting on turn 0)")
+        else:
+            llm_start = time.monotonic()
+            try:
+                response_text = await asyncio.wait_for(
+                    generate_llm_response(agent, transcript, db, session_id=session_id, user_language=current_dominant),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("LLM timeout — client may have disconnected")
+                if _cancel and _cancel.is_set():
+                    return
+                response_text = "I'm sorry, I took too long to respond. Could you please repeat?"
+            llm_ms = int((time.monotonic() - llm_start) * 1000)
+            logger.info(f"[TIMING] LLM: {llm_ms}ms — '{response_text[:80]}'")
+        _session_turn_count[session_id] = turn_count + 1
 
         # ── Detect response language from actual script for TTS ──────────────────
         # This ensures TTS never speaks English text in Hindi voice or vice-versa.
@@ -1344,12 +1452,20 @@ async def handle_audio_turn(
             _interrupt.clear()  # reset before starting new TTS
         try:
             tts_start = time.monotonic()
-            # Use retry-capable TTS wrapper for sarvam, else generic
-            audio_response = await sarvam_synthesize_with_retry(
-                agent, response_text, language_override=tts_lang_for_turn
-            ) if (agent.tts_provider or "sarvam") == "sarvam" else await synthesize_speech(
-                agent, response_text, language_override=tts_lang_for_turn
-            )
+            # BUG 3: Wrap TTS with timeout + cancellation check
+            try:
+                # Use retry-capable TTS wrapper for sarvam, else generic
+                tts_coro = sarvam_synthesize_with_retry(
+                    agent, response_text, language_override=tts_lang_for_turn
+                ) if (agent.tts_provider or "sarvam") == "sarvam" else synthesize_speech(
+                    agent, response_text, language_override=tts_lang_for_turn
+                )
+                audio_response = await asyncio.wait_for(tts_coro, timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("TTS timeout — client may have disconnected")
+                if _cancel and _cancel.is_set():
+                    return
+                audio_response = b""
             tts_ms = int((time.monotonic() - tts_start) * 1000)
             logger.info(f"[TIMING] TTS: {tts_ms}ms ({len(audio_response) if audio_response else 0} bytes)")
 
@@ -1358,9 +1474,23 @@ async def handle_audio_turn(
                 if _interrupt and _interrupt.is_set():
                     logger.info("TTS send aborted — interrupt received for session %s", session_id)
                     tts_ok = False
+                elif _cancel and _cancel.is_set():
+                    logger.info("Session cancelled before TTS send for %s", session_id)
+                    return
                 else:
                     tts_ok = True
-                    await websocket.send_bytes(audio_response)
+                    try:
+                        await websocket.send_bytes(audio_response)
+                    except Exception:
+                        return
+                    # BUG 1: Set agent_speaking_until so incoming mic audio is discarded
+                    # Calculate audio duration: 16-bit PCM @ 24kHz (Sarvam default) ≈ 48000 bytes/sec
+                    audio_duration_s = len(audio_response) / 48000.0
+                    _agent_speaking_until[session_id] = time.time() + audio_duration_s + 0.8
+                    logger.info(
+                        "Agent speaking for %.1fs (audio=%d bytes, buffer=0.8s)",
+                        audio_duration_s + 0.8, len(audio_response),
+                    )
             else:
                 logger.warning(f"TTS returned empty/tiny response ({len(audio_response) if audio_response else 0}B) — sending tts_failed")
         except WebSocketDisconnect:
@@ -1875,11 +2005,15 @@ async def generate_llm_response(
     guardrail = "\n\n--- MANDATORY INSTRUCTIONS (OVERRIDE ALL ABOVE IF CONFLICTING) ---\n"
     guardrail += "1. LANGUAGE RULE: "
     if detected_lang_name:
+        # BUG 2: Use LANGUAGE_INSTRUCTIONS for stronger enforcement
+        lang_instr = LANGUAGE_INSTRUCTIONS.get(
+            user_language,
+            f"ALWAYS respond in {detected_lang_name}. Never switch languages unless user explicitly requests.",
+        )
         guardrail += (
             f"The user is speaking in {detected_lang_name}. "
-            f"You MUST reply ONLY in {detected_lang_name}. "
+            f"{lang_instr} "
             f"Do NOT switch to any other language unless the user explicitly switches first. "
-            f"If the user speaks English, reply in English. If the user speaks Hindi, reply in Hindi. "
             f"NEVER mix languages or reply in a different language than the user spoke in.\n"
         )
     else:
@@ -1894,6 +2028,9 @@ async def generate_llm_response(
         "3. STAY ON TOPIC: You are a clinic receptionist. Do NOT discuss topics unrelated to the clinic, "
         "appointments, doctors, or healthcare services. Politely redirect off-topic conversations.\n"
         "4. CONCISENESS: Keep every response under 2 sentences for voice conversations.\n"
+        "5. GREETING RULE: You have ALREADY greeted the user with the opening message. "
+        "Do NOT repeat the welcome greeting. If the user says Hello or Hi, respond naturally "
+        "as a conversation continuation, NOT a new greeting.\n"
         "--- END MANDATORY INSTRUCTIONS ---\n"
     )
     
