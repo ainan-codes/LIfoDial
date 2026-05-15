@@ -306,8 +306,10 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
         return
 
     logger.info(f"Agent loaded: {agent.agent_name}")
-    # BUG 2: language override per session (must be AFTER agent is loaded from DB)
-    _session_language_override[ws_session_id] = agent.tts_language or "en-IN"
+    # NOTE: _session_language_override is intentionally NOT pre-set here.
+    # It is ONLY populated when the user explicitly asks to switch language
+    # (e.g. "speak in Malayalam"). The default language detection flows through
+    # get_dominant_language() which uses actual STT detections.
 
     # ── Send ready signal ─────────────────────────────────────────────────────
     first_msg = agent.first_message or "Hello, how can I help?"
