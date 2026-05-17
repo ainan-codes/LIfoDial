@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { API_URL, WS_URL } from '../api/client';
+import { useThinkingSound } from '../hooks/useThinkingSound';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface Message {
@@ -142,6 +143,9 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
   const agentId = agent?.id || directId;
   const agentName = agent?.name || agent?.agent_name || directName || 'Agent';
 
+  // Thinking sound — plays a soft ping while STT→LLM→TTS is running
+  const { startThinking, stopThinking } = useThinkingSound('ping');
+
   const [status, setStatus] = useState<CallStatus>('idle');
   const [muted, setMuted] = useState(false);
   const [duration, setDuration] = useState(0);
@@ -226,6 +230,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     analyserRef.current = null;
 
     // 6. Clear timers
+    stopThinking();  // stop thinking sound if still playing
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     if (vadSilenceTimerRef.current) { clearTimeout(vadSilenceTimerRef.current); vadSilenceTimerRef.current = null; }
     if (fallbackSpeakTimerRef.current) { clearTimeout(fallbackSpeakTimerRef.current); fallbackSpeakTimerRef.current = null; }
@@ -372,6 +377,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
       const buffer = await blob.arrayBuffer();
       wsRef.current.send(buffer);
       setCurrentTranscript('Processing...');
+      startThinking(); // ← start thinking sound while pipeline runs
     } catch (e) {
       console.error('Failed to send audio:', e);
     }
@@ -446,6 +452,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
   };
 
   const enqueueAudio = (blob: Blob) => {
+    stopThinking(); // ← audio arrived — stop the thinking sound immediately
     lastAudioAtRef.current = Date.now();
     audioQueueRef.current.push(blob);
     if (!isPlayingRef.current) {

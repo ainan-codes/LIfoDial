@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { API_URL } from '../api/client';
 import { useStreamingSTT } from '../hooks/useStreamingSTT';
+import { useThinkingSound } from '../hooks/useThinkingSound';
 
 interface WebCallInterfaceProps {
   agent: {
@@ -60,6 +61,9 @@ export function WebCallInterface({ agent, onClose }: WebCallInterfaceProps) {
   const animFrameRef = useRef<number | undefined>(undefined);
   const streamRef = useRef<MediaStream | null>(null);
 
+  // Thinking sound — plays soft ping while STT→LLM→TTS pipeline runs
+  const { startThinking, stopThinking } = useThinkingSound('ping');
+
   // Streaming STT hook
   const {
     isConnected: sttConnected,
@@ -91,7 +95,11 @@ export function WebCallInterface({ agent, onClose }: WebCallInterfaceProps) {
     },
     onSpeechEnd: () => {
       setAgentState('thinking');
-      setTimeout(() => setAgentState('speaking'), 500);
+      startThinking();  // ← user stopped talking, pipeline starts
+      setTimeout(() => {
+        setAgentState('speaking');
+        stopThinking();  // ← agent about to speak, stop thinking sound
+      }, 500);
     },
   });
 
@@ -240,6 +248,7 @@ export function WebCallInterface({ agent, onClose }: WebCallInterfaceProps) {
   };
 
   const handleEndCall = () => {
+    stopThinking(); // ← clean up thinking sound on hang-up
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
     }

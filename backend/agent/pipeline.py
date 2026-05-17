@@ -2,14 +2,37 @@ import asyncio
 import logging
 import time
 import uuid
+import base64
+import io
+import wave
+import re
 from datetime import datetime
 from livekit.agents import AgentSession, Agent, RoomInputOptions
 from livekit.plugins import silero
 import google.generativeai as genai
 import httpx
-import base64
 
 logger = logging.getLogger(__name__)
+
+# ── Persistent HTTP client (shared across all plugin calls) ───────────────────
+# Creating a new client per request wastes ~50-150ms on TCP handshake.
+# This client is reused for the lifetime of the process.
+_http_client: httpx.AsyncClient | None = None
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=3.0, read=12.0, write=5.0, pool=2.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=10,
+                max_connections=20,
+                keepalive_expiry=30,
+            ),
+            http2=True,  # HTTP/2 multiplexing reduces per-request overhead
+        )
+    return _http_client
+
 
 class LifodialAgent(Agent):
     """
@@ -42,7 +65,7 @@ class LifodialAgent(Agent):
             for d in doctors
         ]) or "- General Physician available"
         
-        return f"""You are {self.agent_config.get('agent_name', 'Receptionist')}, 
+        return f"""You are {self.agent_config.get('agent_name', 'Receptionist')}, \
 the AI voice receptionist for {self.tenant.get('clinic_name', 'the clinic')}.
 
 CRITICAL RULES FOR VOICE:
@@ -65,7 +88,7 @@ BOOKING FLOW:
 4. Confirm booking
 5. Give appointment ID
 
-EMERGENCY: On keywords (heart attack, accident, emergency, 
+EMERGENCY: On keywords (heart attack, accident, emergency, \
 unconscious, bleeding) → transfer immediately.
 
 FALLBACK: "Kya aap dobara bol sakte hain?" (or in patient's language)"""
@@ -201,13 +224,13 @@ async def entrypoint(ctx):
         # Sarvam STT — best for Indian languages
         stt=SarvamSTTPlugin(
             api_key=settings.sarvam_api_key,
-            model=agent_config.get("stt_model", "saaras:v3"),
+            model=agent_config.get("stt_model", "saaras:v2"),  # v2 is faster for short utterances
             language=agent_config.get("tts_language", "hi-IN"),
         ),
         # Gemini LLM — streaming
         llm=GeminiLLMPlugin(
             api_key=settings.gemini_api_key,
-            model=agent_config.get("llm_model", "gemini-2.5-flash"),
+            model=agent_config.get("llm_model", "gemini-2.0-flash"),  # 2.0-flash is faster than 2.5-flash
             temperature=float(
                 agent_config.get("llm_temperature", 0.3) if agent_config.get("llm_temperature") is not None else 0.3
             ),
@@ -221,8 +244,8 @@ async def entrypoint(ctx):
         ),
         # Silero VAD — detects when patient stops speaking
         vad=silero.VAD.load(
-            min_silence_duration=0.3,  # 300ms silence = turn end
-            prefix_padding_duration=0.2,
+            min_silence_duration=0.25,       # reduced: 250ms instead of 300ms
+            prefix_padding_duration=0.1,     # reduced: 100ms instead of 200ms
             activation_threshold=0.5,
         ),
         turn_detection="vad",
@@ -247,8 +270,6 @@ async def entrypoint(ctx):
     await session.say(first_msg, allow_interruptions=True)
 
     # ── Post-call credit deduction ─────────────────────────────────
-    # When the room participant disconnects, deduct credits based on
-    # call duration. We register a shutdown callback.
     async def _on_call_end():
         """Deduct credits after call ends."""
         try:
@@ -290,7 +311,7 @@ async def entrypoint(ctx):
 class SarvamSTTPlugin:
     """
     Sarvam STT wrapper for LiveKit agents.
-    Uses streaming for low latency.
+    Uses persistent HTTP client for low latency.
     """
     def __init__(self, api_key: str, model: str, language: str):
         self.api_key = api_key
@@ -305,9 +326,6 @@ class SarvamSTTPlugin:
         Sarvam API requires a valid WAV file, so we wrap PCM
         in a WAV header if needed.
         """
-        import io
-        import wave
-
         if not audio or len(audio) < 44:
             return ""
 
@@ -317,7 +335,7 @@ class SarvamSTTPlugin:
         if is_wav:
             wav_bytes = audio
         else:
-            # Raw PCM → WAV conversion (16-bit, 16kHz, mono)
+            # Raw PCM → WAV conversion (16-bit, 16kHz, mono) — in-memory, no disk I/O
             wav_buffer = io.BytesIO()
             with wave.open(wav_buffer, "wb") as wf:
                 wf.setnchannels(1)
@@ -326,35 +344,35 @@ class SarvamSTTPlugin:
                 wf.writeframes(audio)
             wav_bytes = wav_buffer.getvalue()
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                "https://api.sarvam.ai/speech-to-text",
-                headers={
-                    "api-subscription-key": self.api_key
-                },
-                files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-                data={
-                    "language_code": self.language,
-                    "model": self.model,
-                    "with_timestamps": "false",
-                    "with_disfluencies": "false",
-                }
+        client = _get_http_client()
+        response = await client.post(
+            "https://api.sarvam.ai/speech-to-text",
+            headers={"api-subscription-key": self.api_key},
+            files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+            data={
+                "language_code": self.language,
+                "model": self.model,
+                "with_timestamps": "false",
+                "with_disfluencies": "false",
+            },
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "Sarvam STT error %d: %s",
+                response.status_code,
+                response.text[:200],
             )
-            if response.status_code != 200:
-                logger.warning(
-                    "Sarvam STT error %d: %s",
-                    response.status_code,
-                    response.text[:200],
-                )
-                return ""
-            return response.json().get("transcript", "")
+            return ""
+        return response.json().get("transcript", "")
 
 
 # ── Sarvam TTS Plugin ──────────────────────────────────────────
 class SarvamTTSPlugin:
     """
     Sarvam TTS wrapper for LiveKit agents.
-    Handles chunking for low latency.
+    - Persistent HTTP client (no per-request TCP overhead)
+    - enable_preprocessing=False for speed
+    - Parallel chunk synthesis for long texts
     """
     def __init__(self, api_key: str, model: str, 
                  voice: str, language: str):
@@ -373,20 +391,16 @@ class SarvamTTSPlugin:
         if len(text) <= max_chars:
             return await self._call_tts(text)
         
-        # Chunk and concatenate
+        # Chunk and synthesize IN PARALLEL for minimal latency
         chunks = self._chunk_text(text, max_chars - 50)
-        parts = []
-        for chunk in chunks:
-            audio = await self._call_tts(chunk)
-            if audio:
-                parts.append(audio)
-        return b"".join(parts)
+        tasks = [self._call_tts(chunk) for chunk in chunks]
+        results = await asyncio.gather(*tasks)
+        return b"".join(r for r in results if r)
     
     async def _call_tts(self, text: str) -> bytes:
-        # ── Validate model, speaker, and language (prevents 400 errors) ───────
+        # ── Validate model, speaker, and language ───────────────────
         normalized_model = self.model if self.model and self.model.startswith("bulbul:") else "bulbul:v3"
 
-        # Speaker compatibility (bulbul:v3 speaker list — authoritative from Sarvam docs)
         _V3_SPEAKERS = {
             "aditya", "ritu", "ashutosh", "priya", "neha", "rahul",
             "pooja", "rohan", "simran", "kavya", "amit", "dev",
@@ -396,15 +410,12 @@ class SarvamTTSPlugin:
             "shruti", "suhani", "mohit", "kavitha", "rehan", "soham",
             "rupali", "niharika",
         }
-        # Legacy v2 voice → v3 speaker remap
         _VOICE_REMAP = {
             "meera": "shreya", "pavithra": "kavitha", "maitreyi": "priya",
             "arvind": "rahul", "amol": "aditya", "amartya": "rohan",
             "diya": "ritu", "neel": "amit", "misha": "simran", "vian": "shubh",
-            # Also handle "bulbul:v3 kavitha" style compound values
         }
         req_speaker = (self.voice or "priya").lower().strip()
-        # Strip any model prefix if user stored "bulbul:v3 kavitha"
         if " " in req_speaker:
             req_speaker = req_speaker.split(" ", 1)[-1].strip()
         req_speaker = _VOICE_REMAP.get(req_speaker, req_speaker)
@@ -412,7 +423,6 @@ class SarvamTTSPlugin:
         if normalized_voice != req_speaker:
             logger.info("pipeline TTS: remapped speaker '%s' → '%s'", self.voice, normalized_voice)
 
-        # Language validation — Sarvam only supports Indian languages
         _VALID_LANGS = {
             "as-IN", "bn-IN", "brx-IN", "doi-IN", "en-IN", "gu-IN",
             "hi-IN", "kn-IN", "kok-IN", "ks-IN", "mai-IN", "ml-IN",
@@ -425,49 +435,41 @@ class SarvamTTSPlugin:
             lang = next((v for v in _VALID_LANGS if v.startswith(prefix + "-")), "en-IN")
         normalized_language = lang
 
-        # FIX: Sarvam REST API uses 'text' (not 'inputs') for the current endpoint
         payload = {
             "text": text,
             "target_language_code": normalized_language,
             "speaker": normalized_voice,
             "model": normalized_model,
             "speech_sample_rate": 16000,
-            "enable_preprocessing": True,
-            "pace": 1.0,
+            "enable_preprocessing": False,   # ← SPEED: skip server-side preprocessing
+            "pace": 1.05,                    # ← Slightly faster pace to reduce audio length
         }
 
-        # FIX: bulbul:v3 does NOT support pitch/loudness/temperature via REST
-        # Those cause 400 validation errors
-        if normalized_model != "bulbul:v3":
-            payload["pitch"] = 0.0
-            payload["loudness"] = 1.5
+        client = _get_http_client()
+        response = await client.post(
+            "https://api.sarvam.ai/text-to-speech",
+            headers={
+                "api-subscription-key": self.api_key,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                "https://api.sarvam.ai/text-to-speech",
-                headers={
-                    "api-subscription-key": self.api_key,
-                    "Content-Type": "application/json"
-                },
-                json=payload
+        if response.status_code != 200:
+            logger.error(
+                f"Sarvam TTS error {response.status_code}: "
+                f"{response.text[:200]}"
             )
+            return b""
 
-            if response.status_code != 200:
-                logger.error(
-                    f"Sarvam TTS error {response.status_code}: "
-                    f"{response.text[:200]}"
-                )
-                return b""
+        data = response.json()
+        audios = data.get("audios", [])
+        if not audios:
+            return b""
 
-            data = response.json()
-            audios = data.get("audios", [])
-            if not audios:
-                return b""
-
-            return base64.b64decode(audios[0])
+        return base64.b64decode(audios[0])
     
     def _chunk_text(self, text: str, max_len: int) -> list:
-        import re
         sentences = re.split(r'(?<=[।.!?])\s+', text)
         chunks, current = [], ""
         for s in sentences:
@@ -496,7 +498,7 @@ class GeminiLLMPlugin:
             model,
             generation_config={
                 "temperature": temperature,
-                "max_output_tokens": 150,
+                "max_output_tokens": 120,   # ← Reduced: voice responses are short
                 "candidate_count": 1,
             }
         )
