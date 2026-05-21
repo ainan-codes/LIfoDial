@@ -76,6 +76,33 @@ async def get_slots(doctor_id: str, date: str = None) -> List[str]:
 
 
 from backend.models.tenant import Tenant
+import asyncio
+import httpx
+
+async def send_to_sheets_webhook(webhook_url: str | None, payload: dict):
+    """Sends appointment details to a Google Sheets webhook in the background.
+    Falls back to settings.google_sheets_webhook_url if no clinic-specific webhook is set.
+    """
+    target_url = webhook_url or settings.google_sheets_webhook_url
+    if not target_url:
+        logger.info("No Google Sheets webhook URL configured. Skipping sheet sync.")
+        return
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                target_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=5.0
+            )
+            if response.status_code == 200:
+                logger.info(f"Successfully pushed appointment {payload.get('appointment_id')} to Google Sheets.")
+            else:
+                logger.error(f"Google Sheets webhook failed with status {response.status_code}: {response.text}")
+    except Exception as e:
+        logger.error(f"Error pushing to Google Sheets: {e}", exc_info=True)
+
 
 async def create_appointment(tenant_id: str, doctor_id: str, slot_time: str, patient_phone: str) -> dict:
     # Future HIS Integration: POST to /appointments
@@ -92,6 +119,7 @@ async def create_appointment(tenant_id: str, doctor_id: str, slot_time: str, pat
         stmt_t = select(Tenant).where(Tenant.id == tenant_id)
         tenant = (await session.execute(stmt_t)).scalar_one_or_none()
         clinic_name = tenant.clinic_name if tenant else "Unknown Clinic"
+        clinic_webhook = tenant.google_sheets_webhook_url if tenant else None
 
         appointment = Appointment(
             tenant_id=tenant_id,
@@ -104,11 +132,18 @@ async def create_appointment(tenant_id: str, doctor_id: str, slot_time: str, pat
         await session.commit()
         await session.refresh(appointment)
         
-        return {
+        appointment_data = {
             "appointment_id": str(appointment.id),
+            "tenant_id": tenant_id,
+            "clinic_name": clinic_name,
             "doctor_name": doc_name,
             "specialization": specialization,
-            "clinic_name": clinic_name,
             "slot_time": slot_time,
+            "patient_phone": patient_phone,
             "status": "confirmed"
         }
+
+        # Fire Google Sheets sync dynamically in background to avoid blocking the voice agent
+        asyncio.create_task(send_to_sheets_webhook(clinic_webhook, appointment_data))
+
+        return appointment_data

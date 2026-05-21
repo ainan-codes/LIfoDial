@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
+    # ── Google Sheets Webhook ──────────────────────────────────────────────
+    google_sheets_webhook_url: str = ""
+
     # ── CORS (production — set CORS_ORIGIN on Render) ──────────────────────
     cors_origin: str = ""  # e.g. https://lifodial.vercel.app
 
