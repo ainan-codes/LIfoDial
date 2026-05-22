@@ -310,7 +310,7 @@ export default function Integrations() {
 
                 <div>
                   <h4 style={{ fontWeight: 600, color: 'var(--text-primary)', margin: '0 0 4px', fontSize: '13px' }}>2. Setup in Google Sheet</h4>
-                  <ol style={{ paddingLeft: '20px', margin: 0, listStyleType: 'decimal', spaceY: '4px' }}>
+                  <ol style={{ paddingLeft: '20px', margin: 0, listStyleType: 'decimal' }}>
                     <li>Create a new Google Sheet or open an existing one.</li>
                     <li>In the menu, click on <strong>Extensions</strong> &gt; <strong>Apps Script</strong>.</li>
                     <li>Delete any code in the editor, and paste the code copied above. Click the <strong>Save</strong> icon (floppy disk).</li>
