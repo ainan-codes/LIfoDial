@@ -581,6 +581,17 @@ export default function AgentDetail() {
   const [showTest, setShowTest] = useState(false);
   const timerRef = useRef<any>(null);
   
+  // Vapi-style tab navigation
+  type AgentTab = 'assistant' | 'logs' | 'tools' | 'analysis' | 'advanced';
+  const [activeTab, setActiveTab] = useState<AgentTab>('assistant');
+  const AGENT_TABS: { id: AgentTab; label: string; icon: any }[] = [
+    { id: 'assistant', label: 'Assistant',  icon: Mic },
+    { id: 'logs',      label: 'Logs',       icon: LineChart },
+    { id: 'tools',     label: 'Tools',      icon: Wrench },
+    { id: 'analysis',  label: 'Analysis',   icon: Activity },
+    { id: 'advanced',  label: 'Advanced',   icon: Sliders },
+  ];
+  
   // Test lab state
   const [testTab, setTestTab] = useState<'voice'|'chat'>('voice');
   const [chatLog, setChatLog] = useState<{from: 'agent'|'user', text: string}[]>([]);
@@ -965,6 +976,38 @@ export default function AgentDetail() {
         </div>
       </header>
 
+      {/* ── VAPI-STYLE TAB BAR ────────────────────────────────────────────────── */}
+      <div style={{ borderBottom: `1px solid ${BORDER}`, background: '#080808', padding: '0 24px', display: 'flex', gap: '4px' }}>
+        {AGENT_TABS.map(tab => {
+          const isActive = activeTab === tab.id;
+          const Icon = tab.icon;
+          return (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 7,
+                padding: '10px 18px',
+                borderRadius: '8px 8px 0 0',
+                background: isActive ? '#0f0f0f' : 'transparent',
+                border: isActive ? `1px solid ${BORDER}` : '1px solid transparent',
+                borderBottom: isActive ? `1px solid #0f0f0f` : '1px solid transparent',
+                marginBottom: isActive ? -1 : 0,
+                color: isActive ? ACCENT : 'rgba(255,255,255,0.4)',
+                fontSize: 13, fontWeight: isActive ? 600 : 500,
+                cursor: 'pointer',
+                transition: 'all 0.15s ease',
+              }}
+              onMouseEnter={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.75)'; }}
+              onMouseLeave={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = 'rgba(255,255,255,0.4)'; }}
+            >
+              <Icon size={14} />
+              {tab.label}
+            </button>
+          );
+        })}
+      </div>
+
       {/* ── CONTENT BODY ──────────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         
@@ -972,6 +1015,8 @@ export default function AgentDetail() {
         <div style={{ flex: 1, overflowY: 'auto', padding: '32px 40px', display: 'flex', justifyContent: 'center' }}>
           <div style={{ width: '100%', maxWidth: '840px', paddingBottom: '60px' }}>
             
+            {/* ══ ASSISTANT TAB ═══════════════════════════════════════════════ */}
+            {activeTab === 'assistant' && (<>
             {/* 1. MODEL */}
             <CollapsibleSection icon={Brain} title="Model" summary={`${agent.llm_provider} · ${agent.llm_model}`}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
@@ -1114,6 +1159,7 @@ export default function AgentDetail() {
               </div>
             </CollapsibleSection>
 
+            {/* 3. TRANSCRIBER (STT) — still in Assistant tab */}
             {/* 3. TRANSCRIBER (STT) */}
             <CollapsibleSection icon={Activity} title="Transcriber" summary={`${agent.stt_provider} · ${agent.stt_language}`}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '24px' }}>
@@ -1178,6 +1224,7 @@ export default function AgentDetail() {
               </div>
             </CollapsibleSection>
 
+            {/* 5. CALL BEHAVIOR — still Assistant tab */}
             {/* 5. CALL BEHAVIOR */}
             <CollapsibleSection icon={Settings} title="Call Behavior" summary={`Max ${agent.max_duration_seconds}s · ${agent.silence_timeout_seconds}s timeout`}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
@@ -1214,6 +1261,12 @@ export default function AgentDetail() {
               </div>
             </CollapsibleSection>
 
+            {/* 8. VOICEMAIL DETECTION — last in Assistant tab */}
+            {/* 6. VOICEMAIL moved here, end assistant tab below */}
+            </>) /* end assistant tab */}
+
+            {/* ══ TOOLS TAB ═══════════════════════════════════════════════════ */}
+            {activeTab === 'tools' && (<>
             {/* 6. TOOLS */}
             <CollapsibleSection icon={Wrench} title="Tools" summary={`${Array.isArray(agent.tools_enabled) ? agent.tools_enabled.length : (agent.tools_enabled && typeof agent.tools_enabled === 'string' ? JSON.parse(agent.tools_enabled).length : 0)} tools enabled`}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
@@ -1250,6 +1303,7 @@ export default function AgentDetail() {
               </div>
             </CollapsibleSection>
 
+            {/* 7. KNOWLEDGE BASE — still in Tools tab */}
             {/* 7. KNOWLEDGE BASE */}
             <CollapsibleSection icon={BookOpen} title="Knowledge Base" summary="0 documents · 0MB indexed">
               <div style={{ padding: '40px', border: `1px dashed rgba(255,255,255,0.2)`, borderRadius: '12px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', background: 'rgba(255,255,255,0.01)', cursor: 'pointer' }}>
@@ -1263,18 +1317,13 @@ export default function AgentDetail() {
               </div>
             </CollapsibleSection>
 
-            {/* 8. VOICEMAIL DETECTION */}
-            <CollapsibleSection icon={Voicemail} title="Voicemail Detection" summary={agent.voicemail_detection_enabled ? "Enabled" : "Disabled"}>
-              <Toggle checked={agent.voicemail_detection_enabled === 1} onChange={(v:any) => updateField('voicemail_detection_enabled', v?1:0)} label="Enable Voicemail Detection" />
-              {agent.voicemail_detection_enabled === 1 && (
-                <div style={{ marginTop: '16px' }}>
-                  <Label>Voicemail Message</Label>
-                  <Textarea value={agent.voicemail_message ?? ''} onChange={(v:any) => updateField('voicemail_message', v)} placeholder="Hello! Please call back later..." />
-                  <Helper>If voicemail detected, leave this message.</Helper>
-                </div>
-              )}
-            </CollapsibleSection>
+            {/* 11. EMBED / WEBSITE WIDGET — in Tools tab */}
+            {/* Embed section */}
+            <EmbedSection agent={agent} agentId={agentId} updateField={updateField} />
+            </>) /* end tools tab */}
 
+            {/* ══ ANALYSIS TAB ════════════════════════════════════════════════ */}
+            {activeTab === 'analysis' && (<>
             {/* 9. ANALYSIS & OUTCOMES */}
             <CollapsibleSection icon={LineChart} title="Analysis & Outcomes" summary={`Summary · Evaluation · Structured output ${agent.structured_output_enabled ? 'on' : 'off'}`}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
@@ -1294,6 +1343,21 @@ export default function AgentDetail() {
               </div>
             </CollapsibleSection>
 
+            {/* Voicemail Detection — also in Analysis tab */}
+            <CollapsibleSection icon={Voicemail} title="Voicemail Detection" summary={agent.voicemail_detection_enabled ? "Enabled" : "Disabled"}>
+              <Toggle checked={agent.voicemail_detection_enabled === 1} onChange={(v:any) => updateField('voicemail_detection_enabled', v?1:0)} label="Enable Voicemail Detection" />
+              {agent.voicemail_detection_enabled === 1 && (
+                <div style={{ marginTop: '16px' }}>
+                  <Label>Voicemail Message</Label>
+                  <Textarea value={agent.voicemail_message ?? ''} onChange={(v:any) => updateField('voicemail_message', v)} placeholder="Hello! Please call back later..." />
+                  <Helper>If voicemail detected, leave this message.</Helper>
+                </div>
+              )}
+            </CollapsibleSection>
+            </>) /* end analysis tab */}
+
+            {/* ══ ADVANCED TAB ════════════════════════════════════════════════ */}
+            {activeTab === 'advanced' && (<>
             {/* 10. ADVANCED */}
             <CollapsibleSection icon={Sliders} title="Advanced" summary="Recording Consent, Privacy, Keypad">
                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
@@ -1303,10 +1367,10 @@ export default function AgentDetail() {
                  <div><Label>PII Redaction</Label><Toggle checked={agent.pii_redaction_enabled === 1} onChange={(v:any) => updateField('pii_redaction_enabled', v?1:0)} label="Redact names, phone numbers" /></div>
                </div>
             </CollapsibleSection>
+            </>) /* end advanced tab */}
 
-            {/* 11. EMBED / WEBSITE WIDGET */}
-            <EmbedSection agent={agent} agentId={agentId} updateField={updateField} />
-
+            {/* ══ LOGS TAB ════════════════════════════════════════════════════ */}
+            {activeTab === 'logs' && (<>
             {/* 12. SIMULATION TESTING / TEST PANEL */}
             <CollapsibleSection icon={Activity} title="Simulation Testing" summary="Run real-time voice and text patient scenarios">
               <div style={{ height: '600px', display: 'flex', flexDirection: 'column' }}>
@@ -1323,6 +1387,7 @@ export default function AgentDetail() {
             <CollapsibleSection icon={LineChart} title="Agent Health" summary="Latency · Call stats · Eval scores">
               <AgentHealthTab agentId={agentId!} />
             </CollapsibleSection>
+            </>) /* end logs tab */}
             
           </div>
         </div>
