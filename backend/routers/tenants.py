@@ -17,6 +17,10 @@ class TenantCreate(BaseModel):
     clinic_name: str
     primary_language: str = "en-IN"
 
+class TenantUpdate(BaseModel):
+    clinic_name: str | None = None
+    google_sheets_webhook_url: str | None = None
+
 class TenantResponse(BaseModel):
     id: uuid.UUID
     clinic_name: str
@@ -142,3 +146,27 @@ async def delete_tenant(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
 
     await db.delete(tenant)
     await db.commit()
+
+
+@router.put("/{id}")
+async def update_tenant(id: uuid.UUID, payload: TenantUpdate, db: AsyncSession = Depends(get_db)):
+    """Update a tenant/clinic's profile details including webhook settings."""
+    result = await db.execute(select(Tenant).where(Tenant.id == id))
+    tenant = result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+        
+    if payload.clinic_name is not None:
+        tenant.clinic_name = payload.clinic_name
+    if payload.google_sheets_webhook_url is not None:
+        tenant.google_sheets_webhook_url = payload.google_sheets_webhook_url
+        
+    await db.commit()
+    await db.refresh(tenant)
+    return {
+        "id": str(tenant.id),
+        "clinic_name": tenant.clinic_name,
+        "google_sheets_webhook_url": tenant.google_sheets_webhook_url,
+        "language": tenant.language,
+        "ai_number": tenant.ai_number,
+    }
