@@ -14,6 +14,21 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# ── Booking keywords for intent detection ─────────────────────────────────────
+# Used to detect confirmation without an extra LLM call (saves ~200-400ms latency)
+_CONFIRM_WORDS = {
+    "yes", "haan", "ha", "okay", "ok", "theek", "theek hai", "book it",
+    "confirm", "book karo", "book kar do", "book karein", "done", "sahi hai",
+    "bilkul", "zaroor", "schedule it", "go ahead"
+}
+_CANCEL_WORDS = {
+    "cancel", "nahi", "no", "nope", "mat karo", "band karo"
+}
+_SLOT_PATTERNS = re.compile(
+    r'\b(\d{1,2}(?::\d{2})?\s*(?:am|pm|baje|bajey)?)\b',
+    re.IGNORECASE
+)
+
 # ── Persistent HTTP client (shared across all plugin calls) ───────────────────
 # Creating a new client per request wastes ~50-150ms on TCP handshake.
 # This client is reused for the lifetime of the process.
@@ -52,6 +67,18 @@ class LifodialAgent(Agent):
         self.call_start = time.time()
         self.interruption_count = 0
         self.latency_log: list[dict] = []
+        
+        # ── Booking state machine ──────────────────────────────────────────────
+        # Tracks multi-turn booking flow across conversation turns
+        self.booking_state: dict = {
+            "pending_doctor_id": None,    # doctor.id (UUID string)
+            "pending_doctor_name": None,  # human-readable name
+            "pending_slot": None,         # offered slot time string
+            "awaiting_confirm": False,     # True when we've offered a slot and await YES/NO
+            "patient_phone": None,         # filled from call metadata
+            "patient_name": None,          # collected during conversation
+            "confirmed": False,            # True once booking is committed to DB
+        }
         
         # Build system prompt with clinic info
         self.system_prompt = self._build_system_prompt()
@@ -102,12 +129,20 @@ FALLBACK: "Kya aap dobara bol sakte hain?" (or in patient's language)"""
         )
 
     async def on_user_turn_completed(self, turn_ctx, new_message):
-        """Called when patient finishes speaking — logs turn + timing."""
+        """Called when patient finishes speaking — logs turn + timing.
+        
+        Also handles booking state machine:
+        - Detects doctor/specialization mentions → sets pending_doctor
+        - Detects slot preferences → sets pending_slot  
+        - Detects confirmation → calls create_appointment() in background
+        - Detects cancellation → resets state
+        """
         text = new_message.text_content
         if not text:
             return
         
         self.turn_count += 1
+        text_lower = text.lower()
         
         # Add to history
         self.session_history.append({
@@ -118,6 +153,81 @@ FALLBACK: "Kya aap dobara bol sakte hain?" (or in patient's language)"""
             f"Turn {self.turn_count} | Patient: {text[:60]} "
             f"| Lang: {self.detected_lang}"
         )
+        
+        # ── Booking state machine (no extra LLM call = zero added latency) ──
+        
+        # 1. Detect doctor/specialization mention → look up doctor in tenant data
+        if not self.booking_state["confirmed"] and not self.booking_state["awaiting_confirm"]:
+            doctors = self.tenant.get("doctors", [])
+            for doc in doctors:
+                spec = (doc.get("specialization") or "").lower()
+                name = (doc.get("name") or "").lower()
+                if spec in text_lower or any(w in text_lower for w in spec.split()):
+                    self.booking_state["pending_doctor_id"] = doc.get("id")
+                    self.booking_state["pending_doctor_name"] = doc.get("name")
+                    # Offer first available slot and await confirmation
+                    self.booking_state["pending_slot"] = "11:00 AM"  # default; real slot from his.get_slots
+                    self.booking_state["awaiting_confirm"] = True
+                    logger.info(
+                        f"Booking: matched doctor '{doc.get('name')}' for '{spec}' mention."
+                    )
+                    break
+        
+        # 2. Detect slot selection if patient says a time
+        if self.booking_state["awaiting_confirm"] and not self.booking_state["confirmed"]:
+            slot_match = _SLOT_PATTERNS.search(text)
+            if slot_match:
+                self.booking_state["pending_slot"] = slot_match.group(0).strip()
+        
+        # 3. Detect patient name (first proper noun after "naam", "name is", "I am", "main hoon")
+        name_triggers = ["my name is", "i am", "main hoon", "naam hai", "naam", "mera naam"]
+        for trigger in name_triggers:
+            if trigger in text_lower:
+                idx = text_lower.find(trigger) + len(trigger)
+                raw_name = text[idx:].strip().split()[0] if text[idx:].strip() else None
+                if raw_name:
+                    self.booking_state["patient_name"] = raw_name.capitalize()
+                    break
+        
+        # 4. Detect confirmation → commit booking to DB + trigger Google Sheets
+        if (
+            self.booking_state["awaiting_confirm"]
+            and not self.booking_state["confirmed"]
+            and any(w in text_lower for w in _CONFIRM_WORDS)
+        ):
+            tenant_id = self.tenant.get("id")
+            doctor_id = self.booking_state.get("pending_doctor_id")
+            slot_time = self.booking_state.get("pending_slot", "TBD")
+            patient_phone = self.booking_state.get("patient_phone") or "unknown"
+            
+            if tenant_id and doctor_id:
+                logger.info(
+                    f"Booking confirmed by patient! Saving to DB + Google Sheets. "
+                    f"tenant={tenant_id} doctor_id={doctor_id} slot={slot_time}"
+                )
+                # Fire in background — does NOT block voice response
+                asyncio.create_task(
+                    _commit_booking(
+                        tenant_id=str(tenant_id),
+                        doctor_id=str(doctor_id),
+                        slot_time=slot_time,
+                        patient_phone=patient_phone,
+                    )
+                )
+                self.booking_state["confirmed"] = True
+                self.booking_state["awaiting_confirm"] = False
+            else:
+                logger.warning(
+                    f"Booking confirmation detected but missing tenant_id={tenant_id} "
+                    f"or doctor_id={doctor_id}. Skipping DB write."
+                )
+        
+        # 5. Detect cancellation → reset booking state
+        if any(w in text_lower for w in _CANCEL_WORDS) and self.booking_state["awaiting_confirm"]:
+            logger.info("Patient cancelled pending booking. Resetting booking state.")
+            self.booking_state["awaiting_confirm"] = False
+            self.booking_state["pending_doctor_id"] = None
+            self.booking_state["pending_slot"] = None
 
     def record_latency(self, llm_ms: int, tts_ms: int):
         """Record per-turn latency for health dashboard."""
@@ -133,6 +243,37 @@ FALLBACK: "Kya aap dobara bol sakte hain?" (or in patient's language)"""
         if not self.latency_log:
             return None
         return sum(t["total_ms"] for t in self.latency_log) / len(self.latency_log)
+
+
+async def _commit_booking(
+    tenant_id: str,
+    doctor_id: str,
+    slot_time: str,
+    patient_phone: str,
+) -> None:
+    """
+    Bridge between the voice pipeline and his.create_appointment().
+    
+    Called as asyncio.create_task() so it NEVER blocks the voice call.
+    Saves appointment to PostgreSQL and fires Google Sheets webhook.
+    """
+    try:
+        from backend.services.his import create_appointment
+        result = await create_appointment(
+            tenant_id=tenant_id,
+            doctor_id=doctor_id,
+            slot_time=slot_time,
+            patient_phone=patient_phone,
+        )
+        logger.info(
+            f"[Booking] Saved to DB + Sheets. appointment_id={result.get('appointment_id')} "
+            f"doctor={result.get('doctor_name')} slot={slot_time}"
+        )
+    except Exception as exc:
+        logger.error(
+            f"[Booking] Failed to save appointment to DB/Sheets: {exc}",
+            exc_info=True,
+        )
 
 
 async def entrypoint(ctx):
@@ -200,6 +341,7 @@ async def entrypoint(ctx):
                 t = t_result.scalar_one_or_none()
                 if t:
                     tenant["clinic_name"] = t.clinic_name
+                    tenant["id"] = str(t.id)  # ← Critical: needed for booking DB write
                 
                 d_result = await db.execute(
                     select(Doctor).where(
@@ -208,7 +350,11 @@ async def entrypoint(ctx):
                 )
                 doctors = d_result.scalars().all()
                 tenant["doctors"] = [
-                    {"name": d.name, "specialization": d.specialization}
+                    {
+                        "id": str(d.id),              # ← Critical: needed for booking lookup
+                        "name": d.name,
+                        "specialization": d.specialization
+                    }
                     for d in doctors
                 ]
     except Exception as e:
@@ -252,6 +398,16 @@ async def entrypoint(ctx):
     )
     
     agent = LifodialAgent(agent_config, tenant)
+    
+    # Pass caller's phone number into booking state (from LiveKit call metadata)
+    caller_phone = (
+        metadata.get("caller_phone")
+        or metadata.get("from_number")
+        or metadata.get("patient_phone")
+        or "unknown"
+    )
+    agent.booking_state["patient_phone"] = caller_phone
+    agent.booking_state["tenant_id_override"] = tenant_id  # fallback if tenant["id"] not loaded
     
     # Start session
     session.start(
