@@ -581,7 +581,7 @@ export default function AgentDetail() {
   const [showTest, setShowTest] = useState(false);
   const timerRef = useRef<any>(null);
   
-  // Vapi-style tab navigation
+  // Scroll-spy tab navigation
   type AgentTab = 'assistant' | 'logs' | 'tools' | 'analysis' | 'advanced';
   const [activeTab, setActiveTab] = useState<AgentTab>('assistant');
   const AGENT_TABS: { id: AgentTab; label: string; icon: any }[] = [
@@ -591,6 +591,48 @@ export default function AgentDetail() {
     { id: 'analysis',  label: 'Analysis',   icon: Activity },
     { id: 'advanced',  label: 'Advanced',   icon: Sliders },
   ];
+
+  // Refs for scroll-spy section anchors
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const sectionRefs = useRef<Record<AgentTab, HTMLDivElement | null>>({
+    assistant: null, logs: null, tools: null, analysis: null, advanced: null,
+  });
+
+  // Scroll to section when tab is clicked
+  const handleTabClick = (tabId: AgentTab) => {
+    setActiveTab(tabId);
+    const el = sectionRefs.current[tabId];
+    if (el && scrollContainerRef.current) {
+      const containerTop = scrollContainerRef.current.getBoundingClientRect().top;
+      const elTop = el.getBoundingClientRect().top;
+      const offset = elTop - containerTop + scrollContainerRef.current.scrollTop - 16;
+      scrollContainerRef.current.scrollTo({ top: offset, behavior: 'smooth' });
+    }
+  };
+
+  // IntersectionObserver for scroll-spy
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        // Find the topmost section that is intersecting
+        const visible = entries
+          .filter(e => e.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        if (visible.length > 0) {
+          const id = visible[0].target.getAttribute('data-section') as AgentTab;
+          if (id) setActiveTab(id);
+        }
+      },
+      { root: container, rootMargin: '-20% 0px -60% 0px', threshold: 0 }
+    );
+    // Observe all section refs
+    Object.entries(sectionRefs.current).forEach(([, el]) => {
+      if (el) observer.observe(el);
+    });
+    return () => observer.disconnect();
+  }, [agent]); // re-run when agent loads
   
   // Test lab state
   const [testTab, setTestTab] = useState<'voice'|'chat'>('voice');
@@ -976,7 +1018,7 @@ export default function AgentDetail() {
         </div>
       </header>
 
-      {/* ── VAPI-STYLE TAB BAR ────────────────────────────────────────────────── */}
+      {/* ── VAPI-STYLE TAB BAR (scroll-spy) ─────────────────────────────────── */}
       <div style={{ borderBottom: `1px solid ${BORDER}`, background: '#080808', padding: '0 24px', display: 'flex', gap: '4px' }}>
         {AGENT_TABS.map(tab => {
           const isActive = activeTab === tab.id;
@@ -984,7 +1026,7 @@ export default function AgentDetail() {
           return (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => handleTabClick(tab.id)}
               style={{
                 display: 'flex', alignItems: 'center', gap: 7,
                 padding: '10px 18px',
@@ -1011,12 +1053,12 @@ export default function AgentDetail() {
       {/* ── CONTENT BODY ──────────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
         
-        {/* Scrollable Form */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '32px 40px', display: 'flex', justifyContent: 'center' }}>
-          <div style={{ width: '100%', maxWidth: '840px', paddingBottom: '60px' }}>
+        {/* Scrollable Form — all sections rendered, scroll-spy updates tab */}
+        <div ref={scrollContainerRef} style={{ flex: 1, overflowY: 'auto', padding: '32px 40px', display: 'flex', justifyContent: 'center' }}>
+          <div style={{ width: '100%', maxWidth: '840px', paddingBottom: '120px' }}>
             
-            {/* ══ ASSISTANT TAB ═══════════════════════════════════════════════ */}
-            {activeTab === 'assistant' && (<>
+            {/* ══ ASSISTANT SECTION ════════════════════════════════════════════ */}
+            <div ref={el => { sectionRefs.current.assistant = el; }} data-section="assistant">
             {/* 1. MODEL */}
             <CollapsibleSection icon={Brain} title="Model" summary={`${agent.llm_provider} · ${agent.llm_model}`}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
@@ -1261,12 +1303,10 @@ export default function AgentDetail() {
               </div>
             </CollapsibleSection>
 
-            {/* 8. VOICEMAIL DETECTION — last in Assistant tab */}
-            {/* 6. VOICEMAIL moved here, end assistant tab below */}
-            </>) /* end assistant tab */}
+            </div>{/* end assistant section */}
 
-            {/* ══ TOOLS TAB ═══════════════════════════════════════════════════ */}
-            {activeTab === 'tools' && (<>
+            {/* ══ TOOLS SECTION ═════════════════════════════════════════════════ */}
+            <div ref={el => { sectionRefs.current.tools = el; }} data-section="tools">
             {/* 6. TOOLS */}
             <CollapsibleSection icon={Wrench} title="Tools" summary={`${Array.isArray(agent.tools_enabled) ? agent.tools_enabled.length : (agent.tools_enabled && typeof agent.tools_enabled === 'string' ? JSON.parse(agent.tools_enabled).length : 0)} tools enabled`}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
@@ -1317,13 +1357,13 @@ export default function AgentDetail() {
               </div>
             </CollapsibleSection>
 
-            {/* 11. EMBED / WEBSITE WIDGET — in Tools tab */}
-            {/* Embed section */}
+            {/* 11. EMBED / WEBSITE WIDGET */}
             <EmbedSection agent={agent} agentId={agentId} updateField={updateField} />
-            </>) /* end tools tab */}
 
-            {/* ══ ANALYSIS TAB ════════════════════════════════════════════════ */}
-            {activeTab === 'analysis' && (<>
+            </div>{/* end tools section */}
+
+            {/* ══ ANALYSIS SECTION ══════════════════════════════════════════════ */}
+            <div ref={el => { sectionRefs.current.analysis = el; }} data-section="analysis">
             {/* 9. ANALYSIS & OUTCOMES */}
             <CollapsibleSection icon={LineChart} title="Analysis & Outcomes" summary={`Summary · Evaluation · Structured output ${agent.structured_output_enabled ? 'on' : 'off'}`}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
@@ -1354,10 +1394,11 @@ export default function AgentDetail() {
                 </div>
               )}
             </CollapsibleSection>
-            </>) /* end analysis tab */}
 
-            {/* ══ ADVANCED TAB ════════════════════════════════════════════════ */}
-            {activeTab === 'advanced' && (<>
+            </div>{/* end analysis section */}
+
+            {/* ══ ADVANCED SECTION ══════════════════════════════════════════════ */}
+            <div ref={el => { sectionRefs.current.advanced = el; }} data-section="advanced">
             {/* 10. ADVANCED */}
             <CollapsibleSection icon={Sliders} title="Advanced" summary="Recording Consent, Privacy, Keypad">
                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
@@ -1367,10 +1408,11 @@ export default function AgentDetail() {
                  <div><Label>PII Redaction</Label><Toggle checked={agent.pii_redaction_enabled === 1} onChange={(v:any) => updateField('pii_redaction_enabled', v?1:0)} label="Redact names, phone numbers" /></div>
                </div>
             </CollapsibleSection>
-            </>) /* end advanced tab */}
 
-            {/* ══ LOGS TAB ════════════════════════════════════════════════════ */}
-            {activeTab === 'logs' && (<>
+            </div>{/* end advanced section */}
+
+            {/* ══ LOGS SECTION (Simulation + Health) ═════════════════════════════ */}
+            <div ref={el => { sectionRefs.current.logs = el; }} data-section="logs">
             {/* 12. SIMULATION TESTING / TEST PANEL */}
             <CollapsibleSection icon={Activity} title="Simulation Testing" summary="Run real-time voice and text patient scenarios">
               <div style={{ height: '600px', display: 'flex', flexDirection: 'column' }}>
@@ -1387,12 +1429,12 @@ export default function AgentDetail() {
             <CollapsibleSection icon={LineChart} title="Agent Health" summary="Latency · Call stats · Eval scores">
               <AgentHealthTab agentId={agentId!} />
             </CollapsibleSection>
-            </>) /* end logs tab */}
-            
+
+            </div>{/* end logs section */}
+
           </div>
         </div>
 
-        {/* ── TEST PANEL: rendered outside the scroll container as a fixed overlay ── */}
       </div>
 
       {/* ── FOOTER MANUAL SAVE ────────────────────────────────────────────────── */}
