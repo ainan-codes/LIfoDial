@@ -615,6 +615,7 @@ async def delete_agent(agent_id: str) -> None:
 async def test_agent_text(agent_id: str, body: dict = Body(...)) -> dict:
     import time
     patient_message = body.get("message", "Hello")
+    session_id = body.get("session_id") or f"chat-test-{agent_id}"
     try:
         async with async_session() as session:
             result = await session.execute(
@@ -624,27 +625,26 @@ async def test_agent_text(agent_id: str, body: dict = Body(...)) -> dict:
             if not agent:
                 raise HTTPException(status_code=404, detail="Agent not found")
 
-        t0 = time.monotonic()
-        try:
-            from google import genai
-            client = genai.Client(api_key=settings.gemini_api_key)
-            full_prompt = f"{agent.system_prompt}\n\nPatient: {patient_message}\nAgent:"
-            response = client.models.generate_content(
-                model=agent.llm_model,
-                contents=full_prompt,
+            t0 = time.monotonic()
+            
+            # Use generate_llm_response which supports Groq/Gemini, conversation memory, and action tags interceptor!
+            from backend.routers.agent_test import generate_llm_response
+            
+            ai_text = await generate_llm_response(
+                agent=agent,
+                user_message=patient_message,
+                db=session,
+                session_id=session_id
             )
-            ai_text = response.text.strip()
-        except Exception as err:
-            logger.warning("Gemini test failed: %s", err)
-            ai_text = f"I'm {agent.agent_name}. How can I help you today?"
-        latency_ms = int((time.monotonic() - t0) * 1000)
+            
+            latency_ms = int((time.monotonic() - t0) * 1000)
 
-        return {
-            "agent_id": agent_id,
-            "patient_message": patient_message,
-            "ai_response": ai_text,
-            "latency_ms": latency_ms,
-        }
+            return {
+                "agent_id": agent_id,
+                "patient_message": patient_message,
+                "ai_response": ai_text,
+                "latency_ms": latency_ms,
+            }
     except HTTPException:
         raise
     except Exception as e:
