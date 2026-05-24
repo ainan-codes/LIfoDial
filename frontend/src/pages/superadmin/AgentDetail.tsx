@@ -601,8 +601,6 @@ export default function AgentDetail() {
   // Scroll to section when tab is clicked
   const handleTabClick = (tabId: AgentTab) => {
     setActiveTab(tabId);
-    // Auto-scroll disabled to satisfy "do not promote the auto scroll" requirement
-    /*
     const el = sectionRefs.current[tabId];
     if (el && scrollContainerRef.current) {
       const containerTop = scrollContainerRef.current.getBoundingClientRect().top;
@@ -610,7 +608,6 @@ export default function AgentDetail() {
       const offset = elTop - containerTop + scrollContainerRef.current.scrollTop - 16;
       scrollContainerRef.current.scrollTo({ top: offset, behavior: 'smooth' });
     }
-    */
   };
 
   // IntersectionObserver for scroll-spy
@@ -1344,6 +1341,22 @@ export default function AgentDetail() {
                 <Helper>Define custom functions to extend agent capabilities via your own webhooks.</Helper>
                 <button style={{ marginTop: '12px', padding: '8px 16px', background: 'none', border: `1px solid ${BORDER}`, color: '#fff', borderRadius: '8px', fontSize: '13px', cursor: 'pointer' }}>+ Add Function</button>
               </div>
+
+              <div style={{ marginTop: '20px', paddingTop: '20px', borderTop: `1px solid ${BORDER}` }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+                  <Globe size={14} color={ACCENT} />
+                  <span style={{ fontSize: '12px', fontWeight: 600, color: '#fff', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Google Sheets Integration</span>
+                </div>
+                <Label>Google Sheets Webapp URL</Label>
+                <Input 
+                  value={agent.google_sheets_webhook_url} 
+                  onChange={(v:any) => updateField('google_sheets_webhook_url', v)} 
+                  placeholder="e.g. https://script.google.com/macros/s/.../exec"
+                />
+                <Helper>
+                  Paste the deployed Google Apps Script Web App URL here. Every time a patient books, reschedules, or cancels an appointment, the details will automatically sync with this Google Sheet.
+                </Helper>
+              </div>
             </CollapsibleSection>
 
             {/* 7. KNOWLEDGE BASE — still in Tools tab */}
@@ -1357,24 +1370,6 @@ export default function AgentDetail() {
               <div style={{ marginTop: '20px' }}>
                 <Label>Search Test</Label>
                 <Input placeholder="Type a question to test retrieval..." onChange={()=>{}} />
-              </div>
-            </CollapsibleSection>
-
-            {/* Google Sheets Integration Section */}
-            <CollapsibleSection icon={Globe} title="Google Sheets Integration" summary={agent.google_sheets_webhook_url ? "Connected" : "Not configured"}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                <div>
-                  <Label>Google Sheets Webapp URL</Label>
-                  <Input 
-                    value={agent.google_sheets_webhook_url} 
-                    onChange={(v:any) => updateField('google_sheets_webhook_url', v)} 
-                    placeholder="e.g. https://script.google.com/macros/s/.../exec"
-                  />
-                  <Helper>
-                    Paste the deployed Google Apps Script Web App URL here. 
-                    Every time a patient books, reschedules, or cancels an appointment, the details will automatically sync with this Google Sheet.
-                  </Helper>
-                </div>
               </div>
             </CollapsibleSection>
 
