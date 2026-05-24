@@ -450,8 +450,6 @@ async def entrypoint(ctx) -> None:
         settings=GoogleLLMService.Settings(
             temperature=float(agent_config.get("llm_temperature", 0.3)),
             max_tokens=int(agent_config.get("max_response_tokens", 120)),
-            # Disable thinking for 2.5 series to reduce latency
-            thinking=GoogleLLMService.ThinkingConfig(thinking_budget=0),
         ),
     )
 
