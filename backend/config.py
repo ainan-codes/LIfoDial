@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     secret_key: str = "change_me"
 
     # ── Database ───────────────────────────────────────────────────────────
-    database_url: str = os.getenv("DATABASE_URL", "")
+    database_url: str = ""
     postgres_user: str = "lifodial"
     postgres_password: str = "change_this_strong_password"
 

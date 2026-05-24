@@ -138,4 +138,7 @@ services:
 
     envVars:
       - key: VITE_API_URL
-        value: https://lifodial-api.onrender.com
+        fromService:
+          type: web
+          name: lifodial-api
+          property: url
