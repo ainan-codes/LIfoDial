@@ -319,8 +319,10 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     const dataArray = new Uint8Array(analyser.frequencyBinCount);
     let smoothLevel = 0;
 
-    const SPEECH_THRESHOLD = 12;   // Min avg amplitude to consider speech
-    const SILENCE_DURATION = 1200; // ms of silence before sending chunk (ISSUE 3)
+    const SPEECH_THRESHOLD = 25;   // Min avg amplitude to consider speech (increased to ignore noise)
+    const SILENCE_DURATION = 1500; // ms of silence before sending chunk
+    const WARMUP_DELAY = 500;      // ms to ignore mic input on start (avoid pops)
+    const startedAt = Date.now();
 
     const checkLevel = () => {
       analyser.getByteFrequencyData(dataArray);
@@ -331,7 +333,8 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
       smoothLevel = smoothLevel * 0.7 + normalized * 0.3;
       setAudioLevel(smoothLevel);
 
-      const speaking = avg > SPEECH_THRESHOLD;
+      const isWarm = Date.now() - startedAt > WARMUP_DELAY;
+      const speaking = isWarm && (avg > SPEECH_THRESHOLD);
       setIsSpeaking(speaking);
 
       // VAD: detect speech start/stop for auto-chunking
@@ -533,7 +536,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     }, 1400);
   };
 
-  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  // useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
   // ISSUE 4: Cleanup on unmount
   useEffect(() => {
@@ -1037,7 +1040,7 @@ function ChatMode({ agent, agentId: directId, agentName: directName }: { agent?:
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  // useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
   useEffect(() => {
     const init = async () => {

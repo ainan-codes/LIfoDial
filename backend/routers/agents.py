@@ -196,6 +196,7 @@ class AgentPatchPayload(BaseModel):
     livekit_api_key: str | None = None
     livekit_api_secret: str | None = None
     existing_clinic_number: str | None = None
+    google_sheets_webhook_url: str | None = None
     
     status: str | None = None
 
@@ -248,6 +249,7 @@ def _agent_to_dict(agent: AgentConfig, clinic_name: str = "") -> dict:
         "hipaa_enabled": False,
         "pii_redaction_enabled": False,
         "transcriber_keywords": "[]",
+        "google_sheets_webhook_url": "",
     }
     for key, default in _defaults.items():
         if key not in data or data[key] is None:
@@ -424,6 +426,12 @@ async def get_agent(agent_id: str) -> dict:
                 raise HTTPException(status_code=404, detail="Agent not found")
             agent, clinic_name = row
             data = _agent_to_dict(agent, clinic_name)
+            
+            # Fetch Tenant google_sheets_webhook_url
+            t_res = await session.execute(select(Tenant).where(Tenant.id == agent.tenant_id))
+            tenant = t_res.scalar_one_or_none()
+            data["google_sheets_webhook_url"] = tenant.google_sheets_webhook_url if tenant else ""
+            
             # Include full prompt for edit page
             data["system_prompt"] = agent.system_prompt
             data["first_message"] = agent.first_message
@@ -556,6 +564,13 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload) -> dict:
             agent = result.scalar_one_or_none()
             if not agent:
                 raise HTTPException(status_code=404, detail="Agent not found")
+
+            # If google_sheets_webhook_url is provided, update the Tenant's record
+            if payload.google_sheets_webhook_url is not None:
+                t_res = await session.execute(select(Tenant).where(Tenant.id == agent.tenant_id))
+                tenant = t_res.scalar_one_or_none()
+                if tenant:
+                    tenant.google_sheets_webhook_url = payload.google_sheets_webhook_url.strip() if payload.google_sheets_webhook_url else None
 
             # Only set fields that actually exist as DB columns on AgentConfig
             _model_columns = {c.name for c in AgentConfig.__table__.columns}

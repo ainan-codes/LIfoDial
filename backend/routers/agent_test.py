@@ -10,8 +10,10 @@ import time
 import uuid
 import base64
 import os
+import re
 from collections import defaultdict
 from typing import AsyncGenerator, Optional
+from backend.services.sheets import log_booking_to_sheets
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import StreamingResponse, HTMLResponse
@@ -1937,6 +1939,55 @@ async def openai_transcribe(api_key: str, audio_bytes: bytes) -> tuple[str, str]
         return "", ""
 
 
+async def sync_and_log_appointment(action: str, name: str, phone: str, date: str, time: str, doctor: str, notes: str, tenant_id: str, webhook_url: str | None):
+    """
+    Sequentially handles:
+    1. Replicating the Book/Reschedule/Cancel request to Supabase / local DB.
+    2. Extracting the database-generated UUID of the appointment.
+    3. Logging the details (including ID, Status, and Notes) to the clinic's Google Sheets webhook.
+    """
+    try:
+        from backend.services.his import sync_appointment_to_db
+        from backend.services.sheets import log_booking_to_sheets
+        
+        # 1. DB Sync (wait for it to get the generated UUID)
+        db_res = await sync_appointment_to_db(
+            action=action,
+            name=name,
+            phone=phone,
+            date_str=date,
+            time_str=time,
+            doctor_name=doctor,
+            tenant_id=tenant_id,
+            notes=notes
+        )
+        
+        appointment_id = "N/A"
+        status = "cancelled" if action == "CANCEL" else "confirmed"
+        notes_saved = notes
+        
+        if db_res:
+            appointment_id = db_res.get("appointment_id", "N/A")
+            status = db_res.get("status", "confirmed")
+            notes_saved = db_res.get("notes") or notes
+            
+        # 2. Log to Google Sheets
+        await log_booking_to_sheets(
+            action=action,
+            name=name,
+            phone=phone,
+            date=date,
+            time=time,
+            doctor=doctor,
+            appointment_id=appointment_id,
+            status=status,
+            notes=notes_saved,
+            webhook_url=webhook_url
+        )
+    except Exception as e:
+        logger.error(f"Error in sync_and_log_appointment background task: {e}", exc_info=True)
+
+
 # ── LLM Logic ─────────────────────────────────────────────────────────────────
 
 # Store conversation history per session (in-memory for now)
@@ -2065,6 +2116,15 @@ async def generate_llm_response(
         "5. GREETING RULE: You have ALREADY greeted the user with the opening message. "
         "Do NOT repeat the welcome greeting. If the user says Hello or Hi, respond naturally "
         "as a conversation continuation, NOT a new greeting.\n"
+        "6. ACTION RULE: If the user wants to BOOK, RESCHEDULE, or CANCEL an appointment, strictly follow these conditions:\n"
+        "   - BOOK: Politely collect their Name, Phone number, preferred Date, preferred Time, and the Doctor's name (if known).\n"
+        "   - RESCHEDULE or CANCEL: To secure and verify their request, you MUST smartly ask for BOTH their Name and Phone number. Do NOT trigger the action until you have collected and confirmed both details.\n"
+        "   - NOTES: Capture any symptoms, reasons for the visit/reschedule/cancellation, or special requests they mention (or use 'N/A' if none).\n"
+        "Once you have all details, append exactly ONE of these tags at the very end of your response:\n"
+        "   - [ACTION: BOOK|Name|Phone|Date|Time|Doctor|Notes]\n"
+        "   - [ACTION: RESCHEDULE|Name|Phone|Date|Time|Doctor|Notes]\n"
+        "   - [ACTION: CANCEL|Name|Phone|Date|Time|Doctor|Notes]\n"
+        "   (For reschedule and cancel, you MUST specify the verified Name and Phone, using 'N/A' for fields like Date/Time/Doctor if they are not being changed or aren't relevant).\n"
         "--- END MANDATORY INSTRUCTIONS ---\n"
     )
     
@@ -2123,6 +2183,42 @@ async def generate_llm_response(
         else:
             response = generate_demo_response(agent, user_message, history)
         
+        # Intercept Action Trigger (BOOK/RESCHEDULE/CANCEL)
+        action_match = re.search(r'\[ACTION:\s*(BOOK|RESCHEDULE|CANCEL)\|(.*?)\|(.*?)\|(.*?)\|(.*?)\|(.*?)(?:\|(.*?))?\]', response)
+        if action_match:
+            groups = action_match.groups()
+            b_action = groups[0].strip()
+            b_name = groups[1].strip()
+            b_phone = groups[2].strip()
+            b_date = groups[3].strip()
+            b_time = groups[4].strip()
+            b_doctor = groups[5].strip()
+            b_notes = groups[6].strip() if groups[6] is not None else "N/A"
+            
+            tenant_webhook_url = None
+            try:
+                from backend.models.tenant import Tenant
+                t_res = await db.execute(select(Tenant).where(Tenant.id == agent.tenant_id))
+                tenant = t_res.scalar_one_or_none()
+                if tenant and tenant.google_sheets_webhook_url:
+                    tenant_webhook_url = tenant.google_sheets_webhook_url
+            except Exception as e:
+                logger.error(f"Failed to fetch tenant webhook url: {e}")
+
+            # Fire off unified background task for DB sync + Sheets logging sequentially
+            asyncio.create_task(sync_and_log_appointment(
+                action=b_action,
+                name=b_name,
+                phone=b_phone,
+                date=b_date,
+                time=b_time,
+                doctor=b_doctor,
+                notes=b_notes,
+                tenant_id=agent.tenant_id,
+                webhook_url=tenant_webhook_url
+            ))
+            response = re.sub(r'\[ACTION:.*?\]', '', response).strip()
+
         # Add response to history
         history.append({"role": "assistant", "content": response})
         
@@ -2204,6 +2300,42 @@ async def generate_llm_response(
                         )
                     else:
                         continue
+
+                    # Intercept Action Trigger for fallback
+                    action_match = re.search(r'\[ACTION:\s*(BOOK|RESCHEDULE|CANCEL)\|(.*?)\|(.*?)\|(.*?)\|(.*?)\|(.*?)(?:\|(.*?))?\]', response)
+                    if action_match:
+                        groups = action_match.groups()
+                        b_action = groups[0].strip()
+                        b_name = groups[1].strip()
+                        b_phone = groups[2].strip()
+                        b_date = groups[3].strip()
+                        b_time = groups[4].strip()
+                        b_doctor = groups[5].strip()
+                        b_notes = groups[6].strip() if groups[6] is not None else "N/A"
+                        
+                        tenant_webhook_url = None
+                        try:
+                            from backend.models.tenant import Tenant
+                            t_res = await db.execute(select(Tenant).where(Tenant.id == agent.tenant_id))
+                            tenant = t_res.scalar_one_or_none()
+                            if tenant and tenant.google_sheets_webhook_url:
+                                tenant_webhook_url = tenant.google_sheets_webhook_url
+                        except Exception as e:
+                            logger.error(f"Failed to fetch tenant webhook url: {e}")
+
+                        # Fire off unified background task for DB sync + Sheets logging sequentially
+                        asyncio.create_task(sync_and_log_appointment(
+                            action=b_action,
+                            name=b_name,
+                            phone=b_phone,
+                            date=b_date,
+                            time=b_time,
+                            doctor=b_doctor,
+                            notes=b_notes,
+                            tenant_id=agent.tenant_id,
+                            webhook_url=tenant_webhook_url
+                        ))
+                        response = re.sub(r'\[ACTION:.*?\]', '', response).strip()
 
                     history.append({"role": "assistant", "content": response})
                     if len(history) > 20:

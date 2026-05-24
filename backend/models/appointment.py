@@ -41,6 +41,7 @@ class Appointment(Base):
     )
     his_booking_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     call_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    notes: Mapped[str | None] = mapped_column(String(1000), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

@@ -147,3 +147,83 @@ async def create_appointment(tenant_id: str, doctor_id: str, slot_time: str, pat
         asyncio.create_task(send_to_sheets_webhook(clinic_webhook, appointment_data))
 
         return appointment_data
+
+async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: str, time_str: str, doctor_name: str, tenant_id: str, notes: str = None) -> dict | None:
+    """
+    Intelligently Book, Reschedule, or Cancel an appointment in the local DB.
+    `action` is one of: BOOK, RESCHEDULE, CANCEL.
+    Returns a dictionary of the updated/created appointment details (id, status, notes) or None on failure.
+    Requires matching BOTH name and phone number for CANCEL and RESCHEDULE.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            # Clean inputs
+            name_clean = name.strip()
+            phone_clean = phone.strip()
+            notes_clean = notes.strip() if notes else None
+            if notes_clean and notes_clean.lower() == "n/a":
+                notes_clean = None
+
+            if action in ["CANCEL", "RESCHEDULE"]:
+                # Match strictly with patient_phone AND patient_name (case insensitive match on name)
+                stmt = select(Appointment).where(
+                    Appointment.tenant_id == tenant_id,
+                    Appointment.patient_phone == phone_clean,
+                    Appointment.patient_name.ilike(f"%{name_clean}%"),
+                    Appointment.status.in_(["pending", "confirmed"])
+                ).order_by(Appointment.slot_time.asc())
+                result = await session.execute(stmt)
+                appt = result.scalars().first()
+                
+                if not appt:
+                    logger.warning(f"No active appointment found matching phone {phone_clean} and name '{name_clean}' to {action}.")
+                    return None
+                    
+                if action == "CANCEL":
+                    appt.status = "cancelled"
+                elif action == "RESCHEDULE":
+                    appt.slot_time = datetime.utcnow() # mock parsed datetime
+                
+                if notes_clean:
+                    appt.notes = notes_clean
+                    
+                await session.commit()
+                await session.refresh(appt)
+                return {
+                    "appointment_id": str(appt.id),
+                    "status": appt.status,
+                    "notes": appt.notes or ""
+                }
+                
+            elif action == "BOOK":
+                stmt = select(Doctor).where(Doctor.tenant_id == tenant_id, Doctor.name.ilike(f"%{doctor_name}%"))
+                result = await session.execute(stmt)
+                doctor = result.scalars().first()
+                
+                if not doctor:
+                    doc_stmt = select(Doctor).where(Doctor.tenant_id == tenant_id)
+                    doctor = (await session.execute(doc_stmt)).scalars().first()
+                    
+                # We need a fallback ID if absolutely no doctors exist
+                doctor_id = doctor.id if doctor else "00000000-0000-0000-0000-000000000000"
+                
+                new_appt = Appointment(
+                    tenant_id=tenant_id,
+                    doctor_id=doctor_id,
+                    slot_time=datetime.utcnow(), # mock parsed datetime
+                    patient_phone=phone_clean,
+                    patient_name=name_clean,
+                    status="confirmed",
+                    notes=notes_clean
+                )
+                session.add(new_appt)
+                await session.commit()
+                await session.refresh(new_appt)
+                return {
+                    "appointment_id": str(new_appt.id),
+                    "status": new_appt.status,
+                    "notes": new_appt.notes or ""
+                }
+    except Exception as e:
+        logger.error(f"DB Sync error for {action}: {e}", exc_info=True)
+        return None
