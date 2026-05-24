@@ -242,6 +242,11 @@ _agent_speaking: dict[str, asyncio.Event] = {}
 # Checked at key points in handle_audio_turn to abort in-flight work instantly.
 _session_cancelled: dict[str, asyncio.Event] = {}
 
+# ── Per-session active audio turn tasks ───────────────────────────────────────
+# Maps ws_session_id → asyncio.Task. The current active handle_audio_turn task.
+_active_audio_tasks: dict[str, asyncio.Task] = {}
+
+
 # ── WS /ws/agent-call/{agent_id} ──────────────────────────────────────────────
 
 @router.websocket("/ws/agent-call/{agent_id}")
@@ -420,17 +425,27 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
                     )
                     continue  # Skip STT for this chunk
 
-                try:
-                    async with AsyncSessionLocal() as db:
-                        await handle_audio_turn(websocket, agent, raw_bytes, db, ws_session_id)
-                except Exception as e:
-                    logger.error(f"Audio turn error for {agent_id}: {e}", exc_info=True)
+                # Cancel existing audio task if any is still running to achieve true barge-in / interruption
+                active_task = _active_audio_tasks.get(ws_session_id)
+                if active_task and not active_task.done():
+                    logger.info(f"Interrupting/Cancelling active audio turn task for session {ws_session_id} due to new incoming audio")
+                    active_task.cancel()
+
+                async def run_turn(bytes_to_process: bytes):
                     try:
-                        await websocket.send_json({"type": "error", "message": f"Processing error: {e}"})
-                        await websocket.send_json({"type": "status", "status": "idle"})
-                    except Exception:
-                        call_active = False
-                        break
+                        async with AsyncSessionLocal() as db:
+                            await handle_audio_turn(websocket, agent, bytes_to_process, db, ws_session_id)
+                    except asyncio.CancelledError:
+                        logger.info(f"Audio turn task cancelled for session {ws_session_id}")
+                    except Exception as e:
+                        logger.error(f"Background audio turn error for {agent_id}: {e}", exc_info=True)
+                        try:
+                            await websocket.send_json({"type": "error", "message": f"Processing error: {e}"})
+                            await websocket.send_json({"type": "status", "status": "idle"})
+                        except Exception:
+                            pass
+
+                _active_audio_tasks[ws_session_id] = asyncio.create_task(run_turn(raw_bytes))
                 continue
 
             # ── Text frame ──
@@ -453,6 +468,13 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
                 elif msg_type == "interrupt":
                     # ── Barge-in: user spoke while agent was playing audio ──
                     logger.info(f"Interrupt received from client for {agent_id}")
+                    
+                    # Cancel any active audio turn task immediately
+                    active_task = _active_audio_tasks.get(ws_session_id)
+                    if active_task and not active_task.done():
+                        logger.info(f"Cancelling active audio turn task for session {ws_session_id} due to interrupt")
+                        active_task.cancel()
+
                     # Signal any in-flight TTS/greeting to abort
                     interrupt_event.set()
                     # Cancel greeting task if still running
@@ -504,6 +526,13 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
         # Signal cancellation so any in-flight handle_audio_turn aborts
         call_active = False
         cancel_event.set()
+        
+        # Cancel any active audio turn task
+        active_task = _active_audio_tasks.pop(ws_session_id, None)
+        if active_task and not active_task.done():
+            logger.info(f"Cancelling active audio turn task for session {ws_session_id} due to call end")
+            active_task.cancel()
+
         if greeting_task and not greeting_task.done():
             greeting_task.cancel()
             try:
@@ -516,6 +545,7 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
         _session_cancelled.pop(ws_session_id, None)
         _session_turn_count.pop(ws_session_id, None)
         _session_language_override.pop(ws_session_id, None)
+        _active_audio_tasks.pop(ws_session_id, None)
         # Clean up conversation history for this session
         _conversation_history.pop(ws_session_id, None)
         logger.info(f"Voice call ended cleanly for {agent_id}")
