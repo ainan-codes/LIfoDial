@@ -430,9 +430,9 @@ async def entrypoint(ctx) -> None:
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    stop_secs=0.5,      # 500ms silence before turn ends
-                    start_secs=0.2,     # 200ms speech before turn starts
-                    confidence=0.5,     # VAD confidence threshold
+                    stop_secs=0.85,     # 850ms silence before turn ends (allows natural mid-turn pauses)
+                    start_secs=0.35,    # 350ms continuous speech to avoid brief noise/breath trigger
+                    confidence=0.7,     # 70% confidence threshold to prevent false VAD triggers
                 )
             ),
         ),

@@ -98,8 +98,6 @@ class BookingProcessor(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         """Pass every frame through; inspect TranscriptionFrames for state triggers."""
-        await super().process_frame(frame, direction)
-
         if isinstance(frame, TranscriptionFrame) and frame.text:
             await self._handle_transcription(frame.text)
 

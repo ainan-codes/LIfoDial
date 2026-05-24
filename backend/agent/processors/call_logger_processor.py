@@ -75,8 +75,6 @@ class CallLoggerProcessor(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         """Intercept lifecycle frames and log to DB. Always push frame downstream."""
-        await super().process_frame(frame, direction)
-
         try:
             if isinstance(frame, TranscriptionFrame) and frame.text:
                 await self._on_user_speech(frame.text)
