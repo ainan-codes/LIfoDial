@@ -777,96 +777,122 @@
   }
 
 
+  let activeProcessor = null;
+  let activeDummyGain = null;
+  let activeSourceNode = null;
+
   function startRecording(stream) {
-    const mimeType = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm'].find(t => MediaRecorder.isTypeSupported(t)) || '';
-    let chunks = [];
-    let chunkStart = Date.now();
-
-    // ── Voice Activity Detection via AudioContext Analyser ─────────────────
-    vadAnalyser = audioCtx ? audioCtx.createAnalyser() : null;
-    if (vadAnalyser) {
-      vadAnalyser.fftSize = 512;
-      const srcNode = audioCtx.createMediaStreamSource(stream);
-      srcNode.connect(vadAnalyser);
-      const data = new Float32Array(vadAnalyser.fftSize);
-      const lastChunkTime = { t: Date.now() };
-
-      function checkVAD() {
-        if (!callActive || !vadAnalyser) return;
-        vadAnalyser.getFloatTimeDomainData(data);
-        let rms = 0;
-        for (let i = 0; i < data.length; i++) rms += data[i] * data[i];
-        rms = Math.sqrt(rms / data.length);
-
-        const isAgentSpeaking = !!activeSrc;
-
-        if (rms > SILENCE_THRESHOLD) {
-          // ── User is speaking ──
-          silenceMs = 0;
-          if (!speechDetected) speechDetected = true;
-          // If agent is playing audio, barge-in!
-          if (isAgentSpeaking) bargeIn();
-        } else {
-          // ── Silence detected ──
-          silenceMs += 16; // ~16ms per frame at 60fps
-          if (speechDetected && silenceMs >= SILENCE_CUTOFF_MS) {
-            // 800ms of silence after speech — flush chunk immediately
-            speechDetected = false;
-            if (mediaRecorder && mediaRecorder.state === 'recording') {
-              mediaRecorder.stop();
-            }
-          }
-        }
-        vadFrameId = requestAnimationFrame(checkVAD);
-      }
-      vadFrameId = requestAnimationFrame(checkVAD);
+    if (!audioCtx || audioCtx.state === 'closed') {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     }
+    
+    const sampleRate = audioCtx.sampleRate;
+    const sourceNode = audioCtx.createMediaStreamSource(stream);
+    const processor = audioCtx.createScriptProcessor(2048, 1, 1);
+    const dummyGain = audioCtx.createGain();
+    dummyGain.gain.value = 0;
+    
+    sourceNode.connect(processor);
+    processor.connect(dummyGain);
+    dummyGain.connect(audioCtx.destination);
+    
+    let currentUtterance = [];
+    let history = []; // keep last ~100ms to catch start of words
 
-    function recordChunk() {
+    processor.onaudioprocess = (e) => {
       if (!callActive) return;
-      chunks = [];
-      chunkStart = Date.now();
-
-      try {
-        mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
-      } catch (_) {
-        mediaRecorder = new MediaRecorder(stream);
+      const inputData = e.inputBuffer.getChannelData(0);
+      const float32Array = new Float32Array(inputData);
+      
+      // Calculate RMS for VAD
+      let rms = 0;
+      for (let i = 0; i < float32Array.length; i++) {
+        rms += float32Array[i] * float32Array[i];
       }
+      rms = Math.sqrt(rms / float32Array.length);
 
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) chunks.push(e.data);
-      };
+      const isAgentSpeaking = !!activeSrc;
 
-      mediaRecorder.onstop = () => {
-        if (!callActive || !ws || ws.readyState !== WebSocket.OPEN) return;
-        // Merge chunks and do RMS check before sending
-        const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
-        blob.arrayBuffer().then(buf => {
-          if (!ws || ws.readyState !== WebSocket.OPEN) return;
-          // Only send if chunk is substantial (> 1kB) and not during agent speech
-          if (buf.byteLength > 1024 && !activeSrc) {
-            ws.send(buf);
-          } else if (buf.byteLength <= 1024) {
-            // too small — silence-only chunk, skip
-          }
-        });
-        // Start next chunk
-        if (callActive) {
-          recordInterval = setTimeout(recordChunk, 50);
+      if (rms > SILENCE_THRESHOLD) {
+        // ── User is speaking ──
+        silenceMs = 0;
+        if (!speechDetected) {
+          speechDetected = true;
+          currentUtterance = [...history]; // start new utterance with history
         }
-      };
-
-      mediaRecorder.start();
-
-      // Fallback: force-stop after 2500ms even without silence detection
-      recordInterval = setTimeout(() => {
-        if (mediaRecorder && mediaRecorder.state === 'recording') {
-          mediaRecorder.stop();
+        if (isAgentSpeaking) bargeIn();
+      } else {
+        // ── Silence detected ──
+        silenceMs += (float32Array.length / sampleRate) * 1000;
+        if (speechDetected && silenceMs >= SILENCE_CUTOFF_MS) {
+          speechDetected = false;
+          sendUtterance(currentUtterance, sampleRate);
+          currentUtterance = [];
         }
-      }, 2500);
+      }
+      
+      if (speechDetected) {
+        currentUtterance.push(float32Array);
+      } else {
+        history.push(float32Array);
+        if (history.length > 5) history.shift();
+      }
+    };
+    
+    activeProcessor = processor;
+    activeDummyGain = dummyGain;
+    activeSourceNode = sourceNode;
+  }
+
+  function sendUtterance(buffers, sampleRate) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (buffers.length === 0) return;
+    
+    let totalLength = 0;
+    for (let i = 0; i < buffers.length; i++) totalLength += buffers[i].length;
+    
+    // Ignore clicks/pops less than 250ms
+    if ((totalLength / sampleRate) * 1000 < 250) return;
+    
+    const buffer = new ArrayBuffer(44 + totalLength * 2);
+    const view = new DataView(buffer);
+    
+    const writeString = (view, offset, string) => {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    };
+    
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + totalLength * 2, true);
+    writeString(view, 8, 'WAVE');
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeString(view, 36, 'data');
+    view.setUint32(40, totalLength * 2, true);
+    
+    let offset = 44;
+    for (let i = 0; i < buffers.length; i++) {
+      const input = buffers[i];
+      for (let j = 0; j < input.length; j++) {
+        let s = Math.max(-1, Math.min(1, input[j]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        offset += 2;
+      }
     }
-
-    recordChunk();
+    
+    const blob = new Blob([view], { type: 'audio/wav' });
+    blob.arrayBuffer().then(buf => {
+      if (ws && ws.readyState === WebSocket.OPEN && !activeSrc) {
+        ws.send(buf);
+      }
+    });
   }
 
 
@@ -877,19 +903,18 @@
     callTimer = null;
     recordInterval = null;
 
-    // Stop VAD loop
-    if (vadFrameId) { cancelAnimationFrame(vadFrameId); vadFrameId = null; }
-    vadAnalyser = null;
-    silenceMs = 0;
-    speechDetected = false;
-
-    // Stop any playing agent audio
-    if (activeSrc) { try { activeSrc.stop(); } catch (_) {} activeSrc = null; }
-
-    // Stop recording
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-      mediaRecorder.stop();
-      mediaRecorder = null;
+    // Stop ScriptProcessor
+    if (activeProcessor) {
+      activeProcessor.disconnect();
+      activeProcessor = null;
+    }
+    if (activeDummyGain) {
+      activeDummyGain.disconnect();
+      activeDummyGain = null;
+    }
+    if (activeSourceNode) {
+      activeSourceNode.disconnect();
+      activeSourceNode = null;
     }
 
     if (globalStream) {
