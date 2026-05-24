@@ -463,6 +463,8 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
                         except (asyncio.CancelledError, Exception):
                             pass
                         greeting_task = None
+                    # Clear speaking-until timestamp so user's next utterance isn't ignored
+                    _agent_speaking_until[ws_session_id] = 0.0
                     try:
                         await websocket.send_json({"type": "status", "status": "idle"})
                     except Exception:

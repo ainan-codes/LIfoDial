@@ -20,6 +20,7 @@ import {
   PhoneOff,
   RotateCcw,
   Send,
+  Square,
   X
 } from 'lucide-react';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -186,21 +187,61 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
   const chunksRef = useRef<Blob[]>([]);
   const vadActiveRef = useRef(false);
 
-  // ISSUE 4: Master cleanup function — stops everything
-  const cleanupAll = useCallback((keepMessages = false) => {
-    // 1. Stop audio IMMEDIATELY
+  // ── Interruption / Barge-in Handler ──────────────────────────────────────────
+  const interruptAgentSpeech = useCallback(() => {
+    console.log('[TestAgent] Interrupting agent speech...');
+
+    // 1. Stop audio playback immediately
     if (currentAudioRef.current) {
-      currentAudioRef.current.pause();
-      currentAudioRef.current.src = '';
+      try {
+        if ('stop' in currentAudioRef.current) {
+          (currentAudioRef.current as any).onended = null;
+          (currentAudioRef.current as any).stop();
+        } else if ('pause' in currentAudioRef.current) {
+          (currentAudioRef.current as any).onended = null;
+          (currentAudioRef.current as any).pause();
+          (currentAudioRef.current as any).src = '';
+        }
+      } catch (e) {
+        console.warn('[TestAgent] Error stopping audio:', e);
+      }
       currentAudioRef.current = null;
     }
+
+    // 2. Revoke and clean up any URLs
     if (currentAudioUrlRef.current) {
       URL.revokeObjectURL(currentAudioUrlRef.current);
       currentAudioUrlRef.current = null;
     }
+
+    // 3. Clear audio queue and status
     audioQueueRef.current = [];
     isPlayingRef.current = false;
     setAgentSpeaking(false);
+
+    // 4. Send interrupt signal to the backend WebSocket
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      try {
+        wsRef.current.send(JSON.stringify({ type: 'interrupt' }));
+        console.log('[TestAgent] Sent interrupt packet to websocket.');
+      } catch (e) {
+        console.error('[TestAgent] Failed to send interrupt packet:', e);
+      }
+    }
+
+    // 5. Stop the thinking sound if active
+    stopThinking();
+
+    // 6. Cancel fallback speech synthesis
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+  }, [stopThinking]);
+
+  // ISSUE 4: Master cleanup function — stops everything
+  const cleanupAll = useCallback((keepMessages = false) => {
+    // 1. Stop audio IMMEDIATELY
+    interruptAgentSpeech();
 
     // 2. Close WebSocket
     if (wsRef.current) {
@@ -294,7 +335,10 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
       setIsSpeaking(speaking);
 
       // VAD: detect speech start/stop for auto-chunking
-      if (speaking && !vadActiveRef.current && wsRef.current?.readyState === WebSocket.OPEN && !isPlayingRef.current) {
+      if (speaking && !vadActiveRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
+        if (isPlayingRef.current) {
+          interruptAgentSpeech();
+        }
         vadActiveRef.current = true;
         startRecordingChunk();
         if (vadSilenceTimerRef.current) {
@@ -945,6 +989,23 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
           >
             <PhoneOff size={16} /> End Call
           </button>
+          {agentSpeaking && (
+            <button
+              onClick={interruptAgentSpeech}
+              title="Stop Agent Speaking"
+              style={{ width: '48px', height: '48px', borderRadius: '50%', background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.3)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.2s' }}
+              onMouseEnter={e => {
+                e.currentTarget.style.background = 'rgba(239, 68, 68, 0.2)';
+                e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.5)';
+              }}
+              onMouseLeave={e => {
+                e.currentTarget.style.background = 'rgba(239, 68, 68, 0.1)';
+                e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.3)';
+              }}
+            >
+              <Square size={20} color="#ef4444" fill="#ef4444" />
+            </button>
+          )}
         </div>
         {/* ISSUE 3: Show timing info */}
         {timing && timing.total_ms && (
