@@ -1,0 +1,23 @@
+# ── Pipecat Voice Agent — requirements.agent.txt ─────────────────────────────
+# Used ONLY by the agent worker (Dockerfile.agent / python -m backend.agent start)
+# NOT installed on the FastAPI backend Render service.
+#
+# Install: pip install -r requirements.agent.txt
+
+# ── Shared backend deps (agent also needs DB, config, services) ───────────────
+-r requirements.txt
+
+# ── Pipecat — voice agent framework (BSD-2-Clause, zero cost) ────────────────
+# [sarvam]  → SarvamSTTService + SarvamTTSService
+# [livekit] → LiveKitTransport (WebRTC)
+# [google]  → GoogleLLMService (Gemini 2.0 Flash)
+pipecat-ai[sarvam,livekit,google]>=0.0.105
+
+# ── Audio processing (required by Silero VAD in Pipecat) ─────────────────────
+# These are available via apt in Dockerfile.agent (libsndfile1, ffmpeg)
+# Listed here for completeness / local dev with those libs installed
+soundfile>=0.12.1
+
+# ── Full LiveKit RTC SDK (Pipecat LiveKitTransport) ───────────────────────────
+# livekit (RTC) is pulled in automatically by pipecat-ai[livekit]
+# livekit-api is already in requirements.txt for token generation

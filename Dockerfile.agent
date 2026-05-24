@@ -1,20 +1,27 @@
-# Dockerfile.agent — Pipecat voice agent
+# Dockerfile.agent — Pipecat voice agent worker
+# This is NOT deployed on Render. It runs as a separate agent worker
+# (locally, on a VPS, or as a Render Background Worker service).
 FROM python:3.11-slim
 
 WORKDIR /app
 
 # System dependencies required by Pipecat:
-#   libsndfile1 → Silero VAD audio I/O (libsndfile-based resampling)
-#   ffmpeg      → Audio format conversion fallback
+#   libsndfile1 → Silero VAD / soundfile audio I/O
+#   ffmpeg      → Audio format conversion
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# Install base requirements first (for layer caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install agent-only requirements (pipecat + audio libs)
+COPY requirements.agent.txt .
+RUN pip install --no-cache-dir -r requirements.agent.txt
+
 COPY backend/ ./backend/
 
-# Pipecat entrypoint — runs the LiveKit agent worker
+# Pipecat LiveKit agent worker entrypoint
 CMD ["python", "-m", "backend.agent.pipeline", "start"]
