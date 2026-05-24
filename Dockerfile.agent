@@ -1,7 +1,20 @@
-# Dockerfile.agent  
+# Dockerfile.agent — Pipecat voice agent
 FROM python:3.11-slim
+
 WORKDIR /app
+
+# System dependencies required by Pipecat:
+#   libsndfile1 → Silero VAD audio I/O (libsndfile-based resampling)
+#   ffmpeg      → Audio format conversion fallback
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
 COPY backend/ ./backend/
+
+# Pipecat entrypoint — runs the LiveKit agent worker
 CMD ["python", "-m", "backend.agent.pipeline", "start"]
