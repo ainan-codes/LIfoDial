@@ -41,7 +41,7 @@ from loguru import logger as pipecat_logger
 # ── Pipecat core ──────────────────────────────────────────────────────────────
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMMessagesFrame
+from pipecat.frames.frames import LLMMessagesFrame, TextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -408,13 +408,11 @@ async def entrypoint(ctx) -> None:
     if stt_model == "saaras:v2.5":
         stt_settings = SarvamSTTService.Settings(
             model=stt_model,
-            vad_signals=True,
         )
     else:
         stt_settings = SarvamSTTService.Settings(
             model=stt_model,
             language=tts_language,
-            vad_signals=True,
         )
 
     # ── Instantiate Pipecat services ───────────────────────────────────────
@@ -431,8 +429,8 @@ async def entrypoint(ctx) -> None:
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
                     stop_secs=0.85,     # 850ms silence before turn ends (allows natural mid-turn pauses)
-                    start_secs=0.35,    # 350ms continuous speech to avoid brief noise/breath trigger
-                    confidence=0.7,     # 70% confidence threshold to prevent false VAD triggers
+                    start_secs=0.25,    # 250ms continuous speech to capture fast voice input
+                    confidence=0.6,     # 60% confidence threshold (balanced for clear speech vs clicks)
                 )
             ),
         ),
@@ -519,13 +517,10 @@ async def entrypoint(ctx) -> None:
     async def on_first_participant_joined(transport_ref, participant_id: str) -> None:
         """Speak the first message when the caller joins the room."""
         log.info("Participant joined: %s — speaking first message.", participant_id)
-        # Queue the first greeting as an assistant message
-        await task.queue_frames([
-            context_aggregator.user().get_context_frame(),
-            LLMMessagesFrame(
-                messages=[{"role": "assistant", "content": first_message}]
-            ),
-        ])
+        # Add the first message to LLM context so LLM is aware of it
+        context.add_message({"role": "assistant", "content": first_message})
+        # Queue the first greeting as a TextFrame to be synthesized directly by TTS (no self-talk trigger)
+        await task.queue_frames([TextFrame(first_message)])
 
     @transport.event_handler("on_participant_disconnected")
     async def on_participant_disconnected(transport_ref, participant_id: str) -> None:
