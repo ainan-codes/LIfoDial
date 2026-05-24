@@ -2120,7 +2120,7 @@ async def generate_llm_response(
         "   - BOOK: Politely collect their Name, Phone number, preferred Date, preferred Time, and the Doctor's name (if known).\n"
         "   - RESCHEDULE or CANCEL: To secure and verify their request, you MUST smartly ask for BOTH their Name and Phone number. Do NOT trigger the action until you have collected and confirmed both details.\n"
         "   - NOTES: Capture any symptoms, reasons for the visit/reschedule/cancellation, or special requests they mention (or use 'N/A' if none).\n"
-        "Once you have all details, append exactly ONE of these tags at the very end of your response:\n"
+        "You MUST always provide a polite, natural conversational response to the patient (in their language) confirming the action, and then append exactly ONE of these tags at the very end of your response (do not output ONLY the tag):\n"
         "   - [ACTION: BOOK|Name|Phone|Date|Time|Doctor|Notes]\n"
         "   - [ACTION: RESCHEDULE|Name|Phone|Date|Time|Doctor|Notes]\n"
         "   - [ACTION: CANCEL|Name|Phone|Date|Time|Doctor|Notes]\n"
@@ -2218,6 +2218,47 @@ async def generate_llm_response(
                 webhook_url=tenant_webhook_url
             ))
             response = re.sub(r'\[ACTION:.*?\]', '', response).strip()
+            
+            # Fallback if the agent ONLY returned the tag and no conversational text
+            if not response:
+                lang = (user_language or "en-IN").strip()
+                action_fallbacks = {
+                    "BOOK": {
+                        "en-IN": "I have successfully booked your appointment.",
+                        "hi-IN": "मैंने आपका अपॉइंटमेंट सफलतापूर्वक बुक कर लिया है।",
+                        "ml-IN": "ഞാൻ നിങ്ങളുടെ അപ്പോയിന്റ്മെന്റ് വിജയകരമായി ബുക്ക് ചെയ്തിട്ടുണ്ട്.",
+                        "ta-IN": "உங்கள் சந்திப்பு வெற்றிகரமாக முன்பதிவு செய்யப்பட்டுள்ளது.",
+                        "te-IN": "మీ అపాయింట్‌మెంట్ విజయవంతంగా బుక్ చేయబడింది.",
+                        "kn-IN": "ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಯಶಸ್ವಿಯಾಗಿ ಬುಕ್ ಆಗಿದೆ.",
+                        "bn-IN": "আমি সফলভাবে আপনার অ্যাপয়েন্টমেন্ট বুক করেছি।",
+                        "gu-IN": "મેં સફળતાપૂર્વક તમારી એપોઇન્ટમેન્ટ બુક કરી છે.",
+                        "ar-SA": "لقد قمت بحجز موعدك بنجاح."
+                    },
+                    "RESCHEDULE": {
+                        "en-IN": "I have successfully rescheduled your appointment.",
+                        "hi-IN": "मैंने आपका अपॉइंटमेंट सफलतापूर्वक रीशेड्यूल कर लिया है।",
+                        "ml-IN": "ഞാൻ നിങ്ങളുടെ അപ്പോയിന്റ്മെന്റ് വിജയകരമായി പുനഃക്രമീകരിച്ചിട്ടുണ്ട്.",
+                        "ta-IN": "உங்கள் சந்திப்பு வெற்றிகரமாக மாற்றியமைக்கப்பட்டுள்ளது.",
+                        "te-IN": "మీ అపాయింట్‌మెంట్ విజయవంతంగా రీషెడ్యూల్ చేయబడింది.",
+                        "kn-IN": "ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಯಶಸ್ವಿಯಾಗಿ ಮರುನಿಗದಿಪಡಿಸಲಾಗಿದೆ.",
+                        "bn-IN": "আমি সফলভাবে আপনার অ্যাপয়েন্টमेंट পুনর্নির্ধারণ করেছি।",
+                        "gu-IN": "મેં સફળતાપૂર્વक તમારી એપોઇન્ટમેન્ટ ફરીથી શેડ્યૂલ કરી છે.",
+                        "ar-SA": "لقد قمت بإعادة جدولة موعدك بنجاح."
+                    },
+                    "CANCEL": {
+                        "en-IN": "I have successfully cancelled your appointment.",
+                        "hi-IN": "मैंने आपका अपॉइंटमेंट सफलतापूर्वक रद्द कर दिया है।",
+                        "ml-IN": "ഞാൻ നിങ്ങളുടെ അപ്പോയിന്റ്മെന്റ് വിജയകരമായി റദ്ദാക്കിയിട്ടുണ്ട്.",
+                        "ta-IN": "உங்கள் சந்திப்பு வெற்றிகரமாக ரத்து செய்யப்பட்டுள்ளது.",
+                        "te-IN": "మీ అపాయింట్‌మెంట్ విజయవంతంగా రద్దు చేయబడింది.",
+                        "kn-IN": "ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಯಶಸ್ವಿಯಾಗಿ ರದ್ದುಗೊಂಡಿದೆ.",
+                        "bn-IN": "আমি সফলভাবে আপনার অ্যাপয়েন্টমেন্ট বাতিল করেছি।",
+                        "gu-IN": "મેં સફળતાપૂર્વક તમારી એપોઇન્ટમેન્ટ રદ કરી છે.",
+                        "ar-SA": "لقد قمت بإلغاء موعدك بنجاح."
+                    }
+                }
+                act_dict = action_fallbacks.get(b_action, action_fallbacks["BOOK"])
+                response = act_dict.get(lang, act_dict["en-IN"])
 
         # Add response to history
         history.append({"role": "assistant", "content": response})
