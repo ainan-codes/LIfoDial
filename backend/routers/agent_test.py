@@ -60,15 +60,15 @@ SIMPLE_GREETINGS = {
 
 # ── Explicit language-switch keywords ─────────────────────────────────────────
 LANGUAGE_SWITCH_KEYWORDS: dict[str, list[str]] = {
-    "en-IN": ["english", "in english", "speak english", "talk english", "talk in english", "speak in english"],
-    "hi-IN": ["hindi", "in hindi", "speak hindi", "talk hindi", "talk in hindi", "speak in hindi"],
-    "ml-IN": ["malayalam", "in malayalam", "speak malayalam", "talk in malayalam"],
-    "ta-IN": ["tamil", "in tamil", "speak tamil", "talk in tamil"],
-    "te-IN": ["telugu", "in telugu", "speak telugu", "talk in telugu"],
-    "kn-IN": ["kannada", "in kannada", "speak kannada", "talk in kannada"],
-    "bn-IN": ["bengali", "in bengali", "speak bengali", "talk in bengali"],
-    "gu-IN": ["gujarati", "in gujarati", "speak gujarati", "talk in gujarati"],
-    "ar-SA": ["arabic", "in arabic", "speak arabic", "talk in arabic"],
+    "en-IN": ["english", "in english", "speak english", "talk english", "talk in english", "speak in english", "english please"],
+    "hi-IN": ["hindi", "in hindi", "speak hindi", "talk hindi", "talk in hindi", "speak in hindi", "hindi please", "हिंदी", "हिन्दी"],
+    "ml-IN": ["malayalam", "in malayalam", "speak malayalam", "talk in malayalam", "malayalam please", "മലയാളം"],
+    "ta-IN": ["tamil", "in tamil", "speak tamil", "talk in tamil", "tamil please", "தமிழ்"],
+    "te-IN": ["telugu", "in telugu", "speak telugu", "talk in telugu", "telugu please", "తెలుగు"],
+    "kn-IN": ["kannada", "in kannada", "speak kannada", "talk in kannada", "kannada please", "ಕನ್ನಡ"],
+    "bn-IN": ["bengali", "in bengali", "speak bengali", "talk in bengali", "bengali please", "বাংলা"],
+    "gu-IN": ["gujarati", "in gujarati", "speak gujarati", "talk in gujarati", "gujarati please", "ગુજરાતી"],
+    "ar-SA": ["arabic", "in arabic", "speak arabic", "talk in arabic", "arabic please", "عربي", "العربية"],
 }
 
 # ── Per-language system prompt enforcement ────────────────────────────────────
@@ -1209,20 +1209,30 @@ async def handle_text_command(
         if detected_lang and session_id:
             track_language(session_id, detected_lang)
         
-        dominant_lang = get_dominant_language(session_id, agent.tts_language or "en-IN")
+        # ── Explicit language switch detection ──
+        switched = detect_language_switch(user_text)
+        if switched:
+            _session_language_override[session_id] = switched
+            logger.info("Language explicitly switched to: %s in text command", switched)
+
+        # Use explicit override if set, else fall back to ratio-based dominant
+        current_dominant = _session_language_override.get(
+            session_id,
+            get_dominant_language(session_id, agent.tts_language or "en-IN"),
+        )
         
-        response_text = await generate_llm_response(agent, user_text, db, session_id=session_id, user_language=dominant_lang, websocket=websocket)
+        response_text = await generate_llm_response(agent, user_text, db, session_id=session_id, user_language=current_dominant, websocket=websocket)
         
         await websocket.send_json({
             "type": "agent_text", 
             "text": response_text,
-            "detected_language": dominant_lang
+            "detected_language": current_dominant
         })
         
         # Step 3: TTS - synthesize response for voice mode
         # Use the response text's actual script to pick TTS language
         # so TTS never speaks English text in Hindi voice or vice-versa
-        response_lang = detect_text_language(response_text) or dominant_lang
+        response_lang = detect_text_language(response_text) or current_dominant
         tts_lang = normalize_sarvam_language(response_lang) if (agent.tts_provider or "sarvam") == "sarvam" else response_lang
         try:
             await websocket.send_json({"type": "status", "status": "speaking"})
