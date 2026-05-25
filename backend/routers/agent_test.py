@@ -2101,12 +2101,17 @@ async def generate_llm_response(
         return generate_demo_response(agent, user_message, history)
     
     # ── Build System Prompt with Knowledge Base ──────────────────────────────
+    import datetime
+    today = datetime.datetime.now()
+    current_date_str = today.strftime("%d/%m/%Y")
+    current_day_str = today.strftime("%A")
+
     base_prompt = agent.system_prompt or (
         f"You are a helpful AI receptionist for {agent.agent_name}. "
         f"Help patients book appointments, answer questions about "
         f"clinic services, and provide general assistance. "
         f"Keep responses concise and conversational — under 50 words. "
-        f"You are speaking on a phone call."
+        f"You are speaking on a phone call. Today's date is {current_day_str}, {current_date_str}."
     )
     
     # Fetch knowledge base entries for this agent's tenant
@@ -2173,6 +2178,7 @@ async def generate_llm_response(
         "as a conversation continuation, NOT a new greeting.\n"
         "6. ACTION RULE: If the user wants to BOOK, RESCHEDULE, or CANCEL an appointment, strictly follow these conditions:\n"
         "   - BOOK: Politely collect their Name, Phone number, preferred Date, preferred Time, and the Doctor's name (if known).\n"
+        f"     *Note: You must ALWAYS convert relative dates like 'today', 'tomorrow', 'day after tomorrow', 'next Monday', or specific weekdays into the actual calendar date in DD/MM/YYYY format based on the reference date: Today is {current_day_str}, {current_date_str}. Never output relative date words like 'tomorrow' in the ACTION tag. Only use DD/MM/YYYY format.*\n"
         "   - RESCHEDULE or CANCEL: To secure and verify their request, you MUST smartly ask for BOTH their Name and Phone number. Do NOT trigger the action until you have collected and confirmed both details.\n"
         "   - NOTES: Capture any symptoms, reasons for the visit/reschedule/cancellation, or special requests they mention (or use 'N/A' if none).\n"
         "You MUST always provide a polite, natural conversational response to the patient (in their language) confirming the action, and then append exactly ONE of these tags at the very end of your response (do not output ONLY the tag):\n"
