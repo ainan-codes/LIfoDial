@@ -540,7 +540,9 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     }, 1400);
   };
 
-  // useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, currentTranscript]);
 
   // ISSUE 4: Cleanup on unmount
   useEffect(() => {
@@ -1130,7 +1132,9 @@ function ChatMode({ agent, agentId: directId, agentName: directName }: { agent?:
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
 
   useEffect(() => {
     const init = async () => {

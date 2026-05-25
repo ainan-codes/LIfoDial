@@ -41,6 +41,7 @@ async def log_booking_to_sheets(
         return False
         
     payload = {
+        # Lowercase keys
         "appointment_id": appointment_id,
         "action": action,
         "name": name,
@@ -49,7 +50,18 @@ async def log_booking_to_sheets(
         "time": time,
         "doctor": doctor,
         "status": status,
-        "notes": notes
+        "notes": notes,
+
+        # PascalCase keys (matching Google Sheet column headers)
+        "Appointment_ID": appointment_id,
+        "Action": action,
+        "Name": name,
+        "Phone": phone,
+        "Date": date,
+        "Time": time,
+        "Doctor": doctor,
+        "Status": status,
+        "Notes": notes
     }
     
     try:
