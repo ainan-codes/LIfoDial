@@ -1211,7 +1211,7 @@ async def handle_text_command(
         
         dominant_lang = get_dominant_language(session_id, agent.tts_language or "en-IN")
         
-        response_text = await generate_llm_response(agent, user_text, db, session_id=session_id, user_language=dominant_lang)
+        response_text = await generate_llm_response(agent, user_text, db, session_id=session_id, user_language=dominant_lang, websocket=websocket)
         
         await websocket.send_json({
             "type": "agent_text", 
@@ -1446,7 +1446,7 @@ async def handle_audio_turn(
             llm_start = time.monotonic()
             try:
                 response_text = await asyncio.wait_for(
-                    generate_llm_response(agent, transcript, db, session_id=session_id, user_language=current_dominant),
+                    generate_llm_response(agent, transcript, db, session_id=session_id, user_language=current_dominant, websocket=websocket),
                     timeout=15.0,
                 )
             except asyncio.TimeoutError:
@@ -1939,7 +1939,7 @@ async def openai_transcribe(api_key: str, audio_bytes: bytes) -> tuple[str, str]
         return "", ""
 
 
-async def sync_and_log_appointment(action: str, name: str, phone: str, date: str, time: str, doctor: str, notes: str, tenant_id: str, webhook_url: str | None):
+async def sync_and_log_appointment(action: str, name: str, phone: str, date: str, time: str, doctor: str, notes: str, tenant_id: str, webhook_url: str | None, websocket: WebSocket = None):
     """
     Sequentially handles:
     1. Replicating the Book/Reschedule/Cancel request to Supabase / local DB.
@@ -1949,6 +1949,25 @@ async def sync_and_log_appointment(action: str, name: str, phone: str, date: str
     try:
         from backend.services.his import sync_appointment_to_db
         from backend.services.sheets import log_booking_to_sheets
+        
+        if websocket:
+            try:
+                await websocket.send_json({
+                    "type": "tool_call",
+                    "tool": "Database & Google Sheets Sync",
+                    "status": "started",
+                    "payload": {
+                        "action": action,
+                        "name": name,
+                        "phone": phone,
+                        "date": date,
+                        "time": time,
+                        "doctor": doctor,
+                        "notes": notes,
+                    }
+                })
+            except Exception:
+                pass
         
         # 1. DB Sync (wait for it to get the generated UUID)
         db_res = await sync_appointment_to_db(
@@ -1972,7 +1991,7 @@ async def sync_and_log_appointment(action: str, name: str, phone: str, date: str
             notes_saved = db_res.get("notes") or notes
             
         # 2. Log to Google Sheets
-        await log_booking_to_sheets(
+        sheets_success = await log_booking_to_sheets(
             action=action,
             name=name,
             phone=phone,
@@ -1984,8 +2003,43 @@ async def sync_and_log_appointment(action: str, name: str, phone: str, date: str
             notes=notes_saved,
             webhook_url=webhook_url
         )
+
+        if websocket:
+            try:
+                await websocket.send_json({
+                    "type": "tool_call",
+                    "tool": "Database & Google Sheets Sync",
+                    "status": "success" if sheets_success else "failed",
+                    "payload": {
+                        "action": action,
+                        "name": name,
+                        "phone": phone,
+                        "date": date,
+                        "time": time,
+                        "doctor": doctor,
+                        "notes": notes_saved,
+                    },
+                    "result": {
+                        "appointment_id": appointment_id,
+                        "status": status,
+                        "db_sync": "success" if db_res else "failed",
+                        "sheets_sync": "success" if sheets_success else "failed"
+                    }
+                })
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"Error in sync_and_log_appointment background task: {e}", exc_info=True)
+        if websocket:
+            try:
+                await websocket.send_json({
+                    "type": "tool_call",
+                    "tool": "Database & Google Sheets Sync",
+                    "status": "failed",
+                    "result": {"error": str(e)}
+                })
+            except Exception:
+                pass
 
 
 # ── LLM Logic ─────────────────────────────────────────────────────────────────
@@ -1999,6 +2053,7 @@ async def generate_llm_response(
     db: AsyncSession,
     session_id: str = None,
     user_language: str = "",
+    websocket: WebSocket = None,
 ) -> str:
     """Generate LLM response using configured provider, system prompt, and knowledge base.
     
@@ -2215,7 +2270,8 @@ async def generate_llm_response(
                 doctor=b_doctor,
                 notes=b_notes,
                 tenant_id=agent.tenant_id,
-                webhook_url=tenant_webhook_url
+                webhook_url=tenant_webhook_url,
+                websocket=websocket
             ))
             response = re.sub(r'\[ACTION:.*?\]', '', response).strip()
             
@@ -2374,7 +2430,8 @@ async def generate_llm_response(
                             doctor=b_doctor,
                             notes=b_notes,
                             tenant_id=agent.tenant_id,
-                            webhook_url=tenant_webhook_url
+                            webhook_url=tenant_webhook_url,
+                            websocket=websocket
                         ))
                         response = re.sub(r'\[ACTION:.*?\]', '', response).strip()
 

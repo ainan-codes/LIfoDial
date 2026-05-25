@@ -94,7 +94,8 @@ async def send_to_sheets_webhook(webhook_url: str | None, payload: dict):
                 target_url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
-                timeout=5.0
+                timeout=5.0,
+                follow_redirects=True
             )
             if response.status_code == 200:
                 logger.info(f"Successfully pushed appointment {payload.get('appointment_id')} to Google Sheets.")

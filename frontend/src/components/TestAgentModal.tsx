@@ -30,11 +30,15 @@ import { useThinkingSound } from '../hooks/useThinkingSound';
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface Message {
   id: string;
-  role: 'agent' | 'user';
+  role: 'agent' | 'user' | 'tool';
   text: string;
   time: string;
   ms?: number;
   audioUnavailable?: boolean;
+  toolName?: string;
+  toolStatus?: 'started' | 'success' | 'failed';
+  toolPayload?: any;
+  toolResult?: any;
 }
 
 interface TestAgentInnerProps {
@@ -710,6 +714,31 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
         if (msg.type === 'timing') {
           setTiming({ stt_ms: msg.stt_ms, llm_ms: msg.llm_ms, tts_ms: msg.tts_ms, total_ms: msg.total_ms });
         }
+        if (msg.type === 'tool_call') {
+          setMessages(prev => {
+            const existingIndex = prev.findIndex(m => (m as any).role === 'tool' && (m as any).toolName === msg.tool && (m as any).toolStatus === 'started');
+            if (existingIndex > -1) {
+              const updated = [...prev];
+              updated[existingIndex] = {
+                ...updated[existingIndex],
+                toolStatus: msg.status,
+                toolPayload: msg.payload || (updated[existingIndex] as any).toolPayload,
+                toolResult: msg.result || (updated[existingIndex] as any).toolResult,
+              };
+              return updated;
+            }
+            return [...prev, {
+              id: Date.now().toString() + Math.random(),
+              role: 'tool' as any,
+              text: `Tool Call: ${msg.tool}`,
+              time: nowTime(),
+              toolName: msg.tool,
+              toolStatus: msg.status,
+              toolPayload: msg.payload,
+              toolResult: msg.result
+            } as any];
+          });
+        }
         if (msg.type === 'transcript') {
           setCurrentTranscript('');
           if (msg.role === 'user') addMessage('user', msg.text);
@@ -948,25 +977,86 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
             <p style={{ color: '#333', fontSize: '13px', textAlign: 'center' }}>Start speaking — your conversation will appear here in real-time</p>
           </div>
         )}
-        {messages.map((m) => (
-          <div key={m.id} style={{ display: 'flex', flexDirection: 'column', gap: '3px', alignItems: m.role === 'agent' ? 'flex-start' : 'flex-end' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-              {m.role === 'agent' && (
-                <div style={{ width: '20px', height: '20px', borderRadius: '50%', background: 'rgba(62,207,142,0.1)', border: '1px solid #3ECF8E30', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <Headphones size={10} color="#3ECF8E" />
+        {messages.map((m) => {
+          if ((m as any).role === 'tool') {
+            const toolName = (m as any).toolName || 'Unknown';
+            const toolStatus = (m as any).toolStatus || 'started';
+            const toolPayload = (m as any).toolPayload;
+            const toolResult = (m as any).toolResult;
+            return (
+              <div key={m.id} style={{ display: 'flex', flexDirection: 'column', gap: '6px', width: '95%', margin: '12px auto 6px', alignSelf: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '11px', color: '#888' }}>
+                  <div style={{
+                    width: '6px',
+                    height: '6px',
+                    borderRadius: '50%',
+                    backgroundColor: toolStatus === 'success' ? '#3ECF8E' : toolStatus === 'failed' ? '#ef4444' : '#f59e0b',
+                    boxShadow: toolStatus === 'started' ? '0 0 8px #f59e0b' : 'none'
+                  }} />
+                  <span style={{ fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: '#888' }}>Tool Execution: {toolName}</span>
+                  <span style={{ fontSize: '10px', color: '#444' }}>{m.time}</span>
                 </div>
-              )}
-              <span style={{ fontSize: '10px', color: '#555' }}>{m.role === 'agent' ? agentName : 'You'} · {m.time}</span>
+                <div style={{
+                  background: 'rgba(20, 20, 20, 0.65)',
+                  backdropFilter: 'blur(10px)',
+                  border: `1px solid ${toolStatus === 'success' ? 'rgba(62,207,142,0.2)' : toolStatus === 'failed' ? 'rgba(239,68,68,0.2)' : 'rgba(245,158,11,0.2)'}`,
+                  borderRadius: '10px',
+                  padding: '12px',
+                  fontSize: '12px',
+                  fontFamily: 'monospace',
+                  color: '#e5e7eb',
+                  boxShadow: '0 4px 16px rgba(0,0,0,0.3)'
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                    <span style={{ color: '#666' }}>Status:</span>
+                    <span style={{
+                      fontWeight: 700,
+                      color: toolStatus === 'success' ? '#3ECF8E' : toolStatus === 'failed' ? '#ef4444' : '#f59e0b'
+                    }}>
+                      {toolStatus === 'started' ? '⚡ SYNCING...' : toolStatus === 'success' ? '✔ SYNCED SUCCESSFULLY' : '✖ SYNC FAILED'}
+                    </span>
+                  </div>
+                  {toolPayload && (
+                    <div style={{ marginTop: '6px' }}>
+                      <span style={{ color: '#666', display: 'block', marginBottom: '4px', fontSize: '11px' }}>Request Arguments:</span>
+                      <pre style={{ margin: 0, padding: '8px', background: 'rgba(0,0,0,0.4)', border: '1px solid rgba(255,255,255,0.03)', borderRadius: '6px', overflowX: 'auto', fontSize: '11px', color: '#a7f3d0', lineHeight: 1.4 }}>
+                        {JSON.stringify(toolPayload, null, 2)}
+                      </pre>
+                    </div>
+                  )}
+                  {toolResult && (
+                    <div style={{ marginTop: '10px', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '8px' }}>
+                      <span style={{ color: '#666', display: 'block', marginBottom: '4px', fontSize: '11px' }}>Webhook Response:</span>
+                      <pre style={{ margin: 0, padding: '8px', background: 'rgba(0,0,0,0.4)', border: '1px solid rgba(255,255,255,0.03)', borderRadius: '6px', overflowX: 'auto', fontSize: '11px', color: '#93c5fd', lineHeight: 1.4 }}>
+                        {JSON.stringify(toolResult, null, 2)}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          }
+
+          return (
+            <div key={m.id} style={{ display: 'flex', flexDirection: 'column', gap: '3px', alignItems: m.role === 'agent' ? 'flex-start' : 'flex-end' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                {m.role === 'agent' && (
+                  <div style={{ width: '20px', height: '20px', borderRadius: '50%', background: 'rgba(62,207,142,0.1)', border: '1px solid #3ECF8E30', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Headphones size={10} color="#3ECF8E" />
+                  </div>
+                )}
+                <span style={{ fontSize: '10px', color: '#555' }}>{m.role === 'agent' ? agentName : 'You'} · {m.time}</span>
+              </div>
+              <div style={{ background: m.role === 'agent' ? '#1A2A1F' : '#1A1A2E', border: `1px solid ${m.role === 'agent' ? '#3ECF8E25' : '#4444aa25'}`, borderRadius: m.role === 'agent' ? '4px 12px 12px 12px' : '12px 4px 12px 12px', padding: '10px 14px', fontSize: '13px', color: '#d1d5db', maxWidth: '85%', lineHeight: 1.6 }}>
+                {m.text}
+                {/* ISSUE 5: Show audio unavailable badge */}
+                {m.audioUnavailable && (
+                  <span style={{ fontSize: '11px', color: '#6b7280', display: 'block', marginTop: '4px' }}>🔇 Audio unavailable</span>
+                )}
+              </div>
             </div>
-            <div style={{ background: m.role === 'agent' ? '#1A2A1F' : '#1A1A2E', border: `1px solid ${m.role === 'agent' ? '#3ECF8E25' : '#4444aa25'}`, borderRadius: m.role === 'agent' ? '4px 12px 12px 12px' : '12px 4px 12px 12px', padding: '10px 14px', fontSize: '13px', color: '#d1d5db', maxWidth: '85%', lineHeight: 1.6 }}>
-              {m.text}
-              {/* ISSUE 5: Show audio unavailable badge */}
-              {m.audioUnavailable && (
-                <span style={{ fontSize: '11px', color: '#6b7280', display: 'block', marginTop: '4px' }}>🔇 Audio unavailable</span>
-              )}
-            </div>
-          </div>
-        ))}
+          );
+        })}
         {currentTranscript && (
           <div style={{ display: 'flex', justifyContent: 'center' }}>
             <span style={{ fontSize: '12px', color: '#666', fontStyle: 'italic', padding: '4px 12px', background: '#111', borderRadius: '12px', border: '1px solid #1A1A1A' }}>

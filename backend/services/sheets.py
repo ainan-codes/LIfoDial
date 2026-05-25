@@ -54,7 +54,7 @@ async def log_booking_to_sheets(
     
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(final_url, json=payload)
+            response = await client.post(final_url, json=payload, follow_redirects=True)
             response.raise_for_status()
             logger.info("Successfully logged booking to Google Sheets.")
             return True
