@@ -2256,15 +2256,16 @@ async def generate_llm_response(
             b_doctor = groups[5].strip()
             b_notes = groups[6].strip() if groups[6] is not None else "N/A"
             
-            tenant_webhook_url = None
-            try:
-                from backend.models.tenant import Tenant
-                t_res = await db.execute(select(Tenant).where(Tenant.id == agent.tenant_id))
-                tenant = t_res.scalar_one_or_none()
-                if tenant and tenant.google_sheets_webhook_url:
-                    tenant_webhook_url = tenant.google_sheets_webhook_url
-            except Exception as e:
-                logger.error(f"Failed to fetch tenant webhook url: {e}")
+            tenant_webhook_url = getattr(agent, 'webhook_url', None)
+            if not tenant_webhook_url:
+                try:
+                    from backend.models.tenant import Tenant
+                    t_res = await db.execute(select(Tenant).where(Tenant.id == agent.tenant_id))
+                    tenant = t_res.scalar_one_or_none()
+                    if tenant and tenant.google_sheets_webhook_url:
+                        tenant_webhook_url = tenant.google_sheets_webhook_url
+                except Exception as e:
+                    logger.error(f"Failed to fetch tenant webhook url: {e}")
 
             # Fire off unified background task for DB sync + Sheets logging sequentially
             asyncio.create_task(sync_and_log_appointment(
