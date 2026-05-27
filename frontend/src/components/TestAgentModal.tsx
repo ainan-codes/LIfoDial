@@ -81,7 +81,9 @@ function buildTranscript(messages: Message[], mode: Mode, agentName: string, dur
     '----------------------------------------',
   ].filter(Boolean).join('\n');
 
+  // Skip tool-call entries (internal system events, not real conversation turns)
   const body = messages
+    .filter(m => m.role === 'agent' || m.role === 'user')
     .map(m => `${m.role === 'agent' ? `Agent (${agentName})` : 'User'}: ${m.text}`)
     .join('\n');
 
@@ -190,6 +192,8 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
   const isRecordingRef = useRef(false);
   const chunksRef = useRef<Blob[]>([]);
   const vadActiveRef = useRef(false);
+  // Live ref mirror of isPlayingRef so VAD checkLevel() can gate on it without stale closure
+  const agentPlayingRef = useRef(false);
 
   // ── Interruption / Barge-in Handler ──────────────────────────────────────────
   const interruptAgentSpeech = useCallback(() => {
@@ -221,6 +225,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     // 3. Clear audio queue and status
     audioQueueRef.current = [];
     isPlayingRef.current = false;
+    agentPlayingRef.current = false; // ← echo suppression: clear on interrupt
     setAgentSpeaking(false);
 
     // 4. Send interrupt signal to the backend WebSocket
@@ -323,9 +328,14 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     const dataArray = new Uint8Array(analyser.frequencyBinCount);
     let smoothLevel = 0;
 
-    const SPEECH_THRESHOLD = 25;   // Min avg amplitude to consider speech (increased to ignore noise)
-    const SILENCE_DURATION = 1500; // ms of silence before sending chunk
-    const WARMUP_DELAY = 500;      // ms to ignore mic input on start (avoid pops)
+    // ── VAD tuning constants ────────────────────────────────────────────────
+    // Raised to 40 (was 25) — reduces false triggers from background noise,
+    // room echo, and keyboard clicks.
+    const SPEECH_THRESHOLD = 40;
+    // 1800ms silence before we consider the user done speaking (was 1500ms)
+    const SILENCE_DURATION = 1800;
+    // 1500ms warmup so we skip the mic pop / browser noise on connection start
+    const WARMUP_DELAY = 1500;
     const startedAt = Date.now();
 
     const checkLevel = () => {
@@ -341,10 +351,14 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
       const speaking = isWarm && (avg > SPEECH_THRESHOLD);
       setIsSpeaking(speaking);
 
-      // VAD: detect speech start/stop for auto-chunking
+      // VAD: detect speech start/stop for auto-chunking.
+      // CRITICAL: Never start recording while the agent is playing audio —
+      // the mic would pick up the speaker output causing echo / self-talk.
       if (speaking && !vadActiveRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
-        if (isPlayingRef.current) {
+        if (agentPlayingRef.current) {
+          // User is talking over the agent → barge-in: stop agent, then record
           interruptAgentSpeech();
+          agentPlayingRef.current = false;
         }
         vadActiveRef.current = true;
         startRecordingChunk();
@@ -422,7 +436,18 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
 
   const sendAudioToBackend = async (blob: Blob) => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-    if (blob.size < 1000) return; // skip tiny clips
+    // Require at least ~200ms of real speech (≈8 KB for webm/opus at 128kbps).
+    // This filters out noise bursts, brief pops, and tiny accidental triggers.
+    if (blob.size < 8000) {
+      console.log('[VAD] Audio chunk too small, skipping:', blob.size, 'bytes');
+      return;
+    }
+
+    // Final safety gate: don't send if agent is still playing audio
+    if (agentPlayingRef.current) {
+      console.log('[VAD] Skipping audio chunk — agent is speaking (echo suppression)');
+      return;
+    }
 
     try {
       const buffer = await blob.arrayBuffer();
@@ -439,11 +464,13 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
   const playNextAudio = async () => {
     if (audioQueueRef.current.length === 0) {
       isPlayingRef.current = false;
+      agentPlayingRef.current = false; // ← echo suppression: agent finished
       setAgentSpeaking(false);
       currentAudioRef.current = null;
       return;
     }
     isPlayingRef.current = true;
+    agentPlayingRef.current = true; // ← echo suppression: agent is speaking
     setAgentSpeaking(true);
 
     const blob = audioQueueRef.current.shift()!;
@@ -492,12 +519,14 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
       console.error('[TestAgent] <audio> element error:', err);
       if (currentAudioUrlRef.current === url) URL.revokeObjectURL(url);
       currentAudioRef.current = null;
+      agentPlayingRef.current = false;
       playNextAudio();
     };
     audio.src = url;
     audio.play().catch((err) => {
       console.error('[TestAgent] <audio>.play() rejected:', err);
       if (currentAudioUrlRef.current === url) URL.revokeObjectURL(url);
+      agentPlayingRef.current = false;
       playNextAudio();
     });
   };
@@ -505,6 +534,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
   const enqueueAudio = (blob: Blob) => {
     stopThinking(); // ← audio arrived — stop the thinking sound immediately
     lastAudioAtRef.current = Date.now();
+    agentPlayingRef.current = true; // ← mark agent as speaking immediately on enqueue
     audioQueueRef.current.push(blob);
     if (!isPlayingRef.current) {
       playNextAudio();
