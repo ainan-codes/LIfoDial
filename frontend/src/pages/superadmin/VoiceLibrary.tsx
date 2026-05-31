@@ -79,8 +79,44 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
       }
     };
 
+    // Dynamically fetch ALL ElevenLabs voices from backend using connected API key
+    const fetchElevenLabsVoices = async () => {
+      try {
+        const res = await fetch(`${API_URL}/platform/tts/voices/elevenlabs`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.voices && Array.isArray(data.voices)) {
+            const dynamicEleven = data.voices.map((v: any) => ({
+               id: `elevenlabs-${v.voice_id || v.id}`,
+               provider: 'elevenlabs',
+               provider_label: 'ElevenLabs',
+               name: v.name,
+               gender: v.gender?.toUpperCase() || 'NEUTRAL',
+               language: v.language || 'en-US',
+               language_label: v.language || 'English',
+               accent: (v.language || '').substring(0, 5),
+               model: 'eleven_flash_v2_5',
+               voice_id: v.voice_id || v.id,
+               tags: [v.language, v.gender].filter(Boolean),
+               sample_text: v.description || 'Hello! I am your ElevenLabs AI receptionist. How can I help you today?',
+               recommended_for: [],
+               is_recommended: false
+            }));
+            
+            setLocalVoices(prev => {
+               const others = prev.filter(p => p.provider !== 'elevenlabs');
+               return [...dynamicEleven, ...others];
+            });
+          }
+        }
+      } catch (err) {
+         console.error("Failed to fetch dynamic ElevenLabs voices:", err);
+      }
+    };
+
     fetchStatus();
     fetchSarvamVoices();
+    fetchElevenLabsVoices();
   }, []);
 
   // Stop currently playing audio on unmount or when playingId changes
@@ -124,6 +160,7 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
         voice_id: v_id,
         language: lang,
         text: sampleText,
+        model: voice.model || '',
       });
 
       const controller = new AbortController();

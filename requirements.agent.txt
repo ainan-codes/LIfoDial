@@ -11,7 +11,7 @@
 # [sarvam]  → SarvamSTTService + SarvamTTSService
 # [livekit] → LiveKitTransport (WebRTC)
 # [google]  → GoogleLLMService (Gemini 2.0 Flash)
-pipecat-ai[sarvam,livekit,google]>=0.0.105
+pipecat-ai[sarvam,livekit,google,openai,elevenlabs]>=0.0.105
 
 # ── Audio processing (required by Silero VAD in Pipecat) ─────────────────────
 # These are available via apt in Dockerfile.agent (libsndfile1, ffmpeg)

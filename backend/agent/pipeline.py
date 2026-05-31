@@ -49,6 +49,8 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.google.llm import GoogleLLMService
 from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSModel, SarvamTTSService
+from pipecat.services.openai import OpenAISTTService
+from pipecat.services.elevenlabs import ElevenLabsTTSService
 from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
 
 # ── Pipecat LiveKit token helper ──────────────────────────────────────────────
@@ -179,6 +181,8 @@ async def _load_tenant_and_config(
         "first_message":   metadata.get("first_message", ""),
         "system_prompt":   metadata.get("system_prompt", ""),
         "template":        metadata.get("template", "clinic_receptionist"),
+        "stt_provider":    metadata.get("stt_provider", "sarvam"),
+        "tts_provider":    metadata.get("tts_provider", "sarvam"),
         "tts_voice":       metadata.get("tts_voice", "priya"),
         "tts_language":    metadata.get("tts_language", "hi-IN"),
         "tts_model":       metadata.get("tts_model", "bulbul:v3"),
@@ -220,6 +224,8 @@ async def _load_tenant_and_config(
                         "first_message":       cfg.first_message or "",
                         "system_prompt":       cfg.system_prompt or "",
                         "template":            getattr(cfg, "template", "clinic_receptionist"),
+                        "stt_provider":        getattr(cfg, "stt_provider", "sarvam") or "sarvam",
+                        "tts_provider":        getattr(cfg, "tts_provider", "sarvam") or "sarvam",
                         "tts_voice":           cfg.tts_voice or "priya",
                         "tts_language":        cfg.tts_language or "hi-IN",
                         "tts_model":           cfg.tts_model or "bulbul:v3",
@@ -436,11 +442,35 @@ async def entrypoint(ctx) -> None:
         ),
     )
 
-    # STT — Sarvam AI (Indian language speech recognition)
-    stt = SarvamSTTService(
-        api_key=settings.sarvam_api_key,
-        settings=stt_settings,
-    )
+    # STT — Sarvam AI, OpenAI Whisper, or ElevenLabs Realtime
+    stt_provider = agent_config.get("stt_provider", "sarvam")
+    if stt_provider in ("openai", "whisper"):
+        log.info("Instantiating OpenAI Whisper STT...")
+        stt = OpenAISTTService(
+            api_key=settings.openai_api_key,
+            model="whisper-1"
+        )
+    elif stt_provider == "elevenlabs":
+        log.info("Instantiating ElevenLabs Realtime STT...")
+        from pipecat.services.elevenlabs.stt import ElevenLabsRealtimeSTTService
+        
+        # ElevenLabs Scribe uses ISO 2-letter or 3-letter language code
+        stt_lang = agent_config.get("stt_language") or tts_language
+        if stt_lang and "-" in stt_lang:
+            stt_lang = stt_lang.split("-")[0]
+            
+        stt = ElevenLabsRealtimeSTTService(
+            api_key=settings.elevenlabs_api_key,
+            settings=ElevenLabsRealtimeSTTService.Settings(
+                language=stt_lang or None,
+            )
+        )
+    else:
+        log.info("Instantiating Sarvam STT...")
+        stt = SarvamSTTService(
+            api_key=settings.sarvam_api_key,
+            settings=stt_settings,
+        )
 
     # LLM — Google Gemini 2.0 Flash via Pipecat GoogleLLMService
     llm = GoogleLLMService(
@@ -461,14 +491,41 @@ async def entrypoint(ctx) -> None:
     )
     context_aggregator = llm.create_context_aggregator(context)
 
-    # TTS — Sarvam AI (Indian language text-to-speech, streaming)
-    tts = SarvamTTSService(
-        api_key=settings.sarvam_api_key,
-        model=tts_model_str,
-        voice=tts_voice,
-        language=tts_language,
-        pace=tts_pace,
-    )
+    # TTS — Sarvam AI or ElevenLabs
+    tts_provider = agent_config.get("tts_provider", "sarvam")
+    if tts_provider == "elevenlabs":
+        # Safe fallback: if tts_voice is empty or is a Sarvam voice name, default to ElevenLabs' Rachel ID
+        selected_voice = tts_voice
+        sarvam_voice_ids = {
+            "priya", "ritu", "neha", "simran", "kavya", "ishita", "shreya", "tanya", "pooja", "roopa",
+            "kavitha", "suhani", "shruti", "niharika", "rupali", "rahul", "aditya", "ashutosh", "rohan",
+            "amit", "dev", "ratan", "varun", "manan", "sumit", "kabir", "aayan", "shubh", "advait",
+            "anand", "tarun", "sunny", "mani", "gokul", "vijay", "mohit", "rehan", "soham", "meera", "bulbul"
+        }
+        if not selected_voice or selected_voice.lower() in sarvam_voice_ids:
+            selected_voice = "21m00Tcm4TlvDq8ikWAM"  # Rachel (Premium Female English)
+
+        tts_model_configured = agent_config.get("tts_model", "eleven_flash_v2_5")
+        if tts_model_configured not in ("eleven_flash_v2_5", "eleven_multilingual_v2", "eleven_turbo_v2_5"):
+            tts_model_configured = "eleven_flash_v2_5"
+
+        log.info("Instantiating ElevenLabs TTS for voice: %s, model: %s", selected_voice, tts_model_configured)
+        tts = ElevenLabsTTSService(
+            api_key=settings.elevenlabs_api_key,
+            voice_id=selected_voice,
+            settings=ElevenLabsTTSService.Settings(
+                model=tts_model_configured
+            )
+        )
+    else:
+        log.info("Instantiating Sarvam TTS...")
+        tts = SarvamTTSService(
+            api_key=settings.sarvam_api_key,
+            model=tts_model_str,
+            voice=tts_voice,
+            language=tts_language,
+            pace=tts_pace,
+        )
 
     # Custom processors — booking state machine + call logging
     booking_processor = BookingProcessor(

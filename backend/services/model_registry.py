@@ -227,6 +227,17 @@ async def get_all_providers_summary(settings) -> dict:
                     "models": [
                         {"id": "gemini-2.5-flash", "name": "Gemini Flash STT", "recommended": True}
                     ]
+                },
+                {
+                    "id": "elevenlabs",
+                    "name": "ElevenLabs",
+                    "flag": "✨",
+                    "connected": bool(settings.elevenlabs_api_key),
+                    "best_for": "Multilingual & Low Latency — Scribe v2",
+                    "models": [
+                        {"id": "scribe_v2_realtime", "name": "Scribe v2 Realtime", "label": "Streaming — Recommended", "recommended": True},
+                        {"id": "scribe_v2", "name": "Scribe v2 Batch", "label": "Batch processing"},
+                    ]
                 }
             ],
             "llm": [
@@ -259,6 +270,26 @@ async def get_all_providers_summary(settings) -> dict:
                             "name": "Bulbul v2",
                             "label": "Stable — pitch control",
                             "voices": SARVAM_VOICES_DATA["bulbul:v2"]
+                        }
+                    ]
+                },
+                {
+                    "id": "elevenlabs",
+                    "name": "ElevenLabs",
+                    "flag": "✨",
+                    "connected": bool(settings.elevenlabs_api_key),
+                    "best_for": "Premium voices — High naturalness",
+                    "models": [
+                        {
+                            "id": "eleven_flash_v2_5",
+                            "name": "Eleven Flash v2.5",
+                            "label": "Ultra-low Latency (~75ms) — Recommended",
+                            "recommended": True
+                        },
+                        {
+                            "id": "eleven_multilingual_v2",
+                            "name": "Eleven Multilingual v2",
+                            "label": "Expressive / Stable Quality"
                         }
                     ]
                 }

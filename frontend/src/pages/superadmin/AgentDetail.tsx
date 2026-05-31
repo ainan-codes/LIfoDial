@@ -580,6 +580,16 @@ export default function AgentDetail() {
   const [saveStatus, setSaveStatus] = useState<null | 'saving' | 'saved' | 'error'>(null);
   const [showTest, setShowTest] = useState(false);
   const timerRef = useRef<any>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+    };
+  }, []);
   
   // Scroll-spy tab navigation
   type AgentTab = 'assistant' | 'logs' | 'tools' | 'analysis' | 'advanced';
@@ -893,23 +903,83 @@ export default function AgentDetail() {
     }
   };
 
-  const playTTSPreview = async () => {
+  const stopAudio = () => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+  };
+
+  const playTTSPreview = async (overrideParams?: { provider?: string; voice_id?: string; model?: string; language?: string; text?: string }) => {
+    stopAudio();
+    
+    const prov = overrideParams?.provider || agent?.tts_provider || 'sarvam';
+    const voice = overrideParams?.voice_id || agent?.tts_voice || 'meera';
+    const mdl = overrideParams?.model || agent?.tts_model || '';
+    const lang = overrideParams?.language || agent?.tts_language || 'hi-IN';
+    const txt = overrideParams?.text || agent?.first_message || 'Hello! I am your AI receptionist. How can I help you today?';
+    
     try {
       const params = new URLSearchParams({
-        provider: agent.tts_provider || 'sarvam',
-        voice_id: agent.tts_voice || 'meera',
-        text: agent.first_message || 'Hello! I am your clinic receptionist. How can I help you today?',
-        pitch: String(agent.tts_pitch ?? 0),
-        pace: String(agent.tts_pace ?? 1),
-        loudness: String(agent.tts_loudness ?? 1),
+        provider: prov,
+        voice_id: voice,
+        language: lang,
+        text: txt,
+        pitch: String(agent?.tts_pitch ?? 0),
+        pace: String(agent?.tts_pace ?? 1),
+        loudness: String(agent?.tts_loudness ?? 1),
       });
-      const res = await fetch(`${API_URL}/platform/tts/preview?${params}`);
+      if (mdl) {
+        params.append('model', mdl);
+      }
+      
+      const res = await fetch(`${API_URL}/platform/tts/preview?${params.toString()}`);
       if (res.ok) {
         const audioBlob = await res.blob();
-        const audio = new Audio(URL.createObjectURL(audioBlob));
-        audio.play();
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio(audioUrl);
+        audioRef.current = audio;
+        audio.onended = () => {
+          URL.revokeObjectURL(audioUrl);
+          if (audioRef.current === audio) audioRef.current = null;
+        };
+        audio.onerror = () => {
+          URL.revokeObjectURL(audioUrl);
+          if (audioRef.current === audio) audioRef.current = null;
+        };
+        await audio.play();
       }
-    } catch(e) { console.error('Play failed', e); }
+    } catch(e) {
+      console.error('Play preview failed', e);
+    }
+  };
+
+  const playSTTPreview = async (provider: string, model: string) => {
+    let ttsProvider = 'elevenlabs';
+    let voiceId = '21m00Tcm4TlvDq8ikWAM'; // Rachel
+    let text = `Speech-to-text model configured to ElevenLabs Scribe.`;
+    
+    if (provider === 'sarvam') {
+      ttsProvider = 'sarvam';
+      voiceId = 'meera';
+      text = `Speech to text model configured to Sarvam Saaras.`;
+    } else if (provider === 'deepgram') {
+      ttsProvider = 'openai_tts';
+      voiceId = 'alloy';
+      text = `Speech to text model configured to Deepgram Nova.`;
+    } else if (provider === 'whisper') {
+      ttsProvider = 'openai_tts';
+      voiceId = 'alloy';
+      text = `Speech to text model configured to OpenAI Whisper.`;
+    }
+    
+    await playTTSPreview({
+      provider: ttsProvider,
+      voice_id: voiceId,
+      text: text,
+      language: ttsProvider === 'sarvam' ? 'hi-IN' : 'en-US',
+      model: ttsProvider === 'elevenlabs' ? 'eleven_flash_v2_5' : 'bulbul:v3'
+    });
   };
 
   const sendTestChat = async () => {
@@ -1142,28 +1212,46 @@ export default function AgentDetail() {
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px', marginTop: '8px' }}>
                 <div>
                   <Label>Provider</Label>
-                  <Select value={agent.tts_provider} onChange={(v:any) => updateField('tts_provider', v)} options={['sarvam', 'elevenlabs', 'openai', 'azure', 'gemini']} />
+                  <Select value={agent.tts_provider} onChange={(v:any) => {
+                    updateField('tts_provider', v);
+                    setTimeout(() => {
+                      playTTSPreview({ provider: v });
+                    }, 100);
+                  }} options={[
+                    { value: 'sarvam', label: 'Sarvam AI' },
+                    { value: 'elevenlabs', label: 'ElevenLabs' },
+                    { value: 'openai_tts', label: 'OpenAI TTS' }
+                  ]} />
                 </div>
                 <div>
                   <Label>Voice</Label>
                   {ttsVoices.length > 0 ? (
                     <Select 
                        value={agent.tts_voice} 
-                       onChange={(v:any) => updateField('tts_voice', v)} 
+                       onChange={(v:any) => {
+                         updateField('tts_voice', v);
+                         playTTSPreview({ voice_id: v });
+                       }} 
                        options={ttsVoices} 
                     />
                   ) : (
-                    <Input value={agent.tts_voice} onChange={(v:any) => updateField('tts_voice', v)} />
+                    <Input value={agent.tts_voice} onChange={(v:any) => {
+                      updateField('tts_voice', v);
+                      playTTSPreview({ voice_id: v });
+                    }} />
                   )}
                 </div>
                 <div>
                   <Label>Voice Model</Label>
-                  <Select value={agent.tts_model} onChange={(v:any) => updateField('tts_model', v)} options={ttsModels.length ? ttsModels : [agent.tts_model || 'bulbul:v3']} />
+                  <Select value={agent.tts_model} onChange={(v:any) => {
+                    updateField('tts_model', v);
+                    playTTSPreview({ model: v });
+                  }} options={ttsModels.length ? ttsModels : [agent.tts_model || 'bulbul:v3']} />
                 </div>
               </div>
 
               <div style={{ display: 'flex', alignItems: 'center', gap: '16px', padding: '12px 16px', background: 'rgba(255,255,255,0.03)', borderRadius: '12px', border: `1px solid ${BORDER}` }}>
-                <button onClick={playTTSPreview} style={{ padding: '8px 16px', borderRadius: '8px', background: ACCENT, color: '#000', border: 'none', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}><Play size={14} fill="#000" /> Play Sample</button>
+                <button onClick={() => playTTSPreview()} style={{ padding: '8px 16px', borderRadius: '8px', background: ACCENT, color: '#000', border: 'none', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}><Play size={14} fill="#000" /> Play Sample</button>
                 <div style={{ flex: 1, height: '4px', background: 'rgba(255,255,255,0.1)', borderRadius: '2px', position: 'relative' }}>
                   <div style={{ position: 'absolute', top: 0, left: 0, height: '100%', width: '15%', background: ACCENT, borderRadius: '2px' }} />
                 </div>
@@ -1205,8 +1293,19 @@ export default function AgentDetail() {
             {/* 3. TRANSCRIBER (STT) */}
             <CollapsibleSection icon={Activity} title="Transcriber" summary={`${agent.stt_provider} · ${agent.stt_language}`}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '24px' }}>
-                <div><Label>Provider</Label><Select value={agent.stt_provider} onChange={(v:any) => updateField('stt_provider', v)} options={['sarvam', 'deepgram', 'whisper']} /></div>
-                <div><Label>Model</Label><Select value={agent.stt_model} onChange={(v:any) => updateField('stt_model', v)} options={sttModels.length ? sttModels : [agent.stt_model || 'saarika:v2']} /></div>
+                <div><Label>Provider</Label><Select value={agent.stt_provider} onChange={(v:any) => {
+                  updateField('stt_provider', v);
+                  playSTTPreview(v, agent.stt_model);
+                }} options={[
+                  { value: 'sarvam', label: 'Sarvam AI' },
+                  { value: 'elevenlabs', label: 'ElevenLabs' },
+                  { value: 'deepgram', label: 'Deepgram' },
+                  { value: 'whisper', label: 'OpenAI Whisper' }
+                ]} /></div>
+                <div><Label>Model</Label><Select value={agent.stt_model} onChange={(v:any) => {
+                  updateField('stt_model', v);
+                  playSTTPreview(agent.stt_provider, v);
+                }} options={sttModels.length ? sttModels : [agent.stt_model || 'saarika:v2']} /></div>
                 <div><Label>Language</Label><Select value={agent.stt_language} onChange={(v:any) => updateField('stt_language', v)} options={['en-IN', 'hi-IN', 'ta-IN', 'te-IN', 'ar-SA', 'en-US', 'Multilingual (English/Hindi/Regional)', 'auto-detect']} /></div>
               </div>
               <div>
@@ -1474,13 +1573,22 @@ export default function AgentDetail() {
                  <VoiceLibrary 
                    isPickerModal 
                    onSelectVoice={(voice) => {
+                     const newVoiceId = voice.voice_id || voice.id || voice.name;
                      updateFields({
                        tts_provider: voice.provider,
                        tts_model: voice.model,
-                         tts_voice: voice.voice_id || voice.id || voice.name,
+                       tts_voice: newVoiceId,
                        tts_language: voice.language
                      });
                      setShowVoiceModal(false);
+                     setTimeout(() => {
+                       playTTSPreview({
+                         provider: voice.provider,
+                         voice_id: newVoiceId,
+                         model: voice.model,
+                         language: voice.language
+                       });
+                     }, 300);
                    }} 
                  />
               </div>

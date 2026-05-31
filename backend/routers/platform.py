@@ -57,6 +57,9 @@ PROVIDERS = {
         {"id": "sarvam",     "name": "Sarvam AI",      "env_var": "SARVAM_API_KEY",
          "models": ["saaras:v3", "saarika:v2.5"],
          "key_label": "SARVAM_API_KEY",    "key_url": "https://dashboard.sarvam.ai",         "icon": "S"},
+        {"id": "elevenlabs", "name": "ElevenLabs",     "env_var": "ELEVENLABS_API_KEY",
+         "models": ["scribe_v2_realtime", "scribe_v2"],
+         "key_label": "ELEVENLABS_API_KEY", "key_url": "https://elevenlabs.io",               "icon": "El"},
         {"id": "deepgram",   "name": "Deepgram",       "env_var": "DEEPGRAM_API_KEY",
          "models": ["nova-2", "nova-2-medical", "nova-2-meeting", "nova-2-phonecall"],
          "key_label": "DEEPGRAM_API_KEY",  "key_url": "https://console.deepgram.com",        "icon": "D"},
@@ -513,6 +516,7 @@ async def tts_preview(
     pitch: float = 0.0,
     pace: float = 1.0,
     loudness: float = 1.0,
+    model: Optional[str] = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ):
     if provider == "sarvam":
@@ -559,10 +563,11 @@ async def tts_preview(
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             if provider == "elevenlabs":
+                selected_model = model or "eleven_flash_v2_5"
                 r = await client.post(
                     f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream",
                     headers={"xi-api-key": raw_key, "Content-Type": "application/json"},
-                    json={"text": text, "model_id": "eleven_turbo_v2", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}},
+                    json={"text": text, "model_id": selected_model, "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}},
                 )
                 r.raise_for_status()
                 return Response(content=r.content, media_type="audio/mpeg")

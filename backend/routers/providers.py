@@ -116,10 +116,11 @@ async def get_providers() -> dict:
             {
                 "id": "elevenlabs",
                 "name": "ElevenLabs",
-                "type": ["tts"],
+                "type": ["stt", "tts"],
                 "connected": elevenlabs_ok,
                 "voice_count": 0 if not elevenlabs_ok else "sync required",
-                "description": "Premium TTS for English. High naturalness.",
+                "stt_models": ["scribe_v2_realtime", "scribe_v2"],
+                "description": "Premium TTS & Scribe v2 STT. High naturalness.",
                 "website": "https://elevenlabs.io",
             },
             {
@@ -132,10 +133,10 @@ async def get_providers() -> dict:
             },
         ],
         "summary": {
-            "stt_ready": sarvam_ok,
+            "stt_ready": sarvam_ok or elevenlabs_ok,
             "tts_ready": sarvam_ok or elevenlabs_ok,
             "llm_ready": gemini_ok or openai_ok,
-            "can_run_calls": sarvam_ok and gemini_ok,
+            "can_run_calls": (sarvam_ok or elevenlabs_ok) and gemini_ok,
         },
     }
 
@@ -313,6 +314,28 @@ async def test_connection(req: TestConnectionRequest) -> dict:
                     return {"provider": "sarvam", "connected": False, "error": f"HTTP {resp.status_code}: {resp.text[:100]}"}
         except Exception as e:
             return {"provider": "sarvam", "connected": False, "error": str(e)[:100]}
+
+    elif req.provider == "elevenlabs":
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://api.elevenlabs.io/v1/voices",
+                    headers={"xi-api-key": req.api_key},
+                )
+                latency_ms = int((time.time() - t0) * 1000)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    voices = data.get("voices", [])
+                    return {
+                        "provider": "elevenlabs",
+                        "connected": True,
+                        "latency_ms": latency_ms,
+                        "voices_count": len(voices),
+                    }
+                else:
+                    return {"provider": "elevenlabs", "connected": False, "error": f"HTTP {resp.status_code}: {resp.text[:100]}"}
+        except Exception as e:
+            return {"provider": "elevenlabs", "connected": False, "error": str(e)[:100]}
 
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported provider: {req.provider}")

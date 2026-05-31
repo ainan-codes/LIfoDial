@@ -3,6 +3,10 @@ export const AI_PROVIDERS = {
     { id: 'sarvam', name: 'Sarvam AI', recommended: true, models: [
       { id: 'saarika:v2', name: 'saarika:v2', tags: ['Best for Indian languages', 'Recommended'] }
     ]},
+    { id: 'elevenlabs', name: 'ElevenLabs', models: [
+      { id: 'scribe_v2_realtime', name: 'scribe_v2_realtime', tags: ['Streaming', 'Recommended'] },
+      { id: 'scribe_v2', name: 'scribe_v2', tags: ['Batch'] }
+    ]},
     { id: 'deepgram', name: 'Deepgram', models: [
       { id: 'nova-2', name: 'nova-2', tags: ['Fastest'] },
       { id: 'nova-2-medical', name: 'nova-2-medical', tags: ['High Accuracy'] }
@@ -39,8 +43,8 @@ export const AI_PROVIDERS = {
       { id: 'bulbul:v1', name: 'bulbul:v1', tags: ['Best for Indian languages', 'Recommended'] }
     ]},
     { id: 'elevenlabs', name: 'ElevenLabs', models: [
-      { id: 'eleven_multilingual_v2', name: 'eleven_multilingual_v2', tags: ['Best Quality'] },
-      { id: 'eleven_turbo_v2_5', name: 'eleven_turbo_v2_5', tags: ['Fastest'] }
+      { id: 'eleven_flash_v2_5', name: 'eleven_flash_v2_5', tags: ['Ultra-low Latency', 'Recommended'] },
+      { id: 'eleven_multilingual_v2', name: 'eleven_multilingual_v2', tags: ['Best Quality'] }
     ]},
     { id: 'openai', name: 'OpenAI TTS', models: [
       { id: 'tts-1', name: 'tts-1', tags: ['Fastest'] },
