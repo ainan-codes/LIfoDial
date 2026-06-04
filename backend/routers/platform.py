@@ -75,7 +75,7 @@ PROVIDERS = {
          "models": ["bulbul:v3", "bulbul:v2", "bulbul:v1"],
          "key_label": "SARVAM_API_KEY",     "key_url": "https://dashboard.sarvam.ai",        "icon": "S"},
         {"id": "elevenlabs", "name": "ElevenLabs",  "env_var": "ELEVENLABS_API_KEY",
-         "models": ["eleven_turbo_v2", "eleven_turbo_v2_5", "eleven_multilingual_v2", "eleven_flash_v2_5"],
+         "models": ["eleven_v3", "eleven_flash_v2_5", "eleven_multilingual_v2", "eleven_turbo_v2_5"],
          "key_label": "ELEVENLABS_API_KEY", "key_url": "https://elevenlabs.io",              "icon": "El"},
         {"id": "openai_tts", "name": "OpenAI TTS",  "env_var": "OPENAI_API_KEY",
          "models": ["tts-1", "tts-1-hd", "gpt-4o-mini-tts"],
@@ -563,14 +563,43 @@ async def tts_preview(
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             if provider == "elevenlabs":
+                # ── STRATEGY: Use preview_url first (free, zero characters) ──
+                # Fetching the voice's preview_url costs 0 characters.
+                # Only fall back to TTS generation if preview_url is unavailable.
+                try:
+                    voices_resp = await client.get(
+                        "https://api.elevenlabs.io/v1/voices",
+                        headers={"xi-api-key": raw_key},
+                    )
+                    if voices_resp.status_code == 200:
+                        voices_data = voices_resp.json().get("voices", [])
+                        voice_entry = next((v for v in voices_data if v.get("voice_id") == voice_id), None)
+                        if voice_entry and voice_entry.get("preview_url"):
+                            # Stream the pre-built preview MP3 — no characters consumed
+                            preview_audio = await client.get(voice_entry["preview_url"])
+                            if preview_audio.status_code == 200:
+                                return Response(
+                                    content=preview_audio.content,
+                                    media_type="audio/mpeg",
+                                    headers={"X-Preview-Source": "preview_url"},
+                                )
+                except Exception as preview_err:
+                    logger.warning("ElevenLabs preview_url fetch failed, trying TTS generation: %s", preview_err)
+
+                # ── FALLBACK: Generate TTS (uses characters) ──
                 selected_model = model or "eleven_flash_v2_5"
                 r = await client.post(
                     f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream",
                     headers={"xi-api-key": raw_key, "Content-Type": "application/json"},
                     json={"text": text, "model_id": selected_model, "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}},
                 )
+                if r.status_code == 401:
+                    raise HTTPException(
+                        status_code=402,
+                        detail="ElevenLabs character quota exhausted. Your free tier (10,000 chars/month) is used up. Upgrade at elevenlabs.io or wait for monthly reset."
+                    )
                 r.raise_for_status()
-                return Response(content=r.content, media_type="audio/mpeg")
+                return Response(content=r.content, media_type="audio/mpeg", headers={"X-Preview-Source": "tts_generated"})
 
             elif provider == "openai_tts":
                 r = await client.post(
