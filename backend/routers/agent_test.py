@@ -2780,7 +2780,34 @@ async def synthesize_speech(agent: AgentConfig, text: str, language_override: st
             return None
             
     except Exception as e:
-        logger.error(f"TTS synthesis failed: {e}", exc_info=True)
+        logger.error(f"TTS synthesis failed ({tts_provider}): {e}", exc_info=True)
+
+        # ── AUTO-FALLBACK: If ElevenLabs/OpenAI TTS fails, try Sarvam ────────
+        # This ensures the agent call NEVER goes silent during a live call.
+        # Common failures: ElevenLabs 401 (quota exhausted), 429 (rate limit),
+        # network timeouts, OpenAI TTS outages.
+        if tts_provider != "sarvam":
+            sarvam_key = settings.sarvam_api_key or os.getenv("SARVAM_API_KEY")
+            if sarvam_key:
+                try:
+                    logger.warning(
+                        "Auto-fallback: %s TTS failed, falling back to Sarvam for this utterance",
+                        tts_provider,
+                    )
+                    fallback_lang = normalize_sarvam_language(tts_language)
+                    return await sarvam_synthesize(
+                        api_key=sarvam_key,
+                        text=text,
+                        voice="priya",
+                        model="bulbul:v3",
+                        language=fallback_lang,
+                        pitch=0.0,
+                        pace=1.0,
+                        loudness=1.0,
+                    )
+                except Exception as fb_err:
+                    logger.error("Sarvam fallback also failed: %s", fb_err)
+
         return None
 
 
@@ -3031,6 +3058,11 @@ async def elevenlabs_synthesize(api_key: str, text: str,
         
         if response.status_code == 200:
             return response.content
+        elif response.status_code == 401:
+            raise Exception(
+                f"ElevenLabs TTS: 401 — API key invalid or character quota exhausted. "
+                f"Free tier resets monthly. Upgrade at elevenlabs.io or wait for reset."
+            )
         else:
             raise Exception(f"ElevenLabs TTS: {response.status_code}")
 
