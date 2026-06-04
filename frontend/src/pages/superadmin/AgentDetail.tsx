@@ -1214,9 +1214,6 @@ export default function AgentDetail() {
                   <Label>Provider</Label>
                   <Select value={agent.tts_provider} onChange={(v:any) => {
                     updateField('tts_provider', v);
-                    setTimeout(() => {
-                      playTTSPreview({ provider: v });
-                    }, 100);
                   }} options={[
                     { value: 'sarvam', label: 'Sarvam AI' },
                     { value: 'elevenlabs', label: 'ElevenLabs' },
@@ -1230,14 +1227,12 @@ export default function AgentDetail() {
                        value={agent.tts_voice} 
                        onChange={(v:any) => {
                          updateField('tts_voice', v);
-                         playTTSPreview({ voice_id: v });
                        }} 
                        options={ttsVoices} 
                     />
                   ) : (
                     <Input value={agent.tts_voice} onChange={(v:any) => {
                       updateField('tts_voice', v);
-                      playTTSPreview({ voice_id: v });
                     }} />
                   )}
                 </div>
@@ -1245,7 +1240,6 @@ export default function AgentDetail() {
                   <Label>Voice Model</Label>
                   <Select value={agent.tts_model} onChange={(v:any) => {
                     updateField('tts_model', v);
-                    playTTSPreview({ model: v });
                   }} options={ttsModels.length ? ttsModels : [agent.tts_model || 'bulbul:v3']} />
                 </div>
               </div>
@@ -1295,7 +1289,6 @@ export default function AgentDetail() {
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '24px' }}>
                 <div><Label>Provider</Label><Select value={agent.stt_provider} onChange={(v:any) => {
                   updateField('stt_provider', v);
-                  playSTTPreview(v, agent.stt_model);
                 }} options={[
                   { value: 'sarvam', label: 'Sarvam AI' },
                   { value: 'elevenlabs', label: 'ElevenLabs' },
@@ -1304,7 +1297,6 @@ export default function AgentDetail() {
                 ]} /></div>
                 <div><Label>Model</Label><Select value={agent.stt_model} onChange={(v:any) => {
                   updateField('stt_model', v);
-                  playSTTPreview(agent.stt_provider, v);
                 }} options={sttModels.length ? sttModels : [agent.stt_model || 'saarika:v2']} /></div>
                 <div><Label>Language</Label><Select value={agent.stt_language} onChange={(v:any) => updateField('stt_language', v)} options={['en-IN', 'hi-IN', 'ta-IN', 'te-IN', 'ar-SA', 'en-US', 'Multilingual (English/Hindi/Regional)', 'auto-detect']} /></div>
               </div>
