@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { AI_PROVIDERS } from '../../fixtures/ai-providers';
-import { AlertCircle, CheckCircle2, XCircle, Lock, ChevronDown, Activity, ChevronRight, Save } from 'lucide-react';
+import { AlertCircle, CheckCircle2, XCircle, Lock, ChevronDown, Activity, ChevronRight, Save, Mic } from 'lucide-react';
+import VoiceBrowserModal from '../../components/VoiceBrowserModal';
 
 const LOCAL_STORAGE_KEY = 'lifodial_ai_config';
 
@@ -37,6 +38,10 @@ export default function AIConfig() {
   const [saved, setSaved] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
+  // ElevenLabs voice browser
+  const [voiceBrowserOpen, setVoiceBrowserOpen]     = useState(false);
+  const [selectedELVoice, setSelectedELVoice]       = useState<{ voice_id: string; name: string } | null>(null);
+
   useEffect(() => {
     try {
       const stored = localStorage.getItem(LOCAL_STORAGE_KEY);
@@ -65,7 +70,9 @@ export default function AIConfig() {
   const handleSave = () => {
     localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify({
       sttProvider, sttModel, llmProvider, llmModel, ttsProvider, ttsModel,
-      advVad, advMinSpeech, advBackchannel, advInterrupt, advTemp, advTokens, advMemory
+      advVad, advMinSpeech, advBackchannel, advInterrupt, advTemp, advTokens, advMemory,
+      elVoiceId: selectedELVoice?.voice_id || null,
+      elVoiceName: selectedELVoice?.name || null,
     }));
     setSaved(true);
     setTimeout(() => setSaved(false), 3000);
@@ -251,16 +258,60 @@ export default function AIConfig() {
                     {!hasKey && <Lock size={14} color="var(--text-muted)" />}
                   </div>
                   {isActive && (
-                    <select 
-                      value={ttsModel} 
-                      onChange={(e) => setTtsModel(e.target.value)}
-                      onClick={(e) => e.stopPropagation()}
-                      style={{ width: '100%', padding: '8px', borderRadius: '6px', backgroundColor: 'var(--bg-surface)', border: '1px solid var(--accent-border)', color: 'var(--text-primary)', outline: 'none', fontSize: '13px' }}
-                    >
-                      {p.models.map(m => (
-                        <option key={m.id} value={m.id}>{m.name} {m.tags.length > 0 ? `(${m.tags[0]})` : ''}</option>
-                      ))}
-                    </select>
+                    <>
+                      <select 
+                        value={ttsModel} 
+                        onChange={(e) => setTtsModel(e.target.value)}
+                        onClick={(e) => e.stopPropagation()}
+                        style={{ width: '100%', padding: '8px', borderRadius: '6px', backgroundColor: 'var(--bg-surface)', border: '1px solid var(--accent-border)', color: 'var(--text-primary)', outline: 'none', fontSize: '13px', marginBottom: '10px' }}
+                      >
+                        {p.models.map(m => (
+                          <option key={m.id} value={m.id}>{m.name} {m.tags.length > 0 ? `(${m.tags[0]})` : ''}</option>
+                        ))}
+                      </select>
+
+                      {/* ElevenLabs Voice Browser */}
+                      {p.id === 'elevenlabs' && (
+                        <div
+                          onClick={e => e.stopPropagation()}
+                          style={{ marginTop: 2 }}
+                        >
+                          {selectedELVoice && (
+                            <div style={{
+                              display: 'flex', alignItems: 'center', gap: 6,
+                              padding: '6px 10px', borderRadius: 6, marginBottom: 8,
+                              backgroundColor: 'rgba(62,207,142,0.08)',
+                              border: '1px solid rgba(62,207,142,0.25)',
+                            }}>
+                              <Mic size={12} color="#3ECF8E" />
+                              <span style={{ fontSize: 12, color: '#3ECF8E', fontWeight: 600 }}>
+                                {selectedELVoice.name}
+                              </span>
+                              <button
+                                onClick={() => setSelectedELVoice(null)}
+                                style={{ marginLeft: 'auto', background: 'none', border: 'none', color: '#555', cursor: 'pointer', fontSize: 11 }}
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          )}
+                          <button
+                            onClick={() => setVoiceBrowserOpen(true)}
+                            style={{
+                              width: '100%', padding: '8px 12px', borderRadius: 8,
+                              fontSize: 12, fontWeight: 600,
+                              backgroundColor: 'rgba(62,207,142,0.1)',
+                              border: '1px solid rgba(62,207,142,0.3)',
+                              color: '#3ECF8E', cursor: 'pointer',
+                              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+                            }}
+                          >
+                            <Mic size={13} />
+                            {selectedELVoice ? 'Change Voice' : 'Browse Voices'}
+                          </button>
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               );
@@ -387,6 +438,14 @@ export default function AIConfig() {
           </p>
         )}
       </div>
+
+      {/* Voice Browser Modal */}
+      <VoiceBrowserModal
+        open={voiceBrowserOpen}
+        onClose={() => setVoiceBrowserOpen(false)}
+        onSelect={(voice) => setSelectedELVoice(voice)}
+        selectedVoiceId={selectedELVoice?.voice_id}
+      />
 
     </div>
   );

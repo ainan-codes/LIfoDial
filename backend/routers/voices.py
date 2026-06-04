@@ -8,11 +8,115 @@ from pydantic import BaseModel
 import base64
 import httpx
 import logging
+from datetime import datetime, timedelta
 
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# ── In-memory cache for ElevenLabs voices (TTL: 1 hour) ─────────────────────
+_el_voices_cache: dict = {"data": None, "expires": None}
+
+
+def _el_cache_valid() -> bool:
+    return (
+        _el_voices_cache["data"] is not None
+        and _el_voices_cache["expires"] is not None
+        and datetime.utcnow() < _el_voices_cache["expires"]
+    )
+
+
+@router.get("/elevenlabs")
+async def get_elevenlabs_voices(
+    gender: Optional[str] = None,
+    category: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    """
+    Returns all ElevenLabs voices with preview_url for in-platform audio preview.
+    Cached for 1 hour to avoid unnecessary API calls.
+    """
+    api_key = settings.elevenlabs_api_key
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="ElevenLabs API key not configured. Add ELEVENLABS_API_KEY to your .env",
+        )
+
+    # Return cached voices if still valid
+    if _el_cache_valid():
+        voices = _el_voices_cache["data"]
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    "https://api.elevenlabs.io/v1/voices",
+                    headers={"xi-api-key": api_key},
+                )
+                if resp.status_code != 200:
+                    raise HTTPException(
+                        status_code=resp.status_code,
+                        detail=f"ElevenLabs API error: {resp.text[:200]}",
+                    )
+                data = resp.json()
+
+            raw_voices = data.get("voices", [])
+            voices = []
+            for v in raw_voices:
+                labels = v.get("labels", {})
+                voices.append({
+                    "voice_id": v.get("voice_id"),
+                    "name": v.get("name"),
+                    "preview_url": v.get("preview_url"),  # Direct MP3 — no generation needed
+                    "category": v.get("category", "premade"),
+                    "description": v.get("description") or labels.get("description", ""),
+                    "gender": labels.get("gender", "").lower(),
+                    "accent": labels.get("accent", ""),
+                    "age": labels.get("age", ""),
+                    "use_case": labels.get("use case") or labels.get("use_case", ""),
+                    "labels": labels,
+                })
+
+            # Cache for 1 hour
+            _el_voices_cache["data"] = voices
+            _el_voices_cache["expires"] = datetime.utcnow() + timedelta(hours=1)
+            logger.info(f"Fetched and cached {len(voices)} ElevenLabs voices")
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to fetch ElevenLabs voices: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # Apply filters
+    if gender:
+        voices = [v for v in voices if v["gender"] == gender.lower()]
+    if category:
+        voices = [v for v in voices if v["category"] == category]
+    if search:
+        q = search.lower()
+        voices = [
+            v for v in voices
+            if q in v["name"].lower()
+            or q in v.get("description", "").lower()
+            or q in v.get("accent", "").lower()
+            or q in v.get("use_case", "").lower()
+        ]
+
+    return {
+        "total": len(voices),
+        "voices": voices,
+        "cached": _el_cache_valid(),
+    }
+
+
+@router.post("/elevenlabs/refresh")
+async def refresh_elevenlabs_voices():
+    """Force-clear the ElevenLabs voice cache so the next GET re-fetches."""
+    _el_voices_cache["data"] = None
+    _el_voices_cache["expires"] = None
+    return {"message": "Cache cleared. Next GET /voices/elevenlabs will re-fetch."}
 
 
 class PreviewRequest(BaseModel):
