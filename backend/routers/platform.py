@@ -99,6 +99,31 @@ ANTHROPIC_MODELS = [
     "claude-3-opus-20240229", "claude-3-sonnet-20240229", "claude-3-haiku-20240307"
 ]
 
+# ── Static authoritative model lists for providers without a list API ──────────
+# Sarvam has no public model enumeration endpoint
+SARVAM_TTS_MODELS = ["bulbul:v3", "bulbul:v2", "bulbul:v1"]
+SARVAM_STT_MODELS = ["saarika:v2.5", "saarika:v2", "saaras:v3", "saaras:v2"]
+
+# ElevenLabs STT (Scribe) — listed here as fallback; also fetched live via /v1/models
+ELEVENLABS_STT_MODELS = ["scribe_v2_realtime", "scribe_v2"]
+
+# Deepgram Nova models
+DEEPGRAM_STT_MODELS = [
+    "nova-2", "nova-2-general", "nova-2-meeting", "nova-2-phonecall",
+    "nova-2-finance", "nova-2-conversationalai", "nova-2-voicemail",
+    "nova-2-video", "nova-2-medical", "nova-2-drivethru", "nova-2-automotive",
+    "nova-3", "base", "enhanced"
+]
+
+# AssemblyAI models
+ASSEMBLYAI_STT_MODELS = ["best", "nano"]
+
+# OpenAI TTS models
+OPENAI_TTS_MODELS = ["gpt-4o-mini-tts", "tts-1", "tts-1-hd"]
+
+# OpenAI STT models  
+OPENAI_STT_MODELS = ["whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"]
+
 # NOTE: SARVAM_VOICES is now imported from backend.routers.providers (authoritative, full list)
 
 OPENAI_TTS_VOICES = [
@@ -333,14 +358,35 @@ async def trigger_env_sync(db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ── POST /platform/providers/{provider}/fetch-models ─────────────────────────
+class FetchModelsRequest(BaseModel):
+    api_key: Optional[str] = None  # Override: test a key before saving
+
+
 @router.post("/platform/providers/{provider}/fetch-models")
-async def fetch_provider_models(provider: str, db: AsyncSession = Depends(get_db)):
-    """Fetch available models from provider API using stored key."""
-    raw_key = await _get_raw_key(provider, db)
+async def fetch_provider_models(
+    provider: str,
+    body: FetchModelsRequest = FetchModelsRequest(),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Fetch available models from provider API.
+    - Uses stored DB/env key by default.
+    - If 'api_key' is provided in the request body, that key is used instead
+      (allows testing a freshly pasted key before saving it).
+    - Results are cached in the provider's extra_config for fast subsequent reads.
+    """
+    # Resolve key: body override > DB > env
+    raw_key: str | None = body.api_key.strip() if body.api_key else None
+    if not raw_key:
+        raw_key = await _get_raw_key(provider, db)
+    if not raw_key:
+        from backend.config import settings as _s
+        raw_key = getattr(_s, f"{provider}_api_key", None) or ""
 
     models: list[str] = []
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=12) as client:
+            # ── LLM providers ──────────────────────────────────────────────────
             if provider == "gemini":
                 if not raw_key:
                     raise HTTPException(400, "Gemini API key not configured")
@@ -349,10 +395,9 @@ async def fetch_provider_models(provider: str, db: AsyncSession = Depends(get_db
                     headers={"x-goog-api-key": raw_key}
                 )
                 r.raise_for_status()
-                data = r.json()
                 models = sorted([
                     m["name"].replace("models/", "")
-                    for m in data.get("models", [])
+                    for m in r.json().get("models", [])
                     if "generateContent" in m.get("supportedGenerationMethods", [])
                 ])
 
@@ -366,11 +411,11 @@ async def fetch_provider_models(provider: str, db: AsyncSession = Depends(get_db
                 r.raise_for_status()
                 models = sorted([
                     m["id"] for m in r.json().get("data", [])
-                    if any(m["id"].startswith(p) for p in ("gpt-", "o1", "o3", "chatgpt"))
+                    if any(m["id"].startswith(p) for p in ("gpt-", "o1", "o3", "chatgpt", "o4"))
                 ])
 
             elif provider == "anthropic":
-                models = ANTHROPIC_MODELS
+                models = ANTHROPIC_MODELS  # No public list API
 
             elif provider == "deepseek":
                 if not raw_key:
@@ -390,7 +435,11 @@ async def fetch_provider_models(provider: str, db: AsyncSession = Depends(get_db
                     headers={"Authorization": f"Bearer {raw_key}"}
                 )
                 r.raise_for_status()
-                models = sorted([m["id"] for m in r.json().get("data", [])])
+                # Filter to language models only (exclude audio/vision)
+                models = sorted([
+                    m["id"] for m in r.json().get("data", [])
+                    if m.get("object") == "model"
+                ])
 
             elif provider == "mistral":
                 if not raw_key:
@@ -408,20 +457,78 @@ async def fetch_provider_models(provider: str, db: AsyncSession = Depends(get_db
                 r.raise_for_status()
                 models = [m["name"] for m in r.json().get("models", [])]
 
+            # ── TTS providers ──────────────────────────────────────────────────
+            elif provider == "elevenlabs":
+                if raw_key:
+                    # Fetch live TTS model list from ElevenLabs /v1/models
+                    r = await client.get(
+                        "https://api.elevenlabs.io/v1/models",
+                        headers={"xi-api-key": raw_key}
+                    )
+                    if r.status_code == 200:
+                        all_models = r.json()
+                        # Filter to TTS-capable models, sort newest first
+                        models = [
+                            m["model_id"] for m in all_models
+                            if m.get("can_do_text_to_speech", False)
+                        ]
+                        if not models:
+                            models = all_models[0:] and [m["model_id"] for m in all_models]
+                    else:
+                        logger.warning("ElevenLabs models fetch returned %s", r.status_code)
+                if not models:
+                    # Authoritative static fallback — newest models first
+                    models = [
+                        "eleven_v3", "eleven_flash_v2_5", "eleven_multilingual_v2",
+                        "eleven_turbo_v2_5", "eleven_turbo_v2", "eleven_monolingual_v1",
+                    ]
+
+            elif provider in ("openai_tts", "openai-tts"):
+                if raw_key:
+                    # OpenAI TTS models — fetch from /v1/models and filter
+                    r = await client.get(
+                        "https://api.openai.com/v1/models",
+                        headers={"Authorization": f"Bearer {raw_key}"}
+                    )
+                    if r.status_code == 200:
+                        models = sorted([
+                            m["id"] for m in r.json().get("data", [])
+                            if any(m["id"].startswith(p) for p in ("tts-", "gpt-4o-mini-tts", "gpt-4o-audio"))
+                        ])
+                if not models:
+                    models = OPENAI_TTS_MODELS
+
+            elif provider == "sarvam":
+                # Sarvam has no public model enumeration — use authoritative list
+                # Detect category from query param if provided
+                models = SARVAM_TTS_MODELS  # default to TTS; STT caller will send category
+
+            # ── STT providers ──────────────────────────────────────────────────
+            elif provider == "deepgram":
+                # Deepgram has no unauthenticated model list API
+                models = DEEPGRAM_STT_MODELS
+
+            elif provider == "assemblyai":
+                models = ASSEMBLYAI_STT_MODELS
+
+            elif provider == "whisper":
+                models = OPENAI_STT_MODELS
+
             else:
                 raise HTTPException(400, f"Unknown provider: {provider}")
 
     except HTTPException:
         raise
     except Exception as e:
+        logger.warning("Failed to fetch models from %s: %s", provider, e)
         raise HTTPException(500, f"Failed to fetch models from {provider}: {str(e)}")
 
-    # Cache the fetched models in extra_config
-    if models:
+    # ── Cache in extra_config ──────────────────────────────────────────────────
+    if models and not body.api_key:  # Don't cache when using a temp override key
         try:
             rec = (await db.execute(
                 select(ApiKeyConfig).where(ApiKeyConfig.provider == provider)
-            )).scalar_one_or_none()
+            )).scalars().first()
             if rec:
                 ec = json.loads(rec.extra_config or "{}")
                 ec["models"] = models
@@ -435,6 +542,7 @@ async def fetch_provider_models(provider: str, db: AsyncSession = Depends(get_db
         "provider": provider,
         "models": models,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "source": "live" if raw_key else "static",
     }
 
 # ── GET /platform/tts/voices/sarvam ──────────────────────────────────────────
@@ -676,7 +784,7 @@ async def get_models_for_provider(
         except Exception:
             pass
 
-    # Fallback to static PROVIDERS catalogue (category-aware if provided)
+    # Fallback to PROVIDERS catalogue (category-aware if provided)
     if category and category in PROVIDERS:
         for p in PROVIDERS[category]:
             if p["id"] == provider:
@@ -686,6 +794,20 @@ async def get_models_for_provider(
         for p in cat:
             if p["id"] == provider:
                 return {"provider": provider, "category": cat_name, "models": p.get("models", []), "source": "static"}
+
+    # ── Ultimate fallback: hardcoded authoritative lists ──────────────────────
+    # For providers that don't appear in PROVIDERS catalogue but are known
+    _STATIC_FALLBACKS: dict[str, list[str]] = {
+        "sarvam":     SARVAM_TTS_MODELS if (not category or category == "tts") else SARVAM_STT_MODELS,
+        "elevenlabs": ["eleven_v3", "eleven_flash_v2_5", "eleven_multilingual_v2", "eleven_turbo_v2_5", "eleven_turbo_v2"],
+        "openai_tts": OPENAI_TTS_MODELS,
+        "deepgram":   DEEPGRAM_STT_MODELS,
+        "assemblyai": ASSEMBLYAI_STT_MODELS,
+        "whisper":    OPENAI_STT_MODELS,
+        "anthropic":  ANTHROPIC_MODELS,
+    }
+    if provider in _STATIC_FALLBACKS:
+        return {"provider": provider, "category": category, "models": _STATIC_FALLBACKS[provider], "source": "static"}
 
     return {"provider": provider, "category": category, "models": [], "source": "unknown"}
 

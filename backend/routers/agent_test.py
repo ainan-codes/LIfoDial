@@ -2764,7 +2764,8 @@ async def synthesize_speech(agent: AgentConfig, text: str, language_override: st
             return await elevenlabs_synthesize(
                 api_key=api_key,
                 text=text,
-                voice_id=agent.tts_voice or "21m00Tcm4TlvDq8ikWAM"
+                voice_id=agent.tts_voice or "21m00Tcm4TlvDq8ikWAM",
+                model_id=agent.tts_model or "eleven_flash_v2_5"
             )
         
         elif tts_provider == "openai_tts":
@@ -3005,8 +3006,9 @@ async def sarvam_synthesize(api_key: str, text: str, voice: str,
 
 
 
-async def elevenlabs_synthesize(api_key: str, text: str, 
-                                  voice_id: str) -> bytes:
+async def elevenlabs_synthesize(api_key: str, text: str,
+                                  voice_id: str,
+                                  model_id: str = "eleven_flash_v2_5") -> bytes:
     import httpx
     
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -3019,7 +3021,7 @@ async def elevenlabs_synthesize(api_key: str, text: str,
             },
             json={
                 "text": text,
-                "model_id": "eleven_multilingual_v2",
+                "model_id": model_id,
                 "voice_settings": {
                     "stability": 0.5,
                     "similarity_boost": 0.75
