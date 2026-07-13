@@ -1,7 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 
-import { API_URL } from '../../../api/client';
-const API = API_URL;
+import fetchWithAuth from '../../../api/client';
 
 interface HealthData {
   agent_id: string;
@@ -115,8 +114,8 @@ const AgentHealthTab: React.FC<Props> = ({ agentId }) => {
     setError(null);
     try {
       const [h, l] = await Promise.all([
-        fetch(`${API}/agents/${agentId}/health`).then(r => r.json()),
-        fetch(`${API}/agents/${agentId}/latency-stats?days=7`).then(r => r.json()),
+        fetchWithAuth(`/agents/${agentId}/health`),
+        fetchWithAuth(`/agents/${agentId}/latency-stats?days=7`),
       ]);
       setHealth(h);
       setLatency(l);

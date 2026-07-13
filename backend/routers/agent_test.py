@@ -21,10 +21,12 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.auth import CurrentUser
 from backend.db import async_session as AsyncSessionLocal, get_db
 from backend.models.agent_config import AgentConfig
 from backend.models.api_key_config import ApiKeyConfig
 from backend.config import settings
+from backend.security import decode_access_token
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -172,18 +174,19 @@ def decrypt_key(encrypted: str) -> str:
 # ── HTTPS CHAT (REST) ─────────────────────────────────────────────────────────
 
 @router.get("/agent-chat/{agent_id}/greeting")
-async def get_agent_greeting(agent_id: str, db: AsyncSession = Depends(get_db)):
+async def get_agent_greeting(agent_id: str, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(AgentConfig).where(AgentConfig.id == agent_id)
     )
     agent = result.scalar_one_or_none()
-    
+
     if not agent:
         raise HTTPException(
-            status_code=404, 
+            status_code=404,
             detail=f"Agent {agent_id} not found"
         )
-    
+    user.require_owns(str(agent.tenant_id))
+
     return {
         "agent_id": agent_id,
         "agent_name": agent.agent_name,
@@ -198,19 +201,21 @@ async def get_agent_greeting(agent_id: str, db: AsyncSession = Depends(get_db)):
 async def chat_with_agent(
     agent_id: str,
     body: dict,
+    user: CurrentUser = None,
     db: AsyncSession = Depends(get_db)
 ):
     result = await db.execute(
         select(AgentConfig).where(AgentConfig.id == agent_id)
     )
     agent = result.scalar_one_or_none()
-    
+
     if not agent:
         raise HTTPException(
             status_code=404,
             detail=f"Agent {agent_id} not found"
         )
-    
+    user.require_owns(str(agent.tenant_id))
+
     user_message = body.get("message", "")
     session_id = body.get("session_id", agent_id)
     
@@ -229,7 +234,11 @@ async def chat_with_agent(
 
 
 @router.delete("/agent-chat/{agent_id}/session/{session_id}")
-async def clear_agent_session(agent_id: str, session_id: str):
+async def clear_agent_session(agent_id: str, session_id: str, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(AgentConfig).where(AgentConfig.id == agent_id))
+    agent = result.scalar_one_or_none()
+    if agent:
+        user.require_owns(str(agent.tenant_id))
     session_key = session_id or agent_id
     if session_key in _conversation_history:
         del _conversation_history[session_key]
@@ -252,9 +261,12 @@ _active_audio_tasks: dict[str, asyncio.Task] = {}
 # ── WS /ws/agent-call/{agent_id} ──────────────────────────────────────────────
 
 @router.websocket("/ws/agent-call/{agent_id}")
-async def voice_websocket(websocket: WebSocket, agent_id: str):
+async def voice_websocket(websocket: WebSocket, agent_id: str, token: str | None = None):
     """
-    Stable voice WebSocket handler.
+    Stable voice WebSocket handler. Dashboard "test this agent" feature only —
+    the public embed widget does not use this endpoint (it uses /embed/*).
+    Requires a valid session token as ?token=<jwt>, and the caller must own
+    the agent's tenant (or be superadmin).
 
     Key design decisions:
     - DB session opened for agent load only, then closed immediately.
@@ -267,6 +279,11 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
     - Every exception path is caught; greeting task is always cancelled.
     - Interrupt message: client sends {"type":"interrupt"} to stop agent speech.
     """
+    claims = decode_access_token(token) if token else None
+    if not claims:
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
     logger.info(f"Voice WebSocket connected for agent {agent_id}")
 
@@ -306,6 +323,15 @@ async def voice_websocket(websocket: WebSocket, agent_id: str):
         logger.warning(f"Agent {agent_id} not found")
         try:
             await websocket.send_json({"error": "Agent not found", "agent_id": agent_id})
+            await websocket.close(code=1008)
+        except Exception:
+            pass
+        _language_tracker.pop(ws_session_id, None)
+        return
+
+    if claims.get("role") != "superadmin" and claims.get("sub") != str(agent.tenant_id):
+        try:
+            await websocket.send_json({"error": "Not found", "agent_id": agent_id})
             await websocket.close(code=1008)
         except Exception:
             pass
@@ -595,10 +621,11 @@ async def _send_greeting_audio_fast(websocket: WebSocket, agent: AgentConfig, te
 # Streaming TTS using Sarvam's WebSocket API for low-latency audio generation
 
 @router.websocket("/ws/agent/{agent_id}/tts-stream")
-async def tts_streaming_websocket(websocket: WebSocket, agent_id: str):
+async def tts_streaming_websocket(websocket: WebSocket, agent_id: str, token: str | None = None):
     """
-    WebSocket endpoint for streaming text-to-speech.
-    
+    WebSocket endpoint for streaming text-to-speech. Debug/test feature only.
+    Requires a valid session token as ?token=<jwt> and ownership of the agent.
+
     Client flow:
     1. Connect to this endpoint
     2. Send config message with voice parameters
@@ -606,9 +633,14 @@ async def tts_streaming_websocket(websocket: WebSocket, agent_id: str):
     4. Receive audio chunks progressively
     5. Send flush to finish processing
     """
+    claims = decode_access_token(token) if token else None
+    if not claims:
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
     logger.info(f"TTS Streaming WebSocket connected for agent {agent_id}")
-    
+
     # Load agent configuration
     async with AsyncSessionLocal() as db:
         try:
@@ -616,7 +648,7 @@ async def tts_streaming_websocket(websocket: WebSocket, agent_id: str):
                 select(AgentConfig).where(AgentConfig.id == agent_id)
             )
             agent = result.scalar_one_or_none()
-            
+
             if agent is None:
                 logger.warning(f"Agent {agent_id} not found for TTS streaming")
                 await websocket.send_json({
@@ -625,7 +657,12 @@ async def tts_streaming_websocket(websocket: WebSocket, agent_id: str):
                 })
                 await websocket.close(code=1008)
                 return
-            
+
+            if claims.get("role") != "superadmin" and claims.get("sub") != str(agent.tenant_id):
+                await websocket.send_json({"error": "Not found", "agent_id": agent_id})
+                await websocket.close(code=1008)
+                return
+
             # Check if TTS provider is Sarvam and has API key
             if agent.tts_provider != "sarvam":
                 await websocket.send_json({
@@ -947,24 +984,25 @@ async def relay_sarvam_audio(sarvam_ws, client_ws: WebSocket):
 # ── REST Endpoint to Generate HTML Test Client for Streaming TTS ────────────
 
 @router.get("/agent/{agent_id}/tts-stream-test")
-async def get_tts_streaming_test_client(agent_id: str, db: AsyncSession = Depends(get_db)):
+async def get_tts_streaming_test_client(agent_id: str, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
     """
     Returns an HTML page with a test client for the streaming TTS WebSocket endpoint.
-    
+
     Usage:
     1. Visit: GET /agent/{agent_id}/tts-stream-test
     2. In browser: send config, then send text chunks, listen for audio
-    
+
     Supported providers: Sarvam AI
     """
     result = await db.execute(
         select(AgentConfig).where(AgentConfig.id == agent_id)
     )
     agent = result.scalar_one_or_none()
-    
+
     if not agent:
         raise HTTPException(status_code=404, detail=f"Agent {agent_id} not found")
-    
+    user.require_owns(str(agent.tenant_id))
+
     if agent.tts_provider != "sarvam":
         raise HTTPException(
             status_code=400,
@@ -2234,22 +2272,27 @@ async def generate_llm_response(
             old_model, llm_provider, agent_model,
         )
 
+    # Admin-configured response length cap (AgentDetail.tsx "Max Tokens" field).
+    # Was previously ignored here — every provider call hardcoded 150 regardless
+    # of this setting, so the UI field had no effect on the in-browser tester.
+    max_tokens = int(agent.max_response_tokens or 150)
+
     try:
         if llm_provider == "gemini":
             response = await call_gemini(api_key, system_prompt, history,
-                                          agent_model)
+                                          agent_model, max_tokens=max_tokens)
         elif llm_provider == "openai":
             response = await call_openai(api_key, system_prompt, history,
-                                          agent_model)
+                                          agent_model, max_tokens=max_tokens)
         elif llm_provider == "anthropic":
             response = await call_anthropic(api_key, system_prompt, history,
-                                             agent_model)
+                                             agent_model, max_tokens=max_tokens)
         elif llm_provider == "groq":
             response = await call_groq(api_key, system_prompt, history,
-                                        agent_model)
+                                        agent_model, max_tokens=max_tokens)
         elif llm_provider == "deepseek":
             response = await call_openai(api_key, system_prompt, history,
-                                          agent_model,
+                                          agent_model, max_tokens=max_tokens,
                                           base_url="https://api.deepseek.com/v1")
         else:
             response = generate_demo_response(agent, user_message, history)
@@ -2478,8 +2521,8 @@ def err_msg_pad(s: str) -> str:
     return f" {s} "
 
 
-async def call_gemini(api_key: str, system_prompt: str, 
-                       history: list, model: str) -> str:
+async def call_gemini(api_key: str, system_prompt: str,
+                       history: list, model: str, max_tokens: int = 150) -> str:
     import httpx
     
     # Convert history to Gemini format, ensuring alternating roles
@@ -2533,7 +2576,7 @@ async def call_gemini(api_key: str, system_prompt: str,
                     },
                     "contents": contents,
                     "generationConfig": {
-                        "maxOutputTokens": 150,
+                        "maxOutputTokens": max_tokens,
                         "temperature": 0.7
                     }
                 }
@@ -2565,12 +2608,13 @@ async def call_gemini(api_key: str, system_prompt: str,
 
 async def call_openai(api_key: str, system_prompt: str,
                        history: list, model: str,
-                       base_url: str = "https://api.openai.com/v1") -> str:
+                       base_url: str = "https://api.openai.com/v1",
+                       max_tokens: int = 150) -> str:
     import httpx
-    
+
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
-    
+
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.post(
             f"{base_url}/chat/completions",
@@ -2581,7 +2625,7 @@ async def call_openai(api_key: str, system_prompt: str,
             json={
                 "model": model,
                 "messages": messages,
-                "max_tokens": 150,
+                "max_tokens": max_tokens,
                 "temperature": 0.7
             }
         )
@@ -2594,16 +2638,16 @@ async def call_openai(api_key: str, system_prompt: str,
 
 
 async def call_anthropic(api_key: str, system_prompt: str,
-                          history: list, model: str) -> str:
+                          history: list, model: str, max_tokens: int = 150) -> str:
     import httpx
-    
+
     messages = []
     for msg in history:
         messages.append({
             "role": msg["role"],
             "content": msg["content"]
         })
-    
+
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -2616,7 +2660,7 @@ async def call_anthropic(api_key: str, system_prompt: str,
                 "model": model,
                 "system": system_prompt,
                 "messages": messages,
-                "max_tokens": 150
+                "max_tokens": max_tokens
             }
         )
         
@@ -2628,9 +2672,9 @@ async def call_anthropic(api_key: str, system_prompt: str,
 
 
 async def call_groq(api_key: str, system_prompt: str,
-                             history: list, model: str) -> str:
+                             history: list, model: str, max_tokens: int = 150) -> str:
     import httpx
-    
+
     messages = [{"role": "system", "content": system_prompt}]
     for msg in history:
         # groq requires role user or assistant
@@ -2638,7 +2682,7 @@ async def call_groq(api_key: str, system_prompt: str,
             "role": "assistant" if msg["role"] == "model" else msg["role"],
             "content": msg["content"]
         })
-    
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -2649,7 +2693,7 @@ async def call_groq(api_key: str, system_prompt: str,
             json={
                 "model": model,
                 "messages": messages,
-                "max_tokens": 150,
+                "max_tokens": max_tokens,
                 "temperature": 0.7
             }
         )
@@ -2757,7 +2801,8 @@ async def synthesize_speech(agent: AgentConfig, text: str, language_override: st
                 language=normalized_language,
                 pitch=agent.tts_pitch or 0.0,
                 pace=agent.tts_pace or 1.0,
-                loudness=agent.tts_loudness or 1.0
+                loudness=agent.tts_loudness or 1.0,
+                enable_preprocessing=agent.tts_input_preprocessing if agent.tts_input_preprocessing is not None else True,
             )
         
         elif tts_provider == "elevenlabs":
@@ -2765,7 +2810,12 @@ async def synthesize_speech(agent: AgentConfig, text: str, language_override: st
                 api_key=api_key,
                 text=text,
                 voice_id=agent.tts_voice or "21m00Tcm4TlvDq8ikWAM",
-                model_id=agent.tts_model or "eleven_flash_v2_5"
+                model_id=agent.tts_model or "eleven_flash_v2_5",
+                stability=agent.tts_stability,
+                similarity_boost=agent.tts_clarity,
+                style=agent.tts_style,
+                use_speaker_boost=bool(agent.tts_use_speaker_boost) if agent.tts_use_speaker_boost is not None else None,
+                speed=agent.tts_speed,
             )
         
         elif tts_provider == "openai_tts":
@@ -2858,6 +2908,7 @@ async def sarvam_synthesize_with_retry(
                 pitch=agent.tts_pitch or 0.0,
                 pace=agent.tts_pace or 1.1,
                 loudness=agent.tts_loudness or 1.5,
+                enable_preprocessing=agent.tts_input_preprocessing if agent.tts_input_preprocessing is not None else True,
             )
             if audio and len(audio) >= 500:
                 if attempt > 1:
@@ -2962,8 +3013,9 @@ def normalize_sarvam_language(language: str) -> str:
 
 async def sarvam_synthesize(api_key: str, text: str, voice: str,
                                model: str, language: str,
-                               pitch: float, pace: float, 
-                               loudness: float) -> bytes:
+                               pitch: float, pace: float,
+                               loudness: float,
+                               enable_preprocessing: bool = True) -> bytes:
     import httpx
 
     normalized_text = (text or "").strip()
@@ -2993,12 +3045,12 @@ async def sarvam_synthesize(api_key: str, text: str, voice: str,
         "speaker": normalized_voice,
         "model": normalized_model,
         "pace": pace,
-        "enable_preprocessing": True,
+        "enable_preprocessing": enable_preprocessing,
         "speech_sample_rate": 24000,
     }
 
-    # Bulbul v3 currently rejects pitch/loudness parameters.
-    if normalized_model != "bulbul:v3":
+    # Only bulbul:v2 supports pitch/loudness — v3 and v3-beta both reject them.
+    if normalized_model == "bulbul:v2":
         payload["pitch"] = pitch
         payload["loudness"] = loudness
 
@@ -3035,9 +3087,27 @@ async def sarvam_synthesize(api_key: str, text: str, voice: str,
 
 async def elevenlabs_synthesize(api_key: str, text: str,
                                   voice_id: str,
-                                  model_id: str = "eleven_flash_v2_5") -> bytes:
+                                  model_id: str = "eleven_flash_v2_5",
+                                  stability: float | None = None,
+                                  similarity_boost: float | None = None,
+                                  style: float | None = None,
+                                  use_speaker_boost: bool | None = None,
+                                  speed: float | None = None) -> bytes:
     import httpx
-    
+
+    voice_settings = {
+        "stability": stability if stability is not None else 0.5,
+        "similarity_boost": similarity_boost if similarity_boost is not None else 0.75,
+    }
+    if style is not None:
+        voice_settings["style"] = style
+    if use_speaker_boost is not None:
+        voice_settings["use_speaker_boost"] = use_speaker_boost
+    if speed is not None:
+        # ElevenLabs only accepts speed in [0.7, 1.2]; the agent's slider
+        # goes 0.5-2.0, so clamp rather than let the API 400.
+        voice_settings["speed"] = min(max(speed, 0.7), 1.2)
+
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
@@ -3049,10 +3119,7 @@ async def elevenlabs_synthesize(api_key: str, text: str,
             json={
                 "text": text,
                 "model_id": model_id,
-                "voice_settings": {
-                    "stability": 0.5,
-                    "similarity_boost": 0.75
-                }
+                "voice_settings": voice_settings
             }
         )
         

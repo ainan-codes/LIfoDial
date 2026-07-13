@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -11,6 +11,7 @@ import os as _os
 
 from backend.config import settings
 from backend.db import init_db, engine, Base
+from backend.auth import require_superadmin
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -344,12 +345,15 @@ async def _warmup() -> None:
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
+_IS_PROD = settings.environment.lower() == "production"
+
 app = FastAPI(
     title="Lifodial API",
     description="AI Voice Receptionist SaaS for clinics — India & Middle East (Lifodial)",
     version="1.0.4",
-    docs_url="/docs",     # temporarily enabled in production for audit
-    redoc_url="/redoc",   # temporarily enabled in production for audit
+    docs_url=None if _IS_PROD else "/docs",
+    redoc_url=None if _IS_PROD else "/redoc",
+    openapi_url=None if _IS_PROD else "/openapi.json",
     lifespan=lifespan,
 )
 
@@ -366,6 +370,8 @@ _CORS_ORIGINS = [
     "https://lifodial.vercel.app",
     # Production — Render static frontend (if deployed on Render)
     "https://lifodial-frontend.onrender.com",
+    # ngrok dev tunnel (frontend exposed for external testing)
+    "https://belted-annette-antonomastically.ngrok-free.dev",
 ]
 # Also pull any extra origin from env (for production deployment)
 _extra = getattr(settings, "cors_origin", None) or getattr(settings, "frontend_url", None)
@@ -446,34 +452,41 @@ async def root() -> dict[str, str]:
     return {"service": "Lifodial API", "docs": "/docs"}
 
 @app.post("/admin/reset-db", tags=["superadmin"])
-async def reset_db():
+async def reset_db(_user=Depends(require_superadmin)):
     """
-    ONE TIME USE: Drops and recreates all tables.
-    Delete this endpoint after use.
+    DANGER: Drops and recreates all tables. Superadmin only, and permanently
+    disabled in production to prevent catastrophic data loss.
     """
+    if _IS_PROD:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=403, content={"detail": "Disabled in production"})
+
     # Import all models to ensure Base.metadata is fully populated
     from backend.models import tenant, doctor, appointment, call_log, agent_config, onboarding_request, api_key_config, knowledge_base
     from backend.models import phone_number, call_record, embed_analytics, bulk_call, clinic_credits
-    
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
     return {"status": "ok", "message": "All tables recreated"}
 
 @app.post("/admin/seed", tags=["superadmin"])
-async def seed_db():
+async def seed_db(_user=Depends(require_superadmin)):
     """
-    ONE TIME USE: Seeds the database with demo data.
+    Seeds the database with demo data. Superadmin only; disabled in production.
     """
+    if _IS_PROD:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=403, content={"detail": "Disabled in production"})
     from backend.scripts.seed_demo import seed
     await seed()
     return {"status": "ok", "message": "Database seeded successfully"}
 
 
-# ── Debug / Audit Endpoint ────────────────────────────────────────────────────
+# ── Debug / Audit Endpoint (protected) ───────────────────────────────────────
 @app.get("/debug/audit", tags=["debug"])
-async def audit_database():
-    """Complete database audit — shows row counts and sample data. Remove after fixing."""
+async def audit_database(_user=Depends(require_superadmin)):
+    """Complete database audit — shows row counts only. Superadmin only."""
     from backend.db import AsyncSessionLocal
     from sqlalchemy import text
 
@@ -492,18 +505,6 @@ async def audit_database():
                     text(f"SELECT COUNT(*) FROM {table}")
                 )
                 results[table] = {"count": count}
-
-                # Show first 3 rows of key tables
-                if table in ["tenants", "agent_configs"] and count > 0:
-                    rows = await db.execute(
-                        text(f"SELECT * FROM {table} LIMIT 3")
-                    )
-                    cols = list(rows.keys())
-                    data = [dict(zip(cols, row)) for row in rows]
-                    results[table]["sample"] = [
-                        {k: str(v)[:50] for k, v in row.items()}
-                        for row in data
-                    ]
             except Exception as e:
                 results[table] = {"error": str(e)[:100]}
 
@@ -511,11 +512,12 @@ async def audit_database():
 
 
 @app.post("/admin/sync-tenants-from-agents", tags=["superadmin"])
-async def sync_tenants_from_agents():
+async def sync_tenants_from_agents(_user=Depends(require_superadmin)):
     """
     Finds agents that have tenant_ids with no matching tenant.
     Creates missing tenant records.
     """
+    from backend.security import hash_password
     from backend.db import AsyncSessionLocal
     from backend.models.agent_config import AgentConfig
     from backend.models.tenant import Tenant
@@ -541,7 +543,7 @@ async def sync_tenants_from_agents():
                     id=str(agent.tenant_id),
                     clinic_name=f"{name} Clinic",
                     admin_email=f"admin@{name.lower().replace(' ', '')}.com",
-                    admin_password="changeme123",
+                    admin_password=hash_password("changeme123"),
                     language=agent.tts_language or "hi-IN",
                     status="active",
                     is_active=True,
@@ -590,13 +592,17 @@ app.include_router(credits.router,        prefix="",          tags=["credits"])
 
 
 # ── Serve widget.js publicly ────────────────────────────────────────────────────
+# backend/static/widget.js is the ONE canonical embed script. An older,
+# unmaintained copy previously lived at frontend/public/widget.js — it was
+# never reachable through this route (this list always checked backend/static
+# first) and has been deleted so there's no risk of anyone editing the wrong
+# file going forward.
 @app.get("/widget.js", tags=["embed"])
 async def serve_widget():
     """Public widget script served with CORS + cache headers."""
     widget_paths = [
         _os.path.join("backend", "static", "widget.js"),
-        _os.path.join("static", "widget.js"),
-        _os.path.join("frontend", "public", "widget.js"),
+        _os.path.join("static", "widget.js"),  # same file, relative to a different CWD
     ]
     for path in widget_paths:
         if _os.path.isfile(path):

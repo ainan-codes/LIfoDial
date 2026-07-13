@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.auth import CurrentUser
 from backend.db import get_db
 from backend.models.tenant import Tenant
 from backend.agent.sarvam import clone_voice
@@ -23,7 +24,8 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 async def upload_voice_sample(
     id: uuid.UUID,
     file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    user: CurrentUser = None,
 ):
     """
     Upload a custom voice sample (WAV/MP3) for a tenant.
@@ -33,6 +35,7 @@ async def upload_voice_sample(
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    user.require_owns(str(tenant.id))
 
     # Validate file type
     allowed = {"audio/wav", "audio/mpeg", "audio/mp3", "audio/x-wav", "audio/mp4"}
@@ -61,7 +64,7 @@ async def upload_voice_sample(
 
 
 @router.get("/{id}/voice-status")
-async def get_voice_status(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def get_voice_status(id: uuid.UUID, db: AsyncSession = Depends(get_db), user: CurrentUser = None):
     """
     Returns the processing status of an uploaded voice sample for a tenant.
     """
@@ -69,6 +72,7 @@ async def get_voice_status(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    user.require_owns(str(tenant.id))
 
     if not tenant.custom_voice_id:
         return {"status": "default", "message": "Using default AI voice."}

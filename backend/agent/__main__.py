@@ -26,12 +26,20 @@ Environment variables required (.env):
 from livekit.agents import WorkerOptions, cli
 
 from backend.agent.pipeline import entrypoint, prewarm
+from backend.config import settings
 
 if __name__ == "__main__":
+    # The livekit-agents CLI normally reads LIVEKIT_URL/API_KEY/API_SECRET from OS
+    # environment variables. Pass them explicitly from the app settings (which load
+    # the project .env) so `python -m backend.agent start` works without a separate
+    # manual export step — the worker uses the same creds as the backend.
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
             agent_name="lifodial-inbound-agent",
+            ws_url=settings.livekit_url or None,
+            api_key=settings.livekit_api_key or None,
+            api_secret=settings.livekit_api_secret or None,
         )
     )

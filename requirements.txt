@@ -37,3 +37,6 @@ posthog==3.8.3
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 websockets>=12.0
+
+# ── Image processing (widget avatar resize/optimize) ─────────────────────────
+Pillow>=10.0.0

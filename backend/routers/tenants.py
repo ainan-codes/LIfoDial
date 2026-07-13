@@ -3,11 +3,14 @@ import random
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.auth import CurrentUser, SuperAdmin
 from backend.db import get_db
 from backend.models.tenant import Tenant
+from backend.services.tenant_service import create_tenant as create_tenant_row
 
 router = APIRouter()
 
@@ -37,16 +40,18 @@ class AssignNumberResponse(BaseModel):
 # ── Endpoints ────────────────────────────────────────────────────────
 
 @router.get("")
-async def list_tenants(db: AsyncSession = Depends(get_db)):
-    """List all tenants/clinics with has_agent flag for the CreateAgent wizard."""
+async def list_tenants(user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
+    """List all tenants/clinics with agent_count for the CreateAgent wizard."""
     from backend.models.agent_config import AgentConfig
     try:
         result = await db.execute(select(Tenant).order_by(Tenant.clinic_name))
         tenants = result.scalars().all()
 
-        # Get all tenant_ids that already have an agent — normalize to str
-        agent_res = await db.execute(select(AgentConfig.tenant_id))
-        has_agent_ids = {str(row[0]) for row in agent_res.fetchall()}
+        # Count agents per tenant_id — normalize to str
+        agent_res = await db.execute(
+            select(AgentConfig.tenant_id, func.count(AgentConfig.id)).group_by(AgentConfig.tenant_id)
+        )
+        agent_counts = {str(row[0]): row[1] for row in agent_res.fetchall()}
 
         return [
             {
@@ -56,7 +61,9 @@ async def list_tenants(db: AsyncSession = Depends(get_db)):
                 "admin_name": getattr(t, "admin_name", "") or "",
                 "language": getattr(t, "language", "en-IN") or "en-IN",
                 "status": getattr(t, "status", "active") or "active",
-                "has_agent": str(t.id) in has_agent_ids,
+                "agent_count": agent_counts.get(str(t.id), 0),
+                # Kept for any older frontend code still reading this field.
+                "has_agent": agent_counts.get(str(t.id), 0) > 0,
             }
             for t in tenants
         ]
@@ -67,22 +74,65 @@ async def list_tenants(db: AsyncSession = Depends(get_db)):
         return []
 
 
-@router.post("", response_model=TenantResponse, status_code=status.HTTP_201_CREATED)
-async def create_tenant(payload: TenantCreate, db: AsyncSession = Depends(get_db)):
-    tenant_uuid = uuid.uuid4()
-    tenant = Tenant(
-        id=tenant_uuid,
-        tenant_id=tenant_uuid,
-        clinic_name=payload.clinic_name,
-        language=payload.primary_language
+@router.get("/search")
+async def search_tenants(q: str = "", limit: int = 8, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
+    """
+    Type-ahead clinic search for the Create Agent picker.
+    Superadmin only. Case-insensitive match on clinic_name.
+    """
+    from backend.models.agent_config import AgentConfig
+
+    limit = max(1, min(limit, 25))
+    stmt = select(Tenant).order_by(Tenant.clinic_name).limit(limit)
+    q = q.strip()
+    if q:
+        stmt = stmt.where(Tenant.clinic_name.ilike(f"%{q}%"))
+    result = await db.execute(stmt)
+    tenants = result.scalars().all()
+    if not tenants:
+        return []
+
+    tenant_ids = [t.id for t in tenants]
+    agent_res = await db.execute(
+        select(AgentConfig.tenant_id, func.count(AgentConfig.id))
+        .where(AgentConfig.tenant_id.in_(tenant_ids))
+        .group_by(AgentConfig.tenant_id)
     )
-    db.add(tenant)
-    await db.commit()
-    await db.refresh(tenant)
-    return tenant
+    agent_counts = {str(row[0]): row[1] for row in agent_res.fetchall()}
+
+    return [
+        {
+            "id": str(t.id),
+            "clinic_name": t.clinic_name,
+            "admin_email": t.admin_email or "",
+            "language": t.language,
+            "agent_count": agent_counts.get(str(t.id), 0),
+        }
+        for t in tenants
+    ]
+
+
+@router.post("", response_model=TenantResponse, status_code=status.HTTP_201_CREATED)
+async def create_tenant(payload: TenantCreate, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
+    try:
+        tenant = await create_tenant_row(
+            db,
+            clinic_name=payload.clinic_name,
+            language=payload.primary_language,
+        )
+        await db.commit()
+        await db.refresh(tenant)
+        return tenant
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A clinic named '{payload.clinic_name}' already exists.",
+        )
 
 @router.get("/{id}")
-async def get_tenant(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def get_tenant(id: uuid.UUID, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(str(id))
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
     if not tenant:
@@ -90,7 +140,7 @@ async def get_tenant(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     return tenant
 
 @router.post("/{id}/assign-number", response_model=AssignNumberResponse)
-async def assign_number(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def assign_number(id: uuid.UUID, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
     if not tenant:
@@ -113,7 +163,8 @@ async def assign_number(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     )
 
 @router.get("/{id}/forwarding-instructions")
-async def get_forwarding_instructions(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def get_forwarding_instructions(id: uuid.UUID, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(str(id))
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
     if not tenant:
@@ -132,7 +183,7 @@ async def get_forwarding_instructions(id: uuid.UUID, db: AsyncSession = Depends(
 
 
 @router.delete("/{id}", status_code=204)
-async def delete_tenant(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def delete_tenant(id: uuid.UUID, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
     """Delete a clinic and all associated agents."""
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
@@ -149,8 +200,9 @@ async def delete_tenant(id: uuid.UUID, db: AsyncSession = Depends(get_db)):
 
 
 @router.put("/{id}")
-async def update_tenant(id: uuid.UUID, payload: TenantUpdate, db: AsyncSession = Depends(get_db)):
+async def update_tenant(id: uuid.UUID, payload: TenantUpdate, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
     """Update a tenant/clinic's profile details including webhook settings."""
+    user.require_owns(str(id))
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
     if not tenant:

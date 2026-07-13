@@ -6,6 +6,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from backend.auth import CurrentUser
 from backend.db import get_db
 from backend.models.phone_number import PhoneNumber
 from backend.models.agent_config import AgentConfig
@@ -17,9 +18,15 @@ router = APIRouter(prefix="/phone-numbers", tags=["phone-numbers"])
 @router.get("")
 async def list_phone_numbers(
     tenant_id: str = None,
+    user: CurrentUser = None,
     db: AsyncSession = Depends(get_db),
 ):
     """List all phone numbers, optionally filtered by tenant_id."""
+    if tenant_id:
+        user.require_owns(tenant_id)
+    elif not user.is_superadmin:
+        # Without a tenant_id filter this would leak every clinic's numbers.
+        raise HTTPException(403, "tenant_id is required")
     query = select(PhoneNumber).order_by(PhoneNumber.created_at.desc())
     if tenant_id:
         query = query.where(PhoneNumber.tenant_id == tenant_id)
@@ -57,8 +64,9 @@ async def list_phone_numbers(
 
 
 @router.post("")
-async def create_phone_number(body: dict, db: AsyncSession = Depends(get_db)):
+async def create_phone_number(body: dict, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
     """Create a new phone number."""
+    user.require_owns(body.get("tenant_id", ""))
     number = body.get("number", "").strip()
     if not number:
         raise HTTPException(400, "number is required")
@@ -103,6 +111,7 @@ async def create_phone_number(body: dict, db: AsyncSession = Depends(get_db)):
 async def update_phone_number(
     phone_id: str,
     body: dict,
+    user: CurrentUser = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Update a phone number's details."""
@@ -112,6 +121,7 @@ async def update_phone_number(
     pn = result.scalar_one_or_none()
     if not pn:
         raise HTTPException(404, "Phone number not found")
+    user.require_owns(pn.tenant_id)
 
     for field in ["agent_id", "provider", "sip_uri", "sip_username",
                    "sip_password", "sip_domain", "is_active"]:
@@ -127,6 +137,7 @@ async def update_phone_number(
 @router.delete("/{phone_id}")
 async def delete_phone_number(
     phone_id: str,
+    user: CurrentUser = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a phone number."""
@@ -136,6 +147,7 @@ async def delete_phone_number(
     pn = result.scalar_one_or_none()
     if not pn:
         raise HTTPException(404, "Phone number not found")
+    user.require_owns(pn.tenant_id)
     await db.delete(pn)
     return {"status": "deleted"}
 
@@ -143,6 +155,7 @@ async def delete_phone_number(
 @router.post("/{phone_id}/test-sip")
 async def test_sip_connection(
     phone_id: str,
+    user: CurrentUser = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Test SIP connection for a phone number."""
@@ -152,6 +165,7 @@ async def test_sip_connection(
     pn = result.scalar_one_or_none()
     if not pn:
         raise HTTPException(404, "Phone number not found")
+    user.require_owns(pn.tenant_id)
 
     if not pn.sip_domain:
         return {"connected": False, "message": "No SIP domain configured"}

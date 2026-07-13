@@ -1,7 +1,6 @@
 import React, { useState, useCallback } from 'react';
 
-import { API_URL } from '../../../api/client';
-const API = API_URL;
+import fetchWithAuth from '../../../api/client';
 
 interface SimulationScore {
   overall_score: number;
@@ -225,14 +224,11 @@ const SimulationTab: React.FC<Props> = ({ agentId }) => {
     }, 1500);
 
     try {
-      const res = await fetch(`${API}/agents/${agentId}/simulate/all`, {
+      const data: AllSimResults = await fetchWithAuth(`/agents/${agentId}/simulate/all`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
       });
       clearInterval(timer);
       setProgress(100);
-      if (!res.ok) throw new Error(`Server error: ${res.status}`);
-      const data: AllSimResults = await res.json();
       setAllResults(data);
     } catch (e: any) {
       clearInterval(timer);

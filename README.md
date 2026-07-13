@@ -77,7 +77,7 @@ The frontend provides the Administration dashboards (Clinic view and SuperAdmin 
 ## 🔑 Default Dashboards & Logins
 
 - **Clinic Dashboard:** `http://localhost:5173/login` (Use any credentials in demo mode)
-- **SuperAdmin Dashboard:** `http://localhost:5173/superadmin/login` (Hardcoded credentials: `admin@lifodial.com` / `lifodial2026`)
+- **SuperAdmin Dashboard:** `http://localhost:5173/superadmin/login` (credentials come from the `SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD` env vars — see `.env.example`)
 
 ## 🚢 Deployment Updates
 *(Note: A comprehensive VPS container deployment guide is available in `scripts/setup_vps.sh` for when the application moves to production).*

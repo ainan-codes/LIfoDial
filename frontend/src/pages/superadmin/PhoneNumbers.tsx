@@ -8,7 +8,7 @@ import {
     X
 } from 'lucide-react';
 import React, { useEffect, useState } from 'react';
-import { API_URL } from '../../api/client';
+import fetchWithAuth from '../../api/client';
 
 // ── Fixture Phone Numbers ─────────────────────────────────────────────────────
 
@@ -92,15 +92,13 @@ export default function PhoneNumbers() {
 
   // Fetch real data from API (fall back to fixtures)
   useEffect(() => {
-    fetch(`${API_URL}/phone-numbers`)
-      .then((r) => r.json())
+    fetchWithAuth('/phone-numbers')
       .then((data) => {
         if (Array.isArray(data) && data.length > 0) setNumbers(data);
       })
       .catch(() => {/* use fixtures */});
 
-    fetch(`${API_URL}/agents`)
-      .then((r) => r.json())
+    fetchWithAuth('/agents')
       .then((data) => {
         if (Array.isArray(data)) {
           setAgents(data.map((a: any) => ({
@@ -326,9 +324,8 @@ function AddNumberModal({
     setSaving(true);
 
     try {
-      const res = await fetch(`${API_URL}/phone-numbers`, {
+      const data = await fetchWithAuth('/phone-numbers', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           number: number.trim(),
           country_code: country,
@@ -343,37 +340,19 @@ function AddNumberModal({
         }),
       });
 
-      if (res.ok) {
-        const data = await res.json();
-        onAdded({
-          id: data.id,
-          number: number.trim(),
-          country: selectedCountry.name,
-          country_code: country,
-          provider,
-          agent_id: agentId || null,
-          agent_name: agents.find((a) => a.id === agentId)?.name || null,
-          is_active: true,
-          is_assigned: !!agentId,
-          sip_domain: sipDomain || null,
-          created_at: new Date().toISOString(),
-        });
-      } else {
-        // If API fails, add locally anyway (fixture mode)
-        onAdded({
-          id: 'pn-' + Date.now(),
-          number: number.trim(),
-          country: selectedCountry.name,
-          country_code: country,
-          provider,
-          agent_id: agentId || null,
-          agent_name: agents.find((a) => a.id === agentId)?.name || null,
-          is_active: true,
-          is_assigned: !!agentId,
-          sip_domain: sipDomain || null,
-          created_at: new Date().toISOString(),
-        });
-      }
+      onAdded({
+        id: data.id,
+        number: number.trim(),
+        country: selectedCountry.name,
+        country_code: country,
+        provider,
+        agent_id: agentId || null,
+        agent_name: agents.find((a) => a.id === agentId)?.name || null,
+        is_active: true,
+        is_assigned: !!agentId,
+        sip_domain: sipDomain || null,
+        created_at: new Date().toISOString(),
+      });
     } catch {
       // Fallback to local add
       onAdded({

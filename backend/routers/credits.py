@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 
+from backend.auth import CurrentUser, SuperAdmin
 from backend.db import async_session
 from backend.services.credit_service import CreditService
 
@@ -42,7 +43,7 @@ class SetRatePayload(BaseModel):
 # ── Super Admin: All Balances ─────────────────────────────────────────────────
 
 @router.get("/credits")
-async def list_all_credits() -> dict:
+async def list_all_credits(user: SuperAdmin = None) -> dict:
     """Get all clinic credit balances (super admin)."""
     try:
         async with async_session() as db:
@@ -56,7 +57,7 @@ async def list_all_credits() -> dict:
 # ── Super Admin: Top Up ──────────────────────────────────────────────────────
 
 @router.post("/credits/topup")
-async def topup_credits(payload: TopUpPayload) -> dict:
+async def topup_credits(payload: TopUpPayload, user: SuperAdmin = None) -> dict:
     """Add credits to a clinic's balance."""
     try:
         async with async_session() as db:
@@ -79,7 +80,7 @@ async def topup_credits(payload: TopUpPayload) -> dict:
 # ── Super Admin: Set Rate ────────────────────────────────────────────────────
 
 @router.post("/credits/set-rate")
-async def set_credit_rate(payload: SetRatePayload) -> dict:
+async def set_credit_rate(payload: SetRatePayload, user: SuperAdmin = None) -> dict:
     """Update per-minute billing rate for a clinic."""
     try:
         async with async_session() as db:
@@ -100,8 +101,9 @@ async def set_credit_rate(payload: SetRatePayload) -> dict:
 # ── Super Admin: Transaction History ─────────────────────────────────────────
 
 @router.get("/credits/{tenant_id}/transactions")
-async def get_transactions(tenant_id: str, limit: int = 50) -> dict:
+async def get_transactions(tenant_id: str, limit: int = 50, user: CurrentUser = None) -> dict:
     """Get transaction history for a specific clinic."""
+    user.require_owns(tenant_id)
     try:
         async with async_session() as db:
             txns = await CreditService.get_transactions(db, tenant_id, limit)
@@ -114,8 +116,9 @@ async def get_transactions(tenant_id: str, limit: int = 50) -> dict:
 # ── Clinic Admin: My Balance ─────────────────────────────────────────────────
 
 @router.get("/credits/my-balance")
-async def my_balance(tenant_id: str) -> dict:
+async def my_balance(tenant_id: str, user: CurrentUser = None) -> dict:
     """Get credit balance for a specific clinic (clinic admin view)."""
+    user.require_owns(tenant_id)
     try:
         async with async_session() as db:
             credits = await CreditService.get_or_create_balance(db, tenant_id)
@@ -140,7 +143,7 @@ async def my_balance(tenant_id: str) -> dict:
 # ── Super Admin: Initialize Credits for All Clinics ──────────────────────────
 
 @router.post("/credits/init-all")
-async def init_all_credits() -> dict:
+async def init_all_credits(user: SuperAdmin = None) -> dict:
     """Create credit records for all clinics that don't have one."""
     try:
         from backend.models.tenant import Tenant
@@ -172,7 +175,7 @@ async def init_all_credits() -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.post("/debug/test-stt")
-async def test_stt() -> dict:
+async def test_stt(user: SuperAdmin = None) -> dict:
     """
     Test Sarvam STT API connectivity.
     Sends 1 second of silence (16-bit PCM WAV) and checks the response.
@@ -230,7 +233,7 @@ async def test_stt() -> dict:
 
 
 @router.post("/debug/test-tts")
-async def test_tts() -> dict:
+async def test_tts(user: SuperAdmin = None) -> dict:
     """Test Sarvam TTS API connectivity."""
     import httpx
     from backend.config import settings

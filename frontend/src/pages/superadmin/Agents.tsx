@@ -24,7 +24,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import TestAgentModal from '../../components/TestAgentModal';
 import { AgentStatus, FIXTURE_AGENTS, FixtureAgent } from '../../fixtures/data';
-import { API_URL } from '../../api/client';
+import fetchWithAuth from '../../api/client';
 
 // ── Status config ────────────────────────────────────────────────────────────
 
@@ -99,13 +99,14 @@ function AgentDropdown({ agent, onDelete }: { agent: FixtureAgent; onDelete: (id
 
 // ── Agent Card ───────────────────────────────────────────────────────────────
 
-function AgentCard({ agent, onEdit, onTest, onDelete, onWebCall, onPhoneCall }: {
+function AgentCard({ agent, onEdit, onTest, onDelete, onWebCall, onPhoneCall, showDisambiguator }: {
   agent: FixtureAgent;
   onEdit: (id: string) => void;
   onTest: () => void;
   onDelete: (id: string) => void;
   onWebCall: () => void;
   onPhoneCall: () => void;
+  showDisambiguator?: boolean;
 }) {
   const st = STATUS_CONFIG[agent.status];
 
@@ -184,8 +185,20 @@ function AgentCard({ agent, onEdit, onTest, onDelete, onWebCall, onPhoneCall }: 
             <Headphones size={16} color="#3ECF8E" />
           </div>
           <div>
-            <div style={{ fontSize: '15px', fontWeight: 600, color: '#fff', lineHeight: 1.3 }}>{agent.name}</div>
-            <div style={{ fontSize: '12px', color: '#666' }}>{agent.clinic_name}</div>
+            <div style={{ fontSize: '15px', fontWeight: 600, color: '#fff', lineHeight: 1.3 }}>
+              {agent.name}
+              {showDisambiguator && (
+                <span style={{ fontSize: '11px', fontWeight: 500, color: '#666', marginLeft: '6px' }}>
+                  #{agent.id.slice(0, 6)}
+                </span>
+              )}
+            </div>
+            <div style={{ fontSize: '12px', color: '#666' }}>
+              {agent.clinic_name}
+              {showDisambiguator && agent.created_at && (
+                <span> · created {new Date(agent.created_at).toLocaleDateString()}</span>
+              )}
+            </div>
           </div>
         </div>
 
@@ -356,9 +369,20 @@ export default function SAAgents() {
     return matchSearch && matchStatus && matchLang;
   });
 
+  // A clinic can have multiple agents now — when two share the same name,
+  // show a distinguishing id/date on both so they aren't visually identical.
+  const duplicateNameKeys = new Set<string>();
+  {
+    const seen = new Set<string>();
+    for (const a of agents) {
+      const key = `${a.clinic_name}::${a.name}`;
+      if (seen.has(key)) duplicateNameKeys.add(key);
+      seen.add(key);
+    }
+  }
+
   useEffect(() => {
-    fetch(`${API_URL}/agents`)
-      .then(res => res.json())
+    fetchWithAuth('/agents')
       .then(async data => {
         // Map backend agent dict to frontend expected format
         const mapped = data.map((a: any) => ({
@@ -377,7 +401,7 @@ export default function SAAgents() {
         // Fetch real stats for each agent in the background
         mapped.forEach(async (a: any) => {
           try {
-            const h = await fetch(`${API_URL}/agents/${a.id}/health`).then(r => r.json());
+            const h = await fetchWithAuth(`/agents/${a.id}/health`);
             setAgents(prev => prev.map(ag => ag.id === a.id ? {
               ...ag,
               calls_today: h.last_24h?.total_calls ?? 0,
@@ -399,7 +423,7 @@ export default function SAAgents() {
   const handleDelete = async (id: string) => {
     if (!window.confirm('Permanently delete this agent?')) return;
     try {
-      await fetch(`${API_URL}/agents/${id}`, { method: 'DELETE' });
+      await fetchWithAuth(`/agents/${id}`, { method: 'DELETE' });
     } catch {}
     setAgents(prev => prev.filter(a => a.id !== id));
   };
@@ -487,6 +511,7 @@ export default function SAAgents() {
               onDelete={handleDelete}
               onWebCall={() => handleWebCall(a)}
               onPhoneCall={() => handlePhoneCall(a)}
+              showDisambiguator={duplicateNameKeys.has(`${a.clinic_name}::${a.name}`)}
             />
           ))}
         </div>
@@ -560,11 +585,10 @@ export default function SAAgents() {
                   const num = phoneNumber.trim();
                   if (!num) return;
                   const fullNumber = num.startsWith('+') ? num : `+91${num.replace(/\s/g, '')}`;
-                  fetch(`${API_URL}/agents/${phoneCallTarget.id}/outbound-call`, {
+                  fetchWithAuth(`/agents/${phoneCallTarget.id}/outbound-call`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ phone_number: fullNumber }),
-                  }).then(r => r.json()).then(data => {
+                  }).then(data => {
                     alert(data.message || 'Call initiated');
                     setPhoneCallTarget(null);
                     setPhoneNumber('');

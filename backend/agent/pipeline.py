@@ -41,7 +41,7 @@ from loguru import logger as pipecat_logger
 # ── Pipecat core ──────────────────────────────────────────────────────────────
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMMessagesFrame, TextFrame
+from pipecat.frames.frames import TextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -49,8 +49,9 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.google.llm import GoogleLLMService
 from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSModel, SarvamTTSService
-from pipecat.services.openai import OpenAISTTService
-from pipecat.services.elevenlabs import ElevenLabsTTSService
+from pipecat.services.openai.stt import OpenAISTTService
+from pipecat.services.openai.tts import OpenAITTSService
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
 
 # ── Pipecat LiveKit token helper ──────────────────────────────────────────────
@@ -87,18 +88,37 @@ def _safe_lang(lang: str) -> str:
     return _LANG_TO_SARVAM.get(lang, "hi-IN")
 
 
+def _kb_context_block(tenant: dict) -> str:
+    """Render the tenant's knowledge base as an appendable prompt block. Empty
+    string when there are no entries (turn proceeds normally without KB)."""
+    entries = tenant.get("knowledge_base") or []
+    if not entries:
+        return ""
+    lines = [f"[{(e.get('category') or 'info').upper()}] {e.get('title','')}: {e.get('content','')}" for e in entries]
+    return (
+        "\n\n--- CLINIC KNOWLEDGE BASE ---\n"
+        + "\n".join(lines)
+        + "\n--- END KNOWLEDGE BASE ---\n"
+        "Use the knowledge base above to answer clinic-specific questions. "
+        "If it doesn't cover something, say you'll check with the clinic — never invent details."
+    )
+
+
 def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
     """
-    Build the LLM system prompt from stored config, or render from template.
+    Build the LLM system prompt from stored config, or render from template,
+    then append the clinic knowledge base (if any).
 
     Precedence:
       1. agent_config['system_prompt'] — custom prompt set by clinic admin
       2. Rendered prompt_templates entry for agent_config['template']
       3. Hardcoded fallback
     """
+    kb_block = _kb_context_block(tenant)
+
     custom_prompt = (agent_config.get("system_prompt") or "").strip()
     if custom_prompt:
-        return custom_prompt
+        return custom_prompt + kb_block
 
     # Try template render
     try:
@@ -125,7 +145,7 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
                 "doctors_list": doctors_list,
             },
         )
-        return rendered
+        return rendered + kb_block
 
     except Exception as exc:
         log.warning("Template render failed, using fallback prompt: %s", exc)
@@ -136,7 +156,7 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
         f"the AI voice receptionist for {tenant.get('clinic_name', 'the clinic')}. "
         "Be concise, professional, and helpful. Maximum 2 sentences per response. "
         "Never give medical advice."
-    )
+    ) + kb_block
 
 
 def _generate_agent_token(room_name: str) -> str:
@@ -179,6 +199,7 @@ async def _load_tenant_and_config(
     agent_config: dict = {
         "agent_name":      metadata.get("agent_name", "Receptionist"),
         "first_message":   metadata.get("first_message", ""),
+        "first_message_mode": metadata.get("first_message_mode", "assistant-speaks-first"),
         "system_prompt":   metadata.get("system_prompt", ""),
         "template":        metadata.get("template", "clinic_receptionist"),
         "stt_provider":    metadata.get("stt_provider", "sarvam"),
@@ -187,10 +208,39 @@ async def _load_tenant_and_config(
         "tts_language":    metadata.get("tts_language", "hi-IN"),
         "tts_model":       metadata.get("tts_model", "bulbul:v3"),
         "tts_pace":        float(metadata.get("tts_pace", 1.05)),
+        "tts_pitch":       float(metadata.get("tts_pitch", 0.0) or 0.0),
+        "tts_loudness":    float(metadata.get("tts_loudness", 1.0) or 1.0),
+        "tts_input_preprocessing": bool(metadata.get("tts_input_preprocessing", True)),
+        "tts_stability":   metadata.get("tts_stability"),
+        "tts_clarity":     metadata.get("tts_clarity"),
+        "tts_style":       metadata.get("tts_style"),
+        "tts_use_speaker_boost": bool(metadata.get("tts_use_speaker_boost", False)),
+        "tts_speed":       metadata.get("tts_speed"),
         "stt_model":       metadata.get("stt_model", "saaras:v2"),
+        "stt_language":    metadata.get("stt_language", "hi-IN"),
         "llm_model":       metadata.get("llm_model", "gemini-2.0-flash"),
         "llm_temperature": float(metadata.get("llm_temperature", 0.3)),
         "max_response_tokens": int(metadata.get("max_response_tokens", 120)),
+        # ── Tool toggles (Tools tab) ──────────────────────────────────────
+        "can_book_appointments":   bool(metadata.get("can_book_appointments", True)),
+        "can_cancel_appointments": bool(metadata.get("can_cancel_appointments", True)),
+        "can_check_availability":  bool(metadata.get("can_check_availability", True)),
+        "can_transfer_emergency":  bool(metadata.get("can_transfer_emergency", True)),
+        "emergency_transfer_number": metadata.get("emergency_transfer_number"),
+        # ── Post-call analysis toggles (Analysis tab) ──────────────────────
+        "summary_enabled":            bool(metadata.get("summary_enabled", True)),
+        "success_evaluation_enabled": bool(metadata.get("success_evaluation_enabled", True)),
+        "structured_output_enabled":  bool(metadata.get("structured_output_enabled", False)),
+        # ── Call Behavior ───────────────────────────────────────────────────
+        "silence_timeout_seconds": int(metadata.get("silence_timeout_seconds", 10) or 10),
+        "max_duration_seconds":    int(metadata.get("max_duration_seconds", 300) or 300),
+        "end_call_phrases":        metadata.get("end_call_phrases") or [],
+        "end_call_message":        metadata.get("end_call_message", "Thank you for calling. Goodbye!"),
+        "recording_consent_plan":  metadata.get("recording_consent_plan", "none"),
+        # No real agent_id (ad-hoc/metadata-only test room) => nothing to
+        # unpublish, so default to allowed. Overwritten below when a real
+        # AgentConfig row is loaded.
+        "status": "ACTIVE",
     }
 
     tenant: dict = {
@@ -198,6 +248,7 @@ async def _load_tenant_and_config(
         "clinic_name":   metadata.get("clinic_name", "Clinic"),
         "working_hours": "9 AM – 7 PM, Mon–Sat",
         "doctors":       [],
+        "knowledge_base": [],
     }
 
     if not tenant_id and not agent_id:
@@ -222,6 +273,7 @@ async def _load_tenant_and_config(
                     agent_config.update({
                         "agent_name":          cfg.agent_name or "Receptionist",
                         "first_message":       cfg.first_message or "",
+                        "first_message_mode":  getattr(cfg, "first_message_mode", "assistant-speaks-first") or "assistant-speaks-first",
                         "system_prompt":       cfg.system_prompt or "",
                         "template":            getattr(cfg, "template", "clinic_receptionist"),
                         "stt_provider":        getattr(cfg, "stt_provider", "sarvam") or "sarvam",
@@ -230,10 +282,33 @@ async def _load_tenant_and_config(
                         "tts_language":        cfg.tts_language or "hi-IN",
                         "tts_model":           cfg.tts_model or "bulbul:v3",
                         "tts_pace":            float(cfg.tts_pace or 1.05),
+                        "tts_pitch":           float(cfg.tts_pitch if cfg.tts_pitch is not None else 0.0),
+                        "tts_loudness":        float(cfg.tts_loudness if cfg.tts_loudness is not None else 1.0),
+                        "tts_input_preprocessing": bool(cfg.tts_input_preprocessing if cfg.tts_input_preprocessing is not None else True),
+                        "tts_stability":       cfg.tts_stability,
+                        "tts_clarity":         cfg.tts_clarity,
+                        "tts_style":           cfg.tts_style,
+                        "tts_use_speaker_boost": bool(cfg.tts_use_speaker_boost or False),
+                        "tts_speed":           cfg.tts_speed,
                         "stt_model":           cfg.stt_model or "saaras:v2",
+                        "stt_language":        cfg.stt_language or "hi-IN",
                         "llm_model":           cfg.llm_model or "gemini-2.0-flash",
                         "llm_temperature":     float(cfg.llm_temperature or 0.3),
                         "max_response_tokens": int(cfg.max_response_tokens or 120),
+                        "can_book_appointments":   bool(cfg.can_book_appointments if cfg.can_book_appointments is not None else True),
+                        "can_cancel_appointments": bool(cfg.can_cancel_appointments if cfg.can_cancel_appointments is not None else True),
+                        "can_check_availability":  bool(cfg.can_check_availability if cfg.can_check_availability is not None else True),
+                        "can_transfer_emergency":  bool(cfg.can_transfer_emergency if cfg.can_transfer_emergency is not None else True),
+                        "emergency_transfer_number": cfg.emergency_transfer_number,
+                        "summary_enabled":            bool(cfg.summary_enabled if cfg.summary_enabled is not None else True),
+                        "success_evaluation_enabled": bool(cfg.success_evaluation_enabled if cfg.success_evaluation_enabled is not None else True),
+                        "structured_output_enabled":  bool(cfg.structured_output_enabled or False),
+                        "silence_timeout_seconds": int(cfg.silence_timeout_seconds or 10),
+                        "max_duration_seconds":    int(cfg.max_duration_seconds or 300),
+                        "end_call_phrases":        cfg.end_call_phrases or [],
+                        "end_call_message":        cfg.end_call_message or "Thank you for calling. Goodbye!",
+                        "recording_consent_plan":  getattr(cfg, "recording_consent_plan", None) or "none",
+                        "status":              cfg.status,
                     })
                     log.info("AgentConfig loaded from DB: agent_id=%s", agent_id)
 
@@ -264,6 +339,24 @@ async def _load_tenant_and_config(
                     "Tenant loaded from DB: %s (%d doctors)",
                     tenant["clinic_name"], len(tenant["doctors"]),
                 )
+
+                # Knowledge base entries (same source the WS/embed path already
+                # injects) — so the pipecat pipeline is KB-aware too.
+                try:
+                    from backend.models.knowledge_base import KnowledgeBase
+                    kb_result = await db.execute(
+                        select(KnowledgeBase).where(
+                            KnowledgeBase.tenant_id == tenant_id,
+                            KnowledgeBase.is_active == True,  # noqa: E712
+                        )
+                    )
+                    tenant["knowledge_base"] = [
+                        {"category": e.category, "title": e.title, "content": e.content}
+                        for e in kb_result.scalars().all()
+                    ]
+                    log.info("Knowledge base loaded: %d entries", len(tenant["knowledge_base"]))
+                except Exception as kb_exc:
+                    log.warning("Knowledge base load failed (non-fatal): %s", kb_exc)
 
     except Exception as exc:
         log.warning(
@@ -363,6 +456,27 @@ async def entrypoint(ctx) -> None:
     # ── Load config from DB ────────────────────────────────────────────────
     agent_config, tenant = await _load_tenant_and_config(tenant_id, agent_id, metadata)
 
+    # ── Publish/Unpublish enforcement — single source of truth is
+    # AgentConfig.status (see backend/routers/embed.py's _is_published for the
+    # matching check on the widget side). Only enforced when this room is tied
+    # to a real agent_id — an unpublished agent must not take NEW calls, but a
+    # call already in progress when it's unpublished is unaffected (this check
+    # only runs once, at room-join time, not mid-call). Declining here — before
+    # ctx.connect() — means the room is never joined, so no call minutes/audio
+    # are billed or recorded for a call that was never allowed to start.
+    # test_mode (in-dashboard "Test Agent") bypasses the publish gate so an admin
+    # can test an agent that isn't ACTIVE yet — it's the same pipeline, just not
+    # a real/billable inbound call.
+    test_mode = bool(metadata.get("test_mode", False))
+    if agent_id and not test_mode and agent_config.get("status") != "ACTIVE":
+        log.warning(
+            "Declining call: agent_id=%s is unpublished (status=%s) — not joining room %s",
+            agent_id, agent_config.get("status"), room_name,
+        )
+        return
+    if test_mode:
+        log.info("TEST MODE call — publish gate bypassed for agent_id=%s", agent_id)
+
     # ── Create call record ─────────────────────────────────────────────────
     call_meta = {
         "caller_phone": caller_phone,
@@ -383,6 +497,13 @@ async def entrypoint(ctx) -> None:
     tts_voice     = agent_config.get("tts_voice", "priya")
     tts_pace      = min(max(float(agent_config.get("tts_pace", 1.05)), 0.5), 2.0)
     tts_language  = _safe_lang(agent_config.get("tts_language", "hi-IN"))
+    # bulbul:v2 is the only Sarvam model that accepts pitch/loudness — Pipecat's
+    # SarvamTTSService silently ignores them for v3/v3-beta, so it's always
+    # safe to pass through (unlike the raw-httpx Sarvam calls elsewhere, which
+    # error on these params for v3 and must guard explicitly).
+    tts_pitch     = min(max(float(agent_config.get("tts_pitch") or 0.0), -0.75), 0.75)
+    tts_loudness  = min(max(float(agent_config.get("tts_loudness") or 1.0), 0.3), 3.0)
+    tts_input_preprocessing = bool(agent_config.get("tts_input_preprocessing", True))
 
     # Validate tts_model against Pipecat's SarvamTTSModel enum values
     valid_tts_models = {m.value for m in SarvamTTSModel}
@@ -410,6 +531,12 @@ async def entrypoint(ctx) -> None:
         # Legacy model name compat: "saaras:v2" → "saaras:v2.5"
         stt_model = "saaras:v2.5"
 
+    # STT Language dropdown was previously ignored — _load_tenant_and_config
+    # never loaded stt_language into agent_config, so this always fell back to
+    # the TTS language. Now wired: use the agent's own STT language setting,
+    # falling back to TTS language only if it's genuinely unset.
+    stt_language = _safe_lang(agent_config.get("stt_language") or tts_language)
+
     # saaras:v2.5 auto-detects language — don't pass language for it
     if stt_model == "saaras:v2.5":
         stt_settings = SarvamSTTService.Settings(
@@ -418,7 +545,7 @@ async def entrypoint(ctx) -> None:
     else:
         stt_settings = SarvamSTTService.Settings(
             model=stt_model,
-            language=tts_language,
+            language=stt_language,
         )
 
     # ── Instantiate Pipecat services ───────────────────────────────────────
@@ -509,22 +636,59 @@ async def entrypoint(ctx) -> None:
         if tts_model_configured not in ("eleven_flash_v2_5", "eleven_multilingual_v2", "eleven_turbo_v2_5"):
             tts_model_configured = "eleven_flash_v2_5"
 
+        # Voice-character sliders (Stability / Clarity / Style / Speaker Boost /
+        # Speed) — mapped 1:1 to ElevenLabsTTSSettings, which is the class this
+        # websocket-based service actually exposes (confirmed against the
+        # installed pipecat-ai package). `speed` is clamped to ElevenLabs'
+        # accepted 0.7–1.2 range since the agent's slider goes 0.5–2.0.
+        el_speed = agent_config.get("tts_speed")
+        el_speed = min(max(float(el_speed), 0.7), 1.2) if el_speed is not None else None
+
         log.info("Instantiating ElevenLabs TTS for voice: %s, model: %s", selected_voice, tts_model_configured)
         tts = ElevenLabsTTSService(
             api_key=settings.elevenlabs_api_key,
             voice_id=selected_voice,
             settings=ElevenLabsTTSService.Settings(
-                model=tts_model_configured
+                model=tts_model_configured,
+                stability=agent_config.get("tts_stability"),
+                similarity_boost=agent_config.get("tts_clarity"),
+                style=agent_config.get("tts_style"),
+                use_speaker_boost=agent_config.get("tts_use_speaker_boost"),
+                speed=el_speed,
             )
+        )
+    elif tts_provider == "openai_tts":
+        log.info("Instantiating OpenAI TTS for voice: %s, model: %s", tts_voice, tts_model_str)
+        openai_speed = agent_config.get("tts_speed")
+        openai_speed = min(max(float(openai_speed), 0.25), 4.0) if openai_speed is not None else None
+        tts = OpenAITTSService(
+            api_key=settings.openai_api_key,
+            settings=OpenAITTSService.Settings(
+                voice=tts_voice or "alloy",
+                model=tts_model_str if tts_model_str.startswith("gpt-") or tts_model_str.startswith("tts-") else "gpt-4o-mini-tts",
+                speed=openai_speed,
+            ),
         )
     else:
         log.info("Instantiating Sarvam TTS...")
+        # NOTE: SarvamTTSService.__init__ only accepts `api_key`/`model`/
+        # `voice_id` as direct kwargs in the installed pipecat-ai release —
+        # voice/language/pace/pitch/loudness/enable_preprocessing must go
+        # through `settings=`, or they're silently swallowed by **kwargs and
+        # never reach Sarvam at all (confirmed against pipecat-ai 1.5.0;
+        # requirements.agent.txt pins no upper bound so this is what a fresh
+        # deploy installs).
         tts = SarvamTTSService(
             api_key=settings.sarvam_api_key,
-            model=tts_model_str,
-            voice=tts_voice,
-            language=tts_language,
-            pace=tts_pace,
+            settings=SarvamTTSService.Settings(
+                voice=tts_voice,
+                model=tts_model_str,
+                language=tts_language,
+                pace=tts_pace,
+                pitch=tts_pitch,
+                loudness=tts_loudness,
+                enable_preprocessing=tts_input_preprocessing,
+            ),
         )
 
     # Custom processors — booking state machine + call logging
@@ -537,6 +701,7 @@ async def entrypoint(ctx) -> None:
         tenant_id=tenant_id or "",
         agent_id=agent_id,
         call_meta=call_meta,
+        agent_config=agent_config,
     )
 
     # ── Build the Pipeline ─────────────────────────────────────────────────
@@ -568,14 +733,53 @@ async def entrypoint(ctx) -> None:
 
     # ── Event handlers ─────────────────────────────────────────────────────
 
+    first_message_mode = agent_config.get("first_message_mode", "assistant-speaks-first")
+    recording_consent_plan = agent_config.get("recording_consent_plan", "none") or "none"
+    _CONSENT_NOTICE = "This call may be recorded for quality and training purposes."
+
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(transport_ref, participant_id: str) -> None:
-        """Speak the first message when the caller joins the room."""
+        """
+        Greet the caller — but only if the agent is set to speak first.
+        With first_message_mode='wait', the agent stays silent and waits for the
+        caller to speak (matching the browser-test path behavior). Previously the
+        greeting always played regardless of this setting.
+
+        recording_consent_plan handling (Advanced tab — previously stored but
+        never acted on):
+          - "none": no change to greeting behavior.
+          - "inform": consent notice is prepended to the first message.
+          - "require": consent notice is asked as a yes/no question BEFORE
+            anything else; the caller's answer is intercepted by
+            CallLoggerProcessor (see begin_consent_gate) rather than treated
+            as normal conversation. A "no" ends the call politely.
+        """
+        if recording_consent_plan == "require":
+            log.info("Participant joined: %s — asking for recording consent before proceeding.", participant_id)
+            call_logger.begin_consent_gate(
+                decline_message=(
+                    "No problem — this call will not be recorded. Unfortunately I can't "
+                    "continue without your consent, so I'll have to end the call here. Goodbye."
+                ),
+                resume_message=first_message if first_message_mode != "wait" else None,
+            )
+            await task.queue_frames([TextFrame(f"{_CONSENT_NOTICE} Is that okay with you?")])
+            return
+
+        effective_first_message = first_message
+        if recording_consent_plan == "inform":
+            effective_first_message = f"{_CONSENT_NOTICE} {first_message}"
+
+        if first_message_mode == "wait":
+            log.info("Participant joined: %s — mode=wait, staying silent until caller speaks.", participant_id)
+            # Seed the greeting into context so the LLM knows its intended opener,
+            # but do NOT synthesize/speak it.
+            context.add_message({"role": "assistant", "content": effective_first_message})
+            return
         log.info("Participant joined: %s — speaking first message.", participant_id)
-        # Add the first message to LLM context so LLM is aware of it
-        context.add_message({"role": "assistant", "content": first_message})
+        context.add_message({"role": "assistant", "content": effective_first_message})
         # Queue the first greeting as a TextFrame to be synthesized directly by TTS (no self-talk trigger)
-        await task.queue_frames([TextFrame(first_message)])
+        await task.queue_frames([TextFrame(effective_first_message)])
 
     @transport.event_handler("on_participant_disconnected")
     async def on_participant_disconnected(transport_ref, participant_id: str) -> None:
@@ -583,11 +787,66 @@ async def entrypoint(ctx) -> None:
         log.info("Participant disconnected: %s — ending pipeline.", participant_id)
         await task.cancel()
 
+    # ── Call-length watchdogs (Call Behavior tab) ───────────────────────────
+    # Both settings previously round-tripped to the DB with no runtime effect —
+    # max_duration_seconds had no enforcement timer, and silence_timeout_seconds
+    # was never compared against actual call activity.
+    end_call_message = agent_config.get("end_call_message") or "Thank you for calling. Goodbye!"
+    max_duration_seconds = int(agent_config.get("max_duration_seconds", 300) or 300)
+    silence_timeout_seconds = int(agent_config.get("silence_timeout_seconds", 10) or 10)
+
+    # Give the logger a way to end the call directly (used for end_call_phrases
+    # detection — see CallLoggerProcessor._on_user_speech).
+    call_logger.task = task
+
+    watchdog_tasks = [
+        asyncio.create_task(_enforce_max_duration(task, max_duration_seconds, end_call_message)),
+        asyncio.create_task(_enforce_silence_timeout(task, call_logger, silence_timeout_seconds, end_call_message)),
+    ]
+
     # ── Run ────────────────────────────────────────────────────────────────
     runner = PipelineRunner()
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    finally:
+        for t in watchdog_tasks:
+            if not t.done():
+                t.cancel()
 
     log.info("Pipeline finished for room=%s", room_name)
+
+
+async def _enforce_max_duration(task: "PipelineTask", max_duration_seconds: int, end_call_message: str) -> None:
+    """Ends the call once it has run longer than the agent's configured ceiling."""
+    from backend.agent.processors.call_logger_processor import speak_and_end_call
+
+    try:
+        await asyncio.sleep(max_duration_seconds)
+        log.info("Max call duration (%ss) reached — ending call.", max_duration_seconds)
+        await speak_and_end_call(task, end_call_message)
+    except asyncio.CancelledError:
+        pass
+
+
+async def _enforce_silence_timeout(
+    task: "PipelineTask",
+    call_logger: "CallLoggerProcessor",
+    silence_timeout_seconds: int,
+    end_call_message: str,
+) -> None:
+    """Ends the call if the patient goes silent for longer than configured."""
+    from backend.agent.processors.call_logger_processor import speak_and_end_call
+
+    try:
+        while True:
+            await asyncio.sleep(2.0)
+            idle_seconds = time.time() - call_logger.last_activity_ts
+            if idle_seconds >= silence_timeout_seconds:
+                log.info("Silence timeout (%ss) reached — ending call.", silence_timeout_seconds)
+                await speak_and_end_call(task, end_call_message)
+                return
+    except asyncio.CancelledError:
+        pass
 
 
 # ── Worker bootstrap ──────────────────────────────────────────────────────────

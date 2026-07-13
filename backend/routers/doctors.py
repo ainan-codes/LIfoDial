@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.auth import CurrentUser
 from backend.db import get_db
 from backend.models.doctor import Doctor
 from backend.models.tenant import Tenant
@@ -31,7 +32,8 @@ class DoctorResponse(BaseModel):
 # ALL operations MUST filter by tenant_id (multi-tenant rule)
 
 @router.post("/tenants/{tenant_id}/doctors", response_model=DoctorResponse, status_code=status.HTTP_201_CREATED)
-async def add_doctor(tenant_id: uuid.UUID, payload: DoctorCreate, db: AsyncSession = Depends(get_db)):
+async def add_doctor(tenant_id: uuid.UUID, payload: DoctorCreate, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(str(tenant_id))
     # Verify tenant exists
     tenant = await db.scalar(select(Tenant).where(Tenant.id == tenant_id))
     if not tenant:
@@ -48,7 +50,8 @@ async def add_doctor(tenant_id: uuid.UUID, payload: DoctorCreate, db: AsyncSessi
     return doctor
 
 @router.get("/tenants/{tenant_id}/doctors", response_model=list[DoctorResponse])
-async def list_doctors(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def list_doctors(tenant_id: uuid.UUID, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(str(tenant_id))
     result = await db.execute(
         select(Doctor).where(Doctor.tenant_id == tenant_id)
     )
@@ -56,7 +59,8 @@ async def list_doctors(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db))
     return list(doctors)
 
 @router.delete("/tenants/{tenant_id}/doctors/{doctor_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_doctor(tenant_id: uuid.UUID, doctor_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def delete_doctor(tenant_id: uuid.UUID, doctor_id: uuid.UUID, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(str(tenant_id))
     result = await db.execute(
         select(Doctor).where(
             Doctor.id == doctor_id,

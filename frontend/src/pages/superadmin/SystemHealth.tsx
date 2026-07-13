@@ -1,20 +1,23 @@
 import { AlertTriangle, CheckCircle, Database, RefreshCw, Server, WifiOff } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
-import { API_URL } from '../../api/client';
+import fetchWithAuth, { API_URL } from '../../api/client';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface HealthStatus {
   database?: { status: string; latency_ms?: number; type?: string; tenant_count?: number; appointment_count?: number; error?: string; host?: string; hint?: string };
+  session_store?: { type?: string; connected?: boolean; note?: string };
   environment?: string;
   timestamp?: string;
   // Service key statuses — 'connected' | 'missing_key'
   gemini?: string;
   sarvam?: string;
-  livekit?: string;
+  livekit?: string;        // 'connected' | 'auth_failed' | 'missing_key' (real API check)
+  livekit_detail?: string;
   vobiz?: string;
   oxzygen?: string;
   groq?: string;
   elevenlabs?: string;
+  his_implemented?: boolean;
 }
 
 interface ConfigCheck {
@@ -76,22 +79,19 @@ export default function SASystemHealth() {
   const [health, setHealth] = useState<HealthStatus>({});
   const [loading, setLoading] = useState(true);
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
-  const [p50, setP50] = useState(742);
-
-  // Live latency simulation
-  useEffect(() => {
-    const id = setInterval(() => setP50(l => Math.max(680, Math.min(900, l + (Math.random() * 20 - 10)))), 3000);
-    return () => clearInterval(id);
-  }, []);
+  // Real measured round-trip time to the health endpoint (ms). Null until first
+  // successful fetch. This replaces the old Math.random() "simulated" walk.
+  const [apiRtt, setApiRtt] = useState<number | null>(null);
 
   const fetchHealth = useCallback(async () => {
     setLoading(true);
+    const t0 = performance.now();
     try {
-      const res = await fetch(`${API_URL}/admin/health-status`);
-      if (!res.ok) throw new Error();
-      const data = await res.json();
+      const data = await fetchWithAuth('/admin/health-status');
+      setApiRtt(Math.round(performance.now() - t0)); // genuine client→API→client RTT
       setHealth(data);
     } catch {
+      setApiRtt(null);
       setHealth({ database: { status: 'unknown' }, environment: 'development' });
     } finally {
       setLoading(false);
@@ -117,12 +117,15 @@ export default function SASystemHealth() {
 
   const configChecks: ConfigCheck[] = [
     { label: 'Database', description: health.database?.status === 'healthy' ? `${health.database.type} — ${health.database.latency_ms}ms` : 'Not connected', status: dbStatus === 'healthy' ? 'ok' : 'error' },
-    { label: 'Session Store', description: 'In-memory (Redis not required in dev)', status: 'ok' },
+    { label: 'Session Store', description: health.session_store?.type === 'redis' ? 'Redis connected' : 'In-memory (no Redis wired)', status: 'ok' },
     { label: 'Gemini LLM',          description: svcDesc(health.gemini, 'GEMINI_API_KEY'),         status: svcStatus(health.gemini) },
     { label: 'Sarvam STT/TTS',      description: svcDesc(health.sarvam, 'SARVAM_API_KEY'),         status: svcStatus(health.sarvam) },
-    { label: 'LiveKit Voice',        description: svcDesc(health.livekit, 'LIVEKIT_API_KEY'),       status: svcStatus(health.livekit) },
+    // LiveKit is now a real connectivity check: 'connected' means the API
+    // actually responded, not just that an env var exists.
+    { label: 'LiveKit Voice',        description: health.livekit === 'connected' ? 'Live API reachable ✓' : health.livekit === 'auth_failed' ? 'Keys set but unreachable' : 'Not configured', status: health.livekit === 'connected' ? 'ok' : health.livekit === 'auth_failed' ? 'error' : 'warn' },
     { label: 'Telephony (Vobiz)',    description: svcDesc(health.vobiz, 'VOBIZ_ACCOUNT_SID'),      status: svcStatus(health.vobiz) },
-    { label: 'HIS Integration (Oxzygen)', description: svcDesc(health.oxzygen, 'OXZYGEN_API_KEY'), status: svcStatus(health.oxzygen) },
+    // HIS has no integration code behind it — say so plainly instead of "key detected".
+    { label: 'HIS Integration (Oxzygen)', description: health.his_implemented ? svcDesc(health.oxzygen, 'OXZYGEN_API_KEY') : 'Not implemented (planned)', status: 'warn' },
   ];
 
   return (
@@ -205,13 +208,24 @@ export default function SASystemHealth() {
           latency={health.database?.latency_ms}
           extra={health.database?.tenant_count !== undefined ? `${health.database.tenant_count} tenants · ${health.database.appointment_count} appointments` : undefined}
         />
-        <ServiceCard label="Agent API" status="healthy" detail={`FastAPI · ${health.environment ?? 'development'}`} latency={`~${Math.round(p50)}ms`} extra="Live latency (simulated)" />
-        <ServiceCard label="Session Store" status="healthy" detail="In-memory (dev mode)" latency="<1ms" extra="No Redis needed locally" />
+        <ServiceCard
+          label="Agent API"
+          status={apiRtt !== null ? 'healthy' : loading ? 'unknown' : 'error'}
+          detail={`FastAPI · ${health.environment ?? 'development'}`}
+          latency={apiRtt !== null ? apiRtt : '—'}
+          extra="Measured round-trip"
+        />
+        <ServiceCard
+          label="Session Store"
+          status="healthy"
+          detail={health.session_store?.type === 'redis' ? 'Redis' : 'In-memory (no Redis wired)'}
+          extra={health.session_store?.note ?? 'In-process store'}
+        />
         <ServiceCard
           label="LiveKit"
-          status={health.livekit === 'connected' ? 'healthy' : loading ? 'unknown' : 'degraded'}
-          detail={health.livekit === 'connected' ? 'Keys configured ✓' : 'Set LIVEKIT_URL + KEY in env'}
-          extra="Voice infrastructure"
+          status={health.livekit === 'connected' ? 'healthy' : loading ? 'unknown' : health.livekit === 'auth_failed' ? 'error' : 'degraded'}
+          detail={health.livekit === 'connected' ? 'Live API reachable ✓' : health.livekit === 'auth_failed' ? 'Keys set, unreachable' : 'Not configured'}
+          extra={health.livekit_detail ?? 'Voice infrastructure'}
         />
         <ServiceCard
           label="Sarvam AI"

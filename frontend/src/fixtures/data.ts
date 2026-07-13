@@ -240,6 +240,7 @@ export interface FixtureAgent {
   resolution_rate: number;
   languages: string[];
   model?: string;       // optional fallback alias for llm_model
+  created_at?: string;  // present on real backend agent objects, absent on fixtures
 }
 
 export const FIXTURE_AGENTS: FixtureAgent[] = [

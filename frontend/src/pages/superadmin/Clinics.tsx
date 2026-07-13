@@ -1,8 +1,33 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { useSAStore, Clinic, PlanTier } from '../../store/saStore';
 import { PlanBadge, StatusBadge, Modal, SpinBtn, EmptyState } from '../../components/superadmin/SAShared';
-import { Search, Power, Zap, X, ChevronRight, Building2, Plus, Copy, Check, Mail, Trash2 } from 'lucide-react';
-import { API_URL } from '../../api/client';
+import { Search, Power, Zap, X, ChevronRight, Building2, Plus, Copy, Check, Mail, Trash2, ChevronRight as ChevronR } from 'lucide-react';
+import fetchWithAuth, { API_URL } from '../../api/client';
+import { getToken } from '../../api/auth';
+
+// ── Agent status pill — mirrors the vocabulary AgentConfig.status actually uses
+// (ACTIVE/CONFIGURED/ERROR/INACTIVE), which differs from StatusBadge's clinic vocabulary.
+const AGENT_STATUS_COLORS: Record<string, string> = {
+  ACTIVE: '#3ECF8E',
+  CONFIGURED: '#f59e0b',
+  ERROR: '#ef4444',
+  INACTIVE: '#666',
+};
+function AgentStatusPill({ status }: { status: string }) {
+  const color = AGENT_STATUS_COLORS[status] ?? '#888';
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '5px', flexShrink: 0 }}>
+      <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: color }} />
+      <span style={{ fontSize: '11px', color, fontWeight: 600 }}>{status}</span>
+    </div>
+  );
+}
+
+interface ClinicAgentSummary {
+  id: string;
+  agent_name: string;
+  status: string;
+}
 
 const PLANS: PlanTier[] = ['Free', 'Pro', 'Enterprise'];
 
@@ -31,13 +56,10 @@ function AddClinicModal({ onClose }: { onClose: () => void }) {
     if (Object.keys(e).length) { setErrors(e); return; }
     setLoading(true);
     try {
-      const resp = await fetch(`${API_URL}/admin/clinics`, {
+      const data = await fetchWithAuth(`/admin/clinics`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(form)
       });
-      if (!resp.ok) throw new Error('Failed to create clinic');
-      const data = await resp.json();
       setResult(data);
       
       // Update local store to show the new clinic in the list
@@ -166,23 +188,50 @@ function AddClinicModal({ onClose }: { onClose: () => void }) {
 
 // ── Clinic Drawer ────────────────────────────────────────────────────────────
 function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose: () => void; onDeleted: (id: string) => void }) {
-  const { toggleSuspend, models, updateClinicModel } = useSAStore();
+  const { toggleSuspend } = useSAStore();
   const [suspending, setSuspending] = useState(false);
   const [deleting, setDeleting] = useState(false);
-  const [assignOpen, setAssignOpen] = useState(false);
-  const [selectedModel, setSelectedModel] = useState(clinic.model_id);
-  const [reason, setReason] = useState('');
-  const [assigning, setAssigning] = useState(false);
 
-  const currentModel = models.find(m => m.id === clinic.model_id);
-  
+  // ── Agents for this clinic — refetched every time the drawer opens for a
+  // clinic so suspended/deleted/newly-created agents never show a stale entry.
+  const [agents, setAgents] = useState<ClinicAgentSummary[]>([]);
+  const [agentsLoading, setAgentsLoading] = useState(true);
+  const [showAgentPicker, setShowAgentPicker] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setAgentsLoading(true);
+    fetchWithAuth('/agents')
+      .then((data: any[]) => {
+        if (cancelled) return;
+        const mine = (Array.isArray(data) ? data : []).filter(a => a.tenant_id === clinic.id);
+        setAgents(mine);
+      })
+      .catch(() => { if (!cancelled) setAgents([]); })
+      .finally(() => { if (!cancelled) setAgentsLoading(false); });
+    return () => { cancelled = true; };
+  }, [clinic.id]);
+
+  const goToAgent = (agentId: string) => {
+    window.location.href = `/superadmin/agents/${agentId}`;
+  };
+
+  const handleConfigureClick = () => {
+    if (agents.length === 0) {
+      window.location.href = '/superadmin/agents/new';
+    } else if (agents.length === 1) {
+      goToAgent(agents[0].id);
+    } else {
+      setShowAgentPicker(true);
+    }
+  };
+
   const handleSuspend = async () => {
     setSuspending(true);
     try {
       const newStatus = clinic.status === 'Suspended' ? true : false;
-      await fetch(`${API_URL}/admin/clinics/${clinic.id}/status`, {
+      await fetchWithAuth(`/admin/clinics/${clinic.id}/status`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ is_active: newStatus })
       });
       toggleSuspend(clinic.id);
@@ -193,23 +242,6 @@ function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose:
       setSuspending(false);
     }
   };
-
-  // ... (keeping rest of drawer logic similar but using store)
-  const handleAssign = () => {
-    if (!reason.trim()) return;
-    setAssigning(true);
-    setTimeout(() => {
-      updateClinicModel(clinic.id, selectedModel, reason);
-      setAssigning(false);
-      setAssignOpen(false);
-    }, 700);
-  };
-
-  const eligibleModels = models.filter(m => {
-    if (clinic.plan === 'Free') return m.tier === 'basic';
-    if (clinic.plan === 'Pro') return m.tier === 'basic' || m.tier === 'pro';
-    return true; 
-  });
 
   return (
     <div style={{ width: '360px', backgroundColor: '#1A1A1A', border: '1px solid #2E2E2E', borderRadius: '12px', display: 'flex', flexDirection: 'column', overflow: 'hidden', flexShrink: 0 }}>
@@ -244,20 +276,43 @@ function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose:
       </div>
 
       <div style={{ padding: '20px 24px', borderBottom: '1px solid #2E2E2E' }}>
-        <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', marginBottom: '8px' }}>AI Model</p>
-        <div style={{ backgroundColor: '#0F0F0F', border: '1px solid #3ECF8E40', borderRadius: '8px', padding: '12px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span style={{ color: '#3ECF8E', fontFamily: 'monospace', fontSize: '13px' }}>{currentModel?.name ?? 'None'}</span>
-          <button onClick={() => setAssignOpen(v => !v)} style={{ fontSize: '11px', backgroundColor: '#3ECF8E20', color: '#3ECF8E', border: 'none', borderRadius: '6px', padding: '4px 10px', cursor: 'pointer', fontWeight: 700 }}>
-            Change
-          </button>
-        </div>
+        <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', marginBottom: '8px' }}>Agents</p>
+        {agentsLoading ? (
+          <p style={{ color: '#666', fontSize: '12px', margin: 0 }}>Loading…</p>
+        ) : agents.length === 0 ? (
+          <div style={{ backgroundColor: '#0F0F0F', border: '1px solid #2E2E2E', borderRadius: '8px', padding: '14px', textAlign: 'center' }}>
+            <p style={{ color: '#666', fontSize: '12px', margin: 0 }}>No agents configured yet</p>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            {agents.map(a => (
+              <button
+                key={a.id}
+                onClick={() => goToAgent(a.id)}
+                style={{
+                  backgroundColor: '#0F0F0F', border: '1px solid #2E2E2E', borderRadius: '8px',
+                  padding: '10px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  cursor: 'pointer', width: '100%', textAlign: 'left',
+                }}
+              >
+                <span style={{ color: '#fff', fontSize: '13px', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {a.agent_name || 'Receptionist'}
+                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+                  <AgentStatusPill status={a.status} />
+                  <ChevronR size={13} color="#555" />
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       <div style={{ padding: '20px 24px' }}>
         <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', marginBottom: '12px' }}>Quick Actions</p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-          <button 
-            onClick={() => window.location.href = `/superadmin/agents/${clinic.id}`} 
+          <button
+            onClick={handleConfigureClick}
             style={{ width: '100%', padding: '10px', backgroundColor: '#3ECF8E', color: '#000', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
           >
             <Zap size={14} /> Configure AI Receptionist
@@ -271,7 +326,14 @@ function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose:
               if (!window.confirm(`Permanently delete "${clinic.name}" and all its agents? This cannot be undone.`)) return;
               setDeleting(true);
               try {
-                const res = await fetch(`${API_URL}/admin/clinics/${clinic.id}`, { method: 'DELETE' });
+                // Backend returns 204 No Content on success — fetchWithAuth always
+                // parses the body as JSON, which throws on an empty 204 response,
+                // so this stays a raw fetch with the bearer token attached manually.
+                const token = getToken();
+                const res = await fetch(`${API_URL}/admin/clinics/${clinic.id}`, {
+                  method: 'DELETE',
+                  headers: token ? { Authorization: `Bearer ${token}` } : {},
+                });
                 if (res.ok || res.status === 204) {
                   onDeleted(clinic.id);
                   onClose();
@@ -293,6 +355,27 @@ function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose:
           </button>
         </div>
       </div>
+
+      {showAgentPicker && (
+        <Modal title="Which agent?" onClose={() => setShowAgentPicker(false)} width={360}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            {agents.map(a => (
+              <button
+                key={a.id}
+                onClick={() => goToAgent(a.id)}
+                style={{
+                  backgroundColor: '#0F0F0F', border: '1px solid #2E2E2E', borderRadius: '8px',
+                  padding: '12px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  cursor: 'pointer', width: '100%', textAlign: 'left',
+                }}
+              >
+                <span style={{ color: '#fff', fontSize: '14px', fontWeight: 600 }}>{a.agent_name || 'Receptionist'}</span>
+                <AgentStatusPill status={a.status} />
+              </button>
+            ))}
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
@@ -306,8 +389,7 @@ export default function SAClinics() {
 
   // Fetch initial clinics from backend
   useEffect(() => {
-    fetch(`${API_URL}/admin/clinics`)
-      .then(r => r.json())
+    fetchWithAuth(`/admin/clinics`)
       .then(data => {
         // Backend returns {clinics: [...], total: N} — extract the array
         const clinicList = Array.isArray(data) ? data : (data.clinics || []);

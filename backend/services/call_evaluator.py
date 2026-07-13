@@ -28,11 +28,17 @@ EVALUATION_CRITERIA = {
 }
 
 
-async def evaluate_call(call_record_id: str, db) -> dict:
+async def evaluate_call(call_record_id: str, db, summary_enabled: bool = True, eval_enabled: bool = True) -> dict:
     """
     Auto-evaluate a completed call using Gemini.
     Reads the transcript from CallRecord, generates scores,
     then stores summary/sentiment/scores back into the record.
+
+    summary_enabled / eval_enabled gate which fields get persisted (the
+    Analysis tab's "Call Summary" and "Success Evaluation" toggles
+    respectively) — Gemini is still called once for both since the model
+    produces both in a single response, but callers with both disabled
+    should not reach this function at all (see call_logger_processor.py).
 
     Returns the evaluation dict (or {} on failure).
     """
@@ -121,14 +127,17 @@ Transcript:
     # ── Persist into call_records ──────────────────────────────────────────
     try:
         update_kwargs: dict = {}
-        if evaluation.get("summary"):
+        if summary_enabled and evaluation.get("summary"):
             update_kwargs["summary"] = evaluation["summary"]
-        if evaluation.get("sentiment"):
-            update_kwargs["sentiment"] = evaluation["sentiment"]
-        if evaluation.get("outcome"):
-            update_kwargs["intent_detected"] = evaluation["outcome"]
-        if evaluation.get("booking_successful") is not None:
-            update_kwargs["booking_successful"] = evaluation["booking_successful"]
+        if eval_enabled:
+            if evaluation.get("sentiment"):
+                update_kwargs["sentiment"] = evaluation["sentiment"]
+            if evaluation.get("outcome"):
+                update_kwargs["intent_detected"] = evaluation["outcome"]
+            if evaluation.get("booking_successful") is not None:
+                update_kwargs["booking_successful"] = evaluation["booking_successful"]
+        # detected_language isn't gated by either toggle — it's used for
+        # display/debugging regardless of summary/eval preferences.
         if evaluation.get("detected_language"):
             update_kwargs["detected_language"] = evaluation["detected_language"]
         # Store full evaluation JSON in intent_detected field as fallback

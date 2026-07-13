@@ -19,7 +19,7 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import VoiceLibrary from './VoiceLibrary';
 import { useProviders } from '../../hooks/useProviders';
-import { API_URL } from '../../api/client';
+import fetchWithAuth from '../../api/client';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -93,9 +93,6 @@ const VOICES_HI = [
   { id: 'amol',     label: 'amol',     gender: 'Male' },
   { id: 'amartya',  label: 'amartya',  gender: 'Male' },
 ];
-
-// Fixture clinics replaced with real API data (loaded in CreateAgent component)
-const FIXTURE_CLINICS: Array<{ id: string; name: string; email: string; languages: string; has_agent: boolean }> = [];
 
 // ── Shared components ─────────────────────────────────────────────────────────
 
@@ -186,22 +183,24 @@ function ProgressBar({ current }: { current: number }) {
 
 // ── Step 1 — Clinic ───────────────────────────────────────────────────────────
 
-function Step1({ state, onChange, realClinics, clinicsLoading, clinicsError }: {
+function Step1({ state, onChange, clinicQuery, onClinicQueryChange, clinicResults, clinicsLoading, clinicsError }: {
   state: WizardState;
   onChange: (k: keyof WizardState, v: string) => void;
-  realClinics: Array<{ id: string; name: string; email: string; language: string; has_agent: boolean }>;
+  clinicQuery: string;
+  onClinicQueryChange: (q: string) => void;
+  clinicResults: Array<{ id: string; name: string; email: string; language: string; agent_count: number }>;
   clinicsLoading: boolean;
   clinicsError: string;
 }) {
   return (
     <div>
       <h2 style={{ fontSize: '20px', fontWeight: 700, color: '#fff', marginBottom: '6px' }}>Which clinic is this agent for?</h2>
-      <p style={{ fontSize: '14px', color: '#666', marginBottom: '28px' }}>Each agent serves one clinic.</p>
+      <p style={{ fontSize: '14px', color: '#666', marginBottom: '28px' }}>A clinic can have any number of agents.</p>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '28px' }}>
         {[
-          { key: 'existing' as const, icon: <Building2 size={24} color="#3ECF8E" />, title: 'Choose Existing Clinic', desc: 'Assign agent to a clinic you\'ve already created.' },
-          { key: 'new'      as const, icon: <Plus size={24} color="#A78BFA" />,     title: 'Create New Clinic',    desc: 'Add a new clinic and configure its agent together.' },
+          { key: 'existing' as const, icon: <Building2 size={24} color="#3ECF8E" />, title: 'Choose Existing Clinic', desc: 'Add another agent to a clinic you\'ve already created.' },
+          { key: 'new'      as const, icon: <Plus size={24} color="#A78BFA" />,     title: 'Create New Clinic',    desc: 'Add a new clinic and configure its first agent together.' },
         ].map(opt => (
           <button
             key={opt.key}
@@ -222,23 +221,35 @@ function Step1({ state, onChange, realClinics, clinicsLoading, clinicsError }: {
 
       {state.clinic_selection === 'existing' ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-          <label style={{ fontSize: '12px', fontWeight: 500, color: '#A1A1A1' }}>Select Clinic</label>
-          {clinicsLoading && <div style={{ color: '#666', fontSize: '13px', padding: '12px 0' }}>⟳ Loading clinics…</div>}
+          <label htmlFor="clinic-search" style={{ fontSize: '12px', fontWeight: 500, color: '#A1A1A1' }}>Search Clinic</label>
+          <input
+            id="clinic-search"
+            value={clinicQuery}
+            onChange={e => onClinicQueryChange(e.target.value)}
+            placeholder="Type a clinic name…"
+            style={{
+              padding: '10px 12px', borderRadius: '8px', background: '#111', border: '1px solid #2E2E2E',
+              color: '#fff', fontSize: '14px', outline: 'none', width: '100%', boxSizing: 'border-box',
+            }}
+          />
+          {clinicsLoading && <div style={{ color: '#666', fontSize: '13px', padding: '12px 0' }}>⟳ Searching…</div>}
           {clinicsError && <div style={{ color: '#F87171', fontSize: '13px', padding: '8px 12px', background: 'rgba(248,113,113,0.08)', borderRadius: '8px' }}>⚠️ {clinicsError}</div>}
-          {!clinicsLoading && realClinics.length === 0 && !clinicsError && (
+          {!clinicsLoading && clinicResults.length === 0 && !clinicsError && (
             <div style={{ color: '#666', fontSize: '13px', padding: '12px', background: '#111', borderRadius: '8px', border: '1px solid #2E2E2E', textAlign: 'center' }}>
-              No clinics found. <a href="/superadmin/clinics" style={{ color: '#3ECF8E' }}>Create a clinic first</a> or choose "Create New Clinic" above.
+              {clinicQuery.trim()
+                ? <>No clinics match "{clinicQuery}". Try a different name or choose "Create New Clinic" above.</>
+                : <>No clinics yet. <a href="/superadmin/clinics" style={{ color: '#3ECF8E' }}>Create a clinic first</a> or choose "Create New Clinic" above.</>}
             </div>
           )}
-          {realClinics.map(c => (
+          {clinicResults.map(c => (
             <button
               key={c.id}
-              onClick={() => !c.has_agent && onChange('tenant_id', c.id)}
+              onClick={() => onChange('tenant_id', c.id)}
               style={{
                 display: 'flex', alignItems: 'center', justifyContent: 'space-between',
                 padding: '14px 16px', borderRadius: '10px', border: `1px solid ${state.tenant_id === c.id ? '#3ECF8E' : '#2E2E2E'}`,
                 background: state.tenant_id === c.id ? 'rgba(62,207,142,0.06)' : '#111',
-                cursor: c.has_agent ? 'not-allowed' : 'pointer', transition: 'all 0.15s', opacity: c.has_agent ? 0.5 : 1,
+                cursor: 'pointer', transition: 'all 0.15s',
               }}
             >
               <div style={{ textAlign: 'left' }}>
@@ -246,8 +257,9 @@ function Step1({ state, onChange, realClinics, clinicsLoading, clinicsError }: {
                 <div style={{ fontSize: '12px', color: '#666', marginTop: '2px' }}>{c.email} · {c.language}</div>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                {c.has_agent && <span style={{ fontSize: '11px', color: '#FBBF24', background: 'rgba(251,191,36,0.1)', padding: '2px 8px', borderRadius: '20px' }}>Agent configured ⚠️</span>}
-                {!c.has_agent && <span style={{ fontSize: '11px', color: '#3ECF8E', background: 'rgba(62,207,142,0.1)', padding: '2px 8px', borderRadius: '20px' }}>No agent yet ✓</span>}
+                <span style={{ fontSize: '11px', color: c.agent_count > 0 ? '#3ECF8E' : '#666', background: c.agent_count > 0 ? 'rgba(62,207,142,0.1)' : 'rgba(255,255,255,0.05)', padding: '2px 8px', borderRadius: '20px' }}>
+                  {c.agent_count === 0 ? 'No agents yet' : `${c.agent_count} agent${c.agent_count === 1 ? '' : 's'}`}
+                </span>
               </div>
             </button>
           ))}
@@ -406,9 +418,8 @@ function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
         "ar-SA": "مرحباً! أنا مساعدتك الذكية. كيف يمكنني مساعدتك؟",
       }
       
-      const res = await fetch(`${API_URL}/models/voices/preview`, {
+      const data = await fetchWithAuth(`/models/voices/preview`, {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           provider: 'sarvam',
           model: state.tts_model,
@@ -417,8 +428,7 @@ function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
           text: sampleTexts[state.tts_language] || sampleTexts["en-IN"]
         })
       })
-      
-      const data = await res.json()
+
       const audioUrl = `data:audio/wav;base64,${data.audio_base64}`
       
       setAudioCache(prev => ({...prev, [voiceId]: audioUrl}))
@@ -630,8 +640,8 @@ function Step4({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
 
 // ── Step 5 — Review ───────────────────────────────────────────────────────────
 
-function Step5({ state }: { state: WizardState }) {
-  const clinicLabel = state.clinic_selection === 'new' ? state.new_clinic_name : FIXTURE_CLINICS.find(c => c.id === state.tenant_id)?.name || 'Unknown';
+function Step5({ state, selectedClinicName }: { state: WizardState; selectedClinicName: string }) {
+  const clinicLabel = state.clinic_selection === 'new' ? state.new_clinic_name : (selectedClinicName || 'Unknown');
 
   const sections = [
     { title: 'CLINIC', rows: [{ k: 'Clinic', v: clinicLabel }] },
@@ -742,35 +752,45 @@ export default function CreateAgent() {
   const [createdId, setCreatedId] = useState('');
   const [createError, setCreateError] = useState('');
   const [showVoiceModal, setShowVoiceModal] = useState(false);
-  const [realClinics, setRealClinics] = useState<Array<{ id: string; name: string; email: string; language: string; has_agent: boolean }>>([]);
+  const [clinicQuery, setClinicQuery] = useState('');
+  const [clinicResults, setClinicResults] = useState<Array<{ id: string; name: string; email: string; language: string; agent_count: number }>>([]);
+  const [selectedClinicName, setSelectedClinicName] = useState('');
   const [clinicsLoading, setClinicsLoading] = useState(false);
   const [clinicsError, setClinicsError] = useState('');
   const tempPw = 'Lf8#mK2p';
 
-  // Load real tenants from the backend on mount
+  // Debounced type-ahead search against the backend, re-run on every keystroke
+  // (and once on mount with an empty query to show an initial list).
   React.useEffect(() => {
     setClinicsLoading(true);
-    fetch(`${API_URL}/tenants`)
-      .then(r => r.json())
-      .then(data => {
-        if (Array.isArray(data)) {
-          setRealClinics(data.map((t: any) => ({
-            id: t.id,
-            name: t.clinic_name,
-            email: t.admin_email || '',
-            language: t.language || 'en-IN',
-            has_agent: !!t.has_agent,
-          })));
-        }
-      })
-      .catch(() => setClinicsError('Failed to load clinics. Check backend connection.'))
-      .finally(() => setClinicsLoading(false));
-  }, []);
+    setClinicsError('');
+    const handle = setTimeout(() => {
+      fetchWithAuth(`/tenants/search?q=${encodeURIComponent(clinicQuery.trim())}`)
+        .then(data => {
+          if (Array.isArray(data)) {
+            setClinicResults(data.map((t: any) => ({
+              id: t.id,
+              name: t.clinic_name,
+              email: t.admin_email || '',
+              language: t.language || 'en-IN',
+              agent_count: t.agent_count ?? 0,
+            })));
+          }
+        })
+        .catch(() => setClinicsError('Failed to search clinics. Check backend connection.'))
+        .finally(() => setClinicsLoading(false));
+    }, 250);
+    return () => clearTimeout(handle);
+  }, [clinicQuery]);
 
   const onChange = (key: keyof WizardState | 'open_voice_modal', value: any) => {
     if (key === 'open_voice_modal') {
       setShowVoiceModal(value);
       return;
+    }
+    if (key === 'tenant_id') {
+      const picked = clinicResults.find(c => c.id === value);
+      setSelectedClinicName(picked?.name || '');
     }
     setState(prev => ({ ...prev, [key as keyof WizardState]: value }));
   };
@@ -780,7 +800,9 @@ export default function CreateAgent() {
        ...prev,
        tts_provider: voice.provider,
        tts_model: voice.model,
-       tts_voice: voice.name,
+       // Use the provider's canonical voice id (e.g. Sarvam 'priya'), NOT the
+       // display name ('Priya') — the TTS API rejects the display name.
+       tts_voice: voice.voice_id || voice.id || voice.name,
        tts_language: voice.language
     }));
     setShowVoiceModal(false);
@@ -795,9 +817,8 @@ export default function CreateAgent() {
     setLoading(true);
     setCreateError('');
     try {
-      const res = await fetch(`${API_URL}/agents`, {
+      const data = await fetchWithAuth('/agents', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           clinic_selection: state.clinic_selection,
           tenant_id: state.tenant_id || null,
@@ -813,14 +834,6 @@ export default function CreateAgent() {
           telephony_option: state.telephony_option,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        // Surface the real backend error (409 duplicate, 400 validation, etc.)
-        const msg = data?.detail || `Server error ${res.status}`;
-        setCreateError(msg);
-        setLoading(false);
-        return; // Stay on wizard, don't show success screen
-      }
       if (!data.agent_id) {
         setCreateError('Agent created but no ID returned. Check backend logs.');
         setLoading(false);
@@ -829,17 +842,27 @@ export default function CreateAgent() {
       setCreatedId(data.agent_id);
       setDone(true);
     } catch (e: any) {
-      setCreateError(`Network error: ${e?.message || 'Cannot reach backend'}`);
+      // fetchWithAuth throws with the backend's `detail` message (409 duplicate
+      // clinic name, 404 unknown clinic, etc.) already surfaced as e.message.
+      setCreateError(e?.message || 'Cannot reach backend');
     }
     setLoading(false);
   };
 
   const STEP_COMPONENTS = [
-    <Step1 state={state} onChange={(k, v) => onChange(k, v)} realClinics={realClinics} clinicsLoading={clinicsLoading} clinicsError={clinicsError} />,
+    <Step1
+      state={state}
+      onChange={(k, v) => onChange(k, v)}
+      clinicQuery={clinicQuery}
+      onClinicQueryChange={setClinicQuery}
+      clinicResults={clinicResults}
+      clinicsLoading={clinicsLoading}
+      clinicsError={clinicsError}
+    />,
     <Step2 state={state} onChange={(k, v) => onChange(k, v)} />,
     <Step3 state={state} onChange={(k, v) => onChange(k, v)} />,
     <Step4 state={state} onChange={(k, v) => onChange(k, v)} />,
-    <Step5 state={state} />,
+    <Step5 state={state} selectedClinicName={selectedClinicName} />,
   ];
 
   return (

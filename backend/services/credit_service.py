@@ -10,7 +10,7 @@ Handles:
 import logging
 import math
 from datetime import datetime, timezone
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.clinic_credits import ClinicCredits, CreditTransaction
@@ -71,10 +71,11 @@ class CreditService:
         Returns dict with deduction details.
         """
         credits = await CreditService.get_or_create_balance(db, tenant_id)
+        rate = credits.rate_per_minute
 
         # Calculate cost: ceil to nearest minute for billing
         minutes = math.ceil(duration_seconds / 60) if duration_seconds > 0 else 0
-        cost = round(credits.rate_per_minute * minutes, 2)
+        cost = round(rate * minutes, 2)
 
         if cost <= 0:
             return {
@@ -84,36 +85,47 @@ class CreditService:
                 "minutes_billed": 0,
             }
 
-        # Deduct (allow going negative — admin can top up)
-        credits.balance = round(credits.balance - cost, 2)
-        credits.total_deducted = round(credits.total_deducted + cost, 2)
+        # Atomic decrement — avoids the read-modify-write lost-update race under
+        # concurrent calls. The single UPDATE is evaluated by the DB, not Python.
+        await db.execute(
+            update(ClinicCredits)
+            .where(ClinicCredits.tenant_id == tenant_id)
+            .values(
+                balance=ClinicCredits.balance - cost,
+                total_deducted=ClinicCredits.total_deducted + cost,
+            )
+        )
+        # Re-read the authoritative post-update balance for the ledger entry.
+        refreshed = await db.execute(
+            select(ClinicCredits.balance).where(ClinicCredits.tenant_id == tenant_id)
+        )
+        balance_after = round(refreshed.scalar_one(), 2)
 
-        # Log transaction
         txn = CreditTransaction(
             tenant_id=tenant_id,
             transaction_type="call_deduction",
             amount=-cost,
-            balance_after=credits.balance,
+            balance_after=balance_after,
             description=(
-                f"Call {minutes}m ({duration_seconds}s) "
-                f"@ ₹{credits.rate_per_minute:.2f}/min"
+                f"Call {minutes}m ({duration_seconds}s) @ ₹{rate:.2f}/min"
             ),
             call_id=call_id,
             performed_by="system",
         )
         db.add(txn)
+        await db.commit()
 
         logger.info(
             "Credit deduction: tenant=%s cost=₹%.2f balance=₹%.2f call=%s",
-            tenant_id, cost, credits.balance, call_id,
+            tenant_id, cost, balance_after, call_id,
         )
 
         return {
             "deducted": cost,
-            "balance_after": credits.balance,
+            "balance_after": balance_after,
             "duration_seconds": duration_seconds,
             "minutes_billed": minutes,
-            "rate_per_minute": credits.rate_per_minute,
+            "rate_per_minute": rate,
         }
 
     @staticmethod

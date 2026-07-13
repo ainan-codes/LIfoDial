@@ -5,7 +5,20 @@ always import and use `settings` from this module.
 """
 
 import os
+import logging
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+# Values that must never be used as a real secret in production.
+_WEAK_SECRETS = {
+    "",
+    "change_me",
+    "changeme",
+    "lifodial_dev_secret_change_in_production",
+    "lifodial_prod_change_me_32chars_min_xxxxxxxx",
+}
 
 
 class Settings(BaseSettings):
@@ -19,6 +32,10 @@ class Settings(BaseSettings):
     # ── App ────────────────────────────────────────────────────────────────
     environment: str = "development"
     secret_key: str = "change_me"
+
+    # ── Superadmin (platform owner) login — set these in prod env ───────────
+    superadmin_email: str = "admin@lifodial.com"
+    superadmin_password: str = ""  # if empty in prod, superadmin login is disabled
 
     # ── Database ───────────────────────────────────────────────────────────
     database_url: str = ""
@@ -63,6 +80,14 @@ class Settings(BaseSettings):
     # ── AssemblyAI ─────────────────────────────────────────────────────────
     assemblyai_api_key: str = ""
 
+    # ── Newly-added provider catalog keys (STT/TTS/LLM/voice-clone) ────────
+    cerebras_api_key: str = ""
+    google_speech_api_key: str = ""
+    azure_speech_key: str = ""
+    cartesia_api_key: str = ""
+    playht_api_key: str = ""
+    resemble_api_key: str = ""
+
     # ── Exotel ─────────────────────────────────────────────────────────────
     exotel_api_key: str = ""
 
@@ -89,6 +114,31 @@ class Settings(BaseSettings):
     # ── Frontend ───────────────────────────────────────────────────────────
     vite_api_url: str = "http://localhost:8001"
     frontend_url: str = "http://localhost:5173"
+
+    # ── Supabase Storage (object storage for uploads/branding) ─────────────
+    supabase_url: str = ""                     # https://<ref>.supabase.co
+    supabase_service_role_key: str = ""        # server-side only; never sent to client
+    supabase_storage_bucket: str = "lifodial-uploads"        # private: KB, recordings, consent
+    supabase_public_bucket: str = "lifodial-public"          # public: branding/avatars
+
+    # ── Render (production env sync — used ONLY on explicit confirmation) ───
+    render_api_key: str = ""
+    render_service_id: str = ""
+
+
+    @model_validator(mode="after")
+    def _enforce_prod_secrets(self):
+        if self.environment.lower() == "production":
+            if self.secret_key.strip() in _WEAK_SECRETS or len(self.secret_key) < 32:
+                raise RuntimeError(
+                    "SECRET_KEY is missing, weak, or a known default. Set a strong "
+                    "(>=32 char) unique SECRET_KEY before running in production."
+                )
+            if not self.superadmin_password:
+                logger.warning(
+                    "SUPERADMIN_PASSWORD is not set in production — superadmin login is disabled."
+                )
+        return self
 
 
 settings = Settings()

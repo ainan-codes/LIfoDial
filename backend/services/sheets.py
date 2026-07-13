@@ -3,6 +3,8 @@ import logging
 import os
 from dotenv import load_dotenv
 
+from backend.services.net import is_safe_outbound_url
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -39,7 +41,10 @@ async def log_booking_to_sheets(
     if not final_url:
         logger.warning("No GOOGLE_SHEETS_WEBHOOK_URL provided. Skipping Google Sheets integration.")
         return False
-        
+    if not is_safe_outbound_url(final_url):
+        logger.warning("Refusing to POST to unsafe/internal Sheets webhook URL: %s", final_url)
+        return False
+
     payload = {
         # Lowercase keys
         "appointment_id": appointment_id,
@@ -66,7 +71,7 @@ async def log_booking_to_sheets(
     
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(final_url, json=payload, follow_redirects=True)
+            response = await client.post(final_url, json=payload, follow_redirects=False)
             response.raise_for_status()
             logger.info("Successfully logged booking to Google Sheets.")
             return True

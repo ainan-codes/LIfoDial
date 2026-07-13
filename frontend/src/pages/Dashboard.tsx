@@ -13,7 +13,7 @@ import {
 } from 'lucide-react';
 import React from 'react';
 import { Link } from 'react-router-dom';
-import { API_URL } from '../api/client';
+import fetchWithAuth from '../api/client';
 import {
     FIXTURE_APPOINTMENTS, FIXTURE_CALL_LOGS,
     FIXTURE_TENANT
@@ -161,21 +161,13 @@ function QuickSetupCard() {
 export default function Dashboard() {
   const { data: statsData, isLoading: statsLoading } = useQuery({
     queryKey: ['dashboard-stats'],
-    queryFn: async () => {
-      const r = await fetch(`${API_URL}/api/dashboard/stats`);
-      if (!r.ok) throw new Error('no stats');
-      return r.json();
-    },
+    queryFn: () => fetchWithAuth('/api/dashboard/stats'),
     retry: false,
   });
 
   const { data: callsData, isLoading: callsLoading } = useQuery({
     queryKey: ['recent-calls'],
-    queryFn: async () => {
-      const r = await fetch(`${API_URL}/api/call_logs?limit=5`);
-      if (!r.ok) throw new Error('no calls');
-      return r.json();
-    },
+    queryFn: () => fetchWithAuth('/api/call_logs?limit=5'),
     retry: false,
   });
 

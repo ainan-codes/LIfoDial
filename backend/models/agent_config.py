@@ -20,15 +20,15 @@ class AgentConfig(Base):
         primary_key=True,
         default=lambda: str(uuid.uuid4())
     )
+    # NOTE: intentionally NOT unique — a tenant/clinic can have multiple agents.
     tenant_id = Column(
         String(36),
-        ForeignKey("tenants.id"),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
         nullable=False,
-        unique=True,
         index=True
     )
 
-    tenant = relationship("Tenant", back_populates="agent_config")
+    tenant = relationship("Tenant", back_populates="agent_configs")
 
     # ── Identity ─────────────────────────────────
     agent_name = Column(String(100), default="Receptionist")
@@ -67,7 +67,7 @@ class AgentConfig(Base):
     llm_provider = Column(String(30), default="gemini")
     llm_model = Column(String(100), default="gemini-2.5-flash")
     llm_temperature = Column(Float, default=0.3)
-    max_response_tokens = Column(Integer, default=150)
+    max_response_tokens = Column(Integer, default=500)
     llm_max_tokens = Column(Integer, default=250)
     llm_emotion_recognition = Column(Boolean, default=False)
 
@@ -150,6 +150,9 @@ class AgentConfig(Base):
     webhook_url = Column(String(500), nullable=True)
 
     # ── Embed / Widget ─────────────────────────────
+    # Public URL of the per-agent widget avatar (Supabase public bucket).
+    # Nullable — widget falls back to the default icon when unset.
+    avatar_url = Column(String(500), nullable=True)
     embed_enabled = Column(Boolean, default=True)
     embed_allowed_domains = Column(JSON, default=list)
     embed_position = Column(String(20), default="bottom-right")
@@ -157,6 +160,10 @@ class AgentConfig(Base):
     embed_button_text = Column(String(50), default="Talk to Receptionist")
     embed_primary_color = Column(String(7), default="#3ECF8E")
     embed_show_branding = Column(Boolean, default=True)
+    # Widget launcher display mode: "button" (icon + label), "icon" (icon only),
+    # or "auto-invite" (panel auto-expands after a delay — never auto-starts audio).
+    embed_display_mode = Column(String(20), default="button")
+    embed_auto_invite_delay = Column(Integer, default=3)  # seconds, auto-invite only
 
     # ── Status & Meta ─────────────────────────────
     status = Column(String(20), default="CONFIGURED")

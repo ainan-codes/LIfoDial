@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { Eye, EyeOff, Phone } from 'lucide-react';
+import { Eye, EyeOff } from 'lucide-react';
+import { API_URL } from '../api/client';
+import { setSession, isAuthenticated, isSuperAdmin } from '../api/auth';
 
 export default function Login() {
   const [email, setEmail] = useState('');
@@ -11,13 +13,9 @@ export default function Login() {
   const navigate = useNavigate();
 
   // ── Already-authenticated redirect ──────────────────────────────────
-  // If user is already logged in, send them to the correct dashboard
-  // instead of showing the login form again.
   React.useEffect(() => {
-    const isAuthed = localStorage.getItem('lifodial-authed') === 'true';
-    if (isAuthed) {
-      const isSuperAdmin = localStorage.getItem('lifodial-superadmin') === 'true';
-      navigate(isSuperAdmin ? '/superadmin/dashboard' : '/dashboard', { replace: true });
+    if (isAuthenticated()) {
+      navigate(isSuperAdmin() ? '/superadmin/dashboard' : '/my-agent', { replace: true });
     }
   }, [navigate]);
 
@@ -28,52 +26,48 @@ export default function Login() {
 
     const trimmedEmail = email.toLowerCase().trim();
 
-    // ── FAST PATH: SuperAdmin credentials — no API call needed ──────────
-    if (trimmedEmail === 'admin@lifodial.com' && password === 'lifodial2026') {
-      localStorage.setItem('lifodial-authed', 'true');
-      localStorage.setItem('lifodial-superadmin', 'true');
-      localStorage.setItem('lifodial-email', trimmedEmail);
-      navigate('/superadmin/dashboard');
-      return;
-    }
-
-    // ── CLINIC LOGIN: API call with 5-second timeout ────────────────────
-    // Clear superadmin flag — this is a clinic login attempt.
-    localStorage.removeItem('lifodial-superadmin');
-
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s max
-
-      const res = await fetch(`${import.meta.env.VITE_API_URL || 'https://lifodial.onrender.com'}/auth/clinic-login`, {
+      // Try superadmin login first, then fall back to clinic login. Both
+      // require the server to verify credentials and return a signed token —
+      // there is NO client-side credential check and NO fail-open path.
+      let res = await fetch(`${API_URL}/auth/superadmin-login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: trimmedEmail, password }),
-        signal: controller.signal,
       });
-      clearTimeout(timeoutId);
 
       if (res.ok) {
         const data = await res.json();
-        localStorage.setItem('lifodial-authed', 'true');
-        localStorage.setItem('lifodial-tenant-id', data.tenant_id || '');
-        localStorage.setItem('lifodial-email', trimmedEmail);
-        localStorage.setItem('lifodial-clinic-name', data.clinic_name || '');
-        // Clinic admin goes to /my-agent
-        navigate('/my-agent');
+        setSession({ token: data.access_token, role: 'superadmin', email: trimmedEmail });
+        navigate('/superadmin/dashboard', { replace: true });
         return;
-      } else {
-        // API returned error — allow as demo/fallback user
-        localStorage.setItem('lifodial-authed', 'true');
-        localStorage.setItem('lifodial-email', trimmedEmail);
       }
+
+      res = await fetch(`${API_URL}/auth/clinic-login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: trimmedEmail, password }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setSession({
+          token: data.access_token,
+          role: 'clinic',
+          tenantId: data.tenant_id || '',
+          email: trimmedEmail,
+          clinicName: data.clinic_name || '',
+        });
+        navigate('/my-agent', { replace: true });
+        return;
+      }
+
+      setError('Invalid email or password.');
     } catch {
-      // Network error or timeout — allow access as demo fallback
-      localStorage.setItem('lifodial-authed', 'true');
-      localStorage.setItem('lifodial-email', trimmedEmail);
+      setError('Could not reach the server. Please try again.');
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
-    navigate('/dashboard');
   };
 
   return (
@@ -182,6 +176,22 @@ export default function Login() {
                 </button>
               </div>
             </div>
+
+            {error && (
+              <div
+                role="alert"
+                style={{
+                  fontSize: '13px',
+                  color: '#EF4444',
+                  background: 'rgba(239,68,68,0.08)',
+                  border: '1px solid rgba(239,68,68,0.25)',
+                  borderRadius: '8px',
+                  padding: '8px 12px',
+                }}
+              >
+                {error}
+              </div>
+            )}
 
             <button
               data-testid="login-submit"

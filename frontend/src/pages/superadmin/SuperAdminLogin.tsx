@@ -1,18 +1,36 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { API_URL } from '../../api/client';
+import { setSession } from '../../api/auth';
 
 export default function SuperAdminLogin() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
 
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (email === 'admin@lifodial.com' && password === 'lifodial2026') {
-      localStorage.setItem('lifodial-superadmin', 'true');
-      navigate('/superadmin/dashboard');
-    } else {
-      alert('Invalid credentials');
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/auth/superadmin-login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSession({ token: data.access_token, role: 'superadmin', email: email.trim().toLowerCase() });
+        navigate('/superadmin/dashboard', { replace: true });
+      } else {
+        setError('Invalid credentials');
+      }
+    } catch {
+      setError('Could not reach the server.');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -67,21 +85,18 @@ export default function SuperAdminLogin() {
             />
           </div>
 
-          <div className="flex justify-end">
-            <button 
-              type="button"
-              onClick={() => { setEmail('admin@lifodial.com'); setPassword('lifodial2026'); }}
-              style={{ background: 'none', border: 'none', color: '#3ECF8E', fontSize: '11px', fontWeight: 600, cursor: 'pointer', padding: 0 }}
-            >
-              Auto-fill demo credentials
-            </button>
-          </div>
+          {error && (
+            <div role="alert" className="text-xs text-[#EF4444] bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] rounded-lg px-3 py-2">
+              {error}
+            </div>
+          )}
 
-          <button 
+          <button
             type="submit"
-            className="w-full mt-6 py-3 rounded-lg text-sm font-semibold bg-[#3ECF8E] text-black hover:bg-[#34B37A] transition-colors border-none cursor-pointer"
+            disabled={loading}
+            className="w-full mt-6 py-3 rounded-lg text-sm font-semibold bg-[#3ECF8E] text-black hover:bg-[#34B37A] transition-colors border-none cursor-pointer disabled:opacity-60"
           >
-            Authenticate
+            {loading ? 'Authenticating…' : 'Authenticate'}
           </button>
         </form>
       </div>

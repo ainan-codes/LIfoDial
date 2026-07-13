@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { ClipboardList, CheckCircle, XCircle, RefreshCw, Clock, User, Mail, Phone, MapPin, MessageSquare, Building2 } from 'lucide-react';
 import { PlanBadge, StatusBadge, Modal, SpinBtn, EmptyState } from '../../components/superadmin/SAShared';
-import { API_URL } from '../../api/client';
+import fetchWithAuth from '../../api/client';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface OnboardingRequest {
@@ -39,11 +39,9 @@ function ApproveModal({ req, onClose, onDone }: { req: OnboardingRequest; onClos
   const handleApprove = async () => {
     setLoading(true);
     try {
-      const res = await fetch(`${API_URL}/admin/onboarding-requests/${req.id}/approve`, {
+      const data = await fetchWithAuth(`/admin/onboarding-requests/${req.id}/approve`, {
         method: 'PATCH',
       });
-      if (!res.ok) throw new Error(await res.text());
-      const data = await res.json();
       setResult(data);
       onDone();
     } catch (e) {
@@ -119,9 +117,8 @@ function RejectModal({ req, onClose, onDone }: { req: OnboardingRequest; onClose
     if (!reason.trim()) return;
     setLoading(true);
     try {
-      await fetch(`${API_URL}/admin/onboarding-requests/${req.id}/reject`, {
+      await fetchWithAuth(`/admin/onboarding-requests/${req.id}/reject`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason }),
       });
     } catch { /* optimistic */ }
@@ -259,9 +256,7 @@ export default function OnboardingReqs() {
 
   const fetchRequests = useCallback(async () => {
     try {
-      const res = await fetch(`${API_URL}/admin/onboarding-requests`);
-      if (!res.ok) throw new Error();
-      const data = await res.json();
+      const data = await fetchWithAuth('/admin/onboarding-requests');
       setRequests(data);
     } catch {
       // Fallback to demo data if backend not ready

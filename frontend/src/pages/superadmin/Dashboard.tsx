@@ -1,12 +1,39 @@
 import { Activity, Building2, CalendarCheck, IndianRupee, Phone } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { API_URL } from '../../api/client';
+import fetchWithAuth from '../../api/client';
 import { PlanBadge, StatCard, StatusBadge } from '../../components/superadmin/SAShared';
 import { useRealtimeDashboard } from '../../hooks/useRealtimeDashboard';
 import { useSAStore } from '../../store/saStore';
 
-// ── Sparkline bar chart ────────────────────────────────────────────────────────
-const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+// ── Shape returned by GET /admin/overview — see backend/routers/admin.py ───────
+interface OverviewClinic {
+  id: string;
+  clinic_name: string;
+  location: string | null;
+  plan: string;
+  status: 'Active' | 'Suspended';
+  created_at: string | null;
+  calls_month: number;
+  bookings: number;
+  res_rate: string;
+  avg_latency: string;
+}
+
+interface Overview {
+  total_clinics: number;
+  active_this_month: number;
+  total_calls: number;
+  total_bookings: number;
+  mrr: number;
+  active_calls: number;
+  recently_onboarded: OverviewClinic[];
+  top_performing: OverviewClinic[];
+  call_volume_7d: { date: string; day_label: string; count: number }[];
+}
+
+const asPlan = (plan: string) => (['Free', 'Pro', 'Enterprise'].includes(plan) ? plan : 'Free') as any;
+const formatJoined = (iso: string | null) =>
+  iso ? new Date(iso).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
 
 // ─── Skeleton ─────────────────────────────────────────────────────────────────
 function SkeletonRow({ cols }: { cols: number }) {
@@ -47,54 +74,69 @@ function mapApiClinic(c: any) {
 }
 
 export default function SADashboard() {
-  const { clinics, setClinics, getActiveCount, getMRR, getTotalCalls, getTotalBookings, billingPlans } = useSAStore();
+  const { setClinics } = useSAStore();
   const [loading, setLoading] = useState(true);
-  const [callVol, setCallVol] = useState([40, 60, 45, 80, 55, 90, 100]);
+  const [overview, setOverview] = useState<Overview | null>(null);
   const { liveCallCount, lastBooking, isConnected } = useRealtimeDashboard('platform');
 
   useEffect(() => {
     let cancelled = false;
 
-    async function fetchClinics() {
+    // Populates the shared clinics store (other superadmin pages, e.g. Billing,
+    // read from it) — kept separate from the /admin/overview fetch below,
+    // which drives everything actually rendered on this page.
+    async function fetchClinicsForStore() {
       try {
-        const res = await fetch(`${API_URL}/admin/clinics`);
-        if (!res.ok) throw new Error();
-        const data = await res.json();
-        if (!cancelled) {
-          setClinics(data.map(mapApiClinic));
-          // Derive a simple call volume sparkline from real data
-          const totalCalls = data.reduce((sum: number, c: any) => sum + (c.calls_month ?? 0), 0);
-          if (totalCalls > 0) {
-            // Distribute across 7 days with some variance
-            setCallVol(
-              Array.from({ length: 7 }, () =>
-                Math.max(10, Math.round((totalCalls / 7) * (0.6 + Math.random() * 0.8)))
-              )
-            );
-          }
-        }
+        const data = await fetchWithAuth('/admin/clinics');
+        if (!cancelled) setClinics((data.clinics ?? []).map(mapApiClinic));
       } catch {
-        // Keep store's existing demo data if backend not available
+        // Store keeps whatever it already had if the backend is unreachable.
+      }
+    }
+
+    async function fetchOverview() {
+      try {
+        const data: Overview = await fetchWithAuth('/admin/overview');
+        if (!cancelled) setOverview(data);
+      } catch {
+        // Leave overview null — cards/tables render their empty states below.
       } finally {
         if (!cancelled) setLoading(false);
       }
     }
 
-    fetchClinics();
+    fetchClinicsForStore();
+    fetchOverview();
     return () => { cancelled = true; };
   }, [setClinics]);
 
-  // Derive chart max for scaling
-  const chartMax = Math.max(...callVol, 1);
+  const callVol = overview?.call_volume_7d ?? [];
+  const chartMax = Math.max(...callVol.map(d => d.count), 1);
 
-  const recentlyOnboarded = [...clinics]
-    .sort((a, b) => new Date(b.joined).getTime() - new Date(a.joined).getTime())
-    .slice(0, 5);
+  const recentlyOnboarded = (overview?.recently_onboarded ?? []).map(c => ({
+    id: c.id,
+    name: c.clinic_name,
+    location: c.location ?? '—',
+    plan: asPlan(c.plan),
+    joined: formatJoined(c.created_at),
+  }));
 
-  const topPerforming = [...clinics]
-    .filter(c => c.status === 'Active' && c.calls_month > 0)
-    .sort((a, b) => b.calls_month - a.calls_month)
-    .slice(0, 5);
+  const topPerforming = (overview?.top_performing ?? []).map(c => ({
+    id: c.id,
+    name: c.clinic_name,
+    calls_month: c.calls_month,
+    bookings: c.bookings,
+    res_rate: c.res_rate,
+    avg_latency: c.avg_latency,
+    plan: asPlan(c.plan),
+    status: c.status,
+  }));
+
+  const totalClinics = overview?.total_clinics ?? 0;
+  const activeThisMonth = overview?.active_this_month ?? 0;
+  const totalCalls = overview?.total_calls ?? 0;
+  const totalBookings = overview?.total_bookings ?? 0;
+  const mrr = overview?.mrr ?? 0;
 
   const latestBookingLabel = lastBooking?.patient_name || lastBooking?.phone || lastBooking?.patient_phone || null;
 
@@ -161,11 +203,11 @@ export default function SADashboard() {
 
       {/* Stat Cards */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '16px', marginBottom: '28px' }}>
-        <StatCard label="Total Clinics"     value={clinics.length}    icon={Building2} />
-        <StatCard label="Active This Month" value={getActiveCount()}   icon={Activity}  />
-        <StatCard label="Total Calls"       value={getTotalCalls()}    icon={Phone}     />
-        <StatCard label="Total Bookings"    value={getTotalBookings()}  icon={CalendarCheck} />
-        <StatCard label="MRR" value={getMRR() > 0 ? `₹${(getMRR() / 1000).toFixed(0)}k` : '₹0'} icon={IndianRupee} />
+        <StatCard label="Total Clinics"     value={totalClinics}    icon={Building2} />
+        <StatCard label="Active This Month" value={activeThisMonth} icon={Activity}  />
+        <StatCard label="Total Calls"       value={totalCalls}      icon={Phone}     />
+        <StatCard label="Total Bookings"    value={totalBookings}   icon={CalendarCheck} />
+        <StatCard label="MRR" value={mrr > 0 ? `₹${(mrr / 1000).toFixed(0)}k` : '₹0'} icon={IndianRupee} />
       </div>
 
       {/* Tables Row */}
@@ -176,7 +218,7 @@ export default function SADashboard() {
             <h3 style={{ fontSize: '12px', fontWeight: 700, color: '#fff', textTransform: 'uppercase', letterSpacing: '0.06em', margin: 0 }}>
               Recently Onboarded
             </h3>
-            <span style={{ color: '#555', fontSize: '11px' }}>{clinics.length} total</span>
+            <span style={{ color: '#555', fontSize: '11px' }}>{totalClinics} total</span>
           </div>
           <table style={{ width: '100%', fontSize: '13px', borderCollapse: 'collapse' }}>
             <thead>
@@ -216,21 +258,21 @@ export default function SADashboard() {
             Call Volume (7 Days)
           </h3>
           <p style={{ color: '#555', fontSize: '11px', marginBottom: '24px', marginTop: 0 }}>
-            Derived from {getTotalCalls().toLocaleString('en-IN')} total calls this month
+            Real call volume by day, last 7 days (IST)
           </p>
           <div style={{ display: 'flex', alignItems: 'flex-end', gap: '10px', height: '140px', paddingBottom: '4px' }}>
-            {callVol.map((v, i) => (
+            {callVol.map((d, i) => (
               <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', height: '100%', justifyContent: 'flex-end' }}>
                 <div style={{
                   width: '100%',
-                  height: `${Math.round((v / chartMax) * 100)}%`,
+                  height: `${Math.round((d.count / chartMax) * 100)}%`,
                   background: 'linear-gradient(180deg, #3ECF8E 0%, #2EAF74 100%)',
                   borderRadius: '4px 4px 0 0',
                   opacity: 0.85,
                   transition: 'height 0.4s ease',
                   minHeight: '4px',
                 }} />
-                <span style={{ fontSize: '10px', color: '#555' }}>{DAYS[i]}</span>
+                <span style={{ fontSize: '10px', color: '#555' }}>{d.day_label}</span>
               </div>
             ))}
           </div>

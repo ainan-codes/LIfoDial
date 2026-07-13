@@ -5,6 +5,8 @@ import logging
 from datetime import datetime, timezone
 import httpx
 
+from backend.services.net import is_safe_outbound_url
+
 logger = logging.getLogger(__name__)
 
 
@@ -15,6 +17,9 @@ async def send_webhook(url: str, event_type: str, data: dict) -> bool:
     """
     if not url:
         return False
+    if not is_safe_outbound_url(url):
+        logger.warning("Refusing to send webhook to unsafe/internal URL: %s", url)
+        return False
 
     payload = {
         "event": event_type,
@@ -24,7 +29,7 @@ async def send_webhook(url: str, event_type: str, data: dict) -> bool:
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(url, json=payload)
+            response = await client.post(url, json=payload, follow_redirects=False)
             if response.status_code < 400:
                 logger.info(f"Webhook sent: {event_type} -> {url} ({response.status_code})")
                 return True

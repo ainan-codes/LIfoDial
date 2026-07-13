@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Database, MessageSquare, Briefcase, Webhook, Calendar, Send, Settings, CheckCircle2, Zap, Copy, AlertCircle, Trash2, X, RefreshCw } from 'lucide-react';
-import { API_URL, fetchWithAuth } from '../../api/client';
+import fetchWithAuth from '../../api/client';
 
 export default function Integrations() {
   const [showGoogleModal, setShowGoogleModal] = useState(false);

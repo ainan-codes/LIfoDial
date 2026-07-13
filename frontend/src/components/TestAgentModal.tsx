@@ -24,8 +24,9 @@ import {
   X
 } from 'lucide-react';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { API_URL, WS_URL } from '../api/client';
+import fetchWithAuth, { wsUrlWithAuth } from '../api/client';
 import { useThinkingSound } from '../hooks/useThinkingSound';
+import TestVoiceCallLK from './TestVoiceCallLK';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface Message {
@@ -174,6 +175,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
   const wsRef = useRef<WebSocket | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioQueueRef = useRef<Blob[]>([]);
   const isPlayingRef = useRef(false);
@@ -571,7 +573,8 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
   };
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const container = messagesContainerRef.current;
+    if (container) container.scrollTop = container.scrollHeight;
   }, [messages, currentTranscript]);
 
   // ISSUE 4: Cleanup on unmount
@@ -667,7 +670,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
     }
 
     // ISSUE 1: Connect WebSocket with 15-second connection timeout
-    const ws = new WebSocket(`${WS_URL}/ws/agent-call/${agentId}`);
+    const ws = new WebSocket(wsUrlWithAuth(`/ws/agent-call/${agentId}`));
     ws.binaryType = 'blob';
     wsRef.current = ws;
 
@@ -1003,7 +1006,7 @@ function VoiceMode({ agent, agentId: directId, agentName: directName, onClose }:
       </div>
 
       {/* Transcript */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+      <div ref={messagesContainerRef} style={{ flex: 1, overflowY: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
         {messages.length === 0 && !currentTranscript && (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <p style={{ color: '#333', fontSize: '13px', textAlign: 'center' }}>Start speaking — your conversation will appear here in real-time</p>
@@ -1160,17 +1163,18 @@ function ChatMode({ agent, agentId: directId, agentName: directName }: { agent?:
   const [loading, setLoading] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const container = messagesContainerRef.current;
+    if (container) container.scrollTop = container.scrollHeight;
   }, [messages]);
 
   useEffect(() => {
     const init = async () => {
       try {
-        const res = await fetch(`${API_URL}/agent-chat/${agentId}/greeting`);
-        const data = await res.json();
+        const data = await fetchWithAuth(`/agent-chat/${agentId}/greeting`);
         setSessionId(data.session_id);
         setMessages([{ id: '0', role: 'agent', text: data.message || `Hello! I'm ${agentName}. How can I help you today?`, time: nowTime() }]);
       } catch {
@@ -1192,13 +1196,10 @@ function ChatMode({ agent, agentId: directId, agentName: directName }: { agent?:
 
     const t0 = Date.now();
     try {
-      const res = await fetch(`${API_URL}/agent-chat/${agentId}`, {
+      const data = await fetchWithAuth(`/agent-chat/${agentId}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text, session_id: sessionId }),
       });
-      if (!res.ok) throw new Error('API error');
-      const data = await res.json();
       setMessages(prev => [...prev.filter(m => m.id !== 'typing'), { id: Date.now().toString() + '-agent', role: 'agent', text: data.response || 'No response', time: nowTime(), ms: Date.now() - t0 }]);
       if (data.session_id && !sessionId) setSessionId(data.session_id);
     } catch (err: any) {
@@ -1211,7 +1212,7 @@ function ChatMode({ agent, agentId: directId, agentName: directName }: { agent?:
 
   const clearChat = async () => {
     if (sessionId) {
-      try { await fetch(`${API_URL}/agent-chat/${agentId}/session/${sessionId}`, { method: 'DELETE' }); } catch { }
+      try { await fetchWithAuth(`/agent-chat/${agentId}/session/${sessionId}`, { method: 'DELETE' }); } catch { }
     }
     const newSid = crypto.randomUUID();
     setSessionId(newSid);
@@ -1233,7 +1234,7 @@ function ChatMode({ agent, agentId: directId, agentName: directName }: { agent?:
           <Download size={12} /> Export
         </button>
       </div>
-      <div style={{ flex: 1, overflowY: 'auto', padding: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      <div ref={messagesContainerRef} style={{ flex: 1, overflowY: 'auto', padding: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
         {messages.map(m => (
           <div key={m.id} style={{ display: 'flex', flexDirection: 'column', alignItems: m.role === 'agent' ? 'flex-start' : 'flex-end', gap: '3px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -1411,7 +1412,10 @@ export default function TestAgentModal({ agent, agentId: directId, agentName: di
         {/* CONTENT AREA — flex-grow, scrollable */}
         <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
           {mode === 'voice' ? (
-            <VoiceMode agent={agent} agentId={agentId} agentName={agentName} onClose={onClose} />
+            // Voice now runs on the SAME real-time LiveKit + Pipecat pipeline as
+            // production calls (test_mode) — streaming + native barge-in. The old
+            // batch WebSocket VoiceMode harness (below in this file) is retired.
+            <TestVoiceCallLK agent={agent} agentId={agentId} agentName={agentName} onClose={onClose} />
           ) : (
             <ChatMode agent={agent} agentId={agentId} agentName={agentName} onClose={onClose} />
           )}

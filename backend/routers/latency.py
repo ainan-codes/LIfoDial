@@ -7,7 +7,9 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy import select, func as sqlfunc, and_
 from datetime import datetime, timedelta
 
+from backend.auth import CurrentUser
 from backend.db import async_session
+from backend.models.agent_config import AgentConfig
 from backend.models.call_record import CallRecord
 
 logger = logging.getLogger(__name__)
@@ -15,7 +17,7 @@ router = APIRouter()
 
 
 @router.get("/agents/{agent_id}/latency-stats")
-async def get_latency_stats(agent_id: str, days: int = 7) -> dict:
+async def get_latency_stats(agent_id: str, days: int = 7, user: CurrentUser = None) -> dict:
     """
     Return latency statistics for an agent based on stored avg_latency_ms
     across recent completed calls.
@@ -25,6 +27,14 @@ async def get_latency_stats(agent_id: str, days: int = 7) -> dict:
     """
     try:
         async with async_session() as db:
+            agent_result = await db.execute(
+                select(AgentConfig).where(AgentConfig.id == agent_id)
+            )
+            agent = agent_result.scalar_one_or_none()
+            if not agent:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            user.require_owns(str(agent.tenant_id))
+
             since = datetime.utcnow() - timedelta(days=days)
             result = await db.execute(
                 select(CallRecord.avg_latency_ms, CallRecord.turn_count)
@@ -86,6 +96,8 @@ async def get_latency_stats(agent_id: str, days: int = 7) -> dict:
                 "tts_avg": tts_avg,
             },
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Latency stats error for agent %s: %s", agent_id, e)
         raise HTTPException(status_code=500, detail=str(e))

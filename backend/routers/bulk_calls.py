@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select, and_
 
+from backend.auth import CurrentUser
 from backend.db import async_session
 from backend.models.bulk_call import BulkCallCampaign
 
@@ -71,8 +72,9 @@ def _campaign_to_dict(c: BulkCallCampaign) -> dict:
 # ── POST /bulk-calls ───────────────────────────────────────────────────────────
 
 @router.post("/bulk-calls", status_code=201)
-async def create_campaign(payload: BulkCallCreatePayload) -> dict:
+async def create_campaign(payload: BulkCallCreatePayload, user: CurrentUser = None) -> dict:
     """Create a new bulk call campaign."""
+    user.require_owns(payload.tenant_id)
     if not payload.contacts:
         raise HTTPException(status_code=400, detail="contacts list cannot be empty")
 
@@ -111,8 +113,13 @@ async def create_campaign(payload: BulkCallCreatePayload) -> dict:
 # ── GET /bulk-calls ────────────────────────────────────────────────────────────
 
 @router.get("/bulk-calls")
-async def list_campaigns(tenant_id: Optional[str] = None) -> list[dict]:
+async def list_campaigns(tenant_id: Optional[str] = None, user: CurrentUser = None) -> list[dict]:
     """List all campaigns, optionally filtered by tenant_id."""
+    if tenant_id:
+        user.require_owns(tenant_id)
+    elif not user.is_superadmin:
+        # Clinic users never see other tenants' campaigns — force their own scope.
+        tenant_id = user.tenant_id
     try:
         async with async_session() as db:
             query = select(BulkCallCampaign).order_by(BulkCallCampaign.created_at.desc())
@@ -129,7 +136,7 @@ async def list_campaigns(tenant_id: Optional[str] = None) -> list[dict]:
 # ── GET /bulk-calls/{id} ──────────────────────────────────────────────────────
 
 @router.get("/bulk-calls/{campaign_id}")
-async def get_campaign(campaign_id: str) -> dict:
+async def get_campaign(campaign_id: str, user: CurrentUser = None) -> dict:
     """Get a single campaign with full contacts list."""
     try:
         async with async_session() as db:
@@ -139,6 +146,7 @@ async def get_campaign(campaign_id: str) -> dict:
             c = result.scalar_one_or_none()
             if not c:
                 raise HTTPException(status_code=404, detail="Campaign not found")
+            user.require_owns(str(c.tenant_id))
             data = _campaign_to_dict(c)
             data["contacts"] = c.contacts  # full contacts list
             return data
@@ -152,7 +160,7 @@ async def get_campaign(campaign_id: str) -> dict:
 # ── PATCH /bulk-calls/{id}/cancel ─────────────────────────────────────────────
 
 @router.patch("/bulk-calls/{campaign_id}/cancel")
-async def cancel_campaign(campaign_id: str) -> dict:
+async def cancel_campaign(campaign_id: str, user: CurrentUser = None) -> dict:
     """Cancel a pending or running campaign."""
     try:
         async with async_session() as db:
@@ -162,6 +170,7 @@ async def cancel_campaign(campaign_id: str) -> dict:
             campaign = result.scalar_one_or_none()
             if not campaign:
                 raise HTTPException(status_code=404, detail="Campaign not found")
+            user.require_owns(str(campaign.tenant_id))
             if campaign.status in ("completed", "cancelled"):
                 raise HTTPException(
                     status_code=400,

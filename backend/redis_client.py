@@ -1,8 +1,20 @@
 # In-memory session store
 # Works identically to Redis for local testing
 # Replace with real Redis only when deploying
+#
+# BACKEND is what System Health reports. This module is CURRENTLY an in-process
+# dict — it does NOT connect to Redis, and the `redis_url` setting is unused.
+# When a real Redis client is wired here, set BACKEND = "redis" and make ping()
+# actually round-trip, and the health card will reflect it automatically.
+BACKEND = "in-memory"
 
 _sessions: dict = {}
+
+
+async def ping() -> bool:
+    """Liveness probe for the session store. Trivially true for the in-process
+    dict; becomes a real Redis PING once/if Redis is wired here."""
+    return True
 
 async def get_session(tenant_id: str, 
                       call_id: str) -> dict | None:

@@ -4,6 +4,7 @@ from backend.models.doctor import Doctor
 from backend.models.appointment import Appointment
 from backend.models.call_log import CallLog
 from backend.models.agent_config import AgentConfig
+from backend.models.agent_prompt_history import AgentPromptHistory
 from backend.models.api_key_config import ApiKeyConfig
 from backend.models.onboarding_request import OnboardingRequest
 from backend.models.knowledge_base import KnowledgeBase
@@ -19,6 +20,7 @@ __all__ = [
     "Appointment",
     "CallLog",
     "AgentConfig",
+    "AgentPromptHistory",
     "ApiKeyConfig",
     "OnboardingRequest",
     "KnowledgeBase",

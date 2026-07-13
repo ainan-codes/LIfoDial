@@ -9,9 +9,7 @@ import {
   Clock, Phone, HelpCircle, FileText, ChevronDown, Building2, Save,
 } from 'lucide-react';
 
-import { API_URL } from '../../api/client';
-
-const API = API_URL;
+import fetchWithAuth from '../../api/client';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface Clinic { id: string; clinic_name: string; location?: string; }
@@ -190,8 +188,7 @@ export default function KnowledgeBasePage() {
 
   // Load clinics
   useEffect(() => {
-    fetch(`${API}/tenants`)
-      .then(r => r.ok ? r.json() : [])
+    fetchWithAuth('/tenants')
       .then(data => {
         const list = Array.isArray(data) ? data : [];
         setClinics(list);
@@ -205,8 +202,8 @@ export default function KnowledgeBasePage() {
     if (!selectedClinic) return;
     setLoading(true);
     try {
-      const res = await fetch(`${API}/tenants/${selectedClinic}/kb`);
-      if (res.ok) setEntries(await res.json());
+      const data = await fetchWithAuth(`/tenants/${selectedClinic}/kb`);
+      setEntries(data);
     } catch { setEntries([]); }
     finally { setLoading(false); }
   }, [selectedClinic]);
@@ -214,27 +211,40 @@ export default function KnowledgeBasePage() {
   useEffect(() => { loadEntries(); }, [loadEntries]);
 
   const handleAdd = async (data: Partial<KBEntry>) => {
-    const res = await fetch(`${API}/tenants/${selectedClinic}/kb`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...data, is_active: true }),
-    });
-    if (res.ok) { showToast('✓ Entry added'); await loadEntries(); }
+    try {
+      await fetchWithAuth(`/tenants/${selectedClinic}/kb`, {
+        method: 'POST',
+        body: JSON.stringify({ ...data, is_active: true }),
+      });
+      showToast('✓ Entry added');
+      await loadEntries();
+    } catch {
+      // Keep parity with previous behavior: silently no-op on failure.
+    }
   };
 
   const handleUpdate = async (id: string, data: Partial<KBEntry>) => {
     const original = entries.find(e => e.id === id)!;
-    const res = await fetch(`${API}/tenants/${selectedClinic}/kb/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...original, ...data }),
-    });
-    if (res.ok) { showToast('✓ Saved'); await loadEntries(); }
+    try {
+      await fetchWithAuth(`/tenants/${selectedClinic}/kb/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ ...original, ...data }),
+      });
+      showToast('✓ Saved');
+      await loadEntries();
+    } catch {
+      // Keep parity with previous behavior: silently no-op on failure.
+    }
   };
 
   const handleDelete = async (id: string) => {
-    const res = await fetch(`${API}/tenants/${selectedClinic}/kb/${id}`, { method: 'DELETE' });
-    if (res.ok) { showToast('Entry removed'); setEntries(prev => prev.filter(e => e.id !== id)); }
+    try {
+      await fetchWithAuth(`/tenants/${selectedClinic}/kb/${id}`, { method: 'DELETE' });
+      showToast('Entry removed');
+      setEntries(prev => prev.filter(e => e.id !== id));
+    } catch {
+      // Keep parity with previous behavior: silently no-op on failure.
+    }
   };
 
   const filtered = entries.filter(e => {

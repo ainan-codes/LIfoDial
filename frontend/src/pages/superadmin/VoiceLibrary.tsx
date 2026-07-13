@@ -3,14 +3,26 @@ import { useNavigate } from 'react-router-dom';
 import { 
   Search, ChevronDown, Check, Play, Square, FilterX, Clock, MapPin, SearchX, Globe, Settings, CreditCard, Menu, MessageCircle, Music, Shield, Info, ExternalLink, Link2, Download, Copy, Circle
 } from 'lucide-react';
-import { VOICE_LIBRARY } from '../../fixtures/voices';
-import { API_URL } from '../../api/client';
+import fetchWithAuth, { API_URL } from '../../api/client';
+import { getToken } from '../../api/auth';
 
 interface VoiceLibraryProps {
   isPickerModal?: boolean;
   onSelectVoice?: (voice: any) => void;
   readOnly?: boolean;
 }
+
+// Display metadata for every TTS provider. The library is driven by whichever
+// of these actually have a key configured (from /platform/configured-providers).
+const TTS_PROVIDER_META: Record<string, { name: string; icon: string; defaultModel: string; defaultLang: string }> = {
+  sarvam:        { name: 'Sarvam AI',        icon: '🇮🇳', defaultModel: 'bulbul:v3',        defaultLang: 'hi-IN' },
+  elevenlabs:    { name: 'ElevenLabs',       icon: '11',  defaultModel: 'eleven_flash_v2_5', defaultLang: 'en-US' },
+  openai_tts:    { name: 'OpenAI TTS',       icon: '🤖', defaultModel: 'tts-1',             defaultLang: 'en-US' },
+  cartesia:      { name: 'Cartesia',         icon: '🌊', defaultModel: 'sonic-2',           defaultLang: 'en-US' },
+  playht:        { name: 'PlayHT',           icon: '▶',  defaultModel: 'PlayDialog',        defaultLang: 'en-US' },
+  azure_tts:     { name: 'Azure Neural',     icon: '☁',  defaultModel: 'neural',            defaultLang: 'en-US' },
+  deepgram_aura: { name: 'Deepgram Aura',    icon: '🔊', defaultModel: 'aura-2',            defaultLang: 'en-US' },
+};
 
 export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, readOnly = false }: VoiceLibraryProps) {
   const [search, setSearch] = useState('');
@@ -20,103 +32,72 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [loadingAudioId, setLoadingAudioId] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
-  const [providerStatus, setProviderStatus] = useState<any>({
-    sarvam: { connected: false, voice_count: 0 },
-    gemini: { connected: false, voice_count: 0 },
-    elevenlabs: { connected: false, voice_count: 0 }
-  });
+  const [providerStatus, setProviderStatus] = useState<Record<string, { connected: boolean; voice_count: number }>>({});
+  // Configured TTS providers (ids) in the order they should appear.
+  const [ttsProviders, setTtsProviders] = useState<string[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // Load real connectivity status from backend
-  const [localVoices, setLocalVoices] = useState<any[]>(VOICE_LIBRARY);
+  const [localVoices, setLocalVoices] = useState<any[]>([]);
 
   useEffect(() => {
-    const fetchStatus = async () => {
-      try {
-        const res = await fetch(`${API_URL}/voices/`);
-        if (res.ok) {
-          const data = await res.json();
-          setProviderStatus(data.providers);
-        }
-      } catch (err) {
-        console.error("Failed to fetch provider status:", err);
-      }
+    // Normalize any provider's voice payload into a uniform card shape.
+    const normalize = (providerId: string, v: any) => {
+      const meta = TTS_PROVIDER_META[providerId];
+      const lang = v.language || meta?.defaultLang || 'en-US';
+      return {
+        id: `${providerId}-${v.voice_id || v.id}`,
+        provider: providerId,
+        provider_label: meta?.name || providerId,
+        name: v.name,
+        gender: (v.gender || 'neutral').toUpperCase(),
+        language: lang,
+        language_label: lang,
+        accent: String(lang).substring(0, 5),
+        model: v.model || meta?.defaultModel || '',
+        voice_id: v.voice_id || v.id,
+        tags: [lang, v.gender].filter(Boolean),
+        sample_text: v.description || 'Hello! I am your AI receptionist. How can I help you today?',
+        recommended_for: [],
+        is_recommended: false,
+      };
     };
-    
-    // Dynamically fetch ALL sarvam voices from backend instead of relying on the 12 hardcoded ones
-    const fetchSarvamVoices = async () => {
+
+    const fetchVoicesFor = async (providerId: string) => {
       try {
-        const res = await fetch(`${API_URL}/platform/tts/voices/sarvam`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.voices && Array.isArray(data.voices)) {
-            const dynamicSarvam = data.voices.map((v: any) => ({
-               id: `sarvam-${v.id}`,
-               provider: 'sarvam',
-               provider_label: 'Sarvam AI',
-               name: v.name,
-               gender: v.gender?.toUpperCase() || 'NEUTRAL',
-               language: v.language || 'en-IN',
-               language_label: v.language || 'English',
-               accent: (v.language || '').substring(0, 5),
-               model: v.model || 'bulbul:v3',
-               voice_id: v.voice_id || v.id,
-               tags: [v.language, v.gender].filter(Boolean),
-               sample_text: v.description || 'Hello! I am your AI receptionist. How can I help you?',
-               recommended_for: [],
-               is_recommended: false
-            }));
-            
-            setLocalVoices(prev => {
-               const others = prev.filter(p => p.provider !== 'sarvam');
-               return [...dynamicSarvam, ...others];
-            });
-          }
+        const data = await fetchWithAuth(`/platform/tts/voices/${providerId}`);
+        const voices: any[] = Array.isArray(data?.voices) ? data.voices : [];
+        setProviderStatus(prev => ({ ...prev, [providerId]: { connected: true, voice_count: voices.length } }));
+        if (voices.length) {
+          const mapped = voices.map(v => normalize(providerId, v));
+          setLocalVoices(prev => [...prev.filter(p => p.provider !== providerId), ...mapped]);
         }
       } catch (err) {
-         console.error("Failed to fetch dynamic voices:", err);
+        // A single provider's list API being down must not clear the others.
+        console.error(`Failed to fetch voices for ${providerId}:`, err);
+        setProviderStatus(prev => ({ ...prev, [providerId]: { connected: true, voice_count: prev[providerId]?.voice_count || 0 } }));
       }
     };
 
-    // Dynamically fetch ALL ElevenLabs voices from backend using connected API key
-    const fetchElevenLabsVoices = async () => {
+    const loadConfiguredProviders = async () => {
       try {
-        const res = await fetch(`${API_URL}/platform/tts/voices/elevenlabs`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.voices && Array.isArray(data.voices)) {
-            const dynamicEleven = data.voices.map((v: any) => ({
-               id: `elevenlabs-${v.voice_id || v.id}`,
-               provider: 'elevenlabs',
-               provider_label: 'ElevenLabs',
-               name: v.name,
-               gender: v.gender?.toUpperCase() || 'NEUTRAL',
-               language: v.language || 'en-US',
-               language_label: v.language || 'English',
-               accent: (v.language || '').substring(0, 5),
-               model: 'eleven_flash_v2_5',
-               voice_id: v.voice_id || v.id,
-               tags: [v.language, v.gender].filter(Boolean),
-               sample_text: v.description || 'Hello! I am your ElevenLabs AI receptionist. How can I help you today?',
-               recommended_for: [],
-               is_recommended: false
-            }));
-            
-            setLocalVoices(prev => {
-               const others = prev.filter(p => p.provider !== 'elevenlabs');
-               return [...dynamicEleven, ...others];
-            });
-          }
-        }
+        // Authoritative source of which providers actually have a key configured.
+        const data = await fetchWithAuth('/platform/configured-providers');
+        const configured: string[] = (Array.isArray(data?.tts) ? data.tts : [])
+          .map((p: any) => p.id)
+          .filter((id: string) => TTS_PROVIDER_META[id]);
+        setTtsProviders(configured);
+        setLoadError(null);
+        // Fetch each configured provider's voices in parallel.
+        await Promise.all(configured.map(fetchVoicesFor));
       } catch (err) {
-         console.error("Failed to fetch dynamic ElevenLabs voices:", err);
+        console.error('Failed to load configured providers:', err);
+        setLoadError('Could not load configured providers. Check your connection or AI Platform settings.');
       }
     };
 
-    fetchStatus();
-    fetchSarvamVoices();
-    fetchElevenLabsVoices();
+    loadConfiguredProviders();
   }, []);
 
   // Stop currently playing audio on unmount or when playingId changes
@@ -164,17 +145,35 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
       });
 
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 25000); // 25s timeout
+      // Backend caps synthesis at ~12s and returns a clear provider-labeled error;
+      // give it a small margin before the client aborts.
+      const timeout = setTimeout(() => controller.abort(), 15000);
 
+      // Kept as a raw fetch (not fetchWithAuth): this endpoint returns a binary
+      // audio blob, not JSON, so fetchWithAuth's forced response.json() parsing
+      // would break it. Auth is added manually instead.
+      const token = getToken();
       const response = await fetch(
         `${API_URL}/platform/tts/preview?${params.toString()}`,
-        { method: 'GET', signal: controller.signal }
+        {
+          method: 'GET',
+          signal: controller.signal,
+          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        }
       );
       clearTimeout(timeout);
 
       if (!response.ok) {
-        const errText = await response.text().catch(() => `HTTP ${response.status}`);
-        throw new Error(`Preview failed (${response.status}): ${errText.slice(0, 120)}`);
+        // Backend returns { detail: "<Provider>: <reason>" } — surface it verbatim.
+        let detail = `HTTP ${response.status}`;
+        try {
+          const body = await response.json();
+          if (body?.detail) detail = String(body.detail);
+        } catch {
+          const t = await response.text().catch(() => '');
+          if (t) detail = t.slice(0, 160);
+        }
+        throw new Error(detail);
       }
 
       const audioBlob = await response.blob();
@@ -204,10 +203,11 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
       console.error('Failed to fetch audio preview:', err);
       setLoadingAudioId(null);
       setPlayingId(null);
+      const provLabel = TTS_PROVIDER_META[voice.provider]?.name || voice.provider || 'Provider';
       if (err?.name === 'AbortError') {
-        alert('Preview timed out — Sarvam API took too long. Check your SARVAM_API_KEY in .env');
+        alert(`${provLabel} preview timed out — the provider took too long to respond. Try again.`);
       } else {
-        alert(`Could not preview voice: ${String(err)}`);
+        alert(`${provLabel} preview failed: ${err?.message || String(err)}`);
       }
     }
   };
@@ -216,7 +216,7 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
   const syncVoices = async () => {
     setSyncing(true);
     try {
-      await fetch(`${API_URL}/voices/sync`, { method: 'POST' });
+      await fetchWithAuth('/voices/sync', { method: 'POST' });
       // Simulate sync delay
       await new Promise(r => setTimeout(r, 1200));
       alert("✅ Synced 22 voices from Sarvam AI · Google Gemini");
@@ -239,12 +239,13 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
   }, {} as Record<string, typeof localVoices>);
 
   const getProviderInfo = (code: string) => {
-    return [
-      { id: 'sarvam', name: 'Sarvam AI', icon: '🇮🇳' },
-      { id: 'gemini', name: 'Google Gemini', icon: '⚡' },
-      { id: 'elevenlabs', name: 'ElevenLabs', icon: '11' }
-    ].find(p => p.id === code);
+    const meta = TTS_PROVIDER_META[code];
+    return meta ? { id: code, name: meta.name, icon: meta.icon } : { id: code, name: code, icon: '•' };
   };
+
+  // Provider order for display + filter: configured providers first, then any
+  // provider that actually returned voices (defensive), de-duplicated.
+  const displayProviders = Array.from(new Set([...ttsProviders, ...Object.keys(grouped)]));
 
   const wrapContent = (content: React.ReactNode) => {
      if (isPickerModal) {
@@ -294,9 +295,9 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
               }}
             >
                <option value="">Provider ▼</option>
-               <option value="sarvam">Sarvam AI 🇮🇳</option>
-               <option value="gemini">Google Gemini</option>
-               <option value="elevenlabs">ElevenLabs</option>
+               {displayProviders.map(p => (
+                 <option key={p} value={p}>{getProviderInfo(p).name}</option>
+               ))}
             </select>
 
             <select
@@ -362,7 +363,14 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
 
       <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '24px' }}>
         Showing {filtered.length} of {localVoices.length} voices
+        {ttsProviders.length > 0 && ` · ${ttsProviders.length} provider${ttsProviders.length > 1 ? 's' : ''} configured`}
       </div>
+
+      {loadError && (
+        <div style={{ fontSize: '13px', color: '#ff6b6b', background: 'rgba(255,107,107,0.08)', border: '1px solid rgba(255,107,107,0.25)', borderRadius: '8px', padding: '10px 14px', marginBottom: '16px' }}>
+          {loadError}
+        </div>
+      )}
 
       {filtered.length === 0 ? (
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, color: 'var(--text-muted)', gap: '12px' }}>
@@ -379,7 +387,7 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           {/* Display loop: either grouped by provider or flat grid */}
-          {(provider === '' ? ['sarvam', 'gemini', 'elevenlabs'] : [provider]).map(p => {
+          {(provider === '' ? displayProviders : [provider]).map(p => {
              const voices = grouped[p] || [];
              const info = getProviderInfo(p);
              if (voices.length === 0 && provider !== '') return null;

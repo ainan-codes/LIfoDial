@@ -5,12 +5,13 @@ Enables browser-based voice calls to AI agents via LiveKit.
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from backend.auth import CurrentUser
 from backend.db import get_db
 from backend.models.agent_config import AgentConfig
 from backend.models.tenant import Tenant
@@ -21,15 +22,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agents", tags=["web-calls"])
 
 
+# Must match WorkerOptions(agent_name=...) in backend/agent/__main__.py and
+# pipeline.py so LiveKit dispatches OUR worker into the room.
+AGENT_NAME = "lifodial-inbound-agent"
+
+
 @router.post("/{agent_id}/web-call-token")
 async def create_web_call_token(
     agent_id: str,
+    test_mode: bool = False,
+    user: CurrentUser = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Creates a LiveKit room + returns token for browser web call.
-    Admin clicks 'Web Call' -> this endpoint -> browser joins room
-    -> LiveKit agent auto-dispatches to the room.
+    Creates a LiveKit room + returns token for a browser web call, and explicitly
+    dispatches the Pipecat worker into that room (via RoomAgentDispatch on the
+    token — the worker registers under an agent_name, so it does NOT auto-join).
+
+    test_mode=True marks this as an in-dashboard "Test Agent" session: it is
+    flagged in room metadata + the call record (for no-billing/labeling) and lets
+    the worker bypass the publish gate so an admin can test an unpublished agent.
+    This is the SAME real-time pipeline used for real calls — not a separate path.
     """
     # Load agent config
     result = await db.execute(
@@ -38,6 +51,7 @@ async def create_web_call_token(
     agent = result.scalar_one_or_none()
     if not agent:
         raise HTTPException(404, "Agent not found")
+    user.require_owns(str(agent.tenant_id))
 
     # Load tenant
     tenant_result = await db.execute(
@@ -46,7 +60,8 @@ async def create_web_call_token(
     tenant = tenant_result.scalar_one_or_none()
 
     # Create unique room name for this call
-    room_name = f"webcall-{agent_id[:8]}-{uuid.uuid4().hex[:8]}"
+    prefix = "testcall" if test_mode else "webcall"
+    room_name = f"{prefix}-{agent_id[:8]}-{uuid.uuid4().hex[:8]}"
 
     # Room metadata — agent reads this to configure itself
     metadata = json.dumps({
@@ -60,7 +75,8 @@ async def create_web_call_token(
         "tts_model": agent.tts_model,
         "stt_model": agent.stt_model,
         "llm_model": agent.llm_model,
-        "call_type": "web",
+        "call_type": "test" if test_mode else "web",
+        "test_mode": test_mode,
     })
 
     # Check if LiveKit keys are configured
@@ -75,7 +91,7 @@ async def create_web_call_token(
             id=call_id,
             tenant_id=str(agent.tenant_id),
             agent_id=agent_id,
-            call_type="web",
+            call_type="test" if test_mode else "web",
             livekit_room_name=room_name,
             started_at=datetime.now(timezone.utc),
             status="in_progress",
@@ -89,6 +105,7 @@ async def create_web_call_token(
             "wsUrl": lk_url,
             "callId": call_id,
             "demo": True,
+            "test_mode": test_mode,
             "message": "LiveKit not configured — web call will use demo mode",
         }
 
@@ -107,7 +124,10 @@ async def create_web_call_token(
             )
         )
 
-        # Generate browser token for admin/patient
+        # Generate browser token for admin/patient, WITH an explicit agent
+        # dispatch so the Pipecat worker (registered under AGENT_NAME) is pulled
+        # into this room. Without this, a named-agent worker never auto-joins —
+        # this was the missing piece that left rooms agent-less.
         token = livekit_api.AccessToken(lk_key, lk_secret)
         token.with_identity(f"user-{uuid.uuid4().hex[:6]}")
         token.with_name("Web Call User")
@@ -119,7 +139,12 @@ async def create_web_call_token(
                 can_subscribe=True,
             )
         )
-        token.with_ttl(3600)
+        token.with_room_config(
+            livekit_api.RoomConfiguration(
+                agents=[livekit_api.RoomAgentDispatch(agent_name=AGENT_NAME)]
+            )
+        )
+        token.with_ttl(timedelta(seconds=3600))  # SDK expects a timedelta, not an int
 
         jwt_token = token.to_jwt()
     except Exception as e:
@@ -132,7 +157,7 @@ async def create_web_call_token(
         id=call_id,
         tenant_id=str(agent.tenant_id),
         agent_id=agent_id,
-        call_type="web",
+        call_type="test" if test_mode else "web",
         livekit_room_name=room_name,
         started_at=datetime.now(timezone.utc),
         status="in_progress",
@@ -144,6 +169,7 @@ async def create_web_call_token(
         "roomName": room_name,
         "wsUrl": lk_url,
         "callId": call_id,
+        "test_mode": test_mode,
     }
 
 
@@ -151,6 +177,7 @@ async def create_web_call_token(
 async def make_outbound_call(
     agent_id: str,
     body: dict,
+    user: CurrentUser = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -172,6 +199,7 @@ async def make_outbound_call(
     agent = result.scalar_one_or_none()
     if not agent:
         raise HTTPException(404, "Agent not found")
+    user.require_owns(str(agent.tenant_id))
 
     room_name = f"outbound-{agent_id[:8]}-{uuid.uuid4().hex[:8]}"
 
@@ -212,9 +240,16 @@ async def make_outbound_call(
 @router.get("/{agent_id}/call-records")
 async def get_call_records(
     agent_id: str,
+    user: CurrentUser = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Get all call records for an agent."""
+    agent_result = await db.execute(select(AgentConfig).where(AgentConfig.id == agent_id))
+    agent = agent_result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    user.require_owns(str(agent.tenant_id))
+
     result = await db.execute(
         select(CallRecord)
         .where(CallRecord.agent_id == agent_id)

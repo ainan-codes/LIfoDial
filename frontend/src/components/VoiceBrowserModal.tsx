@@ -3,7 +3,7 @@ import {
   X, Search, Play, Pause, Volume2, VolumeX,
   RefreshCw, Mic, User, Users, Check, Loader,
 } from 'lucide-react';
-import { API_URL } from '../api/client';
+import fetchWithAuth from '../api/client';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -46,14 +46,9 @@ export default function VoiceBrowserModal({ open, onClose, onSelect, selectedVoi
     setError('');
     try {
       if (forceRefresh) {
-        await fetch(`${API_URL}/voices/elevenlabs/refresh`, { method: 'POST' });
+        await fetchWithAuth('/voices/elevenlabs/refresh', { method: 'POST' });
       }
-      const res = await fetch(`${API_URL}/voices/elevenlabs`);
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.detail || `HTTP ${res.status}`);
-      }
-      const data = await res.json();
+      const data = await fetchWithAuth('/voices/elevenlabs');
       setVoices(data.voices || []);
     } catch (e: any) {
       setError(e.message || 'Failed to load voices');

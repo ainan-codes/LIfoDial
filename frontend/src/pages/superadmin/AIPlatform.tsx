@@ -8,20 +8,19 @@ import React, { useState, useEffect, useCallback } from 'react';
 import {
   Brain, Mic, Volume2, Phone, Database, Key, CheckCircle,
   AlertCircle, Eye, EyeOff, Trash2, ExternalLink, Star, RefreshCw,
-  ChevronRight, Settings, Zap, Download, CloudDownload,
+  ChevronRight, Settings, Zap, Download, CloudDownload, Copy,
 } from 'lucide-react';
 
-import { API_URL } from '../../api/client';
-
-const API = API_URL;
+import fetchWithAuth from '../../api/client';
 
 // ── Category metadata ─────────────────────────────────────────────────────────
 const CATEGORIES = [
-  { id: 'llm',       label: 'Language Models',  icon: Brain,    color: '#a78bfa', desc: 'AI reasoning and conversation — powers the agent brain' },
-  { id: 'stt',       label: 'Speech-to-Text',   icon: Mic,      color: '#60a5fa', desc: 'Converts patient voice to text for the agent to understand' },
-  { id: 'tts',       label: 'Text-to-Speech',   icon: Volume2,  color: '#f59e0b', desc: 'Converts agent responses to natural voice audio' },
-  { id: 'telephony', label: 'Telephony',         icon: Phone,    color: '#3ECF8E', desc: 'Phone number routing, SIP trunking, call handling' },
-  { id: 'his',       label: 'HIS Integration',  icon: Database, color: '#f87171', desc: 'Hospital Information System — bookings, EMR, patient data' },
+  { id: 'llm',         label: 'Language Models',  icon: Brain,    color: '#a78bfa', desc: 'AI reasoning and conversation — powers the agent brain' },
+  { id: 'stt',         label: 'Speech-to-Text',   icon: Mic,      color: '#60a5fa', desc: 'Converts patient voice to text for the agent to understand' },
+  { id: 'tts',         label: 'Text-to-Speech',   icon: Volume2,  color: '#f59e0b', desc: 'Converts agent responses to natural voice audio' },
+  { id: 'voice_clone', label: 'Voice Cloning',    icon: Copy,     color: '#ec4899', desc: 'Clone a clinic-specific voice from a short sample' },
+  { id: 'telephony',   label: 'Telephony',         icon: Phone,    color: '#3ECF8E', desc: 'Phone number routing, SIP trunking, call handling' },
+  { id: 'his',         label: 'HIS Integration',  icon: Database, color: '#f87171', desc: 'Hospital Information System — bookings, EMR, patient data' },
 ];
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -86,11 +85,8 @@ function ProviderCard({
   const handleFetchModels = async () => {
     setFetchingModels(true);
     try {
-      const res = await fetch(`${API}/platform/providers/${provider.id}/fetch-models`, { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        setFetchedModels(data.models || []);
-      }
+      const data = await fetchWithAuth(`/platform/providers/${provider.id}/fetch-models`, { method: 'POST' });
+      setFetchedModels(data.models || []);
     } catch {}
     finally { setFetchingModels(false); }
   };
@@ -225,6 +221,99 @@ function ProviderCard({
   );
 }
 
+// ── LiveKit card (3 fields: URL + API key + write-only secret) ────────────────
+function LiveKitCard({ catColor, showToast }: { catColor: string; showToast: (m: string, t?: 'ok' | 'err') => void }) {
+  const [data, setData] = useState<{ url: string; api_key_masked: string; secret_set: boolean } | null>(null);
+  const [url, setUrl] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [secret, setSecret] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; detail: string } | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const d = await fetchWithAuth('/platform/livekit');
+      setData(d); setUrl(d.url || '');
+    } catch { /* backend offline */ }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async () => {
+    setSaving(true); setTestResult(null);
+    try {
+      const body: any = {};
+      if (url) body.url = url;
+      if (apiKey.trim()) body.api_key = apiKey.trim();
+      if (secret.trim()) body.api_secret = secret.trim();
+      const res = await fetchWithAuth('/platform/livekit', { method: 'PUT', body: JSON.stringify(body) });
+      if (res.warning) showToast(res.warning, 'err'); else showToast('✓ LiveKit credentials saved (encrypted)');
+      setApiKey(''); setSecret('');   // never keep raw values in state after save
+      await load();
+    } catch (e: any) {
+      showToast(e?.message || 'Save failed', 'err');
+    } finally { setSaving(false); }
+  };
+
+  const test = async () => {
+    setTesting(true); setTestResult(null);
+    try {
+      const r = await fetchWithAuth('/platform/livekit/test', { method: 'POST' });
+      setTestResult(r);
+    } catch (e: any) {
+      setTestResult({ ok: false, detail: e?.message || 'Test failed' });
+    } finally { setTesting(false); }
+  };
+
+  const inputStyle: React.CSSProperties = { width: '100%', padding: '9px 12px', borderRadius: '8px', background: '#0F0F0F', border: '1px solid #2E2E2E', color: '#fff', fontSize: '13px', outline: 'none', boxSizing: 'border-box', fontFamily: 'monospace' };
+  const labelStyle: React.CSSProperties = { fontSize: '11px', fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '6px', display: 'block' };
+
+  return (
+    <div style={{ border: `1px solid ${catColor}30`, borderRadius: '12px', padding: '20px', background: '#141414' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <div style={{ width: '32px', height: '32px', borderRadius: '8px', background: `${catColor}20`, color: catColor, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: '13px' }}>Lk</div>
+          <div>
+            <div style={{ color: '#fff', fontWeight: 600, fontSize: '14px' }}>LiveKit</div>
+            <div style={{ color: '#555', fontSize: '11px' }}>Voice infrastructure — needs URL, API Key & Secret</div>
+          </div>
+        </div>
+        {data?.secret_set && <span style={{ fontSize: '11px', color: '#3ECF8E', background: '#3ECF8E15', padding: '3px 10px', borderRadius: '20px', fontWeight: 600 }}>CONFIGURED</span>}
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+        <div>
+          <label style={labelStyle}>LiveKit URL</label>
+          <input style={inputStyle} value={url} onChange={e => setUrl(e.target.value)} placeholder="wss://your-project.livekit.cloud" />
+        </div>
+        <div>
+          <label style={labelStyle}>API Key {data?.api_key_masked && <span style={{ color: '#3ECF8E', textTransform: 'none' }}>· current: {data.api_key_masked}</span>}</label>
+          <input style={inputStyle} value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder={data?.api_key_masked ? 'Enter to replace…' : 'APIxxxxxxxx'} />
+        </div>
+        <div>
+          <label style={labelStyle}>API Secret {data?.secret_set && <span style={{ color: '#3ECF8E', textTransform: 'none' }}>· set (write-only)</span>}</label>
+          <input style={inputStyle} type="password" value={secret} onChange={e => setSecret(e.target.value)} placeholder={data?.secret_set ? 'Enter to replace…' : 'secret'} autoComplete="new-password" />
+          <div style={{ fontSize: '10px', color: '#555', marginTop: '4px' }}>The secret signs room tokens — it is stored encrypted and never shown again after saving.</div>
+        </div>
+
+        <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginTop: '4px' }}>
+          <button onClick={save} disabled={saving} style={{ padding: '8px 16px', background: catColor, color: '#000', border: 'none', borderRadius: '8px', fontWeight: 700, fontSize: '12px', cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.6 : 1 }}>
+            {saving ? 'Saving…' : 'Save Credentials'}
+          </button>
+          <button onClick={test} disabled={testing} style={{ padding: '8px 16px', background: 'none', border: '1px solid #2E2E2E', color: '#fff', borderRadius: '8px', fontWeight: 600, fontSize: '12px', cursor: testing ? 'not-allowed' : 'pointer' }}>
+            {testing ? 'Testing…' : 'Test Connection'}
+          </button>
+          {testResult && (
+            <span style={{ fontSize: '12px', fontWeight: 600, color: testResult.ok ? '#3ECF8E' : '#ef4444' }}>
+              {testResult.ok ? '✓ ' : '✗ '}{testResult.detail}
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Main Page ─────────────────────────────────────────────────────────────────
 export default function AIPlatform() {
   const [activeCategory, setActiveCategory] = useState('llm');
@@ -233,6 +322,7 @@ export default function AIPlatform() {
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<{ msg: string; type: 'ok' | 'err' } | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [pushing, setPushing] = useState(false);
 
   const showToast = (msg: string, type: 'ok' | 'err' = 'ok') => {
     setToast({ msg, type });
@@ -242,12 +332,12 @@ export default function AIPlatform() {
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [provRes, keyRes] = await Promise.all([
-        fetch(`${API}/platform/providers`),
-        fetch(`${API}/platform/keys`),
+      const [provData, keyData] = await Promise.all([
+        fetchWithAuth(`/platform/providers`),
+        fetchWithAuth(`/platform/keys`),
       ]);
-      if (provRes.ok) setProviders(await provRes.json());
-      if (keyRes.ok) setSavedKeys(await keyRes.json());
+      setProviders(provData);
+      setSavedKeys(keyData);
     } catch {
       // backend offline — use empty state
     } finally {
@@ -258,42 +348,66 @@ export default function AIPlatform() {
   useEffect(() => { loadAll(); }, [loadAll]);
 
   const handleSave = async (provider: string, category: string, key: string, extraConfig?: string) => {
-    const res = await fetch(`${API}/platform/keys`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider, category, api_key: key, extra_config: extraConfig }),
-    });
-    if (res.ok) { showToast(`✓ Key saved for ${provider}`); await loadAll(); }
-    else showToast('Failed to save key', 'err');
+    try {
+      await fetchWithAuth(`/platform/keys`, {
+        method: 'POST',
+        body: JSON.stringify({ provider, category, api_key: key, extra_config: extraConfig }),
+      });
+      showToast(`✓ Key saved for ${provider}`);
+      await loadAll();
+    } catch {
+      showToast('Failed to save key', 'err');
+    }
   };
 
   const handleDelete = async (id: string) => {
-    const res = await fetch(`${API}/platform/keys/${id}`, { method: 'DELETE' });
-    if (res.ok) { showToast('Key removed'); await loadAll(); }
-    else showToast('Failed to remove key', 'err');
+    try {
+      await fetchWithAuth(`/platform/keys/${id}`, { method: 'DELETE' });
+      showToast('Key removed');
+      await loadAll();
+    } catch {
+      showToast('Failed to remove key', 'err');
+    }
   };
 
   const handleActivate = async (id: string) => {
-    const res = await fetch(`${API}/platform/keys/${id}/activate`, { method: 'PATCH' });
-    if (res.ok) { showToast('✓ Active provider updated'); await loadAll(); }
-    else showToast('Failed to set active', 'err');
+    try {
+      await fetchWithAuth(`/platform/keys/${id}/activate`, { method: 'PATCH' });
+      showToast('✓ Active provider updated');
+      await loadAll();
+    } catch {
+      showToast('Failed to set active', 'err');
+    }
   };
 
   const handleSyncEnv = async () => {
     setSyncing(true);
     try {
-      const res = await fetch(`${API}/platform/sync-from-env`, { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        showToast(`✓ Synced ${data.synced} key(s) from .env`);
-        await loadAll();
-      } else {
-        showToast('Sync failed — check backend logs', 'err');
-      }
+      const data = await fetchWithAuth(`/platform/sync-from-env`, { method: 'POST' });
+      showToast(`✓ Synced ${data.synced} key(s) from .env`);
+      await loadAll();
     } catch {
       showToast('Backend not reachable', 'err');
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const handlePushToRender = async () => {
+    if (!window.confirm(
+      'Push all configured provider keys to Render PRODUCTION environment variables?\n\n' +
+      'This updates the live service and triggers a redeploy. It does NOT change your local .env or database.'
+    )) return;
+    setPushing(true);
+    try {
+      const data = await fetchWithAuth(`/platform/push-to-render`, {
+        method: 'POST', body: JSON.stringify({}),
+      });
+      showToast(`✓ Pushed ${data.count} key(s) to Render — service will redeploy`);
+    } catch (e: any) {
+      showToast(e?.message || 'Render push failed — nothing changed on Render', 'err');
+    } finally {
+      setPushing(false);
     }
   };
 
@@ -384,6 +498,15 @@ export default function AIPlatform() {
               <Download size={13} />
               {syncing ? 'Syncing…' : 'Sync from .env'}
             </button>
+            <button
+              onClick={handlePushToRender}
+              disabled={pushing}
+              style={{ padding: '8px 14px', background: pushing ? '#1A1A1A' : '#f59e0b15', border: '1px solid #f59e0b40', borderRadius: '8px', color: '#f59e0b', cursor: pushing ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 700, opacity: pushing ? 0.6 : 1 }}
+              title="Push configured keys to Render production env vars (asks for confirmation)"
+            >
+              <CloudDownload size={13} />
+              {pushing ? 'Pushing…' : 'Push to Render (production)'}
+            </button>
             <button onClick={loadAll} style={{ padding: '8px', background: 'none', border: '1px solid #2E2E2E', borderRadius: '8px', color: '#555', cursor: 'pointer', display: 'flex', alignItems: 'center' }} title="Refresh">
               <RefreshCw size={14} />
             </button>
@@ -422,16 +545,21 @@ export default function AIPlatform() {
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
             {catProviders.map(p => (
-              <ProviderCard
-                key={p.id}
-                provider={p}
-                catId={activeCategory}
-                catColor={cat.color}
-                saved={catKeys.find(k => k.provider === p.id)}
-                onSave={handleSave}
-                onDelete={handleDelete}
-                onActivate={handleActivate}
-              />
+              // LiveKit needs 3 fields (URL/key/secret) — dedicated card. Others use the generic card.
+              p.id === 'livekit' ? (
+                <LiveKitCard key={p.id} catColor={cat.color} showToast={showToast} />
+              ) : (
+                <ProviderCard
+                  key={p.id}
+                  provider={p}
+                  catId={activeCategory}
+                  catColor={cat.color}
+                  saved={catKeys.find(k => k.provider === p.id)}
+                  onSave={handleSave}
+                  onDelete={handleDelete}
+                  onActivate={handleActivate}
+                />
+              )
             ))}
           </div>
         )}
@@ -439,7 +567,7 @@ export default function AIPlatform() {
         {/* Info callout */}
         <div style={{ marginTop: '28px', padding: '16px 20px', background: '#111', border: '1px solid #1A1A1A', borderRadius: '12px', fontSize: '12px', color: '#555', lineHeight: 1.7 }}>
           <strong style={{ color: '#888', display: 'block', marginBottom: '6px' }}>🔑 Key Security</strong>
-          Keys are stored obfuscated in the local database. In production, use a secrets manager (e.g. AWS Secrets Manager, HashiCorp Vault) and set keys via environment variables. Keys are never returned in plain text — only masked previews are shown.
+          Keys are encrypted at rest with Fernet (AES-128-CBC + HMAC, keyed off the app secret) and mirrored into the local .env. Keys are never returned in plain text — only masked previews. The LiveKit API Secret is write-only: it signs room tokens, so it is never returned in any response, not even masked. Every add/update/delete is written to an audit log.
           <br /><br />
           <strong style={{ color: '#888' }}>⚠️ No Active Provider Warning</strong> — If an agent is configured to use a provider with no API key set, it will display "Add API key in Settings → AI Platform" and fall back to a demo response.
         </div>

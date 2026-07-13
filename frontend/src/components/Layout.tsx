@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import React, { useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { clearSession } from '../api/auth';
 
 // Agent setup pending — will be enabled later
 // To show the Agents nav item, set CLINIC_AGENT_NAV_ENABLED = true
@@ -177,11 +178,7 @@ export default function Layout() {
           </div>
           <button
             onClick={() => {
-              localStorage.removeItem('lifodial-authed');
-              localStorage.removeItem('lifodial-superadmin');
-              localStorage.removeItem('lifodial-tenant-id');
-              localStorage.removeItem('lifodial-email');
-              localStorage.removeItem('lifodial-clinic-name');
+              clearSession();
               navigate('/');
             }}
             className="flex items-center gap-2 w-full transition-colors"

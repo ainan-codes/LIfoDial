@@ -1,5 +1,6 @@
 import {
   Activity,
+  AlertTriangle,
   BookOpen,
   Brain,
   CheckCircle2,
@@ -9,8 +10,11 @@ import {
   Code2,
   Globe,
   Headphones,
+  History,
   LineChart,
+  Loader2,
   Mic,
+  Pause,
   Phone,
   Play,
   Send,
@@ -21,9 +25,10 @@ import {
   Wrench,
   X
 } from 'lucide-react';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
-import { API_URL } from '../../api/client';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import fetchWithAuth, { API_URL } from '../../api/client';
+import { getToken } from '../../api/auth';
 import TestAgentModal from '../../components/TestAgentModal';
 import { FIXTURE_AGENTS } from '../../fixtures/data';
 import VoiceLibrary from './VoiceLibrary';
@@ -34,6 +39,55 @@ const ACCENT = '#00D4AA';
 const BG = '#0a0a0a';
 const CARD_BG = '#0f0f0f';
 const BORDER = 'rgba(255,255,255,0.06)';
+
+// Human-friendly provider label for preview error messages (never Sarvam-only).
+const _PROVIDER_LABELS: Record<string, string> = {
+  sarvam: 'Sarvam AI', elevenlabs: 'ElevenLabs', openai_tts: 'OpenAI TTS',
+  cartesia: 'Cartesia', playht: 'PlayHT', azure_tts: 'Azure Neural',
+  deepgram_aura: 'Deepgram Aura',
+};
+const prettyProvider = (p?: string) => _PROVIDER_LABELS[p || ''] || (p ? p : 'Provider');
+
+// mm:ss formatter for the sample player timer.
+const fmtTime = (secs: number) => {
+  if (!isFinite(secs) || secs < 0) secs = 0;
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+};
+
+// Quick-inject prompt blocks. Each appends a real, production-quality
+// instruction block to the system prompt (previously these just appended their
+// own button label — a no-op bug). Kept provider-neutral so they work with any LLM.
+const PROMPT_SNIPPETS: { label: string; block: string }[] = [
+  { label: '+ Appointment booking', block:
+`## Appointment Booking
+When a caller wants to book, reschedule, or cancel an appointment:
+1. Ask for the patient's full name and phone number (confirm the number by reading it back).
+2. Ask which doctor or department, and their preferred day and time.
+3. Offer the nearest available slots; never invent availability you haven't been given.
+4. Read the final appointment details back to the caller and get an explicit "yes" before confirming.
+5. If no slot fits, offer to take a callback request rather than leaving the caller without a next step.` },
+  { label: '+ Clinic hours', block:
+`## Clinic Hours & Location
+- State opening hours clearly when asked, including which days the clinic is closed.
+- If the caller asks about a time outside working hours, tell them the next time the clinic is open.
+- Give the address and a nearby landmark if asked, and offer to send directions by SMS if that capability is enabled.` },
+  { label: '+ Doctor list', block:
+`## Doctors & Specialities
+- When asked "which doctors are available", list doctors by speciality, not all at once — ask what kind of problem the caller has first, then suggest the right speciality.
+- Do not give medical advice or diagnoses; route clinical questions to booking an appointment with the appropriate doctor.` },
+  { label: '+ Emergency redirect', block:
+`## Emergency Handling
+- If the caller describes a medical emergency (chest pain, difficulty breathing, severe bleeding, unconsciousness, stroke symptoms), STOP the normal flow immediately.
+- Tell them clearly to call emergency services / go to the nearest emergency room now, and offer to connect them to the clinic's emergency line if one is configured.
+- Never attempt to book a routine appointment for an emergency.` },
+  { label: '+ Language detection', block:
+`## Language
+- Detect the language the caller is speaking and respond in that same language for the rest of the call.
+- If the caller switches languages mid-call, switch with them.
+- Keep responses natural and conversational in the chosen language — do not mix languages within a single sentence unless the caller does.` },
+];
 
 // ── UI Components ────────────────────────────────────────────────────────────
 
@@ -49,12 +103,14 @@ const Helper = ({ children }: { children: React.ReactNode }) => (
   </div>
 );
 
-const Input = ({ value, onChange, placeholder, type = 'text', style }: any) => (
+const Input = ({ value, onChange, placeholder, type = 'text', style, min, max }: any) => (
   <input
     type={type}
     value={value ?? ''}
     onChange={e => onChange(e.target.value)}
     placeholder={placeholder}
+    min={min}
+    max={max}
     style={{
       width: '100%', padding: '10px 14px', borderRadius: '8px', background: '#1a1a1a',
       border: '1px solid rgba(255,255,255,0.1)', color: '#fff', fontSize: '13px', outline: 'none',
@@ -164,6 +220,99 @@ const TagInput = ({ tags, onChange, placeholder }: any) => {
   );
 };
 
+// ── Prompt version history (system_prompt / first_message) ──────────────────
+// Last 5 versions with one-click revert — see backend/routers/agents.py
+// GET/POST /agents/{id}/prompt-history[/{history_id}/revert].
+function PromptHistoryButton({ agentId, field, onReverted }: {
+  agentId: string; field: 'system_prompt' | 'first_message'; onReverted: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [reverting, setReverting] = useState<string | null>(null);
+  const [history, setHistory] = useState<{ id: string; value: string; created_at: string }[]>([]);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onOutside(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', onOutside);
+    return () => document.removeEventListener('mousedown', onOutside);
+  }, [open]);
+
+  const handleOpen = async () => {
+    setOpen(true);
+    setLoading(true);
+    try {
+      const data = await fetchWithAuth(`/agents/${agentId}/prompt-history?field=${field}`);
+      setHistory(Array.isArray(data) ? data : []);
+    } catch {
+      setHistory([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRevert = async (historyId: string) => {
+    setReverting(historyId);
+    try {
+      const data = await fetchWithAuth(`/agents/${agentId}/prompt-history/${historyId}/revert`, { method: 'POST' });
+      onReverted(data.value);
+      setOpen(false);
+    } catch {
+      alert('Failed to revert.');
+    } finally {
+      setReverting(null);
+    }
+  };
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <button
+        onClick={handleOpen}
+        style={{ background: 'none', border: `1px solid ${BORDER}`, borderRadius: '12px', padding: '4px 8px', fontSize: '11px', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}
+      >
+        <History size={11} /> History
+      </button>
+      {open && (
+        <div style={{
+          position: 'absolute', top: '28px', right: 0, zIndex: 60, width: '320px',
+          background: '#161616', border: `1px solid ${BORDER}`, borderRadius: '10px',
+          padding: '12px', boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+        }}>
+          <div style={{ fontSize: '11px', fontWeight: 700, color: 'rgba(255,255,255,0.45)', textTransform: 'uppercase', marginBottom: '8px' }}>
+            Last {history.length || 5} version{history.length === 1 ? '' : 's'}
+          </div>
+          {loading ? (
+            <div style={{ fontSize: '12px', color: '#666', padding: '6px 0' }}>Loading…</div>
+          ) : history.length === 0 ? (
+            <div style={{ fontSize: '12px', color: '#666', padding: '6px 0' }}>No earlier versions yet — edit and save to start building history.</div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '280px', overflowY: 'auto' }}>
+              {history.map(h => (
+                <div key={h.id} style={{ border: `1px solid ${BORDER}`, borderRadius: '8px', padding: '8px' }}>
+                  <div style={{ fontSize: '10px', color: '#666', marginBottom: '4px' }}>{new Date(h.created_at).toLocaleString()}</div>
+                  <div style={{ fontSize: '11px', color: '#ccc', marginBottom: '8px', whiteSpace: 'pre-wrap', maxHeight: '54px', overflow: 'hidden' }}>
+                    {h.value.slice(0, 160)}{h.value.length > 160 ? '…' : ''}
+                  </div>
+                  <button
+                    onClick={() => handleRevert(h.id)}
+                    disabled={reverting === h.id}
+                    style={{ fontSize: '11px', fontWeight: 600, background: 'rgba(0,212,170,0.1)', color: ACCENT, border: 'none', borderRadius: '6px', padding: '4px 10px', cursor: reverting === h.id ? 'not-allowed' : 'pointer', opacity: reverting === h.id ? 0.6 : 1 }}
+                  >
+                    {reverting === h.id ? 'Reverting…' : 'Revert to this'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Section Card Component ───────────────────────────────────────────────────
 
 const CollapsibleSection = ({ icon: Icon, title, summary, children }: any) => {
@@ -201,6 +350,52 @@ function EmbedSection({ agent, agentId, updateField }: { agent: any; agentId: st
   const [copied, setCopied] = React.useState(false);
   const [showGuide, setShowGuide] = React.useState(false);
   const [guidePlatform, setGuidePlatform] = React.useState('wordpress');
+  const [avatarState, setAvatarState] = React.useState<'idle' | 'uploading' | 'error'>('idle');
+  const [avatarError, setAvatarError] = React.useState('');
+  const avatarInputRef = React.useRef<HTMLInputElement>(null);
+
+  const handleAvatarPick = async (fileList: FileList | null) => {
+    const f = fileList?.[0];
+    if (!f) return;
+    setAvatarError('');
+    // Client-side guard mirrors the server-side validation (PNG/JPG/WebP, ≤8MB).
+    if (!['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(f.type)) {
+      setAvatarState('error'); setAvatarError('Use a PNG, JPG, or WebP image.'); return;
+    }
+    if (f.size > 8 * 1024 * 1024) {
+      setAvatarState('error'); setAvatarError('Image must be 8MB or smaller.'); return;
+    }
+    setAvatarState('uploading');
+    try {
+      const fd = new FormData();
+      fd.append('file', f);
+      // Bare fetch (not fetchWithAuth) so we don't force a JSON Content-Type on multipart.
+      const token = localStorage.getItem('lifodial-token');
+      const res = await fetch(`${API_URL}/agents/${agentId}/avatar`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: fd,
+      });
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || `Upload failed (${res.status})`); }
+      const data = await res.json();
+      updateField('avatar_url', data.avatar_url); // sync local state + persist
+      setAvatarState('idle');
+    } catch (e: any) {
+      setAvatarState('error'); setAvatarError(e?.message || 'Upload failed');
+    }
+  };
+
+  const handleAvatarRemove = async () => {
+    setAvatarState('uploading');
+    try {
+      const token = localStorage.getItem('lifodial-token');
+      await fetch(`${API_URL}/agents/${agentId}/avatar`, { method: 'DELETE', headers: token ? { Authorization: `Bearer ${token}` } : {} });
+      updateField('avatar_url', null);
+      setAvatarState('idle');
+    } catch {
+      setAvatarState('idle');
+    }
+  };
 
   // Derive API base from current browser origin for dynamic embed code generation.
   // In production the admin dashboard is served from the same domain as the API.
@@ -215,8 +410,7 @@ function EmbedSection({ agent, agentId, updateField }: { agent: any; agentId: st
   const embedCode = `<script\n  src="${apiBase}/widget.js"\n  data-agent-id="${agentId}"\n  data-position="${position}"\n  data-theme="${theme}"\n></script>`;
 
   React.useEffect(() => {
-    fetch(`${apiBase}/embed/${agentId}/analytics`)
-      .then(r => r.json())
+    fetchWithAuth(`/embed/${agentId}/analytics`)
       .then(setStats)
       .catch(() => {});
   }, [agentId]);
@@ -229,18 +423,65 @@ function EmbedSection({ agent, agentId, updateField }: { agent: any; agentId: st
   };
 
   const platforms: Record<string, { title: string; steps: React.ReactNode }> = {
+    react: {
+      title: 'React',
+      steps: (
+        <div style={{ fontSize: '13px', lineHeight: 1.8, color: 'rgba(255,255,255,0.7)' }}>
+          <b style={{ color: '#fff' }}>Create React App or Vite — same fix either way:</b><br />
+          1. Open <code style={{ color: color }}>public/index.html</code> (CRA) or <code style={{ color: color }}>index.html</code> (Vite) — the static HTML shell, <em>not</em> a <code style={{ color: color }}>.jsx</code>/<code style={{ color: color }}>.tsx</code> file.<br />
+          2. Paste the code just before <code style={{ color: color }}>&lt;/body&gt;</code>, as a sibling of <code style={{ color: color }}>&lt;div id="root"&gt;</code> (or <code style={{ color: color }}>#app</code> for Vite).<br /><br />
+          <b style={{ color: '#fff' }}>Why here and not inside a component:</b> React Router only re-renders what's inside your root div — it never touches the static shell around it, so a script tag placed here survives every client-side route change automatically. Put it inside a component instead (e.g. a shared <code style={{ color: color }}>Layout.tsx</code>) and it can re-execute every time that component remounts, which is exactly the double-load bug this widget guards against — but placing it in the HTML shell avoids the question entirely.
+        </div>
+      ),
+    },
+    nextjs: {
+      title: 'Next.js',
+      steps: (
+        <div style={{ fontSize: '13px', lineHeight: 1.8, color: 'rgba(255,255,255,0.7)' }}>
+          <b style={{ color: '#fff' }}>App Router — <code style={{ color: color }}>app/layout.tsx</code>:</b><br />
+          1. Import <code style={{ color: color }}>Script</code> from <code style={{ color: color }}>next/script</code> at the top of your root layout.<br />
+          2. Render it inside <code style={{ color: color }}>&lt;body&gt;</code>, alongside <code style={{ color: color }}>{'{children}'}</code>:
+          <pre style={{ background: '#0a0a0a', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '8px', padding: '12px', margin: '8px 0', fontSize: '12px', color: '#ccc', overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+{`import Script from 'next/script'
+
+<Script
+  src="${apiBase}/widget.js"
+  data-agent-id="${agentId}"
+  strategy="afterInteractive"
+/>`}
+          </pre>
+          <b style={{ color: '#fff' }}>Pages Router — <code style={{ color: color }}>pages/_app.tsx</code>:</b><br />
+          Same <code style={{ color: color }}>next/script</code> import, rendered once around <code style={{ color: color }}>&lt;Component {'{...pageProps}'} /&gt;</code>.<br /><br />
+          Either way, put it in the <em>root</em> layout/app file, not an individual page — that's what makes it persist across navigation. <code style={{ color: color }}>next/script</code> also dedupes by <code style={{ color: color }}>src</code> on its own, on top of the widget's own duplicate-load guard.
+        </div>
+      ),
+    },
     wordpress: {
       title: 'WordPress',
       steps: (
         <div style={{ fontSize: '13px', lineHeight: 1.8, color: 'rgba(255,255,255,0.7)' }}>
+          Most themes strip raw <code style={{ color: color }}>&lt;script&gt;</code> tags pasted directly into post/page content — use one of these instead:<br /><br />
           <b style={{ color: '#fff' }}>Option A — Theme Editor:</b><br />
           1. Go to <em>Appearance → Theme File Editor</em><br />
           2. Choose <code style={{ color: color }}>footer.php</code><br />
           3. Paste the code just before <code style={{ color: color }}>&lt;/body&gt;</code><br /><br />
-          <b style={{ color: '#fff' }}>Option B — Plugin (easier):</b><br />
-          1. Install "WP Headers and Footers" plugin<br />
+          <b style={{ color: '#fff' }}>Option B — Plugin (easier, survives theme updates):</b><br />
+          1. Install "WP Headers and Footers" (or "Insert Headers and Footers")<br />
           2. Go to <em>Settings → WP Headers and Footers</em><br />
-          3. Paste code in the Footer Scripts box
+          3. Paste the code in the Footer Scripts box
+        </div>
+      ),
+    },
+    shopify: {
+      title: 'Shopify',
+      steps: (
+        <div style={{ fontSize: '13px', lineHeight: 1.8, color: 'rgba(255,255,255,0.7)' }}>
+          Shopify blocks script injection through the storefront editor's content areas — <code style={{ color: color }}>theme.liquid</code> (or an app embed block) is the only reliable path:<br /><br />
+          1. <em>Online Store → Themes → Edit Code</em><br />
+          2. Open <code style={{ color: color }}>layout/theme.liquid</code><br />
+          3. Paste the code just before <code style={{ color: color }}>&lt;/body&gt;</code><br />
+          4. Click <b style={{ color: '#fff' }}>Save</b><br /><br />
+          If your theme is managed by an agency and direct code edits get overwritten on theme updates, ask them to add it as an <b style={{ color: '#fff' }}>app embed block</b> instead — same script tag, just delivered through the Theme App Extension so it survives theme changes.
         </div>
       ),
     },
@@ -264,17 +505,6 @@ function EmbedSection({ agent, agentId, updateField }: { agent: any; agentId: st
           1. Go to <em>Pages → Website Tools → Code Injection</em><br />
           2. Paste the code in the <b style={{ color: '#fff' }}>Footer</b> section<br />
           3. Click <b style={{ color: '#fff' }}>Save</b>
-        </div>
-      ),
-    },
-    shopify: {
-      title: 'Shopify',
-      steps: (
-        <div style={{ fontSize: '13px', lineHeight: 1.8, color: 'rgba(255,255,255,0.7)' }}>
-          1. <em>Online Store → Themes → Edit Code</em><br />
-          2. Open <code style={{ color: color }}>theme.liquid</code><br />
-          3. Paste the code just before <code style={{ color: color }}>&lt;/body&gt;</code><br />
-          4. Click <b style={{ color: '#fff' }}>Save file</b>
         </div>
       ),
     },
@@ -325,6 +555,36 @@ function EmbedSection({ agent, agentId, updateField }: { agent: any; agentId: st
             <Toggle checked={agent.embed_enabled !== false && agent.embed_enabled !== 0} onChange={(v: any) => updateField('embed_enabled', v ? 1 : 0)} label="" />
           </div>
 
+          {/* Avatar — per-agent widget image */}
+          <div>
+            <div style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '16px', fontWeight: 600 }}>Widget Avatar</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+              <div style={{ width: '56px', height: '56px', borderRadius: '50%', overflow: 'hidden', background: 'rgba(255,255,255,0.05)', border: `1px solid rgba(255,255,255,0.1)`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                {agent.avatar_url
+                  ? <img src={agent.avatar_url} alt="Agent avatar" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  : <Headphones size={22} color={ACCENT} />}
+              </div>
+              <div style={{ flex: 1 }}>
+                <input ref={avatarInputRef} type="file" accept="image/png,image/jpeg,image/webp" style={{ display: 'none' }} onChange={e => handleAvatarPick(e.target.files)} />
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button onClick={() => avatarInputRef.current?.click()} disabled={avatarState === 'uploading'}
+                    style={{ padding: '8px 14px', borderRadius: '8px', border: `1px solid rgba(255,255,255,0.15)`, background: 'rgba(255,255,255,0.06)', color: '#fff', fontSize: '13px', fontWeight: 500, cursor: 'pointer' }}>
+                    {avatarState === 'uploading' ? 'Uploading…' : agent.avatar_url ? 'Replace image' : 'Upload image'}
+                  </button>
+                  {agent.avatar_url && (
+                    <button onClick={handleAvatarRemove} disabled={avatarState === 'uploading'}
+                      style={{ padding: '8px 14px', borderRadius: '8px', border: `1px solid rgba(255,255,255,0.12)`, background: 'transparent', color: 'rgba(255,255,255,0.6)', fontSize: '13px', cursor: 'pointer' }}>
+                      Remove
+                    </button>
+                  )}
+                </div>
+                <div style={{ fontSize: '11px', color: avatarState === 'error' ? '#EF4444' : 'rgba(255,255,255,0.4)', marginTop: '8px' }}>
+                  {avatarState === 'error' ? avatarError : 'PNG, JPG, or WebP · max 8MB · automatically optimized to a fast 256×256 image · shown in the widget launcher & header. Falls back to the default icon if unset.'}
+                </div>
+              </div>
+            </div>
+          </div>
+
           {/* Appearance */}
           <div>
             <div style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '16px', fontWeight: 600 }}>Appearance</div>
@@ -366,6 +626,34 @@ function EmbedSection({ agent, agentId, updateField }: { agent: any; agentId: st
                 </div>
               </div>
               <div>
+                <Label>Display Mode</Label>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '6px' }}>
+                  {[
+                    { id: 'button', name: 'Button with label', desc: 'Icon + button text (default).' },
+                    { id: 'icon', name: 'Icon only', desc: 'Just the launcher icon — minimal footprint, no text.' },
+                    { id: 'auto-invite', name: 'Auto-invite', desc: 'Panel auto-opens after a delay to invite the visitor. Does NOT start audio or ask for the mic — the visitor still taps to talk.' },
+                  ].map(m => (
+                    <label key={m.id} style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', fontSize: '13px', color: '#fff', cursor: 'pointer' }}>
+                      <input type="radio" checked={(agent.embed_display_mode || 'button') === m.id}
+                        onChange={() => updateField('embed_display_mode', m.id)} style={{ accentColor: ACCENT, marginTop: '2px' }} />
+                      <span>
+                        <span style={{ fontWeight: 600 }}>{m.name}</span>
+                        <span style={{ display: 'block', fontSize: '11px', color: 'rgba(255,255,255,0.45)' }}>{m.desc}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+                {(agent.embed_display_mode === 'auto-invite') && (
+                  <div style={{ marginTop: '10px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <Label>Auto-invite delay (seconds)</Label>
+                    <input type="number" min={1} max={60}
+                      value={agent.embed_auto_invite_delay ?? 3}
+                      onChange={e => updateField('embed_auto_invite_delay', Math.max(1, Math.min(60, parseInt(e.target.value) || 3)))}
+                      style={{ width: '64px', background: 'rgba(255,255,255,0.04)', border: `1px solid ${BORDER}`, borderRadius: '8px', padding: '6px 8px', color: '#fff', fontSize: '13px' }} />
+                  </div>
+                )}
+              </div>
+              <div>
                 <Label>Show Lifosys Branding</Label>
                 <Toggle checked={agent.embed_show_branding !== false && agent.embed_show_branding !== 0} onChange={(v: any) => updateField('embed_show_branding', v ? 1 : 0)} label="Powered by Lifosys" />
               </div>
@@ -387,15 +675,32 @@ function EmbedSection({ agent, agentId, updateField }: { agent: any; agentId: st
             <Helper>One domain per line. Leave empty to allow all domains (not recommended in production).</Helper>
           </div>
 
-          {/* Live Preview */}
-          <div>
-            <div style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '12px', fontWeight: 600 }}>Live Preview</div>
-            <iframe
-              src={`${apiBase}/embed/${agentId}/preview`}
-              style={{ width: '100%', height: '280px', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '12px', background: '#0a0a0a' }}
-              title="Widget Preview"
-            />
-          </div>
+          {/* Live Preview — reflects UNSAVED appearance + display mode in real time.
+              The form values are forwarded to the preview page as query params,
+              which it maps to the widget's data-* attributes. `key` forces the
+              iframe to reload whenever any of these change. */}
+          {(() => {
+            const previewParams = new URLSearchParams({
+              style: agent.embed_display_mode || 'button',
+              theme: agent.embed_theme || 'dark',
+              position: agent.embed_position || 'bottom-right',
+              color: agent.embed_primary_color || '#3ECF8E',
+              label: agent.embed_button_text || 'Talk to Receptionist',
+              delay: String(agent.embed_auto_invite_delay ?? 3),
+            }).toString();
+            const previewSrc = `${apiBase}/embed/${agentId}/preview?${previewParams}`;
+            return (
+              <div>
+                <div style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '12px', fontWeight: 600 }}>Live Preview</div>
+                <iframe
+                  key={previewSrc}
+                  src={previewSrc}
+                  style={{ width: '100%', height: '280px', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '12px', background: '#0a0a0a' }}
+                  title="Widget Preview"
+                />
+              </div>
+            );
+          })()}
 
           {/* Embed Code */}
           <div>
@@ -549,6 +854,29 @@ data-theme="light"            → Use light background
 data-language="ta-IN"         → Force Tamil language`}
                 </pre>
               </div>
+
+              {/* Step 6 — CSP */}
+              <div>
+                <div style={{ fontSize: '12px', color: ACCENT, fontWeight: 700, marginBottom: '8px' }}>STEP 6 — Nothing showing up? Check your CSP</div>
+                <p style={{ fontSize: '13px', color: 'rgba(255,255,255,0.6)', marginBottom: '12px' }}>
+                  Many WordPress security plugins and enterprise sites ship a strict <code style={{ color: ACCENT }}>Content-Security-Policy</code> that blocks third-party widgets with <em>no visible error</em> on the page — only a CSP violation in the browser console. If the button never appears, hand this to whoever manages the site's security headers:
+                </p>
+                <pre style={{ background: '#080808', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '10px', padding: '14px 16px', fontSize: '12px', color: '#ccc', fontFamily: 'monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: 0 }}>
+{(() => {
+  const origin = (() => { try { return new URL(apiBase).origin; } catch { return apiBase; } })();
+  const wsOrigin = origin.replace(/^http/, 'ws');
+  return `script-src ${origin};
+connect-src ${origin} ${wsOrigin};
+style-src 'unsafe-inline';`;
+})()}
+                </pre>
+                <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.45)', marginTop: '10px', lineHeight: 1.7 }}>
+                  <b style={{ color: 'rgba(255,255,255,0.7)' }}>script-src</b> — loads widget.js itself.<br />
+                  <b style={{ color: 'rgba(255,255,255,0.7)' }}>connect-src</b> — the widget's chat/config requests (<code style={{ color: ACCENT }}>https</code>) and its live voice call (<code style={{ color: ACCENT }}>wss</code>) both count as "connect," not "frame" — the widget never uses an iframe, so <code style={{ color: ACCENT }}>frame-src</code> isn't needed.<br />
+                  <b style={{ color: 'rgba(255,255,255,0.7)' }}>style-src 'unsafe-inline'</b> — the widget injects its own <code style={{ color: ACCENT }}>&lt;style&gt;</code> tag at runtime to theme itself; without this the button and panel will render completely unstyled.<br /><br />
+                  Voice calls also need microphone access — if the site sets a <code style={{ color: ACCENT }}>Permissions-Policy</code> header that blocks <code style={{ color: ACCENT }}>microphone</code> site-wide, voice will fail even with CSP correctly configured. Chat is unaffected either way.
+                </p>
+              </div>
             </div>
           </div>
         </div>
@@ -574,6 +902,7 @@ function getLlmFallbackModels(provider: string): string[] {
 export default function AgentDetail() {
   const { agentId } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const [agent, setAgent] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -582,11 +911,40 @@ export default function AgentDetail() {
   const timerRef = useRef<any>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
+  // Play Sample player state machine (idle | loading | playing | error)
+  const [samplePlayer, setSamplePlayer] = useState<'idle' | 'loading' | 'playing' | 'error'>('idle');
+  const [sampleProgress, setSampleProgress] = useState(0); // 0..1 of duration
+  const [sampleDuration, setSampleDuration] = useState(0); // seconds
+  const [samplePosition, setSamplePosition] = useState(0); // seconds
+  const [sampleError, setSampleError] = useState<string | null>(null);
+  // Brief in-memory cache of the last synthesized sample, keyed by voice/settings,
+  // so replaying the same voice doesn't re-hit the provider. Invalidated on any
+  // change to voice/model/language/pitch/pace/etc via the cache key.
+  const sampleCacheRef = useRef<{ key: string; url: string } | null>(null);
+
+  // System prompt "Generate with LLM" state
+  const [generatingPrompt, setGeneratingPrompt] = useState(false);
+  const [generateError, setGenerateError] = useState<string | null>(null);
+  const [preGeneratePrompt, setPreGeneratePrompt] = useState<string | null>(null);
+  const [generateProviderUsed, setGenerateProviderUsed] = useState<string | null>(null);
+  const generateAbortRef = useRef<AbortController | null>(null);
+
+  // First message "Compose with AI" state
+  const [composingFirst, setComposingFirst] = useState(false);
+  const [composeError, setComposeError] = useState<string | null>(null);
+  const [preComposeFirst, setPreComposeFirst] = useState<string | null>(null);
+  const [composeProviderUsed, setComposeProviderUsed] = useState<string | null>(null);
+  const composeAbortRef = useRef<AbortController | null>(null);
+
   useEffect(() => {
     return () => {
       if (audioRef.current) {
         audioRef.current.pause();
         audioRef.current = null;
+      }
+      if (sampleCacheRef.current) {
+        URL.revokeObjectURL(sampleCacheRef.current.url);
+        sampleCacheRef.current = null;
       }
     };
   }, []);
@@ -658,6 +1016,24 @@ export default function AgentDetail() {
   const [ttsVoices, setTtsVoices] = useState<any[]>([]);
   const [sttModels, setSttModels] = useState<string[]>([]);
 
+  // Phase B — providers that actually have a key configured. The provider
+  // dropdowns show ONLY these (never a hardcoded catalog), and if the agent is
+  // currently assigned to a provider that's no longer configured we warn rather
+  // than silently keep a dead selection.
+  const [configuredProviders, setConfiguredProviders] = useState<Record<string, { id: string; display_name: string }[]>>({});
+  useEffect(() => {
+    fetchWithAuth('/platform/configured-providers').then(setConfiguredProviders).catch(() => {});
+  }, []);
+  const configuredIds = (cat: string) => (configuredProviders[cat] || []).map(p => p.id);
+  // Options = configured providers, plus the agent's current value if it's set
+  // (so the current selection is always visible even when its key was removed).
+  const providerOptions = (cat: string, current?: string) => {
+    const ids = configuredIds(cat);
+    return current && !ids.includes(current) ? [current, ...ids] : (ids.length ? ids : (current ? [current] : []));
+  };
+  const isDeadProvider = (cat: string, current?: string) =>
+    !!current && Object.keys(configuredProviders).length > 0 && !configuredIds(cat).includes(current);
+
   const toFallbackAgent = useCallback((id?: string) => {
     const found = FIXTURE_AGENTS.find(a => a.id === id) || FIXTURE_AGENTS[0];
     if (!found) return null;
@@ -705,12 +1081,7 @@ export default function AgentDetail() {
     const timeout = setTimeout(() => controller.abort(), 12000);
 
     try {
-      const res = await fetch(`${API_URL}/agents/${agentId}`, { signal: controller.signal });
-      if (!res.ok) {
-        throw new Error(`Failed to fetch agent (${res.status})`);
-      }
-
-      const data = await res.json();
+      const data = await fetchWithAuth(`/agents/${agentId}`, { signal: controller.signal });
       if (!data || typeof data !== 'object') {
         throw new Error('Invalid agent payload');
       }
@@ -736,13 +1107,41 @@ export default function AgentDetail() {
     loadAgent();
   }, [loadAgent]);
 
+  // ── Centralized landing behavior for EVERY navigation into this page ────────
+  // React Router reuses this component instance when only :agentId changes
+  // (same route, different param), so the scroll container's DOM node — and
+  // whatever tab the IntersectionObserver last saw — persists from the
+  // previous agent unless explicitly reset here. This is the single place
+  // that controls it; don't patch individual callers instead.
+  //
+  // Runs in a layout effect (before paint) so there's no visible flash of the
+  // old scroll position for a split second on navigation.
+  useLayoutEffect(() => {
+    setActiveTab('assistant');
+    if (scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTop = 0;
+    }
+  }, [agentId]);
+
+  // Deep-link support: a caller can request a specific tab via ?tab=<id>
+  // (e.g. a future "View Logs" link) to opt out of the assistant/top default
+  // above. Runs after the agent has loaded so the target section actually
+  // exists in the DOM to scroll to.
+  useEffect(() => {
+    if (loading || !agent) return;
+    const requested = new URLSearchParams(location.search).get('tab');
+    const validTabs: AgentTab[] = ['assistant', 'logs', 'tools', 'analysis', 'advanced'];
+    if (requested && (validTabs as string[]).includes(requested) && requested !== 'assistant') {
+      handleTabClick(requested as AgentTab);
+    }
+  }, [agentId, location.search, loading, agent]);
+
   // Fetch models when provider changes.
   // FIX: Only auto-reset model when the current model does NOT belong to the
   // newly selected provider — preserves the user's explicit model choice.
   useEffect(() => {
     if (!agent?.llm_provider) return;
-    fetch(`${API_URL}/platform/models/${agent.llm_provider}`)
-      .then(r => r.json())
+    fetchWithAuth(`/platform/models/${agent.llm_provider}`)
       .then(d => {
         const models = d.models?.length ? d.models : getLlmFallbackModels(agent.llm_provider);
         setLlmModels(models);
@@ -762,8 +1161,7 @@ export default function AgentDetail() {
 
   useEffect(() => {
     if (!agent?.tts_provider) return;
-    fetch(`${API_URL}/platform/models/${agent.tts_provider}?category=tts`)
-      .then(r => r.json())
+    fetchWithAuth(`/platform/models/${agent.tts_provider}?category=tts`)
       .then(d => {
         const models = d.models?.length ? d.models : ['bulbul:v3'];
         setTtsModels(models);
@@ -779,8 +1177,7 @@ export default function AgentDetail() {
     if (!agent?.tts_provider) return;
     // Pass model as a filter param so the dropdown only shows voices for the selected model
     const modelParam = agent.tts_model ? `?model=${encodeURIComponent(agent.tts_model)}` : '';
-    fetch(`${API_URL}/platform/tts/voices/${agent.tts_provider}${modelParam}`)
-      .then(r => r.json())
+    fetchWithAuth(`/platform/tts/voices/${agent.tts_provider}${modelParam}`)
       .then(d => {
         if (d.voices && Array.isArray(d.voices)) {
           const mapped = d.voices.map((v: any) => ({
@@ -798,8 +1195,7 @@ export default function AgentDetail() {
 
   useEffect(() => {
     if (!agent?.stt_provider) return;
-    fetch(`${API_URL}/platform/models/${agent.stt_provider}?category=stt`)
-      .then(r => r.json())
+    fetchWithAuth(`/platform/models/${agent.stt_provider}?category=stt`)
       .then(d => {
         const models = d.models?.length ? d.models : ['saarika:v2'];
         setSttModels(models);
@@ -821,13 +1217,11 @@ export default function AgentDetail() {
       timerRef.current = setTimeout(async () => {
         try {
           const payloadVal = (Array.isArray(val) || typeof val === 'object') ? JSON.stringify(val) : val;
-          const res = await fetch(`${API_URL}/agents/${agentId}`, {
+          await fetchWithAuth(`/agents/${agentId}`, {
             method: 'PATCH',
-            headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ [key]: payloadVal })
           });
-          if (res.ok) setSaveStatus('saved');
-          else setSaveStatus('error');
+          setSaveStatus('saved');
           setTimeout(() => setSaveStatus(null), 3000);
         } catch {
           setSaveStatus('error');
@@ -852,13 +1246,11 @@ export default function AgentDetail() {
               payload[k] = JSON.stringify(payload[k]);
             }
           });
-          const res = await fetch(`${API_URL}/agents/${agentId}`, {
+          await fetchWithAuth(`/agents/${agentId}`, {
             method: 'PATCH',
-            headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(payload)
           });
-          if (res.ok) setSaveStatus('saved');
-          else setSaveStatus('error');
+          setSaveStatus('saved');
           setTimeout(() => setSaveStatus(null), 3000);
         } catch {
           setSaveStatus('error');
@@ -867,6 +1259,175 @@ export default function AgentDetail() {
       return next;
     });
   }, [agentId]);
+
+  const handleGeneratePrompt = useCallback(async () => {
+    if (generatingPrompt) return; // debounce: ignore clicks while one is in flight
+    const originalPrompt = agent?.system_prompt ?? '';
+    setGenerateError(null);
+    setGenerateProviderUsed(null);
+    setPreGeneratePrompt(originalPrompt);
+    setGeneratingPrompt(true);
+
+    const controller = new AbortController();
+    generateAbortRef.current = controller;
+    let receivedAny = false;
+
+    try {
+      const token = getToken();
+      const response = await fetch(`${API_URL}/agents/${agentId}/generate-system-prompt`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        signal: controller.signal,
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Request failed (${response.status})`);
+      }
+
+      // Response is newline-delimited JSON events, streamed as they're generated.
+      updateField('system_prompt', '');
+      let buffer = '';
+      let liveText = '';
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let evt: any;
+          try {
+            evt = JSON.parse(line);
+          } catch {
+            continue;
+          }
+
+          if (evt.type === 'meta') {
+            setGenerateProviderUsed(evt.fallback_used ? `${evt.provider} (fallback)` : evt.provider);
+          } else if (evt.type === 'chunk') {
+            receivedAny = true;
+            liveText += evt.text;
+            updateField('system_prompt', liveText);
+          } else if (evt.type === 'error') {
+            throw new Error(evt.message || 'Generation failed');
+          }
+          // 'done' needs no action — loop just ends naturally.
+        }
+      }
+
+      if (!receivedAny || !liveText.trim()) {
+        // Never wipe the existing prompt on an empty/whitespace result.
+        updateField('system_prompt', originalPrompt);
+        throw new Error('The model returned an empty response. Please try again.');
+      }
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') {
+        setGenerateError(err?.message || 'Generation failed. Please try again.');
+        // Also restore on any failure (e.g. network drop mid-stream) so a
+        // partial/garbled generation never overwrites the admin's prior text
+        // unless at least a full, non-empty response streamed in.
+        if (!receivedAny) updateField('system_prompt', originalPrompt);
+      }
+    } finally {
+      setGeneratingPrompt(false);
+      generateAbortRef.current = null;
+    }
+  }, [agentId, agent?.system_prompt, generatingPrompt, updateField]);
+
+  const handleRestoreOriginalPrompt = useCallback(() => {
+    if (preGeneratePrompt === null) return;
+    updateField('system_prompt', preGeneratePrompt);
+    setPreGeneratePrompt(null);
+    setGenerateProviderUsed(null);
+  }, [preGeneratePrompt, updateField]);
+
+  // "Compose with AI" — streams a clinic-specific first greeting into the
+  // First Message textarea using the agent's OWN selected LLM. Mirrors the
+  // system-prompt generator: undo-able, never wipes on empty/error.
+  const handleComposeFirstMessage = useCallback(async () => {
+    if (composingFirst) return;
+    const original = agent?.first_message ?? '';
+    setComposeError(null);
+    setComposeProviderUsed(null);
+    setPreComposeFirst(original);
+    setComposingFirst(true);
+
+    const controller = new AbortController();
+    composeAbortRef.current = controller;
+    let receivedAny = false;
+
+    try {
+      const token = getToken();
+      const response = await fetch(`${API_URL}/agents/${agentId}/generate-first-message`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        signal: controller.signal,
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Request failed (${response.status})`);
+      }
+
+      updateField('first_message', '');
+      let buffer = '';
+      let liveText = '';
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let evt: any;
+          try { evt = JSON.parse(line); } catch { continue; }
+          if (evt.type === 'meta') {
+            setComposeProviderUsed(evt.fallback_used ? `${evt.provider} (fallback)` : evt.provider);
+          } else if (evt.type === 'chunk') {
+            receivedAny = true;
+            liveText += evt.text;
+            updateField('first_message', liveText.replace(/^["']|["']$/g, ''));
+          } else if (evt.type === 'error') {
+            throw new Error(evt.message || 'Generation failed');
+          }
+        }
+      }
+
+      if (!receivedAny || !liveText.trim()) {
+        updateField('first_message', original);
+        throw new Error('The model returned an empty response. Please try again.');
+      }
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') {
+        setComposeError(err?.message || 'Compose failed. Please try again.');
+        if (!receivedAny) updateField('first_message', original);
+      }
+    } finally {
+      setComposingFirst(false);
+      composeAbortRef.current = null;
+    }
+  }, [agentId, agent?.first_message, composingFirst, updateField]);
+
+  const handleRestoreFirstMessage = useCallback(() => {
+    if (preComposeFirst === null) return;
+    updateField('first_message', preComposeFirst);
+    setPreComposeFirst(null);
+    setComposeProviderUsed(null);
+  }, [preComposeFirst, updateField]);
 
   const saveAllManual = async () => {
     setSaveStatus('saving');
@@ -886,39 +1447,54 @@ export default function AgentDetail() {
          payload.tools_enabled = JSON.stringify(payload.tools_enabled);
       }
       
-      const res = await fetch(`${API_URL}/agents/${agentId}`, {
+      await fetchWithAuth(`/agents/${agentId}`, {
         method: 'PATCH',
-        headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(payload)
       });
-      if (res.ok) {
-        setSaveStatus('saved');
-        // also fetch refreshed value
-        fetch(`${API_URL}/agents/${agentId}`).then(r => r.json()).then(setAgent);
-      } else {
-        setSaveStatus('error');
-      }
+      setSaveStatus('saved');
+      // also fetch refreshed value
+      fetchWithAuth(`/agents/${agentId}`).then(setAgent);
     } catch {
       setSaveStatus('error');
     }
   };
 
+  // Stop playback and return the Play Sample control to a true idle state.
   const stopAudio = () => {
     if (audioRef.current) {
       audioRef.current.pause();
+      audioRef.current.onended = null;
+      audioRef.current.ontimeupdate = null;
+      audioRef.current.onloadedmetadata = null;
+      audioRef.current.onerror = null;
       audioRef.current = null;
+    }
+    setSamplePlayer('idle');
+    setSampleProgress(0);
+    setSamplePosition(0);
+  };
+
+  // Button handler: toggle between playing and idle.
+  const toggleSamplePlayback = () => {
+    if (samplePlayer === 'playing') {
+      stopAudio();
+    } else {
+      playTTSPreview();
     }
   };
 
   const playTTSPreview = async (overrideParams?: { provider?: string; voice_id?: string; model?: string; language?: string; text?: string }) => {
     stopAudio();
-    
+
     const prov = overrideParams?.provider || agent?.tts_provider || 'sarvam';
     const voice = overrideParams?.voice_id || agent?.tts_voice || 'meera';
     const mdl = overrideParams?.model || agent?.tts_model || '';
     const lang = overrideParams?.language || agent?.tts_language || 'hi-IN';
     const txt = overrideParams?.text || agent?.first_message || 'Hello! I am your AI receptionist. How can I help you today?';
-    
+
+    setSampleError(null);
+    setSamplePlayer('loading');
+
     try {
       const params = new URLSearchParams({
         provider: prov,
@@ -928,29 +1504,81 @@ export default function AgentDetail() {
         pitch: String(agent?.tts_pitch ?? 0),
         pace: String(agent?.tts_pace ?? 1),
         loudness: String(agent?.tts_loudness ?? 1),
+        input_preprocessing: String(agent?.tts_input_preprocessing !== 0 && agent?.tts_input_preprocessing !== false),
       });
       if (mdl) {
         params.append('model', mdl);
       }
-      
-      const res = await fetch(`${API_URL}/platform/tts/preview?${params.toString()}`);
-      if (res.ok) {
-        const audioBlob = await res.blob();
-        const audioUrl = URL.createObjectURL(audioBlob);
-        const audio = new Audio(audioUrl);
-        audioRef.current = audio;
-        audio.onended = () => {
-          URL.revokeObjectURL(audioUrl);
-          if (audioRef.current === audio) audioRef.current = null;
-        };
-        audio.onerror = () => {
-          URL.revokeObjectURL(audioUrl);
-          if (audioRef.current === audio) audioRef.current = null;
-        };
-        await audio.play();
+      if (prov !== 'sarvam') {
+        if (agent?.tts_stability != null) params.append('stability', String(agent.tts_stability));
+        if (agent?.tts_clarity != null) params.append('similarity_boost', String(agent.tts_clarity));
+        if (agent?.tts_style != null) params.append('style', String(agent.tts_style));
+        if (agent?.tts_use_speaker_boost != null) params.append('use_speaker_boost', String(agent.tts_use_speaker_boost === 1 || agent.tts_use_speaker_boost === true));
+        if (agent?.tts_speed != null) params.append('speed', String(agent.tts_speed));
       }
-    } catch(e) {
+
+      // Any change to voice/model/language/pitch/pace/etc changes this key,
+      // invalidating the cached sample as required.
+      const cacheKey = params.toString();
+      let audioUrl: string;
+      if (sampleCacheRef.current && sampleCacheRef.current.key === cacheKey) {
+        audioUrl = sampleCacheRef.current.url;
+      } else {
+        // Returns raw audio bytes (not JSON), so fetchWithAuth (which always parses
+        // the response as JSON) can't be used here — attach the bearer token manually.
+        const token = getToken();
+        const res = await fetch(`${API_URL}/platform/tts/preview?${cacheKey}`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (!res.ok) {
+          let detail = `Preview failed (HTTP ${res.status})`;
+          try {
+            const body = await res.json();
+            if (body?.detail) detail = String(body.detail);
+          } catch { /* non-JSON error body */ }
+          setSampleError(`${prettyProvider(prov)}: ${detail}`);
+          setSamplePlayer('error');
+          return;
+        }
+        const audioBlob = await res.blob();
+        if (!audioBlob.size) {
+          setSampleError(`${prettyProvider(prov)}: empty audio returned`);
+          setSamplePlayer('error');
+          return;
+        }
+        audioUrl = URL.createObjectURL(audioBlob);
+        // Replace any prior cached sample (revoke its object URL to avoid a leak).
+        if (sampleCacheRef.current) URL.revokeObjectURL(sampleCacheRef.current.url);
+        sampleCacheRef.current = { key: cacheKey, url: audioUrl };
+      }
+
+      const audio = new Audio(audioUrl);
+      audioRef.current = audio;
+      audio.onloadedmetadata = () => {
+        if (isFinite(audio.duration)) setSampleDuration(audio.duration);
+      };
+      audio.ontimeupdate = () => {
+        if (audioRef.current !== audio) return;
+        setSamplePosition(audio.currentTime);
+        if (audio.duration > 0) setSampleProgress(audio.currentTime / audio.duration);
+      };
+      audio.onended = () => {
+        if (audioRef.current === audio) audioRef.current = null;
+        setSamplePlayer('idle');
+        setSampleProgress(0);
+        setSamplePosition(0);
+      };
+      audio.onerror = () => {
+        if (audioRef.current === audio) audioRef.current = null;
+        setSampleError(`${prettyProvider(prov)}: audio playback failed`);
+        setSamplePlayer('error');
+      };
+      await audio.play();
+      setSamplePlayer('playing');
+    } catch (e: any) {
       console.error('Play preview failed', e);
+      setSampleError(`${prettyProvider(prov)}: ${e?.message || 'preview failed'}`);
+      setSamplePlayer('error');
     }
   };
 
@@ -988,11 +1616,10 @@ export default function AgentDetail() {
     const inputMsg = chatIn;
     setChatIn('');
     try {
-      const res = await fetch(`${API_URL}/agents/${agentId}/test`, {
-        method: 'POST', headers: {'Content-Type':'application/json'},
+      const data = await fetchWithAuth(`/agents/${agentId}/test`, {
+        method: 'POST',
         body: JSON.stringify({ message: inputMsg })
       });
-      const data = await res.json();
       setChatLog(p => [...p, {from:'agent', text: data.ai_response || 'Response received'}]);
     } catch(e) {
       setChatLog(p => [...p, {from:'agent', text: 'Error connecting to agent.'}]);
@@ -1131,16 +1758,24 @@ export default function AgentDetail() {
             <div ref={el => { sectionRefs.current.assistant = el; }} data-section="assistant">
             {/* 1. MODEL */}
             <CollapsibleSection icon={Brain} title="Model" summary={`${agent.llm_provider} · ${agent.llm_model}`}>
+              {isDeadProvider('llm', agent.llm_provider) && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '12px 14px', marginBottom: '16px', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', borderRadius: '10px' }}>
+                  <AlertTriangle size={16} color="#f59e0b" style={{ flexShrink: 0 }} />
+                  <span style={{ fontSize: '13px', color: '#f59e0b' }}>
+                    This agent uses <strong>{agent.llm_provider}</strong>, which is no longer configured in AI Platform. Add its key or pick a configured provider — calls will fall back until then.
+                  </span>
+                </div>
+              )}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                   <div>
                     <Label>Provider</Label>
-                    <Select value={agent.llm_provider} onChange={(v:any) => updateField('llm_provider', v)} options={['gemini', 'openai', 'anthropic', 'groq', 'deepseek', 'mistral']} />
+                    <Select value={agent.llm_provider} onChange={(v:any) => updateField('llm_provider', v)} options={providerOptions('llm', agent.llm_provider)} />
                   </div>
                   <div>
                     <Label>Model</Label>
                     <Select value={agent.llm_model} onChange={(v:any) => updateField('llm_model', v)} options={llmModels.length ? llmModels : [agent.llm_model || 'gemini-2.5-flash']} />
-                    <Helper>Models are auto-fetched from your API key. <span style={{color: ACCENT, cursor:'pointer', fontSize:'11px'}} onClick={() => { fetch(`${API_URL}/platform/providers/${agent.llm_provider}/fetch-models`, {method:'POST'}).then(r=>r.json()).then(d=>{if(d.models?.length) setLlmModels(d.models)}); }}>⟳ Refresh Models</span></Helper>
+                    <Helper>Models are auto-fetched from your API key. <span style={{color: ACCENT, cursor:'pointer', fontSize:'11px'}} onClick={() => { fetchWithAuth(`/platform/providers/${agent.llm_provider}/fetch-models`, {method:'POST'}).then(d=>{if(d.models?.length) setLlmModels(d.models)}); }}>⟳ Refresh Models</span></Helper>
                   </div>
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -1160,10 +1795,37 @@ export default function AgentDetail() {
                   <div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <Label>First Message</Label>
-                      <button style={{ background: 'none', border: `1px solid ${BORDER}`, borderRadius: '12px', padding: '4px 8px', fontSize: '11px', color: '#fff', cursor: 'pointer' }}>✨ Compose with AI</button>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        {preComposeFirst !== null && !composingFirst && (
+                          <span
+                            onClick={handleRestoreFirstMessage}
+                            style={{ fontSize: '11px', color: 'var(--text-muted, #888)', cursor: 'pointer', textDecoration: 'underline' }}
+                            title="Restore the message from before AI compose"
+                          >
+                            ↺ Undo
+                          </span>
+                        )}
+                        <PromptHistoryButton agentId={agentId!} field="first_message" onReverted={(v) => updateField('first_message', v)} />
+                        <button
+                          onClick={handleComposeFirstMessage}
+                          disabled={composingFirst}
+                          style={{ background: 'none', border: `1px solid ${BORDER}`, borderRadius: '12px', padding: '4px 8px', fontSize: '11px', color: '#fff', cursor: composingFirst ? 'not-allowed' : 'pointer', opacity: composingFirst ? 0.6 : 1, display: 'flex', alignItems: 'center', gap: '5px' }}
+                        >
+                          {composingFirst && <Loader2 size={11} style={{ animation: 'spin 0.8s linear infinite' }} />}
+                          {composingFirst ? 'Composing…' : '✨ Compose with AI'}
+                        </button>
+                      </div>
                     </div>
                     <Textarea value={agent.first_message} onChange={(v:any) => updateField('first_message', v)} />
-                    <Helper>{agent.first_message?.length || 0} characters</Helper>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <Helper>{agent.first_message?.length || 0} characters</Helper>
+                      {composeProviderUsed && !composingFirst && !composeError && (
+                        <span style={{ fontSize: '11px', color: 'var(--text-muted, #888)' }}>Generated using {composeProviderUsed}</span>
+                      )}
+                    </div>
+                    {composeError && (
+                      <div style={{ fontSize: '12px', color: '#ff6b6b', marginTop: '4px' }}>{composeError}</div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1171,20 +1833,76 @@ export default function AgentDetail() {
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
                   <Label>System Prompt</Label>
-                  <button style={{ background: 'none', border: `1px solid ${BORDER}`, borderRadius: '12px', padding: '4px 8px', fontSize: '11px', color: '#fff', cursor: 'pointer' }}>Generate with LLM</button>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    {preGeneratePrompt !== null && !generatingPrompt && (
+                      <span
+                        onClick={handleRestoreOriginalPrompt}
+                        style={{ fontSize: '11px', color: ACCENT, cursor: 'pointer', textDecoration: 'underline', marginRight: '2px' }}
+                      >
+                        Restore original
+                      </span>
+                    )}
+                    <PromptHistoryButton agentId={agentId!} field="system_prompt" onReverted={(v) => updateField('system_prompt', v)} />
+                    <button
+                      onClick={handleGeneratePrompt}
+                      disabled={generatingPrompt}
+                      style={{
+                        background: 'none', border: `1px solid ${BORDER}`, borderRadius: '12px', padding: '4px 8px',
+                        fontSize: '11px', color: '#fff', cursor: generatingPrompt ? 'not-allowed' : 'pointer',
+                        opacity: generatingPrompt ? 0.6 : 1, display: 'flex', alignItems: 'center', gap: '5px',
+                      }}
+                    >
+                      {generatingPrompt && (
+                        <span
+                          style={{
+                            width: '10px', height: '10px', borderRadius: '50%',
+                            border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff',
+                            display: 'inline-block', animation: 'lifodial-spin 0.7s linear infinite',
+                          }}
+                        />
+                      )}
+                      {generatingPrompt ? 'Generating…' : 'Generate with LLM'}
+                    </button>
+                  </div>
                 </div>
+                <style>{`@keyframes lifodial-spin { to { transform: rotate(360deg); } }`}</style>
                 <Textarea value={agent.system_prompt} onChange={(v:any) => updateField('system_prompt', v)} rows={12} mono />
+                {generateError && (
+                  <div style={{ marginTop: '6px', fontSize: '12px', color: '#ff6b6b', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <AlertTriangle size={13} /> {generateError}
+                  </div>
+                )}
+                {generateProviderUsed && !generatingPrompt && !generateError && (
+                  <Helper>Generated using {generateProviderUsed}.</Helper>
+                )}
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '12px' }}>
-                  {['+ Appointment booking', '+ Clinic hours', '+ Doctor list', '+ Emergency redirect', '+ Language detection'].map(chip => (
-                    <div key={chip} style={{ padding: '6px 12px', background: 'rgba(255,255,255,0.05)', border: `1px solid ${BORDER}`, borderRadius: '16px', fontSize: '12px', color: '#ccc', cursor: 'pointer' }} onClick={() => updateField('system_prompt', agent.system_prompt + '\n\n' + chip)}>{chip}</div>
+                  {PROMPT_SNIPPETS.map(s => (
+                    <div key={s.label} style={{ padding: '6px 12px', background: 'rgba(255,255,255,0.05)', border: `1px solid ${BORDER}`, borderRadius: '16px', fontSize: '12px', color: '#ccc', cursor: 'pointer' }}
+                      title={s.block.trim().slice(0, 90) + '…'}
+                      onClick={() => updateField('system_prompt', (agent.system_prompt || '').trimEnd() + '\n\n' + s.block)}>{s.label}</div>
                   ))}
                 </div>
               </div>
               
               <div style={{ width: '50%' }}>
                 <Label>Max Tokens</Label>
-                <Input type="number" value={agent.max_response_tokens} onChange={(v:any) => updateField('max_response_tokens', parseInt(v))} />
-                <Helper>Maximum response length per turn</Helper>
+                <Input
+                  type="number"
+                  min={50}
+                  max={2000}
+                  value={agent.max_response_tokens}
+                  onChange={(v: any) => {
+                    const n = parseInt(v);
+                    if (Number.isNaN(n)) return;
+                    updateField('max_response_tokens', Math.min(2000, Math.max(50, n)));
+                  }}
+                />
+                <Helper>Maximum response length per turn (50–2000)</Helper>
+                {agent.max_response_tokens < 200 && (
+                  <div style={{ marginTop: '6px', fontSize: '12px', color: '#ffb020', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <AlertTriangle size={13} /> Low token limit may cause truncated responses mid-sentence.
+                  </div>
+                )}
               </div>
             </CollapsibleSection>
 
@@ -1244,12 +1962,31 @@ export default function AgentDetail() {
                 </div>
               </div>
 
-              <div style={{ display: 'flex', alignItems: 'center', gap: '16px', padding: '12px 16px', background: 'rgba(255,255,255,0.03)', borderRadius: '12px', border: `1px solid ${BORDER}` }}>
-                <button onClick={() => playTTSPreview()} style={{ padding: '8px 16px', borderRadius: '8px', background: ACCENT, color: '#000', border: 'none', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}><Play size={14} fill="#000" /> Play Sample</button>
-                <div style={{ flex: 1, height: '4px', background: 'rgba(255,255,255,0.1)', borderRadius: '2px', position: 'relative' }}>
-                  <div style={{ position: 'absolute', top: 0, left: 0, height: '100%', width: '15%', background: ACCENT, borderRadius: '2px' }} />
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '12px 16px', background: 'rgba(255,255,255,0.03)', borderRadius: '12px', border: `1px solid ${BORDER}` }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                  <button
+                    onClick={toggleSamplePlayback}
+                    disabled={samplePlayer === 'loading'}
+                    style={{ padding: '8px 16px', borderRadius: '8px', background: ACCENT, color: '#000', border: 'none', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 600, cursor: samplePlayer === 'loading' ? 'default' : 'pointer', opacity: samplePlayer === 'loading' ? 0.7 : 1, minWidth: '150px', justifyContent: 'center' }}
+                  >
+                    {samplePlayer === 'loading' ? (
+                      <><Loader2 size={14} style={{ animation: 'spin 0.8s linear infinite' }} /> Synthesizing…</>
+                    ) : samplePlayer === 'playing' ? (
+                      <><Pause size={14} fill="#000" /> Stop</>
+                    ) : (
+                      <><Play size={14} fill="#000" /> Play Sample</>
+                    )}
+                  </button>
+                  <div style={{ flex: 1, height: '4px', background: 'rgba(255,255,255,0.1)', borderRadius: '2px', position: 'relative' }}>
+                    <div style={{ position: 'absolute', top: 0, left: 0, height: '100%', width: `${Math.round(sampleProgress * 100)}%`, background: ACCENT, borderRadius: '2px', transition: 'width 0.1s linear' }} />
+                  </div>
+                  <span style={{ fontSize: '12px', color: '#888', fontVariantNumeric: 'tabular-nums', minWidth: '72px', textAlign: 'right' }}>
+                    {fmtTime(samplePosition)} / {fmtTime(sampleDuration)}
+                  </span>
                 </div>
-                <span style={{ fontSize: '12px', color: '#888' }}>0:03</span>
+                {samplePlayer === 'error' && sampleError && (
+                  <span style={{ fontSize: '12px', color: '#ff6b6b' }}>{sampleError}</span>
+                )}
               </div>
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '32px 24px', marginTop: '8px' }}>
@@ -1268,17 +2005,22 @@ export default function AgentDetail() {
                     <Toggle checked={agent.tts_use_speaker_boost === 1} onChange={(v:any) => updateField('tts_use_speaker_boost', v ? 1 : 0)} label="Use Speaker Boost" />
                   </>
                 )}
-                <Slider value={agent.tts_speed} min={0.5} max={2.0} onChange={(v:any) => updateField('tts_speed', v)} leftLabel="0.5x Speed" rightLabel="2.0x Speed" />
+                {/* Redundant with the Sarvam-only Pace slider above (both control
+                    playback speed for that provider) — only shown for providers
+                    where tts_speed is the sole speed control. */}
+                {agent.tts_provider !== 'sarvam' && (
+                  <Slider value={agent.tts_speed} min={0.5} max={2.0} onChange={(v:any) => updateField('tts_speed', v)} leftLabel="0.5x Speed" rightLabel="2.0x Speed" />
+                )}
               </div>
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px', marginTop: '8px' }}>
-                <div>
+                <div style={{ opacity: 0.5 }}>
                   <Label>Optimize for Streaming Latency</Label>
-                  <Select value={agent.tts_optimize_streaming_latency} onChange={(v:any) => updateField('tts_optimize_streaming_latency', parseInt(v))} options={[0,1,2,3,4]} />
-                  <Helper>Higher = faster response, lower quality</Helper>
+                  <Select value={agent.tts_optimize_streaming_latency} onChange={() => {}} options={[0,1,2,3,4]} style={{ pointerEvents: 'none' }} />
+                  <Helper>Not supported by the currently-used Sarvam/ElevenLabs streaming integration — has no effect on calls.</Helper>
                 </div>
-                <div style={{ paddingTop: '16px' }}>
-                  <Toggle checked={agent.tts_filler_injection === 1} onChange={(v:any) => updateField('tts_filler_injection', v?1:0)} label="Filler Injection" helper="Adds 'mm-hmm', 'I see' during pauses" />
+                <div style={{ paddingTop: '16px', opacity: 0.5 }}>
+                  <Toggle checked={false} onChange={() => {}} label="Filler Injection" helper="Not yet implemented — has no effect on calls." />
                 </div>
               </div>
             </CollapsibleSection>
@@ -1307,8 +2049,15 @@ export default function AgentDetail() {
               </div>
               <div>
                 <Label>Fallback Transcribers</Label>
-                <button style={{ padding: '8px 12px', background: 'none', border: `1px solid ${BORDER}`, color: '#fff', borderRadius: '8px', fontSize: '13px', cursor: 'pointer' }}>+ Add Fallback</button>
-                <Helper>If primary transcriber fails, try these.</Helper>
+                <TagInput
+                  tags={Array.isArray(agent.fallback_transcribers) ? agent.fallback_transcribers : (agent.fallback_transcribers ? (typeof agent.fallback_transcribers === 'string' ? JSON.parse(agent.fallback_transcribers) : []) : [])}
+                  onChange={(t: any) => updateField('fallback_transcribers', JSON.stringify(t))}
+                  placeholder="Type a provider name (e.g. deepgram) and press enter..."
+                />
+                <Helper>
+                  Persisted, but not yet consulted by the live pipeline — the currently-running STT service isn't
+                  retried against a fallback provider on failure. Configuring this list documents intent for now.
+                </Helper>
               </div>
             </CollapsibleSection>
 
@@ -1321,7 +2070,12 @@ export default function AgentDetail() {
                   </div>
                 ))}
               </div>
-              
+              <Helper>
+                {agent.telephony_option === 'livekit'
+                  ? 'LiveKit is what actually carries every call today (web + browser test), regardless of this setting.'
+                  : `Exotel/Twilio/SIP selection is saved, but no telephony integration is wired to it yet — calls still route through LiveKit. Configure keys under AI Platform → Telephony before relying on ${agent.telephony_option || 'this provider'}.`}
+              </Helper>
+
               <div style={{ marginTop: '8px' }}>
                 {agent.telephony_option === 'exotel' && (
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
@@ -1402,22 +2156,29 @@ export default function AgentDetail() {
             <CollapsibleSection icon={Wrench} title="Tools" summary={`${Array.isArray(agent.tools_enabled) ? agent.tools_enabled.length : (agent.tools_enabled && typeof agent.tools_enabled === 'string' ? JSON.parse(agent.tools_enabled).length : 0)} tools enabled`}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                 {[
-                  { id: 'appt_booking', name: '🗓️ Appointment Booking', desc: 'Connect to HIS to check availability & book.' },
-                  { id: 'transfer_call', name: '📞 Transfer Call', desc: 'Transfer to human agent.' },
-                  { id: 'sms', name: '📱 Send SMS', desc: 'Send appointment confirmation.' },
-                  { id: 'status', name: '🔍 Check Appt Status', desc: 'Patients can check existing.' },
-                  { id: 'cancel', name: '❌ Cancel Appointment', desc: 'Patients can cancel.' },
+                  { id: 'appt_booking', name: '🗓️ Appointment Booking', desc: 'Connect to HIS to check availability & book.', dbField: 'can_book_appointments' },
+                  { id: 'transfer_call', name: '📞 Transfer Call', desc: 'Transfer to human agent. (Not yet available — no telephony transfer integration configured.)' },
+                  { id: 'sms', name: '📱 Send SMS', desc: 'Send appointment confirmation. (Not yet available — no SMS provider configured.)' },
+                  { id: 'status', name: '🔍 Check Appt Status', desc: 'Patients can check existing.', dbField: 'can_check_availability' },
+                  { id: 'cancel', name: '❌ Cancel Appointment', desc: 'Patients can cancel.', dbField: 'can_cancel_appointments' },
                   { id: 'doctors', name: '🩺 Doctor Information', desc: 'Answer questions about doctors.' },
                   { id: 'hours', name: '⏰ Clinic Hours', desc: 'Tell patients about hours.' },
-                  { id: 'emergency', name: '🚨 Emergency Redirect', desc: 'Detect emergencies & redirect.' }
+                  { id: 'emergency', name: '🚨 Emergency Redirect', desc: 'Detect emergencies & speak the emergency number. (Announcement only — no live call transfer yet.)', dbField: 'can_transfer_emergency' }
                 ].map(t => {
                   const enabledTools = Array.isArray(agent.tools_enabled) ? agent.tools_enabled : (agent.tools_enabled && typeof agent.tools_enabled === 'string' ? JSON.parse(agent.tools_enabled) : []);
-                  const isEnabled = enabledTools.includes(t.id);
+                  // Tools backed by a real AgentConfig column (dbField) are gated by
+                  // that column at call time — read/write it directly instead of the
+                  // flat tools_enabled list, which nothing in the pipeline reads.
+                  const isEnabled = t.dbField ? (agent[t.dbField] ?? true) : enabledTools.includes(t.id);
                   return (
                     <div key={t.id} style={{ background: 'rgba(255,255,255,0.02)', border: `1px solid ${BORDER}`, borderRadius: '12px', padding: '16px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                         <span style={{ fontSize: '14px', fontWeight: 600, color: '#fff' }}>{t.name}</span>
                         <Toggle checked={isEnabled} onChange={(on:any) => {
+                          if (t.dbField) {
+                            updateField(t.dbField, on);
+                            return;
+                          }
                           const newer = on ? [...enabledTools, t.id] : enabledTools.filter((x:any) => x !== t.id);
                           updateField('tools_enabled', JSON.stringify(newer));
                         }} label="" />

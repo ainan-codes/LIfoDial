@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
-import { WS_URL } from '../api/client';
+import { wsUrlWithAuth } from '../api/client';
 
 interface Booking {
   id: string;
   patient_phone: string;
   patient_name?: string;
   phone?: string;
-  doctor: string;
+  clinic_name?: string;
+  doctor?: string;
   slot_time: string;
 }
 
@@ -22,7 +23,7 @@ export function useRealtimeDashboard(tenantId: string) {
     if (!tenantId) return;
 
     function connect() {
-      const ws = new WebSocket(`${WS_URL}/ws/calls/${tenantId}`);
+      const ws = new WebSocket(wsUrlWithAuth(`/ws/calls/${tenantId}`));
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -37,6 +38,9 @@ export function useRealtimeDashboard(tenantId: string) {
             case 'connected':
               setLiveCallCount(data.active_calls || 0);
               setAgentStatus('online');
+              break;
+            case 'call.active_count':
+              setLiveCallCount(data.active_calls || 0);
               break;
             case 'call.started':
               setLiveCallCount((c) => c + 1);

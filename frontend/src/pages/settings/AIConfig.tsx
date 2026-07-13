@@ -10,7 +10,7 @@ import {
   Activity, ChevronRight, Save, Mic, RefreshCw, Loader,
   Edit3, Check, ExternalLink,
 } from 'lucide-react';
-import { API_URL } from '../../api/client';
+import fetchWithAuth from '../../api/client';
 import VoiceBrowserModal from '../../components/VoiceBrowserModal';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -55,9 +55,7 @@ const LOCAL_KEY = 'lifodial_ai_config_v2';
 
 async function fetchModels(provider: string, category: string): Promise<string[]> {
   try {
-    const res = await fetch(`${API_URL}/platform/models/${provider}?category=${category}`);
-    if (!res.ok) return [];
-    const data = await res.json();
+    const data = await fetchWithAuth(`/platform/models/${provider}?category=${category}`);
     return data.models || [];
   } catch {
     return [];
@@ -66,9 +64,7 @@ async function fetchModels(provider: string, category: string): Promise<string[]
 
 async function triggerFetchModels(provider: string): Promise<string[]> {
   try {
-    const res = await fetch(`${API_URL}/platform/providers/${provider}/fetch-models`, { method: 'POST' });
-    if (!res.ok) return [];
-    const data = await res.json();
+    const data = await fetchWithAuth(`/platform/providers/${provider}/fetch-models`, { method: 'POST' });
     return data.models || [];
   } catch {
     return [];
@@ -517,12 +513,11 @@ export default function AIConfig() {
     if (!key) return;
     setKeyStatus(p => ({ ...p, [providerId]: 'testing' }));
     try {
-      const res = await fetch(`${API_URL}/platform/providers/${providerId}/fetch-models`, {
+      await fetchWithAuth(`/platform/providers/${providerId}/fetch-models`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ api_key: key }),
       });
-      setKeyStatus(p => ({ ...p, [providerId]: res.ok ? 'ok' : 'fail' }));
+      setKeyStatus(p => ({ ...p, [providerId]: 'ok' }));
     } catch {
       setKeyStatus(p => ({ ...p, [providerId]: 'fail' }));
     }
@@ -541,9 +536,8 @@ export default function AIConfig() {
     const keyPushes = Object.entries(keys).filter(([, v]) => v.trim()).map(async ([pid, val]) => {
       const meta = PROVIDER_META[pid];
       if (!meta) return;
-      await fetch(`${API_URL}/platform/keys`, {
+      await fetchWithAuth('/platform/keys', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider: pid, category: meta.category, api_key: val, is_active: true }),
       }).catch(() => {});
     });

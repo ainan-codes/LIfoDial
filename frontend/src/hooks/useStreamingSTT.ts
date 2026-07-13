@@ -4,6 +4,7 @@
  * WebSocket-based with auto-reconnection and error handling
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { wsUrlWithAuth } from '../api/client';
 
 interface STTMessage {
   type: 'speech_start' | 'speech_end' | 'transcript' | 'translation' | 'error' | 'ready' | 'pong';
@@ -52,8 +53,7 @@ export function useStreamingSTT(options: UseStreamingSTTOptions) {
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/streaming-stt/${tenantId}/${agentId}`;
+    const wsUrl = wsUrlWithAuth(`/ws/streaming-stt/${tenantId}/${agentId}`);
 
     try {
       wsRef.current = new WebSocket(wsUrl);

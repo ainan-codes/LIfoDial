@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 from typing import Optional
 
+from backend.auth import CurrentUser
 from backend.db import AsyncSessionLocal
 from backend.models.knowledge_base import KnowledgeBase
 
@@ -32,7 +33,8 @@ class KBEntry(BaseModel):
 
 # ── GET /tenants/{tenant_id}/kb ───────────────────────────────────────────────
 @router.get("/tenants/{tenant_id}/kb")
-async def list_kb(tenant_id: str, db: AsyncSession = Depends(get_db)):
+async def list_kb(tenant_id: str, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(tenant_id)
     try:
         result = await db.execute(
             select(KnowledgeBase)
@@ -61,7 +63,8 @@ async def list_kb(tenant_id: str, db: AsyncSession = Depends(get_db)):
 
 # ── POST /tenants/{tenant_id}/kb ─────────────────────────────────────────────────
 @router.post("/tenants/{tenant_id}/kb", status_code=201)
-async def create_kb_entry(tenant_id: str, data: KBEntry, db: AsyncSession = Depends(get_db)):
+async def create_kb_entry(tenant_id: str, data: KBEntry, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(tenant_id)
     try:
         entry = KnowledgeBase(
             id=str(uuid.uuid4()),
@@ -83,7 +86,8 @@ async def create_kb_entry(tenant_id: str, data: KBEntry, db: AsyncSession = Depe
 
 # ── PATCH /tenants/{tenant_id}/kb/{entry_id} ─────────────────────────────────
 @router.patch("/tenants/{tenant_id}/kb/{entry_id}")
-async def update_kb_entry(tenant_id: str, entry_id: str, data: KBEntry, db: AsyncSession = Depends(get_db)):
+async def update_kb_entry(tenant_id: str, entry_id: str, data: KBEntry, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(tenant_id)
     try:
         result = await db.execute(
             select(KnowledgeBase).where(
@@ -111,7 +115,8 @@ async def update_kb_entry(tenant_id: str, entry_id: str, data: KBEntry, db: Asyn
 
 # ── DELETE /tenants/{tenant_id}/kb/{entry_id} ────────────────────────────────
 @router.delete("/tenants/{tenant_id}/kb/{entry_id}", status_code=204)
-async def delete_kb_entry(tenant_id: str, entry_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_kb_entry(tenant_id: str, entry_id: str, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(tenant_id)
     try:
         result = await db.execute(
             select(KnowledgeBase).where(

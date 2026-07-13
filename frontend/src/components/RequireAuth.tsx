@@ -1,16 +1,16 @@
 import React from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
+import { isAuthenticated as hasValidToken, clearSession } from '../api/auth';
 
 /**
- * Wraps protected routes.
- * Checks localStorage for 'lifodial-authed' === 'true'.
- * Redirects to /login with ?from= if not authenticated.
+ * Wraps protected routes. Requires a valid (present, unexpired) session token.
+ * This is a UX gate only — the backend independently verifies the token on
+ * every API call, so tampering with client state grants no data access.
  */
 export function RequireAuth({ children }: { children: React.ReactNode }) {
   const location = useLocation();
-  const isAuthed = localStorage.getItem('lifodial-authed') === 'true';
 
-  if (!isAuthed) {
+  if (!hasValidToken()) {
     return <Navigate to="/login" state={{ from: location }} replace />;
   }
 
@@ -18,13 +18,9 @@ export function RequireAuth({ children }: { children: React.ReactNode }) {
 }
 
 export function isAuthenticated(): boolean {
-  return localStorage.getItem('lifodial-authed') === 'true';
+  return hasValidToken();
 }
 
 export function signOut(): void {
-  localStorage.removeItem('lifodial-authed');
-  localStorage.removeItem('lifodial-superadmin');
-  localStorage.removeItem('lifodial-tenant-id');
-  localStorage.removeItem('lifodial-email');
-  localStorage.removeItem('lifodial-clinic-name');
+  clearSession();
 }

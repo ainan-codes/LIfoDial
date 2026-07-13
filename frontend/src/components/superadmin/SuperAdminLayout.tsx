@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import React, { useState } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { clearSession } from '../../api/auth';
 import { ToastContainer } from './SAShared';
 
 const SA_NAV = [
@@ -62,11 +63,7 @@ export default function SuperAdminLayout() {
   const crumbs = useBreadcrumbs();
 
   const handleLogout = () => {
-    localStorage.removeItem('lifodial-authed');
-    localStorage.removeItem('lifodial-superadmin');
-    localStorage.removeItem('lifodial-tenant-id');
-    localStorage.removeItem('lifodial-email');
-    localStorage.removeItem('lifodial-clinic-name');
+    clearSession();
     navigate('/');
   };
 

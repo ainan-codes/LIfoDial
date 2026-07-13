@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { CalendarCheck, Search, Filter, Clock, User, Building2, Stethoscope, Phone } from 'lucide-react';
 import { EmptyState, StatusBadge } from '../../components/superadmin/SAShared';
-import { API_URL } from '../../api/client';
+import fetchWithAuth from '../../api/client';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface SAAppointment {
@@ -56,9 +56,7 @@ export default function SAAppointments() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${API_URL}/admin/appointments`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
+      const data = await fetchWithAuth(`/admin/appointments`);
       setAppointments(data);
     } catch (e) {
       // Fallback to rich mock data so the page is always useful

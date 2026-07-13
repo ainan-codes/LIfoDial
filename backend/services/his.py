@@ -1,7 +1,7 @@
 import logging
 from typing import List, Dict, Any
 from sqlalchemy import select
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import json
 
 from backend.config import settings
@@ -10,6 +10,65 @@ from backend.models.doctor import Doctor
 from backend.models.appointment import Appointment
 
 logger = logging.getLogger(__name__)
+
+# ── Slot parsing ──────────────────────────────────────────────────────────────
+_TIME_FORMATS = ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%H.%M")
+_DATE_FORMATS = ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d %b %Y", "%d %B %Y")
+
+
+def parse_slot_datetime(date_str: str | None, time_str: str | None) -> datetime:
+    """Best-effort parse of a requested appointment slot into a tz-aware datetime.
+
+    Accepts times like "11:00 AM", "2 PM", "14:30" and dates like "2026-07-06",
+    "today", "tomorrow". Falls back to the next occurrence of the given time
+    (or now) if a field is missing/unparseable — and logs when it does so the
+    mis-parse is observable rather than silent.
+    """
+    now = datetime.now(timezone.utc)
+
+    # ── Date ──
+    day: datetime | None = None
+    ds = (date_str or "").strip().lower()
+    if ds in ("", "today"):
+        day = now
+    elif ds in ("tomorrow", "tmrw"):
+        day = now + timedelta(days=1)
+    else:
+        for fmt in _DATE_FORMATS:
+            try:
+                day = datetime.strptime(date_str.strip(), fmt).replace(tzinfo=timezone.utc)
+                break
+            except (ValueError, AttributeError):
+                continue
+        if day is None:
+            logger.warning("Could not parse appointment date %r; defaulting to today", date_str)
+            day = now
+
+    # ── Time ──
+    ts = (time_str or "").strip()
+    parsed_time = None
+    if ts:
+        norm = ts.upper().replace(".", ":") if ("AM" in ts.upper() or "PM" in ts.upper()) else ts
+        for fmt in _TIME_FORMATS:
+            try:
+                parsed_time = datetime.strptime(norm.strip(), fmt)
+                break
+            except ValueError:
+                continue
+        if parsed_time is None:
+            logger.warning("Could not parse appointment time %r; defaulting to now", time_str)
+
+    if parsed_time is None:
+        return day.replace(second=0, microsecond=0)
+
+    combined = day.replace(
+        hour=parsed_time.hour, minute=parsed_time.minute, second=0, microsecond=0
+    )
+    # If only a time was given and it already passed today, roll to tomorrow.
+    if not ds and combined < now:
+        combined += timedelta(days=1)
+    return combined
+
 
 # Simple in-memory cache for doctors (no Redis dependency)
 _doctor_cache: dict[str, tuple[float, list]] = {}
@@ -87,6 +146,10 @@ async def send_to_sheets_webhook(webhook_url: str | None, payload: dict):
     if not target_url:
         logger.info("No Google Sheets webhook URL configured. Skipping sheet sync.")
         return
+    from backend.services.net import is_safe_outbound_url
+    if not is_safe_outbound_url(target_url):
+        logger.warning("Refusing to POST to unsafe/internal Sheets webhook URL: %s", target_url)
+        return
 
     try:
         async with httpx.AsyncClient() as client:
@@ -95,7 +158,7 @@ async def send_to_sheets_webhook(webhook_url: str | None, payload: dict):
                 json=payload,
                 headers={"Content-Type": "application/json"},
                 timeout=5.0,
-                follow_redirects=True
+                follow_redirects=False
             )
             if response.status_code == 200:
                 logger.info(f"Successfully pushed appointment {payload.get('appointment_id')} to Google Sheets.")
@@ -105,11 +168,39 @@ async def send_to_sheets_webhook(webhook_url: str | None, payload: dict):
         logger.error(f"Error pushing to Google Sheets: {e}", exc_info=True)
 
 
-async def create_appointment(tenant_id: str, doctor_id: str, slot_time: str, patient_phone: str) -> dict:
+async def create_appointment(tenant_id: str, doctor_id: str, slot_time: str, patient_phone: str, call_id: str | None = None) -> dict:
     # Future HIS Integration: POST to /appointments
     # if settings.oxzygen_base_url: ...
 
     async with AsyncSessionLocal() as session:
+        # Idempotency guard: a call can only produce one booking. Retries of
+        # the same confirmed call (reconnects, duplicate confirm keywords)
+        # must not create a second appointment row.
+        if call_id:
+            existing_stmt = select(Appointment).where(
+                Appointment.tenant_id == tenant_id,
+                Appointment.call_id == call_id,
+            )
+            existing = (await session.execute(existing_stmt)).scalar_one_or_none()
+            if existing:
+                logger.info(
+                    "create_appointment: idempotent hit for call_id=%s — returning existing appointment %s",
+                    call_id, existing.id,
+                )
+                stmt_doc = select(Doctor).where(Doctor.id == existing.doctor_id)
+                doc = (await session.execute(stmt_doc)).scalar_one_or_none()
+                return {
+                    "appointment_id": str(existing.id),
+                    "tenant_id": tenant_id,
+                    "clinic_name": "",
+                    "doctor_name": doc.name if doc else "Unknown",
+                    "specialization": doc.specialization if doc else "Specialist",
+                    "slot_time": slot_time,
+                    "patient_phone": patient_phone,
+                    "status": existing.status,
+                    "idempotent_hit": True,
+                }
+
         # Resolve doctor name
         stmt = select(Doctor).where(Doctor.id == doctor_id).where(Doctor.tenant_id == tenant_id)
         doctor = (await session.execute(stmt)).scalar_one_or_none()
@@ -125,9 +216,10 @@ async def create_appointment(tenant_id: str, doctor_id: str, slot_time: str, pat
         appointment = Appointment(
             tenant_id=tenant_id,
             doctor_id=doctor_id,
-            slot_time=datetime.utcnow(), # in real app parse `slot_time` string into datetime 
+            slot_time=parse_slot_datetime(None, slot_time),
             patient_phone=patient_phone,
-            status="confirmed"
+            status="confirmed",
+            call_id=call_id,
         )
         session.add(appointment)
         await session.commit()
@@ -183,7 +275,7 @@ async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: s
                 if action == "CANCEL":
                     appt.status = "cancelled"
                 elif action == "RESCHEDULE":
-                    appt.slot_time = datetime.utcnow() # mock parsed datetime
+                    appt.slot_time = parse_slot_datetime(date_str, time_str)
                 
                 if notes_clean:
                     appt.notes = notes_clean
@@ -211,7 +303,7 @@ async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: s
                 new_appt = Appointment(
                     tenant_id=tenant_id,
                     doctor_id=doctor_id,
-                    slot_time=datetime.utcnow(), # mock parsed datetime
+                    slot_time=parse_slot_datetime(date_str, time_str),
                     patient_phone=phone_clean,
                     patient_name=name_clean,
                     status="confirmed",

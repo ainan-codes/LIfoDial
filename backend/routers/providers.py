@@ -16,6 +16,7 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from backend.auth import CurrentUser
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
@@ -85,7 +86,7 @@ STT_MODELS = [
 # ── GET /providers ─────────────────────────────────────────────────────────────
 
 @router.get("/providers")
-async def get_providers() -> dict:
+async def get_providers(user: CurrentUser = None) -> dict:
     """Returns all configured providers with live connection status."""
     sarvam_ok = bool(settings.sarvam_api_key)
     gemini_ok = bool(settings.gemini_api_key)
@@ -144,7 +145,7 @@ async def get_providers() -> dict:
 # ── GET /providers/voices ──────────────────────────────────────────────────────
 
 @router.get("/providers/voices")
-async def list_all_voices(language: str | None = None, model: str | None = None, gender: str | None = None) -> dict:
+async def list_all_voices(language: str | None = None, model: str | None = None, gender: str | None = None, user: CurrentUser = None) -> dict:
     """Returns all Sarvam voices with optional filtering."""
     voices = SARVAM_VOICES
     if language:
@@ -171,7 +172,7 @@ async def list_all_voices(language: str | None = None, model: str | None = None,
 # ── GET /providers/llms ────────────────────────────────────────────────────────
 
 @router.get("/providers/llms")
-async def list_llms() -> dict:
+async def list_llms(user: CurrentUser = None) -> dict:
     """Returns available LLM models. Gemini models are from our catalogue."""
     return {
         "gemini": {
@@ -193,7 +194,7 @@ async def list_llms() -> dict:
 # ── GET /providers/voices/{voice_id}/preview ───────────────────────────────────
 
 @router.get("/providers/voices/{voice_id}/preview")
-async def preview_voice_by_id(voice_id: str, language: str = "hi-IN", model: str = "bulbul:v3") -> dict:
+async def preview_voice_by_id(voice_id: str, language: str = "hi-IN", model: str = "bulbul:v3", user: CurrentUser = None) -> dict:
     """Generate audio preview for a specific Sarvam voice_id."""
     if not settings.sarvam_api_key:
         raise HTTPException(status_code=400, detail="Sarvam API key not configured")
@@ -262,7 +263,7 @@ class TestConnectionRequest(BaseModel):
 
 
 @router.post("/providers/test-connection")
-async def test_connection(req: TestConnectionRequest) -> dict:
+async def test_connection(req: TestConnectionRequest, user: CurrentUser = None) -> dict:
     """Test if an API key is valid for the given provider."""
     t0 = time.time()
 

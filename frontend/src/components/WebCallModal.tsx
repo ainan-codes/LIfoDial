@@ -7,7 +7,7 @@ import {
   VoiceAssistantControlBar,
 } from '@livekit/components-react'
 import '@livekit/components-styles'
-import { API_URL } from '../api/client'
+import fetchWithAuth from '../api/client'
 
 interface Agent {
   id: string
@@ -67,15 +67,7 @@ export function WebCallModal({
           return
         }
 
-        const res = await fetch(
-          `${API_URL}/agents/${agent.id}/web-call-token`,
-          { method: 'POST' }
-        )
-        if (!res.ok) {
-          const err = await res.json()
-          throw new Error(err.detail || 'Failed to connect')
-        }
-        const data = await res.json()
+        const data = await fetchWithAuth(`/agents/${agent.id}/web-call-token`, { method: 'POST' })
         setToken(data.token)
         setWsUrl(data.wsUrl)
         setIsConnecting(false)

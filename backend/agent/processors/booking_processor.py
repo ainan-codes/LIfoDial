@@ -21,7 +21,7 @@ import logging
 import re
 from typing import Optional
 
-from pipecat.frames.frames import Frame, TranscriptionFrame
+from pipecat.frames.frames import Frame, TextFrame, TranscriptionFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 logger = logging.getLogger(__name__)
@@ -117,10 +117,17 @@ class BookingProcessor(FrameProcessor):
                 logger.warning(
                     "EMERGENCY keyword detected in utterance: '%s'", text[:80]
                 )
+                await self._handle_emergency()
             return  # Don't process booking after emergency
 
         # Already confirmed — nothing more to do
         if self.booking_state["confirmed"]:
+            return
+
+        # Appointment booking (including the doctor-match step that starts the
+        # flow) is gated on can_book_appointments — if the clinic admin turned
+        # this tool off, the agent must not start collecting booking details.
+        if not self._agent_config.get("can_book_appointments", True):
             return
 
         # 1. Extract patient name from utterance
@@ -147,6 +154,39 @@ class BookingProcessor(FrameProcessor):
         if self.booking_state["awaiting_confirm"]:
             if any(w in text_lower for w in _CONFIRM_WORDS):
                 await self._try_commit_booking()
+
+    async def _handle_emergency(self) -> None:
+        """
+        Speak an emergency message as soon as an emergency keyword is detected,
+        gated on can_transfer_emergency.
+
+        NOTE — scope: this pushes a TextFrame straight to TTS (the same
+        mechanism the first-message greeting uses via task.queue_frames, so it
+        is known to flow through the LLM stage untouched). It does NOT perform
+        an actual SIP/telephony call transfer — no such capability exists
+        anywhere in this codebase yet (no LiveKit SIP transfer call, no
+        Exotel/Twilio integration). A real transfer would need that telephony
+        integration built first; this only ensures the caller is told to call
+        emergency services / the clinic's emergency number without waiting for
+        the LLM to finish its current turn.
+        """
+        if not self._agent_config.get("can_transfer_emergency", True):
+            logger.info("Emergency keyword detected but can_transfer_emergency is off — no action taken.")
+            return
+
+        number = self._agent_config.get("emergency_transfer_number")
+        if number:
+            message = (
+                f"This sounds like a medical emergency. Please call {number} "
+                "or go to your nearest emergency room right away."
+            )
+        else:
+            message = (
+                "This sounds like a medical emergency. Please call your local "
+                "emergency number or go to your nearest emergency room right away."
+            )
+        await self.push_frame(TextFrame(message), FrameDirection.DOWNSTREAM)
+        logger.warning("Emergency message queued for TTS: '%s'", message)
 
     def _try_extract_name(self, text: str, text_lower: str) -> None:
         """Extract patient name when name-trigger phrases are detected."""
@@ -188,6 +228,16 @@ class BookingProcessor(FrameProcessor):
         """Record a matched doctor and mark booking as awaiting confirmation."""
         self.booking_state["pending_doctor_id"]   = doc.get("id")
         self.booking_state["pending_doctor_name"] = doc.get("name")
+
+        if not self.check_availability_allowed():
+            # Doctor identified, but the clinic disabled availability lookups —
+            # don't offer a slot or move to confirmation.
+            logger.info(
+                "Booking: matched doctor '%s' but can_check_availability is off — not offering a slot.",
+                doc.get("name"),
+            )
+            return
+
         # Default slot — real implementation would call his.get_slots()
         self.booking_state["pending_slot"]        = "11:00 AM"
         self.booking_state["awaiting_confirm"]    = True
@@ -237,6 +287,13 @@ class BookingProcessor(FrameProcessor):
             )
         )
 
+    def check_availability_allowed(self) -> bool:
+        """Gate for the 'Check Availability' tool toggle — offering a slot to
+        confirm is the live pipeline's only availability-check equivalent
+        (see _set_pending_doctor; real per-doctor scheduling data is not
+        wired here yet, matching the mocked his.get_slots())."""
+        return self._agent_config.get("can_check_availability", True)
+
 
 # ── Standalone DB commit function (called as background task) ─────────────────
 
@@ -261,6 +318,7 @@ async def _commit_booking_to_db(
             doctor_id=doctor_id,
             slot_time=slot_time,
             patient_phone=patient_phone,
+            call_id=call_record_id,
         )
         logger.info(
             "[BookingProcessor] Appointment saved: id=%s doctor=%s slot=%s",

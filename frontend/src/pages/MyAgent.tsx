@@ -6,7 +6,7 @@ import {
   ChevronDown, ChevronUp, Download, Zap, Shield, RefreshCw,
   PhoneMissed, PlayCircle, Globe, Lock, Bell,
 } from 'lucide-react';
-import { API_URL } from '../api/client';
+import fetchWithAuth from '../api/client';
 import { FIXTURE_CALL_LOGS, FIXTURE_APPOINTMENTS } from '../fixtures/data';
 
 /**
@@ -95,24 +95,21 @@ export default function MyAgent() {
       let myAgent: AgentInfo | null = null;
 
       if (tenantId) {
-        const res = await fetch(`${API_URL}/agents`);
-        if (res.ok) {
-          const agents = await res.json();
+        try {
+          const agents = await fetchWithAuth('/agents');
           myAgent = agents.find((a: any) => a.tenant_id === tenantId) || null;
-        }
+        } catch {}
       }
       if (!myAgent && email) {
         try {
-          const res = await fetch(`${API_URL}/agents/mine?email=${encodeURIComponent(email)}`);
-          if (res.ok) myAgent = await res.json();
+          myAgent = await fetchWithAuth(`/agents/mine?email=${encodeURIComponent(email)}`);
         } catch {}
       }
       if (!myAgent) {
-        const res = await fetch(`${API_URL}/agents`);
-        if (res.ok) {
-          const agents = await res.json();
+        try {
+          const agents = await fetchWithAuth('/agents');
           if (agents.length > 0) myAgent = agents[0];
-        }
+        } catch {}
       }
 
       if (myAgent) {
@@ -120,13 +117,11 @@ export default function MyAgent() {
         try {
           const tid = (myAgent as any).tenant_id || tenantId;
           if (tid) {
-            const creditsRes = await fetch(`${API_URL}/credits/my-balance?tenant_id=${tid}`);
-            if (creditsRes.ok) setCredits(await creditsRes.json());
+            setCredits(await fetchWithAuth(`/credits/my-balance?tenant_id=${tid}`));
           }
         } catch {}
         try {
-          const callsRes = await fetch(`${API_URL}/agents/${myAgent.id}/call-logs?limit=10`);
-          if (callsRes.ok) setCalls(await callsRes.json());
+          setCalls(await fetchWithAuth(`/agents/${myAgent.id}/call-logs?limit=10`));
         } catch {}
       } else {
         setError(email ? `No agent configured for ${email}` : 'No agent found for your clinic.');

@@ -14,12 +14,24 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 
+from backend.auth import CurrentUser
 from backend.db import async_session
 from backend.models.agent_config import AgentConfig
 from backend.models.embed_analytics import EmbedEvent
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _is_published(agent: AgentConfig) -> bool:
+    """
+    Single source of truth for "can this agent take calls right now".
+    The Publish/Unpublish button in AgentDetail.tsx toggles status between
+    'ACTIVE' and 'CONFIGURED' — everything except 'ACTIVE' is unpublished.
+    Checked here (widget config + chat) and in backend/agent/pipeline.py
+    (LiveKit room join) — those are the two enforcement points.
+    """
+    return agent.status == "ACTIVE"
 
 # ── In-memory rate limits ──────────────────────────────────────────────────────
 # {session_id: [timestamps]}
@@ -121,15 +133,21 @@ async def embed_config(agent_id: str, request: Request) -> JSONResponse:
         },
         "modes": ["chat", "voice"],
         "allowed_domains": allowed_domains,
-        # An agent is callable if it's not explicitly disabled. CONFIGURED, ACTIVE,
-        # and (None) all count as "ready". Only "INACTIVE" / "DISABLED" exclude it.
-        "is_active": (agent.status or "").upper() not in ("INACTIVE", "DISABLED", "ARCHIVED"),
+        # Per-agent widget avatar (public URL) — null when unset; widget falls
+        # back to its default icon.
+        "avatar_url": getattr(agent, "avatar_url", None),
+        # Reflects the real Publish/Unpublish state — widget.js already hides
+        # the button entirely when this is false (no code change needed there).
+        "is_active": _is_published(agent),
         # Public embed settings
         "embed_primary_color": getattr(agent, "embed_primary_color", "#3ECF8E"),
         "embed_position": getattr(agent, "embed_position", "bottom-right"),
         "embed_theme": getattr(agent, "embed_theme", "dark"),
         "embed_button_text": getattr(agent, "embed_button_text", "Talk to Receptionist"),
         "embed_show_branding": getattr(agent, "embed_show_branding", True),
+        # Launcher display mode + auto-invite delay (widget reads these).
+        "embed_display_mode": getattr(agent, "embed_display_mode", "button") or "button",
+        "embed_auto_invite_delay": getattr(agent, "embed_auto_invite_delay", 3) or 3,
     }
 
     return JSONResponse(payload, headers=_cors_headers())
@@ -157,6 +175,11 @@ async def embed_chat(agent_id: str, body: EmbedChatRequest, request: Request) ->
 
         if not agent:
             raise HTTPException(404, "Agent not found")
+
+        # Enforced here (not just at /config) so a direct API call can't bypass
+        # the widget's own pre-flight check — this is a real gate, not cosmetic.
+        if not _is_published(agent):
+            raise HTTPException(403, "This AI receptionist is currently unavailable.")
 
         # Re-use existing LLM logic
         from backend.routers.agent_test import generate_llm_response
@@ -230,12 +253,18 @@ async def embed_track(agent_id: str, body: EmbedTrackRequest) -> JSONResponse:
 
 # ── GET /embed/{agent_id}/analytics ───────────────────────────────────────────
 @router.get("/embed/{agent_id}/analytics")
-async def embed_analytics(agent_id: str) -> JSONResponse:
-    """Returns this month's analytics stats for the embed settings page."""
+async def embed_analytics(agent_id: str, user: CurrentUser = None) -> JSONResponse:
+    """Returns this month's analytics stats for the embed settings page (dashboard-only)."""
     from sqlalchemy import func, extract
     from datetime import datetime
 
     async with async_session() as db:
+        agent_res = await db.execute(select(AgentConfig).where(AgentConfig.id == agent_id))
+        agent = agent_res.scalars().first()
+        if not agent:
+            raise HTTPException(404, "Agent not found")
+        user.require_owns(str(agent.tenant_id))
+
         now = datetime.utcnow()
         result = await db.execute(
             select(
@@ -273,8 +302,39 @@ async def embed_analytics(agent_id: str) -> JSONResponse:
 
 # ── GET /embed/{agent_id}/preview ─────────────────────────────────────────────
 @router.get("/embed/{agent_id}/preview", response_class=HTMLResponse)
-async def embed_preview(agent_id: str) -> HTMLResponse:
-    """Returns a minimal HTML page with the widget loaded — for iframe preview."""
+async def embed_preview(
+    agent_id: str,
+    style: str | None = None,
+    theme: str | None = None,
+    position: str | None = None,
+    color: str | None = None,
+    label: str | None = None,
+    delay: int | None = None,
+) -> HTMLResponse:
+    """Returns a minimal HTML page with the widget loaded — for iframe preview.
+
+    Accepts live appearance params so the dashboard's Live Preview reflects
+    UNSAVED form state in real time (the frontend appends the current form
+    values to the iframe src). These map to the widget's data-* attributes.
+    """
+    # Forward the raw dashboard display mode via data-display-mode so the widget
+    # applies it with priority over the saved config (this is how the Live Preview
+    # reflects UNSAVED changes). Only forwarded when provided.
+    attrs = ""
+    if style:
+        attrs += f'\n    data-display-mode="{style}"'
+    if delay is not None:
+        attrs += f'\n    data-auto-invite-delay="{int(delay)}"'
+    if theme:
+        attrs += f'\n    data-theme="{theme}"'
+    if position:
+        attrs += f'\n    data-position="{position}"'
+    if color:
+        attrs += f'\n    data-primary-color="{color}"'
+    if label:
+        # Escape double-quotes to keep the attribute well-formed.
+        attrs += f'\n    data-label="{label.replace(chr(34), "&quot;")}"'
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -318,7 +378,7 @@ async def embed_preview(agent_id: str) -> HTMLResponse:
   <script
     src="/widget.js"
     data-agent-id="{agent_id}"
-    data-api-url=""
+    data-api-url=""{attrs}
   ></script>
 </body>
 </html>"""

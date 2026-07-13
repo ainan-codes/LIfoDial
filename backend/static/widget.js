@@ -29,9 +29,22 @@
 (function () {
   'use strict';
 
+  // ── Double-init guard ───────────────────────────────────────────────────────
+  // SPA frameworks (React/Vue/Next) can re-evaluate this script tag on
+  // route changes or re-renders — e.g. if it's mounted inside a component
+  // instead of the persistent HTML shell. A second execution would otherwise
+  // create a whole second closure (its own WebSocket, its own DOM nodes with
+  // duplicate ids) rather than just re-running setup. One tag wins; every
+  // later evaluation on the same page is a no-op.
+  if (window.__LFD_WIDGET_LOADED__) {
+    console.warn('[Lifodial] Widget script already initialized on this page — skipping duplicate load.');
+    return;
+  }
+  window.__LFD_WIDGET_LOADED__ = true;
+
   // ── Config from script tag ─────────────────────────────────────────────────
   const script = document.currentScript || document.querySelector('script[data-agent-id]');
-  if (!script) return;
+  if (!script) { console.warn('[Lifodial] Could not find the widget <script> tag.'); return; }
 
   const AGENT_ID  = script.getAttribute('data-agent-id');
   // Determine API base dynamically from script src (works in prod and dev)
@@ -45,7 +58,13 @@
   const WS_BASE   = API_BASE.replace(/^http/, 'ws');
   const POSITION  = script.getAttribute('data-position') || 'bottom-right';
   const THEME     = script.getAttribute('data-theme')    || 'dark';
-  const STYLE     = script.getAttribute('data-style')    || 'full';  // full | call-only | icon | minimal
+  // `let` because the dashboard's embed_display_mode (from /config) overrides the
+  // script attribute — the dashboard is the source of truth for configured widgets.
+  let STYLE       = script.getAttribute('data-style')    || 'full';  // full | call-only | icon | minimal
+  // Live-preview override: raw dashboard display mode (button | icon | auto-invite).
+  // When present it wins over the saved config's embed_display_mode.
+  const DISPLAY_MODE_OVERRIDE = script.getAttribute('data-display-mode');
+  const AUTO_INVITE_DELAY_ATTR = script.getAttribute('data-auto-invite-delay');
   const LABEL_OVERRIDE    = script.getAttribute('data-label');
   const PRIMARY_OVERRIDE  = script.getAttribute('data-primary-color');
   const ICON_BG_OVERRIDE  = script.getAttribute('data-icon-bg');
@@ -87,13 +106,15 @@
 
 
   // ── Fetch config ───────────────────────────────────────────────────────────
+  // Every failure path here is console-only by design — a misconfigured or
+  // temporarily-unreachable widget must never show an error to the clinic's
+  // actual site visitors, only to whoever opens devtools.
   async function loadConfig() {
     try {
       const res = await fetch(API_BASE + '/embed/' + AGENT_ID + '/config');
       if (!res.ok) {
         const errText = await res.text().catch(() => '');
         console.error('[Lifodial] Config load failed: HTTP ' + res.status + ' from ' + API_BASE + '/embed/' + AGENT_ID + '/config', errText);
-        injectErrorBadge('Receptionist unavailable (HTTP ' + res.status + ')');
         return;
       }
       config = await res.json();
@@ -101,26 +122,33 @@
         console.warn('[Lifodial] Agent ' + AGENT_ID + ' is not active');
         return;
       }
+
+      // Effective display mode: live-preview attribute override wins, then the
+      // saved dashboard config. Skipped if the developer forced call-only/minimal.
+      let autoInvite = false;
+      const mode = DISPLAY_MODE_OVERRIDE || config.embed_display_mode;
+      if (mode && STYLE !== 'call-only' && STYLE !== 'minimal') {
+        if (mode === 'icon') STYLE = 'icon';
+        else if (mode === 'auto-invite') { STYLE = 'full'; autoInvite = true; }
+        else STYLE = 'full'; // "button"
+      }
+      activeTab = STYLE === 'call-only' ? 'voice' : 'chat';
+
       injectWidget();
       track('widget_view');
       // If call-only: open mic automatically after 400ms (give DOM time to render)
       if (STYLE === 'call-only') setTimeout(() => startVoiceCall(), 400);
+      // Auto-invite: OPEN THE PANEL only after a delay to invite the visitor.
+      // This deliberately does NOT start audio or request the mic — browsers
+      // block audio/mic without a direct user gesture, and we must not try to
+      // circumvent that. The visitor still taps "Talk" to begin.
+      if (autoInvite) {
+        const delaySec = Number(AUTO_INVITE_DELAY_ATTR) || Number(config.embed_auto_invite_delay) || 3;
+        setTimeout(() => { if (!isOpen) togglePanel(true); }, delaySec * 1000);
+      }
     } catch (err) {
       console.error('[Lifodial] Config fetch error — is API_BASE reachable?', API_BASE, err);
-      injectErrorBadge('Receptionist offline (network)');
     }
-  }
-
-  // ── Minimal fallback badge so devs see the widget tried to load ───────────
-  function injectErrorBadge(msg) {
-    if (document.getElementById('lfd-err-badge')) return;
-    const el = document.createElement('div');
-    el.id = 'lfd-err-badge';
-    el.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:999998;background:#1a1a1a;color:#ef4444;padding:10px 16px;border-radius:8px;font:13px -apple-system,sans-serif;border:1px solid rgba(239,68,68,.3);box-shadow:0 4px 20px rgba(0,0,0,.3);max-width:300px';
-    el.textContent = '⚠ ' + msg;
-    document.body.appendChild(el);
-    // Auto-hide after 8s — devs see it in console anyway
-    setTimeout(() => { try { el.remove(); } catch (_) {} }, 8000);
   }
 
   // ── Analytics ──────────────────────────────────────────────────────────────
@@ -317,7 +345,18 @@
   };
 
   // ── Build trigger button based on style ────────────────────────────────────
-  function buildTrigger() {
+  // Returns an <img> for the per-agent avatar (config.avatar_url) at the given
+  // pixel size, or the supplied default SVG when no avatar is set. If the image
+  // URL fails to load, onerror swaps the default SVG back in — so it is NEVER a
+  // broken image. (btoa keeps the SVG safe inside the attribute; SVGs are ASCII.)
+  function avatarHTML(px, fallbackSvg) {
+    const url = config && config.avatar_url;
+    if (!url) return fallbackSvg;
+    const fb = btoa(fallbackSvg);
+    return `<img src="${url}" alt="" width="${px}" height="${px}" style="width:${px}px;height:${px}px;border-radius:50%;object-fit:cover;display:block" onerror="this.outerHTML=atob('${fb}')" />`;
+  }
+
+  function buildTrigger(container) {
     const C = getColors();
     const label = LABEL_OVERRIDE || (config && config.embed_button_text) || (config && config.embed_label) || 'Talk to Receptionist';
     const btn   = document.createElement('button');
@@ -326,12 +365,13 @@
 
     if (STYLE === 'call-only' || STYLE === 'icon') {
       btn.classList.add('icon-only');
-      btn.innerHTML = STYLE === 'call-only' ? SVG.phone : SVG.headphone;
+      // call-only stays a phone glyph (it's a call action); icon style shows the avatar.
+      btn.innerHTML = STYLE === 'call-only' ? SVG.phone : avatarHTML(28, SVG.headphone);
     } else if (STYLE === 'minimal') {
       btn.style.cssText += 'padding:7px 14px;font-size:12px;border-radius:50px';
-      btn.innerHTML = `${SVG.headphone}<span id="lfd-trigger-label">${label}</span>`;
+      btn.innerHTML = `${avatarHTML(22, SVG.headphone)}<span id="lfd-trigger-label">${label}</span>`;
     } else { // full
-      btn.innerHTML = `${SVG.headphone}<span id="lfd-trigger-label">${label}</span>`;
+      btn.innerHTML = `${avatarHTML(22, SVG.headphone)}<span id="lfd-trigger-label">${label}</span>`;
     }
 
     // Notification badge
@@ -349,11 +389,12 @@
       togglePanel();
     });
 
-    document.body.appendChild(btn);
+    container.appendChild(btn);
+    return btn;
   }
 
   // ── Build full panel (chat + voice tabs) ───────────────────────────────────
-  function buildPanel() {
+  function buildPanel(container) {
     const C    = getColors();
     const name = (config && config.agent_name) || (config && config.clinic_name) || 'AI Receptionist';
     const sub  = 'Online · Instant Reply';
@@ -365,7 +406,7 @@
 
     panel.innerHTML = `
       <div id="lfd-header">
-        <div id="lfd-avatar">${SVG.headphone}</div>
+        <div id="lfd-avatar">${avatarHTML(36, SVG.headphone)}</div>
         <div id="lfd-header-info">
           <h3>${name}</h3>
           <p>🟢 ${sub}</p>
@@ -403,7 +444,7 @@
       <div id="lfd-footer">Powered by <a href="https://lifodial.com" target="_blank">Lifodial AI</a></div>
     `;
 
-    document.body.appendChild(panel);
+    container.appendChild(panel);
 
     // Tab switching
     panel.querySelectorAll('.lfd-tab').forEach(tab => {
@@ -445,6 +486,8 @@
     // Initial greeting message (chat pane only — voice greeting is handled by WebSocket)
     const greeting = (config && config.first_message) || (config && config.greeting) || 'Hello! How can I help you today?';
     appendMessage('ai', greeting);
+
+    return panel;
   }
 
   // ── Panel toggle ───────────────────────────────────────────────────────────
@@ -943,15 +986,18 @@
   }
 
   // ── Widget entry point ─────────────────────────────────────────────────────
+  // Idempotent: safe to call more than once (e.g. from the self-healing watch
+  // below) — if the container is already in the document, does nothing.
   function injectWidget() {
-    // Wrap everything in a namespaced container
+    if (document.getElementById('lfd-widget')) return;
+
     const wrapper = document.createElement('div');
     wrapper.id = 'lfd-widget';
     document.body.appendChild(wrapper);
 
     injectStyles();
-    buildTrigger();
-    if (STYLE !== 'call-only') buildPanel();
+    buildTrigger(wrapper);
+    if (STYLE !== 'call-only') buildPanel(wrapper);
 
     // Show badge after 3 seconds to encourage interaction
     setTimeout(() => {
@@ -960,11 +1006,32 @@
     }, 3000);
   }
 
+  // ── SPA resilience ───────────────────────────────────────────────────────
+  // Correct install is a script tag in the persistent HTML shell (see the
+  // per-framework docs), which client-side route changes never touch — React/
+  // Vue/Next only re-render inside their own root element, not the whole
+  // <body>. This watches for the pathological case anyway (a site-wide
+  // transition library, or a CMS block, wiping #lfd-widget out from under us)
+  // and re-renders from the config already in memory — no re-fetch needed.
+  function watchForRemoval() {
+    const observer = new MutationObserver(() => {
+      if (config && !document.getElementById('lfd-widget')) {
+        isOpen = false;
+        injectWidget();
+      }
+    });
+    observer.observe(document.body, { childList: true });
+  }
+
   // ── Boot ───────────────────────────────────────────────────────────────────
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', loadConfig);
-  } else {
+  function boot() {
     loadConfig();
+    watchForRemoval();
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
   }
 
 })();

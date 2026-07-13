@@ -4,6 +4,7 @@
 
 import os
 import logging
+from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import (
     create_async_engine,
     AsyncSession,
@@ -13,6 +14,14 @@ from sqlalchemy.pool import NullPool
 from sqlalchemy.orm import DeclarativeBase
 
 logger = logging.getLogger(__name__)
+
+# Load .env into os.environ so get_database_url() below sees DATABASE_URL.
+# pydantic-settings (backend/config.py) reads .env into the `settings` object
+# but does NOT export to os.environ, and this module reads os.getenv directly.
+# Without this, local dev silently fell back to SQLite whenever no other module
+# happened to have called load_dotenv() first — a real source of "why is it on
+# SQLite / why did it connect to the wrong DB" flakiness.
+load_dotenv()
 
 
 def get_database_url() -> str:
@@ -124,6 +133,9 @@ async def init_db():
             await conn.run_sync(
                 lambda c: Base.metadata.create_all(c, checkfirst=True)
             )
+        # create_all only creates missing TABLES, not new columns on existing
+        # ones. Apply small additive column migrations idempotently here.
+        await _apply_lightweight_migrations()
         logger.info("? init_db: complete")
         print(f"? Database ready ({db_label})")
     except Exception as e:
@@ -131,6 +143,32 @@ async def init_db():
         logger.warning(f"init_db non-fatal warning: {str(e)[:120]}")
         print(f"??  DB init warning (non-fatal): {str(e)[:80]}")
         print("    Tables likely already exist in Supabase - continuing...")
+
+
+async def _apply_lightweight_migrations():
+    """Additive, idempotent column adds for existing tables. Postgres supports
+    ADD COLUMN IF NOT EXISTS; SQLite (dev) is best-effort via try/except."""
+    from sqlalchemy import text
+    # (table, column, type + default) — safe to re-run every startup.
+    migrations = [
+        ("agent_configs", "embed_display_mode", "VARCHAR(20) DEFAULT 'button'"),
+        ("agent_configs", "embed_auto_invite_delay", "INTEGER DEFAULT 3"),
+    ]
+    for table, column, coldef in migrations:
+        try:
+            if IS_SQLITE:
+                # SQLite lacks ADD COLUMN IF NOT EXISTS; check pragma first.
+                async with engine.begin() as conn:
+                    cols = await conn.run_sync(
+                        lambda c: [r[1] for r in c.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()]
+                    )
+                    if column not in cols:
+                        await conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
+            else:
+                async with engine.begin() as conn:
+                    await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {coldef}"))
+        except Exception as e:
+            logger.warning("Lightweight migration %s.%s skipped: %s", table, column, str(e)[:120])
 
 
 def _import_all_models():
@@ -159,6 +197,8 @@ def _import_all_models():
         "backend.models.embed_analytics",  # was embed_event
         "backend.models.onboarding_request",
         "backend.models.api_key_config",
+        "backend.models.agent_prompt_history",
+        "backend.models.audit_log",
     ]
 
     for module_path in optional:

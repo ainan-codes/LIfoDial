@@ -9,8 +9,12 @@ import base64
 import httpx
 import logging
 from datetime import datetime, timedelta
+from sqlalchemy import select
 
+from backend.auth import CurrentUser, SuperAdmin
 from backend.config import settings
+from backend.db import async_session
+from backend.models.agent_config import AgentConfig
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -32,6 +36,7 @@ async def get_elevenlabs_voices(
     gender: Optional[str] = None,
     category: Optional[str] = None,
     search: Optional[str] = None,
+    user: CurrentUser = None,
 ):
     """
     Returns all ElevenLabs voices with preview_url for in-platform audio preview.
@@ -112,8 +117,9 @@ async def get_elevenlabs_voices(
 
 
 @router.post("/elevenlabs/refresh")
-async def refresh_elevenlabs_voices():
-    """Force-clear the ElevenLabs voice cache so the next GET re-fetches."""
+async def refresh_elevenlabs_voices(user: SuperAdmin = None):
+    """Force-clear the ElevenLabs voice cache so the next GET re-fetches.
+    Platform-wide cache invalidation — superadmin only, not a per-tenant action."""
     _el_voices_cache["data"] = None
     _el_voices_cache["expires"] = None
     return {"message": "Cache cleared. Next GET /voices/elevenlabs will re-fetch."}
@@ -133,7 +139,7 @@ class AssignVoiceRequest(BaseModel):
 
 
 @router.get("/")
-async def get_voices():
+async def get_voices(user: CurrentUser = None):
     """Returns provider connection status."""
     from backend.routers.providers import SARVAM_VOICES, GEMINI_MODELS
     return {
@@ -163,7 +169,7 @@ SARVAM_V3_SUPPORTED_LANGS = {
 }
 
 @router.post("/preview")
-async def preview_voice(req: PreviewRequest):
+async def preview_voice(req: PreviewRequest, user: CurrentUser = None):
     """Generates live preview audio using the configured provider."""
     try:
         if req.provider == "sarvam":
@@ -280,10 +286,20 @@ async def preview_voice(req: PreviewRequest):
 
 
 @router.post("/sync")
-async def sync_voices():
+async def sync_voices(user: SuperAdmin = None):
+    """Platform-wide provider sync — superadmin only, not tenant-scoped."""
     return {"message": "Synced voices from configured providers.", "status": "success"}
 
 
 @router.post("/assign")
-async def assign_voice(req: AssignVoiceRequest):
+async def assign_voice(req: AssignVoiceRequest, user: CurrentUser = None):
+    """Assigns a voice to one clinic's agent — enforce that the caller owns that agent."""
+    async with async_session() as db:
+        result = await db.execute(
+            select(AgentConfig.tenant_id).where(AgentConfig.id == req.agent_id)
+        )
+        tenant_id = result.scalar_one_or_none()
+        if tenant_id is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        user.require_owns(str(tenant_id))
     return {"message": f"Assigned voice {req.voice_id} to agent {req.agent_id}", "status": "success"}

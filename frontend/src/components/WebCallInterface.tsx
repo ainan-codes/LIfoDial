@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { API_URL } from '../api/client';
+import fetchWithAuth from '../api/client';
 import { useStreamingSTT } from '../hooks/useStreamingSTT';
 import { useThinkingSound } from '../hooks/useThinkingSound';
 
@@ -28,12 +28,7 @@ async function getCallToken(agentId: string): Promise<{
   demo?: boolean;
   message?: string;
 }> {
-  const res = await fetch(`${API_URL}/agents/${agentId}/web-call-token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-  });
-  if (!res.ok) throw new Error('Failed to get call token');
-  return res.json();
+  return fetchWithAuth(`/agents/${agentId}/web-call-token`, { method: 'POST' });
 }
 
 const LANG_LABELS: Record<string, string> = {

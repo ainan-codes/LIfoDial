@@ -24,12 +24,40 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     MetricsFrame,
+    TextFrame,
     TranscriptionFrame,
     TTSStartedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 logger = logging.getLogger(__name__)
+
+_CONSENT_DECLINE_WORDS: frozenset[str] = frozenset({
+    "no", "nope", "not okay", "not ok", "don't", "do not", "i don't consent",
+    "nahi", "mat karo",
+})
+
+
+async def speak_and_end_call(task, message: str) -> None:
+    """Queue a final TTS message, give it time to play out, then end the call.
+
+    Shared by CallLoggerProcessor (end_call_phrases match) and pipeline.py's
+    max-duration / silence-timeout watchdogs — all three are "graceful hangup"
+    triggers that should behave identically.
+    """
+    try:
+        if message:
+            await task.queue_frames([TextFrame(message)])
+            # Rough speaking-time estimate (~14 chars/sec) so we don't hang up
+            # mid-sentence, clamped to a sane range for very short/long messages.
+            estimated_seconds = min(max(len(message) / 14.0, 1.5), 12.0)
+            await asyncio.sleep(estimated_seconds)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("Failed to queue end-of-call message: %s", exc)
+    finally:
+        await task.cancel()
 
 
 class CallLoggerProcessor(FrameProcessor):
@@ -47,18 +75,47 @@ class CallLoggerProcessor(FrameProcessor):
         tenant_id: str,
         agent_id: Optional[str],
         call_meta: dict,
+        agent_config: Optional[dict] = None,
     ) -> None:
         super().__init__()
 
         self._tenant_id = tenant_id
         self._agent_id = agent_id
         self._call_meta = call_meta
+        self._agent_config = agent_config or {}
 
         # ── Runtime state ─────────────────────────────────────────────────────
         self._call_record_id: Optional[str] = call_meta.get("call_record_id")
         self._call_start_time: float = time.time()
         self._turn_count: int = 0
         self._transcript: list[dict] = []
+
+        # Wall-clock timestamp of the last user utterance — read by pipeline.py's
+        # silence-timeout watchdog (Call Behavior "Silence Timeout" setting).
+        self.last_activity_ts: float = time.time()
+
+        # Set by pipeline.py right after PipelineTask construction — lets this
+        # processor end the call directly on an end_call_phrases match.
+        self.task = None
+        self._end_call_phrases = [
+            p.strip().lower() for p in (self._agent_config.get("end_call_phrases") or []) if p and p.strip()
+        ]
+        self._end_call_message = self._agent_config.get("end_call_message") or "Thank you for calling. Goodbye!"
+        self._ending_call = False
+
+        # Recording Consent Plan ("require" mode) — set via begin_consent_gate()
+        # from pipeline.py once the consent question has been asked.
+        self._consent_pending = False
+        self._consent_decline_message: str = ""
+        self._consent_resume_message: Optional[str] = None
+
+    def begin_consent_gate(self, decline_message: str, resume_message: Optional[str]) -> None:
+        """Start gating on the patient's answer to the recording-consent question.
+        The next utterance is treated as the yes/no answer instead of normal
+        conversation (booking, end-call phrases, etc. are skipped for it)."""
+        self._consent_pending = True
+        self._consent_decline_message = decline_message
+        self._consent_resume_message = resume_message
 
         # Latency tracking from Pipecat MetricsFrame
         self._latency_samples: list[float] = []  # total ms per turn (ttfb)
@@ -99,6 +156,7 @@ class CallLoggerProcessor(FrameProcessor):
 
     async def _on_user_speech(self, text: str) -> None:
         """Record each user utterance in the in-memory transcript."""
+        self.last_activity_ts = time.time()
         self._turn_count += 1
 
         entry = {
@@ -120,6 +178,37 @@ class CallLoggerProcessor(FrameProcessor):
             asyncio.create_task(
                 _update_call_record_turns(self._call_record_id, self._turn_count)
             )
+
+        text_lower = text.lower().strip()
+
+        # Recording Consent Plan ("require" mode) — this utterance IS the
+        # yes/no answer to the consent question; don't let booking or
+        # end-call-phrase logic see it as normal conversation.
+        if self._consent_pending:
+            self._consent_pending = False
+            if any(w in text_lower for w in _CONSENT_DECLINE_WORDS):
+                self._ending_call = True
+                logger.info("Recording consent declined — ending call politely.")
+                if self.task is not None:
+                    asyncio.create_task(speak_and_end_call(self.task, self._consent_decline_message))
+            else:
+                # Anything else is treated as consent granted — an ambiguous
+                # reply shouldn't trap the caller in a re-prompt loop.
+                logger.info("Recording consent granted — resuming normal flow.")
+                if self._consent_resume_message and self.task is not None:
+                    asyncio.create_task(self.task.queue_frames([TextFrame(self._consent_resume_message)]))
+            return
+
+        # End-call phrase detection — was previously stored (Call Behavior tab)
+        # but never matched against anything the patient actually said.
+        if (
+            not self._ending_call
+            and self.task is not None
+            and any(phrase in text_lower for phrase in self._end_call_phrases)
+        ):
+            self._ending_call = True
+            logger.info("End-call phrase matched in utterance: '%s'", text[:80])
+            asyncio.create_task(speak_and_end_call(self.task, self._end_call_message))
 
     def _on_metrics(self, frame: MetricsFrame) -> None:
         """Capture TTFB (time-to-first-byte) latency from Pipecat's MetricsFrame."""
@@ -177,10 +266,14 @@ class CallLoggerProcessor(FrameProcessor):
                 )
             )
 
-        # Post-call Gemini evaluation (non-blocking)
-        if self._call_record_id:
+        # Post-call Gemini evaluation (non-blocking) — gated on the Analysis
+        # tab's Call Summary / Success Evaluation toggles. Skip the Gemini
+        # call entirely if both are off (was previously unconditional).
+        summary_on = bool(self._agent_config.get("summary_enabled", True))
+        eval_on = bool(self._agent_config.get("success_evaluation_enabled", True))
+        if self._call_record_id and (summary_on or eval_on):
             asyncio.create_task(
-                _run_post_call_evaluation(self._call_record_id)
+                _run_post_call_evaluation(self._call_record_id, summary_on, eval_on)
             )
 
 
@@ -275,14 +368,14 @@ async def _deduct_call_credits(
         logger.error("_deduct_call_credits error: %s", exc, exc_info=True)
 
 
-async def _run_post_call_evaluation(call_record_id: str) -> None:
+async def _run_post_call_evaluation(call_record_id: str, summary_enabled: bool = True, eval_enabled: bool = True) -> None:
     """Run Gemini post-call evaluation in the background."""
     try:
         from backend.db import AsyncSessionLocal
         from backend.services.call_evaluator import evaluate_call
 
         async with AsyncSessionLocal() as db:
-            await evaluate_call(call_record_id, db)
+            await evaluate_call(call_record_id, db, summary_enabled=summary_enabled, eval_enabled=eval_enabled)
 
         logger.info("Post-call evaluation completed for call %s", call_record_id)
     except Exception as exc:

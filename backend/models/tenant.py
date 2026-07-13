@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, DateTime, String, text
+from sqlalchemy import Boolean, DateTime, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from backend.db import Base
 
@@ -34,6 +34,10 @@ class Tenant(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     google_sheets_webhook_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
+    # Future hook for plan-based agent limits. NOT enforced anywhere yet —
+    # deliberately nullable so "no limit" is the default until that feature ships.
+    max_agents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -45,7 +49,8 @@ class Tenant(Base):
     doctors: Mapped[list["Doctor"]] = relationship("Doctor", back_populates="tenant", cascade="all, delete-orphan")
     appointments: Mapped[list["Appointment"]] = relationship("Appointment", back_populates="tenant", cascade="all, delete-orphan")
     call_logs: Mapped[list["CallLog"]] = relationship("CallLog", back_populates="tenant", cascade="all, delete-orphan")
-    agent_config: Mapped["AgentConfig | None"] = relationship("AgentConfig", back_populates="tenant", uselist=False, cascade="all, delete-orphan")
+    # A clinic can have multiple agents — see backend/routers/agents.py create_agent.
+    agent_configs: Mapped[list["AgentConfig"]] = relationship("AgentConfig", back_populates="tenant", cascade="all, delete-orphan")
 
     def __repr__(self) -> str:
         return f"<Tenant id={self.id} clinic={self.clinic_name!r}>"
