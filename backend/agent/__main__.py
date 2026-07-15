@@ -50,5 +50,13 @@ if __name__ == "__main__":
             api_secret=settings.livekit_api_secret or None,
             host="0.0.0.0",
             port=port,
+            # ── Resource-constrained (Render free: 0.1 CPU / 512MB) tuning ──
+            # Defaults crash-loop the free instance: the heavy cold import
+            # (pipecat + numba JIT + Silero VAD) blows the 10s init timeout, 4
+            # prewarmed processes exhaust RAM, and a low-CPU box reads as
+            # "overloaded" (load_threshold 0.7) so it refuses all jobs.
+            initialize_process_timeout=120.0,
+            num_idle_processes=1,
+            load_threshold=float("inf"),
         )
     )

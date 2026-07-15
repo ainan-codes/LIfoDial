@@ -992,5 +992,9 @@ if __name__ == "__main__":
             api_secret=settings.livekit_api_secret or None,
             host="0.0.0.0",
             port=_port,
+            # Resource-constrained (Render free) tuning — see backend/agent/__main__.py.
+            initialize_process_timeout=120.0,
+            num_idle_processes=1,
+            load_threshold=float("inf"),
         )
     )
