@@ -14,12 +14,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install base requirements first (for layer caching)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install agent-only requirements (pipecat + audio libs)
-COPY requirements.agent.txt .
+# Install base + agent requirements in ONE pip pass so the resolver sees the
+# full set together (requirements.agent.txt starts with `-r requirements.txt`).
+# A two-phase install resolved them separately and hit ResolutionImpossible
+# (e.g. base httpx pin vs pipecat's google-genai httpx>=0.28.1).
+COPY requirements.txt requirements.agent.txt ./
 RUN pip install --no-cache-dir -r requirements.agent.txt
 
 COPY backend/ ./backend/
