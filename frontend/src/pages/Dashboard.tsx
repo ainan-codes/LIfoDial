@@ -15,7 +15,7 @@ import React from 'react';
 import { Link } from 'react-router-dom';
 import fetchWithAuth from '../api/client';
 import {
-    FIXTURE_APPOINTMENTS, FIXTURE_CALL_LOGS,
+    FIXTURE_APPOINTMENTS,
     FIXTURE_TENANT
 } from '../fixtures/data';
 
@@ -171,8 +171,9 @@ export default function Dashboard() {
     retry: false,
   });
 
-  // Fall back to fixture data when API is offline
-  const recentCalls = (callsData?.items ?? callsData) ?? FIXTURE_CALL_LOGS.slice(0, 5);
+  // Real data only — /api/call_logs returns {items: [...]}. No fixture fallback:
+  // when there are no calls (or the fetch fails) the table renders its empty state.
+  const recentCalls = callsData?.items ?? [];
   const liveCount   = statsData?.live_calls ?? 0;
   const isAgentOnline = true; // fixture: always online
 

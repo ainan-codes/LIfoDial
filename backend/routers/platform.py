@@ -607,15 +607,47 @@ async def configured_providers(user: CurrentUser = None, db: AsyncSession = Depe
 # ── POST /platform/push-to-render — explicit, confirmed production sync ────────
 class RenderPushRequest(BaseModel):
     category: Optional[str] = None   # push one category, or all configured keys if None
+    include_infra: Optional[bool] = False  # also sync infrastructure vars (fill-only)
+
+
+# Infrastructure env vars this endpoint MAY sync, mapped to their settings field.
+# These are synced FILL-ONLY (see below): pushed only when missing/empty on Render,
+# never overwriting an existing prod value — so a push from a dev machine can never
+# clobber a correct production SECRET_KEY / ENVIRONMENT / DATABASE_URL.
+_INFRA_ENV_FIELDS = [
+    ("DATABASE_URL", "database_url"),
+    ("ENVIRONMENT", "environment"),
+    ("SECRET_KEY", "secret_key"),
+    ("LIVEKIT_URL", "livekit_url"),
+    ("LIVEKIT_API_SECRET", "livekit_api_secret"),
+    ("CORS_ORIGIN", "cors_origin"),
+    ("FRONTEND_URL", "frontend_url"),
+    ("SUPABASE_URL", "supabase_url"),
+    ("SUPABASE_SERVICE_ROLE_KEY", "supabase_service_role_key"),
+    ("SUPERADMIN_EMAIL", "superadmin_email"),
+    ("SUPERADMIN_PASSWORD", "superadmin_password"),
+]
+
 
 @router.post("/platform/push-to-render")
 async def push_to_render(data: RenderPushRequest, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
     """
-    Push configured provider keys to the Render service's environment variables.
+    Push configuration to the Render service's environment variables.
     Fires ONLY on this explicit call (the UI gates it behind a confirm dialog).
     If Render is unreachable, fails cleanly and leaves local/.env/DB untouched.
+
+    Two scopes:
+      • Provider keys (always): the configured AI/telephony keys from the DB. These
+        OVERWRITE the matching Render var — updating a key is the whole point.
+      • Infrastructure vars (only when include_infra=True): DATABASE_URL, ENVIRONMENT,
+        SECRET_KEY, LIVEKIT_URL/SECRET, CORS/FRONTEND, SUPABASE_*, SUPERADMIN_*.
+        Synced FILL-ONLY — pushed only when the var is missing/empty on Render, never
+        overwriting an existing value. This lets a fresh service be bootstrapped
+        without risking a dev machine stomping a correct prod SECRET_KEY/ENVIRONMENT.
+        Extra guards: ENVIRONMENT is only ever pushed as "production"; a weak/short
+        SECRET_KEY is refused outright.
     """
-    from backend.config import settings
+    from backend.config import settings, _WEAK_SECRETS
     api_key = settings.render_api_key or os.getenv("api_key") or ""
     service_id = settings.render_service_id or os.getenv("service_id") or ""
     if not api_key or not service_id:
@@ -627,16 +659,18 @@ async def push_to_render(data: RenderPushRequest, user: SuperAdmin = None, db: A
         q = q.where(ApiKeyConfig.category == data.category)
     rows = (await db.execute(q)).scalars().all()
 
-    env_updates: dict[str, str] = {}
+    key_updates: dict[str, str] = {}
     for r in rows:
         ev = _provider_env_var(r.provider, r.category)
         raw = r.get_key_raw()
         if ev and raw:
-            env_updates[ev] = raw
-    if not env_updates:
+            key_updates[ev] = raw
+    if not key_updates and not data.include_infra:
         raise HTTPException(status_code=400, detail="No configured keys to push.")
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "application/json"}
+    infra_added: list[str] = []
+    infra_skipped: dict[str, str] = {}
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             # Merge with existing Render env vars (PUT replaces the whole set).
@@ -648,7 +682,29 @@ async def push_to_render(data: RenderPushRequest, user: SuperAdmin = None, db: A
                 ev = item.get("envVar", item)
                 if ev.get("key"):
                     merged[ev["key"]] = ev.get("value", "")
-            merged.update(env_updates)  # our keys win
+
+            # Provider keys overwrite (that's the intent of a key push).
+            merged.update(key_updates)
+
+            # Infra vars: FILL-ONLY. Only set when missing/empty on Render.
+            if data.include_infra:
+                for env_name, field in _INFRA_ENV_FIELDS:
+                    val = (getattr(settings, field, "") or "").strip()
+                    if not val:
+                        infra_skipped[env_name] = "empty locally"
+                        continue
+                    if merged.get(env_name, "").strip():
+                        infra_skipped[env_name] = "already set on Render (not overwritten)"
+                        continue
+                    if env_name == "ENVIRONMENT" and val.lower() != "production":
+                        infra_skipped[env_name] = f"refused to push non-production value '{val}'"
+                        continue
+                    if env_name == "SECRET_KEY" and (val in _WEAK_SECRETS or len(val) < 32):
+                        infra_skipped[env_name] = "refused to push weak/short SECRET_KEY"
+                        continue
+                    merged[env_name] = val
+                    infra_added.append(env_name)
+
             payload = [{"key": k, "value": v} for k, v in merged.items()]
             put = await client.put(f"https://api.render.com/v1/services/{service_id}/env-vars", headers=headers, json=payload)
             if put.status_code not in (200, 201):
@@ -659,8 +715,10 @@ async def push_to_render(data: RenderPushRequest, user: SuperAdmin = None, db: A
         raise HTTPException(status_code=502, detail=f"Render unreachable: {str(e)[:150]}. Local/.env/DB untouched.")
 
     await _audit(db, getattr(user, "subject", None) or "superadmin", "render.push",
-                 target=data.category or "all", detail=f"pushed {len(env_updates)} keys")
-    return {"pushed": sorted(env_updates.keys()), "count": len(env_updates),
+                 target=data.category or "all",
+                 detail=f"pushed {len(key_updates)} keys, {len(infra_added)} infra (fill-only)")
+    return {"pushed": sorted(key_updates.keys()), "count": len(key_updates),
+            "infra_added": sorted(infra_added), "infra_skipped": infra_skipped,
             "note": "Render will redeploy the service to apply the new env vars."}
 
 

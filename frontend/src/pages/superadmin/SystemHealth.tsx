@@ -91,8 +91,11 @@ export default function SASystemHealth() {
       setApiRtt(Math.round(performance.now() - t0)); // genuine client→API→client RTT
       setHealth(data);
     } catch {
+      // Do NOT fabricate a status here. Leaving these unknown makes the cards
+      // render "Unknown"/"—" instead of a misleading "SQLite / development"
+      // (which is what made prod look broken when the call merely 401'd).
       setApiRtt(null);
-      setHealth({ database: { status: 'unknown' }, environment: 'development' });
+      setHealth({ database: { status: 'unknown' } });
     } finally {
       setLoading(false);
       setLastRefresh(new Date());
@@ -204,14 +207,14 @@ export default function SASystemHealth() {
         <ServiceCard
           label="Database"
           status={dbStatus}
-          detail={health.database?.type ?? 'SQLite'}
+          detail={health.database?.type ?? 'Unknown'}
           latency={health.database?.latency_ms}
           extra={health.database?.tenant_count !== undefined ? `${health.database.tenant_count} tenants · ${health.database.appointment_count} appointments` : undefined}
         />
         <ServiceCard
           label="Agent API"
           status={apiRtt !== null ? 'healthy' : loading ? 'unknown' : 'error'}
-          detail={`FastAPI · ${health.environment ?? 'development'}`}
+          detail={`FastAPI · ${health.environment ?? 'unknown'}`}
           latency={apiRtt !== null ? apiRtt : '—'}
           extra="Measured round-trip"
         />
@@ -271,7 +274,7 @@ export default function SASystemHealth() {
                   { label: 'Tenants', value: health.database.tenant_count?.toString() ?? '0' },
                   { label: 'Appointments', value: health.database.appointment_count?.toString() ?? '0' },
                   { label: 'Latency', value: `${health.database.latency_ms}ms` },
-                  { label: 'Engine', value: health.database.type ?? 'SQLite' },
+                  { label: 'Engine', value: health.database.type ?? 'Unknown' },
                 ].map(({ label, value }) => (
                   <div key={label} style={{ display: 'flex', justifyContent: 'space-between' }}>
                     <span style={{ color: '#888', fontSize: '12px' }}>{label}</span>
@@ -291,7 +294,7 @@ export default function SASystemHealth() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span style={{ color: '#888', fontSize: '12px' }}>Mode</span>
-                <code style={{ backgroundColor: '#0F0F0F', color: '#3ECF8E', padding: '2px 8px', borderRadius: '4px', fontSize: '12px' }}>{health.environment ?? 'development'}</code>
+                <code style={{ backgroundColor: '#0F0F0F', color: '#3ECF8E', padding: '2px 8px', borderRadius: '4px', fontSize: '12px' }}>{health.environment ?? 'unknown'}</code>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span style={{ color: '#888', fontSize: '12px' }}>API Base</span>

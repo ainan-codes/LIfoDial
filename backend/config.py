@@ -129,10 +129,22 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _enforce_prod_secrets(self):
         if self.environment.lower() == "production":
+            # SECRET_KEY also derives the Fernet key used to encrypt provider keys
+            # at rest (see backend/security.py::_fernet), so this single guard
+            # protects both JWT signing AND encryption-at-rest — there is no
+            # separate FERNET_KEY to check.
             if self.secret_key.strip() in _WEAK_SECRETS or len(self.secret_key) < 32:
                 raise RuntimeError(
                     "SECRET_KEY is missing, weak, or a known default. Set a strong "
                     "(>=32 char) unique SECRET_KEY before running in production."
+                )
+            # Never boot production against a missing DB or SQLite (db.py enforces
+            # the resolved-URL case too; this catches it earlier with a clear msg).
+            if not self.database_url.strip() or "sqlite" in self.database_url.lower():
+                raise RuntimeError(
+                    "DATABASE_URL is missing or points at SQLite while "
+                    "ENVIRONMENT=production. Set the Supabase session-pooler "
+                    "connection string before running in production."
                 )
             if not self.superadmin_password:
                 logger.warning(

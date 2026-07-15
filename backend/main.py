@@ -11,7 +11,7 @@ import os as _os
 
 from backend.config import settings
 from backend.db import init_db, engine, Base
-from backend.auth import require_superadmin
+from backend.auth import require_superadmin, get_current_user
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -318,20 +318,32 @@ async def _warmup() -> None:
     except Exception as e:
         logger.warning("[WARMUP] DB warmup failed: %s", e)
 
-    # 2. Sarvam API (cheap OPTIONS call or real transcribe with silent audio)
+    # 2. Sarvam API — hit a REAL endpoint (the list-models route). The bare root
+    #    "/" returns 404 (no route there), which used to log a misleading
+    #    "[WARMUP] Sarvam API reachable: HTTP 404" even though the key was valid.
+    #    /v1/models returns 200 for a valid key, so status<400 = genuinely healthy.
     sarvam_key = getattr(_s, "sarvam_api_key", None)
     if sarvam_key:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 r = await client.get(
-                    "https://api.sarvam.ai/",
+                    "https://api.sarvam.ai/v1/models",
                     headers={"api-subscription-key": sarvam_key},
                 )
-            logger.info("[WARMUP] Sarvam API reachable: HTTP %s", r.status_code)
+            if r.status_code < 400:
+                logger.info("[WARMUP] Sarvam API reachable: HTTP %s (OK)", r.status_code)
+            else:
+                logger.warning(
+                    "[WARMUP] Sarvam API rejected the request: HTTP %s — key may be "
+                    "invalid/expired. Body: %s", r.status_code, r.text[:120]
+                )
         except Exception as e:
             logger.warning("[WARMUP] Sarvam API warmup failed (non-fatal): %s", e)
 
-    # 3. Gemini API
+    # 3. Gemini API — distinguish "reachable+valid" (2xx) from a real key problem
+    #    (401/403 = revoked/leaked/geo-blocked key, NOT a malformed check). A 403
+    #    with "reported as leaked" means the key must be ROTATED in Google AI
+    #    Studio; log it loudly rather than as a bland "reachable: HTTP 403".
     gemini_key = getattr(_s, "gemini_api_key", None)
     if gemini_key:
         try:
@@ -339,7 +351,16 @@ async def _warmup() -> None:
                 r = await client.get(
                     f"https://generativelanguage.googleapis.com/v1beta/models?key={gemini_key}"
                 )
-            logger.info("[WARMUP] Gemini API reachable: HTTP %s", r.status_code)
+            if r.status_code < 400:
+                logger.info("[WARMUP] Gemini API reachable: HTTP %s (OK)", r.status_code)
+            elif r.status_code in (401, 403):
+                logger.error(
+                    "[WARMUP] Gemini API key REJECTED: HTTP %s — key is likely "
+                    "revoked/leaked/geo-blocked and must be rotated. Body: %s",
+                    r.status_code, r.text[:160]
+                )
+            else:
+                logger.warning("[WARMUP] Gemini API returned HTTP %s: %s", r.status_code, r.text[:120])
         except Exception as e:
             logger.warning("[WARMUP] Gemini API warmup failed (non-fatal): %s", e)
 
@@ -424,9 +445,11 @@ async def block_foreign_requests(request: Request, call_next):
     return await call_next(request)
 
 # ── Core routes ────────────────────────────────────────────────────────────────
-@app.get("/health", tags=["meta"])
+@app.api_route("/health", methods=["GET", "HEAD"], tags=["meta"])
 async def health() -> dict:
-    """Health check — returns database connection status."""
+    """Health check — returns database connection status.
+    Accepts HEAD (uptime monitors / Render health checks) as well as GET so a
+    HEAD probe does not log a 405."""
     from backend.db import AsyncSessionLocal, IS_SQLITE
     db_status = "unknown"
     db_type = "postgresql" if not IS_SQLITE else "sqlite"
@@ -447,9 +470,69 @@ async def health() -> dict:
         "environment": settings.environment,
     }
 
-@app.get("/", tags=["meta"])
+@app.api_route("/", methods=["GET", "HEAD"], tags=["meta"])
 async def root() -> dict[str, str]:
+    # HEAD is handled by the same route so the frequent "HEAD / -> 405" from
+    # Render's health monitor / external uptime checkers stops being logged as
+    # an error. FastAPI strips the body for HEAD automatically.
     return {"service": "Lifodial API", "docs": "/docs"}
+
+
+# ── Recent call logs (real data, tenant-scoped) ─────────────────────────────────
+def _fmt_call_duration(secs) -> str:
+    """Seconds → 'M:SS'. Returns '—' when unknown so the UI never fabricates one."""
+    if not secs or secs < 0:
+        return "—"
+    m, s = divmod(int(secs), 60)
+    return f"{m}:{s:02d}"
+
+
+def _call_record_to_row(rec) -> dict:
+    """Shape a CallRecord into the row the dashboard table renders. Every field
+    comes from the real row — no fixtures, no fabricated placeholders."""
+    outcome = (rec.outcome or "").lower()
+    status_map = {
+        "booked": "Booked", "transferred": "Transferred", "resolved": "Resolved",
+        "cancelled": "CANCELLED", "unresolved": "Failed",
+    }
+    if outcome in status_map:
+        display_status = status_map[outcome]
+    else:
+        display_status = {
+            "completed": "Resolved", "failed": "Failed", "in_progress": "Pending",
+            "transferred": "Transferred", "voicemail": "Pending",
+        }.get((rec.status or "").lower(), "Pending")
+    return {
+        "id": rec.id,
+        "caller_number": rec.patient_number_masked or rec.patient_number or "—",
+        "intent": rec.intent_detected or "—",
+        "duration": _fmt_call_duration(rec.duration_seconds),
+        "created_at": rec.created_at.strftime("%d %b %Y, %H:%M") if rec.created_at else "—",
+        "status": display_status,
+    }
+
+
+@app.get("/api/call_logs", tags=["calls"])
+async def recent_call_logs(limit: int = 5, user=Depends(get_current_user)) -> dict:
+    """Most-recent calls from the real call_records table.
+
+    Tenant-scoped: a clinic token sees only its own tenant's calls; a superadmin
+    token sees calls across all tenants. Returns {"items": []} when there are no
+    calls yet — the UI renders a clean empty state, never fixture data.
+    """
+    from backend.db import AsyncSessionLocal
+    from backend.models.call_record import CallRecord
+    from sqlalchemy import select, desc
+
+    limit = max(1, min(limit, 50))
+    async with AsyncSessionLocal() as db:
+        stmt = select(CallRecord).order_by(desc(CallRecord.created_at)).limit(limit)
+        if not user.is_superadmin:
+            # tenant_id is derived from the verified token, never the request.
+            stmt = stmt.where(CallRecord.tenant_id == user.tenant_id)
+        rows = (await db.execute(stmt)).scalars().all()
+
+    return {"items": [_call_record_to_row(r) for r in rows]}
 
 @app.post("/admin/reset-db", tags=["superadmin"])
 async def reset_db(_user=Depends(require_superadmin)):

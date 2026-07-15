@@ -25,19 +25,39 @@ load_dotenv()
 
 
 def get_database_url() -> str:
-    raw = os.getenv("DATABASE_URL", "")
+    raw = os.getenv("DATABASE_URL", "").strip()
+    env = os.getenv("ENVIRONMENT", "development").strip().lower()
 
     if not raw:
-        logger.warning("No DATABASE_URL - using SQLite fallback")
+        # NON-NEGOTIABLE: production must NEVER silently fall back to SQLite.
+        # A missing DATABASE_URL in production is a fatal misconfiguration —
+        # refuse to boot loudly instead of coming up on an empty local file DB.
+        if env == "production":
+            raise RuntimeError(
+                "FATAL: DATABASE_URL is not set but ENVIRONMENT=production. "
+                "Refusing to boot on the SQLite fallback in production. Set "
+                "DATABASE_URL to the Supabase session-pooler connection string."
+            )
+        logger.warning("No DATABASE_URL - using SQLite fallback (development only)")
         return "sqlite+aiosqlite:///./lifodial.db"
 
     # Convert sync URL to async driver format
     if raw.startswith("postgresql://"):
-        return raw.replace("postgresql://", "postgresql+asyncpg://", 1)
-    if raw.startswith("postgres://"):
-        return raw.replace("postgres://", "postgresql+asyncpg://", 1)
+        url = raw.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif raw.startswith("postgres://"):
+        url = raw.replace("postgres://", "postgresql+asyncpg://", 1)
+    else:
+        url = raw
 
-    return raw
+    # Even if DATABASE_URL is set, guard against it resolving to SQLite in prod
+    # (e.g. someone sets DATABASE_URL=sqlite:///x.db). Same hard-fail rule.
+    if env == "production" and "sqlite" in url.lower():
+        raise RuntimeError(
+            "FATAL: DATABASE_URL resolves to SQLite while ENVIRONMENT=production. "
+            "Refusing to boot on SQLite in production."
+        )
+
+    return url
 
 
 DATABASE_URL = get_database_url()
