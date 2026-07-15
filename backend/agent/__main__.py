@@ -25,10 +25,12 @@ Environment variables required (.env):
 
 from livekit.agents import WorkerOptions, cli
 
-from backend.agent.pipeline import entrypoint, prewarm
+from backend.agent.pipeline import AGENT_NAME, entrypoint, prewarm, _preflight_or_die
 from backend.config import settings
 
 if __name__ == "__main__":
+    # Fail loudly if the worker can't register with LiveKit (audit FIX 1.4).
+    _preflight_or_die()
     # The livekit-agents CLI normally reads LIVEKIT_URL/API_KEY/API_SECRET from OS
     # environment variables. Pass them explicitly from the app settings (which load
     # the project .env) so `python -m backend.agent start` works without a separate
@@ -37,7 +39,7 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
-            agent_name="lifodial-inbound-agent",
+            agent_name=AGENT_NAME,
             ws_url=settings.livekit_url or None,
             api_key=settings.livekit_api_key or None,
             api_secret=settings.livekit_api_secret or None,

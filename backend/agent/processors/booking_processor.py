@@ -16,12 +16,11 @@ It only reads TranscriptionFrames and triggers side-effects.
 No added latency to the voice pipeline (all DB writes are fire-and-forget tasks).
 """
 
-import asyncio
 import logging
 import re
 from typing import Optional
 
-from pipecat.frames.frames import Frame, TextFrame, TranscriptionFrame
+from pipecat.frames.frames import Frame, LLMContextFrame, TextFrame, TranscriptionFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 logger = logging.getLogger(__name__)
@@ -46,6 +45,12 @@ _EMERGENCY_WORDS: frozenset[str] = frozenset({
 # Matches times like "11 AM", "3:30 pm", "11 baje", "gyarah baje"
 _SLOT_PATTERN = re.compile(
     r'\b(\d{1,2}(?::\d{2})?\s*(?:am|pm|baje|bajey)?)\b',
+    re.IGNORECASE,
+)
+
+# Day words that qualify a requested time ("tomorrow 3 pm", "kal 11 baje")
+_DAY_PATTERN = re.compile(
+    r'\b(today|tomorrow|tonight|aaj|kal|parso|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b',
     re.IGNORECASE,
 )
 
@@ -81,13 +86,19 @@ class BookingProcessor(FrameProcessor):
         self.booking_state: dict = {
             "pending_doctor_id":   None,   # UUID string of matched doctor
             "pending_doctor_name": None,   # Human-readable name
-            "pending_slot":        None,   # Offered slot time string
-            "awaiting_confirm":    False,  # True after slot offered, awaiting YES/NO
+            "pending_slot":        None,   # Slot the CALLER asked for (never fabricated)
+            "awaiting_confirm":    False,  # True once doctor + caller-given slot exist
             "patient_phone":       call_meta.get("caller_phone", "unknown"),
             "patient_name":        None,   # Extracted from conversation
             "confirmed":           False,  # True once booking committed to DB
             "emergency_detected":  False,  # True on emergency keyword
         }
+
+        # Set when a confirm keyword is heard; consumed on the next
+        # LLMContextFrame, where the DB write is AWAITED and its real result is
+        # injected into the LLM context BEFORE generation (audit FIX 4 — the
+        # agent must never say "booked" unless the row actually exists).
+        self._commit_pending: bool = False
 
         logger.info(
             "BookingProcessor initialised | tenant=%s caller=%s",
@@ -97,9 +108,26 @@ class BookingProcessor(FrameProcessor):
     # ── FrameProcessor interface ──────────────────────────────────────────────
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        """Pass every frame through; inspect TranscriptionFrames for state triggers."""
+        """Pass every frame through; inspect TranscriptionFrames for state triggers.
+
+        LLMContextFrame is the frame that triggers LLM generation downstream —
+        when a booking commit is pending, we HOLD it here, await the DB write,
+        and inject the real result into the context first. This is the
+        mechanism that makes "booked" impossible to speak before the row
+        exists. Only the confirmation turn pays this DB round-trip; every
+        other frame passes straight through (no hot-path latency added).
+        """
+        # REQUIRED first: lets the base FrameProcessor handle system frames
+        # (StartFrame/CancelFrame/…) and mark itself started. Without it,
+        # pipecat 1.5 floods "Trying to process X but StartFrame not received"
+        # and blocks CancelFrame from reaching the pipeline end at teardown.
+        await super().process_frame(frame, direction)
+
         if isinstance(frame, TranscriptionFrame) and frame.text:
             await self._handle_transcription(frame.text)
+
+        if isinstance(frame, LLMContextFrame) and self._commit_pending:
+            await self._commit_and_inject_result(frame)
 
         # Always push the frame downstream — never block the voice pipeline
         await self.push_frame(frame, direction)
@@ -137,9 +165,24 @@ class BookingProcessor(FrameProcessor):
         if not self.booking_state["awaiting_confirm"]:
             self._try_match_doctor(text_lower)
 
-        # 3. Detect explicit slot time from utterance
-        if self.booking_state["awaiting_confirm"]:
+        # 3. Extract the slot the CALLER asks for. Runs whenever a doctor is
+        #    pending — before confirm (caller states a time) or during confirm
+        #    (caller changes the time). There is NO fabricated default slot
+        #    (audit FIX 4: the old code offered a hardcoded "11:00 AM").
+        if self.booking_state["pending_doctor_id"]:
             self._try_extract_slot(text)
+            # Doctor + a caller-given time = ready to ask for a yes/no.
+            if (
+                self.booking_state["pending_slot"]
+                and not self.booking_state["awaiting_confirm"]
+                and self.check_availability_allowed()
+            ):
+                self.booking_state["awaiting_confirm"] = True
+                logger.info(
+                    "Booking: doctor '%s' + caller-requested slot '%s' — awaiting confirm.",
+                    self.booking_state["pending_doctor_name"],
+                    self.booking_state["pending_slot"],
+                )
 
         # 4. Detect cancellation
         if self.booking_state["awaiting_confirm"]:
@@ -150,10 +193,13 @@ class BookingProcessor(FrameProcessor):
                 self.booking_state["pending_slot"] = None
                 return
 
-        # 5. Detect confirmation → commit appointment
-        if self.booking_state["awaiting_confirm"]:
+        # 5. Detect confirmation → mark commit pending. The actual DB write is
+        #    awaited on the next LLMContextFrame (see process_frame) so its
+        #    real result reaches the LLM before it can speak a confirmation.
+        if self.booking_state["awaiting_confirm"] and self.booking_state["pending_slot"]:
             if any(w in text_lower for w in _CONFIRM_WORDS):
-                await self._try_commit_booking()
+                self._commit_pending = True
+                logger.info("Booking confirm keyword heard — commit will be awaited before LLM reply.")
 
     async def _handle_emergency(self) -> None:
         """
@@ -225,67 +271,88 @@ class BookingProcessor(FrameProcessor):
                 break
 
     def _set_pending_doctor(self, doc: dict) -> None:
-        """Record a matched doctor and mark booking as awaiting confirmation."""
+        """Record a matched doctor. Confirmation is NOT armed here — it requires
+        a slot the caller actually asked for (see _handle_transcription step 3).
+        The old hardcoded '11:00 AM' default is gone (audit FIX 4)."""
         self.booking_state["pending_doctor_id"]   = doc.get("id")
         self.booking_state["pending_doctor_name"] = doc.get("name")
-
-        if not self.check_availability_allowed():
-            # Doctor identified, but the clinic disabled availability lookups —
-            # don't offer a slot or move to confirmation.
-            logger.info(
-                "Booking: matched doctor '%s' but can_check_availability is off — not offering a slot.",
-                doc.get("name"),
-            )
-            return
-
-        # Default slot — real implementation would call his.get_slots()
-        self.booking_state["pending_slot"]        = "11:00 AM"
-        self.booking_state["awaiting_confirm"]    = True
         logger.info(
-            "Booking: matched doctor '%s' (id=%s) — awaiting patient confirm.",
+            "Booking: matched doctor '%s' (id=%s) — waiting for the caller's requested time.",
             doc.get("name"), doc.get("id"),
         )
 
     def _try_extract_slot(self, text: str) -> None:
-        """Extract a time slot from the utterance and update pending_slot."""
+        """Extract the requested slot from the caller's own words. Captures an
+        explicit clock time plus any nearby day word ("tomorrow 3 pm",
+        "kal 11 baje") so the stored slot reflects what was actually asked."""
         match = _SLOT_PATTERN.search(text)
-        if match:
-            slot = match.group(0).strip()
-            self.booking_state["pending_slot"] = slot
-            logger.info("Slot updated from utterance: '%s'", slot)
+        if not match:
+            return
+        slot = match.group(0).strip()
 
-    async def _try_commit_booking(self) -> None:
-        """Fire appointment DB write as a background task (never blocks voice)."""
+        day_match = _DAY_PATTERN.search(text)
+        if day_match:
+            slot = f"{day_match.group(0).strip().capitalize()} {slot}"
+
+        self.booking_state["pending_slot"] = slot
+        logger.info("Slot captured from caller utterance: '%s'", slot)
+
+    async def _commit_and_inject_result(self, frame: LLMContextFrame) -> None:
+        """AWAIT the appointment DB write, then inject the REAL outcome into the
+        LLM context carried by this frame — before the LLM generates.
+
+        Success → the LLM is told the row exists (id + doctor + slot) and may
+        confirm. Failure → the LLM is told to apologize and offer to retry, and
+        booking state is re-armed so a fresh "yes" retries the commit (the
+        idempotency key in his.create_appointment makes retries safe).
+        """
+        self._commit_pending = False
+
         tenant_id = self._tenant.get("id")
         doctor_id = self.booking_state.get("pending_doctor_id")
-        slot_time = self.booking_state.get("pending_slot", "TBD")
+        slot_time = self.booking_state.get("pending_slot")
         patient_phone = self.booking_state.get("patient_phone", "unknown")
 
-        if not tenant_id or not doctor_id:
+        if not tenant_id or not doctor_id or not slot_time:
             logger.warning(
-                "Confirmation detected but missing tenant_id=%s or doctor_id=%s — skipping.",
-                tenant_id, doctor_id,
+                "Confirm heard but booking incomplete (tenant=%s doctor=%s slot=%s) — not committing.",
+                tenant_id, doctor_id, slot_time,
             )
             return
 
-        logger.info(
-            "Booking confirmed! tenant=%s doctor_id=%s slot=%s phone=%s",
-            tenant_id, doctor_id, slot_time, patient_phone,
+        ok, result = await _commit_booking_to_db(
+            tenant_id=str(tenant_id),
+            doctor_id=str(doctor_id),
+            slot_time=slot_time,
+            patient_phone=patient_phone,
+            call_record_id=self._call_meta.get("call_record_id"),
         )
 
-        # Mark state BEFORE firing task — prevents double-fire on repeated "yes"
-        self.booking_state["confirmed"]       = True
-        self.booking_state["awaiting_confirm"] = False
-
-        asyncio.create_task(
-            _commit_booking_to_db(
-                tenant_id=str(tenant_id),
-                doctor_id=str(doctor_id),
-                slot_time=slot_time,
-                patient_phone=patient_phone,
-                call_record_id=self._call_meta.get("call_record_id"),
+        context = getattr(frame, "context", None)
+        if ok:
+            self.booking_state["confirmed"] = True
+            self.booking_state["awaiting_confirm"] = False
+            msg = (
+                f"[BOOKING_RESULT success=true] The appointment IS saved in the system: "
+                f"{result.get('doctor_name', self.booking_state['pending_doctor_name'])} at {slot_time} "
+                f"(appointment id {result.get('appointment_id')}). "
+                "Confirm this to the caller in one short sentence."
             )
-        )
+        else:
+            # Re-arm so another "yes" retries — idempotency key prevents dupes.
+            self.booking_state["confirmed"] = False
+            self.booking_state["awaiting_confirm"] = True
+            msg = (
+                "[BOOKING_RESULT success=false] The appointment could NOT be saved due to a system error. "
+                "Do NOT say it is booked. Apologize briefly and ask if they'd like you to try again."
+            )
+
+        if context is not None:
+            try:
+                context.add_message({"role": "system", "content": msg})
+            except Exception as exc:
+                logger.error("Failed to inject booking result into LLM context: %s", exc)
+        logger.info("Booking commit result injected: ok=%s slot=%s", ok, slot_time)
 
     def check_availability_allowed(self) -> bool:
         """Gate for the 'Check Availability' tool toggle — offering a slot to
@@ -295,7 +362,7 @@ class BookingProcessor(FrameProcessor):
         return self._agent_config.get("can_check_availability", True)
 
 
-# ── Standalone DB commit function (called as background task) ─────────────────
+# ── Standalone DB commit function ─────────────────────────────────────────────
 
 async def _commit_booking_to_db(
     tenant_id: str,
@@ -303,12 +370,15 @@ async def _commit_booking_to_db(
     slot_time: str,
     patient_phone: str,
     call_record_id: Optional[str] = None,
-) -> None:
+) -> tuple[bool, dict]:
     """
-    Write appointment to PostgreSQL and fire Google Sheets webhook.
+    Write appointment to PostgreSQL and return (ok, result).
 
-    Runs as asyncio.create_task() — never blocks the voice call.
-    All errors are logged and swallowed; the call continues regardless.
+    AWAITED by BookingProcessor before the LLM is allowed to speak a
+    confirmation (audit FIX 4: "booked" must never be spoken on a failed or
+    unconfirmed write). Idempotency lives in his.create_appointment — a
+    repeated commit for the same call_id returns the existing row instead of
+    creating a duplicate.
     """
     try:
         from backend.services.his import create_appointment  # Lazy import — avoids circular deps
@@ -320,15 +390,20 @@ async def _commit_booking_to_db(
             patient_phone=patient_phone,
             call_id=call_record_id,
         )
+        if not result or not result.get("appointment_id"):
+            logger.error("[BookingProcessor] create_appointment returned no appointment_id: %r", result)
+            return False, {}
         logger.info(
             "[BookingProcessor] Appointment saved: id=%s doctor=%s slot=%s",
             result.get("appointment_id"),
             result.get("doctor_name"),
             slot_time,
         )
+        return True, result
     except Exception as exc:
         logger.error(
             "[BookingProcessor] Failed to save appointment: %s",
             exc,
             exc_info=True,
         )
+        return False, {}

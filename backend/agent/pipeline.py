@@ -46,7 +46,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.services.google.llm import GoogleLLMService
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSModel, SarvamTTSService
 from pipecat.services.openai.stt import OpenAISTTService
@@ -104,17 +104,37 @@ def _kb_context_block(tenant: dict) -> str:
     )
 
 
+# Appended to EVERY system prompt (custom, template, or fallback). This is the
+# honesty contract that pairs with BookingProcessor._commit_and_inject_result:
+# the DB write is awaited and its outcome arrives as a [BOOKING_RESULT] system
+# message BEFORE the LLM generates — so the model must never claim success on
+# its own (audit FIX 4).
+_BOOKING_RULES_BLOCK = (
+    "\n\n--- APPOINTMENT BOOKING RULES (STRICT) ---\n"
+    "1. When the caller wants an appointment, ask which doctor and what day/time "
+    "they want. Never invent or assume a time yourself.\n"
+    "2. Once they give a time, repeat the doctor + time back and ask them to confirm.\n"
+    "3. NEVER say an appointment is booked, confirmed, or scheduled unless a system "
+    "message starting with [BOOKING_RESULT success=true] appears. Until then, say it "
+    "is not yet confirmed.\n"
+    "4. If a [BOOKING_RESULT success=false] message appears, apologize, say the "
+    "booking could not be saved, and offer to try again.\n"
+    "--- END BOOKING RULES ---"
+)
+
+
 def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
     """
     Build the LLM system prompt from stored config, or render from template,
-    then append the clinic knowledge base (if any).
+    then append the clinic knowledge base (if any) and the booking honesty
+    rules (always).
 
     Precedence:
       1. agent_config['system_prompt'] — custom prompt set by clinic admin
       2. Rendered prompt_templates entry for agent_config['template']
       3. Hardcoded fallback
     """
-    kb_block = _kb_context_block(tenant)
+    kb_block = _kb_context_block(tenant) + _BOOKING_RULES_BLOCK
 
     custom_prompt = (agent_config.get("system_prompt") or "").strip()
     if custom_prompt:
@@ -431,10 +451,19 @@ async def entrypoint(ctx) -> None:
 
     ctx: livekit.agents.JobContext
     """
-    # ── Parse room metadata ────────────────────────────────────────────────
+    # ── Parse call metadata ─────────────────────────────────────────────────
+    # Prefer room metadata (the web-call flow sets it at create_room). Fall back
+    # to the job's dispatch metadata, which is where an explicit agent dispatch
+    # (SIP inbound, or a programmatic create_dispatch) carries it. Without this
+    # fallback, explicit-dispatch jobs saw tenant/agent = None and ran on
+    # defaults.
     metadata: dict = {}
+    _raw_meta = ""
     try:
-        metadata = json.loads(ctx.room.metadata or "{}")
+        _raw_meta = (getattr(ctx.room, "metadata", "") or "").strip()
+        if not _raw_meta:
+            _raw_meta = (getattr(getattr(ctx, "job", None), "metadata", "") or "").strip()
+        metadata = json.loads(_raw_meta or "{}")
     except (json.JSONDecodeError, AttributeError):
         pass
 
@@ -599,24 +628,28 @@ async def entrypoint(ctx) -> None:
             settings=stt_settings,
         )
 
-    # LLM — Google Gemini 2.0 Flash via Pipecat GoogleLLMService
-    llm = GoogleLLMService(
-        api_key=settings.gemini_api_key,
-        model=agent_config.get("llm_model", "gemini-2.0-flash"),
-        system_instruction=system_prompt,
-        settings=GoogleLLMService.Settings(
-            temperature=float(agent_config.get("llm_temperature", 0.3)),
-            max_tokens=int(agent_config.get("max_response_tokens", 120)),
-        ),
-    )
+    # LLM — resilient provider selection (audit FIX 2). Probe the configured
+    # provider first, fall back through healthy alternatives. This is what makes
+    # a dead/leaked primary key (the Gemini key is currently revoked) non-fatal:
+    # the whole call runs on the first reachable provider instead of going silent.
+    # Probes run once here at setup — never in the per-turn hot loop.
+    from backend.agent.resilience import select_llm_provider, build_llm, ResilienceProcessor
 
-    # Build LLM context (conversation history)
+    llm_provider, llm_key, llm_model = await select_llm_provider(agent_config)
+    log.info("Using LLM provider=%s model=%s for room=%s", llm_provider, llm_model, room_name)
+    llm = build_llm(llm_provider, llm_key, llm_model, system_prompt, agent_config)
+
+    # Build LLM context (conversation history) + a PROVIDER-AGNOSTIC aggregator.
+    # llm.create_context_aggregator(...) only exists on GoogleLLMService; since
+    # the LLM is now chosen at runtime (Gemini/Groq/OpenAI — audit FIX 2), use
+    # the universal LLMContextAggregatorPair, which drives any provider off the
+    # same LLMContext.
     context = LLMContext(
         messages=[
             {"role": "system", "content": system_prompt},
         ]
     )
-    context_aggregator = llm.create_context_aggregator(context)
+    context_aggregator = LLMContextAggregatorPair(context)
 
     # TTS — Sarvam AI or ElevenLabs
     tts_provider = agent_config.get("tts_provider", "sarvam")
@@ -704,6 +737,12 @@ async def entrypoint(ctx) -> None:
         agent_config=agent_config,
     )
 
+    # Never-silence guard (audit FIX 2): sits at the tail of the pipeline and,
+    # on any LLM/TTS ErrorFrame, speaks a short reassurance phrase in the agent's
+    # language instead of leaving dead air. Task is bound after PipelineTask
+    # construction below.
+    resilience = ResilienceProcessor(language=tts_language)
+
     # ── Build the Pipeline ─────────────────────────────────────────────────
     # Data flows left to right through each processor:
     #
@@ -718,6 +757,7 @@ async def entrypoint(ctx) -> None:
         context_aggregator.assistant(),          # Stores assistant reply in context
         call_logger,                             # Metrics + call record updates (transparent)
         tts,                                     # LLMResponseFrame → TTSAudioRawFrame
+        resilience,                              # Never-silence: ErrorFrame → spoken fallback
         transport.output(),                      # Audio out to LiveKit room
     ])
 
@@ -736,6 +776,22 @@ async def entrypoint(ctx) -> None:
     first_message_mode = agent_config.get("first_message_mode", "assistant-speaks-first")
     recording_consent_plan = agent_config.get("recording_consent_plan", "none") or "none"
     _CONSENT_NOTICE = "This call may be recorded for quality and training purposes."
+
+    # ── Recording is NOT implemented (audit FIX 5, Option B) ─────────────────
+    # Call audio is never captured and recording_url is never written. Asking a
+    # caller to consent to a recording that does not exist is a trust/legal
+    # problem, so the consent prompt is force-disabled at runtime regardless of
+    # the stored recording_consent_plan. The admin field is left intact; when
+    # real recording (LiveKit Egress → Supabase recordings/) is built in a later
+    # batch, flip RECORDING_IMPLEMENTED to True and this suppression lifts itself.
+    RECORDING_IMPLEMENTED = False
+    if not RECORDING_IMPLEMENTED and recording_consent_plan != "none":
+        log.warning(
+            "Recording is not implemented — ignoring recording_consent_plan=%s and NOT asking "
+            "the caller to consent to a recording that will not happen (audit FIX 5, Option B).",
+            recording_consent_plan,
+        )
+        recording_consent_plan = "none"
 
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(transport_ref, participant_id: str) -> None:
@@ -799,19 +855,36 @@ async def entrypoint(ctx) -> None:
     # detection — see CallLoggerProcessor._on_user_speech).
     call_logger.task = task
 
+    # Let the never-silence guard inject a spoken phrase via the source on error.
+    resilience.bind_task(task)
+
     watchdog_tasks = [
         asyncio.create_task(_enforce_max_duration(task, max_duration_seconds, end_call_message)),
         asyncio.create_task(_enforce_silence_timeout(task, call_logger, silence_timeout_seconds, end_call_message)),
     ]
 
     # ── Run ────────────────────────────────────────────────────────────────
-    runner = PipelineRunner()
+    # handle_sigint=False: the livekit-agents worker runs each job in its own
+    # subprocess/thread and owns process lifecycle + signal handling. Letting
+    # PipelineRunner install its own SIGINT handler crashes with
+    # "signal only works in main thread" (and is unnecessary — the worker
+    # already handles graceful shutdown).
+    runner = PipelineRunner(handle_sigint=False)
     try:
         await runner.run(task)
     finally:
         for t in watchdog_tasks:
             if not t.done():
                 t.cancel()
+        # Keep the job process alive until the CallRecord is finalized. The
+        # end/cancel frame schedules finalization as a task; without this await
+        # the process could exit before duration/transcript/latency persist
+        # (audit FIX 3 — call_records must finalize on real hangups).
+        try:
+            ok = await call_logger.wait_finalized(timeout=10.0)
+            log.info("Finalization %s for room=%s", "completed" if ok else "TIMED OUT", room_name)
+        except Exception as exc:
+            log.error("Error awaiting finalization for room=%s: %s", room_name, exc)
 
     log.info("Pipeline finished for room=%s", room_name)
 
@@ -851,6 +924,14 @@ async def _enforce_silence_timeout(
 
 # ── Worker bootstrap ──────────────────────────────────────────────────────────
 
+# Single source of truth for the dispatch name — MUST equal
+# backend/routers/web_calls.py::AGENT_NAME or dispatched calls connect but no
+# agent ever joins (audit FIX 1.2).
+AGENT_NAME = "lifodial-inbound-agent"
+
+_PLACEHOLDER_LK_URL = "wss://your-project.livekit.cloud"
+
+
 def prewarm(proc) -> None:
     """
     Pre-warm Silero VAD model before the first call.
@@ -861,13 +942,48 @@ def prewarm(proc) -> None:
     log.info("Agent worker pre-warmed.")
 
 
+def _preflight_or_die() -> None:
+    """Fail LOUDLY before the worker starts if it can't possibly register with
+    LiveKit (audit FIX 1.4 — never start silently and never pick up calls).
+
+    A missing/placeholder LiveKit URL/key/secret is a fatal misconfiguration:
+    the worker would otherwise appear to boot but never register, so every
+    dispatched call would connect to a room no agent ever joins.
+    """
+    missing = [
+        name for name, val in (
+            ("LIVEKIT_URL", settings.livekit_url),
+            ("LIVEKIT_API_KEY", settings.livekit_api_key),
+            ("LIVEKIT_API_SECRET", settings.livekit_api_secret),
+        )
+        if not (val or "").strip()
+    ]
+    placeholder = settings.livekit_url.strip() == _PLACEHOLDER_LK_URL
+    if missing or placeholder:
+        reason = (
+            f"placeholder LIVEKIT_URL ({_PLACEHOLDER_LK_URL})" if placeholder
+            else f"missing {', '.join(missing)}"
+        )
+        log.critical(
+            "FATAL: agent worker cannot register with LiveKit — %s. Refusing to start "
+            "(a silently-started worker would never pick up any call). Set the LiveKit "
+            "credentials and restart.", reason,
+        )
+        raise SystemExit(1)
+    log.info("Preflight OK — LiveKit creds present; registering worker as agent_name=%s", AGENT_NAME)
+
+
 if __name__ == "__main__":
     from livekit.agents import WorkerOptions, cli
 
+    _preflight_or_die()
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
-            agent_name="lifodial-inbound-agent",
+            agent_name=AGENT_NAME,
+            ws_url=settings.livekit_url or None,
+            api_key=settings.livekit_api_key or None,
+            api_secret=settings.livekit_api_secret or None,
         )
     )

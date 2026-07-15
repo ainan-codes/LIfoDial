@@ -21,6 +21,7 @@ import uuid
 from typing import Optional
 
 from pipecat.frames.frames import (
+    CancelFrame,
     EndFrame,
     Frame,
     MetricsFrame,
@@ -109,6 +110,31 @@ class CallLoggerProcessor(FrameProcessor):
         self._consent_decline_message: str = ""
         self._consent_resume_message: Optional[str] = None
 
+        # Latency tracking from Pipecat MetricsFrame.
+        # MUST live in __init__: these were previously (incorrectly) initialized
+        # inside begin_consent_gate(), so every call whose consent plan wasn't
+        # "require" hit AttributeError in _on_metrics/_finalize_call and never
+        # finalized duration/transcript/latency (audit FIX 3).
+        self._latency_samples: list[float] = []  # total ms per turn (ttfb)
+
+        # Store last TTS start time for response latency calc
+        self._last_tts_start: Optional[float] = None
+
+        # Finalize exactly once, whether the call ends via EndFrame (graceful)
+        # or CancelFrame (caller hangup → task.cancel()). Keying only on EndFrame
+        # meant a real hangup never finalized the CallRecord (audit FIX 3).
+        self._finalized: bool = False
+        # Finalization runs as a task (so the End/Cancel frame is NOT blocked
+        # from propagating — blocking it stalls pipeline teardown). The
+        # entrypoint awaits wait_finalized() in its finally so the job process
+        # stays alive until the write actually lands.
+        self._finalize_task = None
+
+        logger.info(
+            "CallLoggerProcessor init | tenant=%s agent=%s call_id=%s",
+            tenant_id, agent_id, self._call_record_id,
+        )
+
     def begin_consent_gate(self, decline_message: str, resume_message: Optional[str]) -> None:
         """Start gating on the patient's answer to the recording-consent question.
         The next utterance is treated as the yes/no answer instead of normal
@@ -117,21 +143,12 @@ class CallLoggerProcessor(FrameProcessor):
         self._consent_decline_message = decline_message
         self._consent_resume_message = resume_message
 
-        # Latency tracking from Pipecat MetricsFrame
-        self._latency_samples: list[float] = []  # total ms per turn (ttfb)
-
-        # Store last TTS start time for response latency calc
-        self._last_tts_start: Optional[float] = None
-
-        logger.info(
-            "CallLoggerProcessor init | tenant=%s agent=%s call_id=%s",
-            tenant_id, agent_id, self._call_record_id,
-        )
-
     # ── FrameProcessor interface ──────────────────────────────────────────────
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         """Intercept lifecycle frames and log to DB. Always push frame downstream."""
+        # REQUIRED first (pipecat 1.5): handle system frames + mark started.
+        await super().process_frame(frame, direction)
         try:
             if isinstance(frame, TranscriptionFrame) and frame.text:
                 await self._on_user_speech(frame.text)
@@ -142,15 +159,34 @@ class CallLoggerProcessor(FrameProcessor):
             elif isinstance(frame, MetricsFrame):
                 self._on_metrics(frame)
 
-            elif isinstance(frame, EndFrame):
-                # Schedule finalization as background task so we don't delay the EndFrame
-                asyncio.create_task(self._finalize_call())
+            elif isinstance(frame, (EndFrame, CancelFrame)):
+                # Kick off finalization WITHOUT blocking the frame (a blocked
+                # End/Cancel frame stalls pipeline teardown). The entrypoint
+                # awaits wait_finalized() so the process outlives this task.
+                # Handles BOTH graceful end and hangup-cancel.
+                if self._finalize_task is None:
+                    self._finalize_task = asyncio.create_task(self._finalize_call())
 
         except Exception as exc:
             # Never let logging errors crash the voice pipeline
             logger.error("CallLoggerProcessor error on frame %s: %s", type(frame).__name__, exc)
 
         await self.push_frame(frame, direction)
+
+    async def wait_finalized(self, timeout: float = 10.0) -> bool:
+        """Await the finalization write. Called from the entrypoint's finally so
+        the job process doesn't exit before duration/transcript/latency persist.
+        If no End/Cancel frame was ever seen (hard teardown), finalize inline as
+        a last resort. Returns True if finalization completed within `timeout`."""
+        if self._finalize_task is None:
+            await self._finalize_call()
+            return True
+        try:
+            await asyncio.wait_for(asyncio.shield(self._finalize_task), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning("Finalization did not complete within %.0fs.", timeout)
+            return False
 
     # ── Internal handlers ─────────────────────────────────────────────────────
 
@@ -224,9 +260,15 @@ class CallLoggerProcessor(FrameProcessor):
 
     async def _finalize_call(self) -> None:
         """
-        Write final call stats to DB and trigger background jobs.
-        Called once on EndFrame — all DB writes are fire-and-forget.
+        Write final call stats to DB and trigger background jobs. Runs exactly
+        once (EndFrame or CancelFrame). The core record write and credit
+        deduction are AWAITED so they survive job teardown; only the slow,
+        external post-call Gemini evaluation stays a background task.
         """
+        if self._finalized:
+            return
+        self._finalized = True
+
         if not self._call_record_id:
             logger.info("No call_record_id — skipping finalization.")
             return
@@ -245,30 +287,27 @@ class CallLoggerProcessor(FrameProcessor):
             avg_latency_ms or 0,
         )
 
-        # DB finalization
-        asyncio.create_task(
-            _finalize_call_record(
-                call_record_id=self._call_record_id,
-                duration_seconds=duration_seconds,
-                turn_count=self._turn_count,
-                avg_latency_ms=avg_latency_ms,
-                transcript=self._transcript,
-            )
+        # Core record write — AWAITED (not fire-and-forget) so duration/turns/
+        # transcript/latency/status actually persist before teardown.
+        await _finalize_call_record(
+            call_record_id=self._call_record_id,
+            duration_seconds=duration_seconds,
+            turn_count=self._turn_count,
+            avg_latency_ms=avg_latency_ms,
+            transcript=self._transcript,
         )
 
-        # Credit deduction
+        # Credit deduction — AWAITED (billing correctness).
         if self._tenant_id:
-            asyncio.create_task(
-                _deduct_call_credits(
-                    tenant_id=self._tenant_id,
-                    duration_seconds=duration_seconds,
-                    call_record_id=self._call_record_id,
-                )
+            await _deduct_call_credits(
+                tenant_id=self._tenant_id,
+                duration_seconds=duration_seconds,
+                call_record_id=self._call_record_id,
             )
 
-        # Post-call Gemini evaluation (non-blocking) — gated on the Analysis
-        # tab's Call Summary / Success Evaluation toggles. Skip the Gemini
-        # call entirely if both are off (was previously unconditional).
+        # Post-call Gemini evaluation — slow + external, keep in the background
+        # (gated on the Analysis tab toggles). May not finish on abrupt teardown;
+        # that's acceptable, the core record is already persisted above.
         summary_on = bool(self._agent_config.get("summary_enabled", True))
         eval_on = bool(self._agent_config.get("success_evaluation_enabled", True))
         if self._call_record_id and (summary_on or eval_on):
