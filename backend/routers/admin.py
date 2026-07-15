@@ -618,16 +618,52 @@ async def system_health_status(user: SuperAdmin = None):
     results["livekit"] = livekit_status
     results["livekit_detail"] = livekit_detail
 
-    # ── API key presence checks (no live call available for these yet) ────────
+    # ── Provider reachability: a REAL round-trip, not a presence check ────────
+    # A key that merely exists tells you nothing — Google will revoke a leaked
+    # key and it then 403s at call time. So each provider with a key gets one
+    # cheap list-models probe (run concurrently). A dead/revoked key surfaces as
+    # "auth_failed" instead of a misleading green "connected".
+    import httpx
+
+    async def _probe(name: str, key: str, url: str, headers: dict) -> tuple[str, str, str]:
+        if not (key and key.strip()):
+            return name, "missing_key", "No key set"
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as c:
+                r = await c.get(url, headers=headers)
+            if r.status_code < 400:
+                return name, "connected", f"Live API reachable ✓ (HTTP {r.status_code})"
+            if r.status_code in (401, 403):
+                msg = ""
+                try:
+                    msg = (r.json().get("error", {}) or {}).get("message", "") if isinstance(r.json(), dict) else ""
+                except Exception:
+                    msg = r.text[:100]
+                return name, "auth_failed", f"Key rejected (HTTP {r.status_code}) — likely revoked/leaked. {msg[:120]}"
+            return name, "unreachable", f"Unexpected HTTP {r.status_code}"
+        except Exception as e:
+            return name, "unreachable", f"Check failed: {str(e)[:80]}"
+
+    _probes = await asyncio.gather(
+        _probe("gemini", settings.gemini_api_key,
+               f"https://generativelanguage.googleapis.com/v1beta/models?key={settings.gemini_api_key}", {}),
+        _probe("sarvam", settings.sarvam_api_key,
+               "https://api.sarvam.ai/v1/models", {"api-subscription-key": settings.sarvam_api_key}),
+        _probe("groq", settings.groq_api_key,
+               "https://api.groq.com/openai/v1/models", {"Authorization": f"Bearer {settings.groq_api_key}"}),
+        _probe("elevenlabs", settings.elevenlabs_api_key,
+               "https://api.elevenlabs.io/v1/models", {"xi-api-key": settings.elevenlabs_api_key}),
+    )
+    for name, status, detail in _probes:
+        results[name] = status
+        results[f"{name}_detail"] = detail
+
+    # No cheap unauthenticated probe for these — report key presence honestly.
     def _key_status(value: str) -> str:
         return "connected" if value and value.strip() else "missing_key"
 
-    results["gemini"] = _key_status(settings.gemini_api_key)
-    results["sarvam"] = _key_status(settings.sarvam_api_key)
     results["vobiz"] = _key_status(settings.vobiz_account_sid)
     results["oxzygen"] = _key_status(settings.oxzygen_api_key)
-    results["groq"] = _key_status(settings.groq_api_key)
-    results["elevenlabs"] = _key_status(settings.elevenlabs_api_key)
     # HIS/Oxzygen has no integration code behind it yet — surface that honestly.
     results["his_implemented"] = False
 
