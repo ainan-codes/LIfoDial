@@ -1,0 +1,52 @@
+#!/bin/sh
+# Lifodial pre-commit secret scanner.
+# Blocks a commit if staged content contains anything that looks like a live
+# secret. This exists because provider keys (Render, Gemini, Supabase, etc.) were
+# once committed to public git history and had to be scrubbed. Enable it with:
+#     git config core.hooksPath scripts/hooks
+#
+# Patterns are deliberately conservative (real key prefixes) to avoid false
+# positives. Bypass in a genuine emergency with `git commit --no-verify`.
+
+# Only scan the staged additions (lines starting with '+'), not the whole file.
+staged_diff=$(git diff --cached --no-color -U0 | grep '^+' | grep -v '^+++')
+
+# Never allow a real .env (any name) to be staged.
+if git diff --cached --name-only | grep -Eq '(^|/)\.env($|\.)' ; then
+  if git diff --cached --name-only | grep -Ev '\.env\.example$' | grep -Eq '(^|/)\.env($|\.)'; then
+    echo "✋ pre-commit: refusing to commit a .env file. Keep secrets out of git." >&2
+    echo "   (Only .env.example may be committed.)" >&2
+    exit 1
+  fi
+fi
+
+# Secret value patterns (prefix-anchored to minimize false positives), one per
+# line. Iterated with `while read` — NOT `for` — so a pattern containing spaces
+# (the private-key header) stays a single pattern instead of being word-split.
+hit=0
+while IFS= read -r p; do
+  [ -z "$p" ] && continue
+  if printf '%s\n' "$staged_diff" | grep -Eq -e "$p"; then
+    echo "✋ pre-commit: staged content matches a secret pattern: /$p/" >&2
+    hit=1
+  fi
+done <<'PATTERNS'
+rnd_[A-Za-z0-9]{20,}
+AIza[0-9A-Za-z_-]{30,}
+gsk_[0-9A-Za-z]{40,}
+sk_[a-z]{2,}[0-9A-Za-z_]{20,}
+xoxb-[0-9A-Za-z-]{20,}
+BEGIN (RSA |OPENSSH |EC |PGP |)PRIVATE KEY
+postgres(ql)?://[^:@/]+:[^@/]{6,}@[^/]+
+eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}
+PATTERNS
+
+if [ "$hit" -ne 0 ]; then
+  echo "" >&2
+  echo "   Refusing to commit. Move the secret to .env (gitignored) and reference it" >&2
+  echo "   via backend/config.py settings. If this is a false positive, re-run with" >&2
+  echo "   git commit --no-verify (use sparingly)." >&2
+  exit 1
+fi
+
+exit 0

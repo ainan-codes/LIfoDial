@@ -75,4 +75,9 @@ logs/
 # Temporary developer scripts
 scratch/
 test_db_conn.py
+test_gemini.py
 push_render_env.ps1
+
+# Any dotenv variant except the example (belt-and-suspenders with the block above)
+.env.*
+!.env.example
