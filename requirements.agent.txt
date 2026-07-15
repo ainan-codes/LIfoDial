@@ -10,12 +10,20 @@
 # ── Pipecat — voice agent framework (BSD-2-Clause, zero cost) ────────────────
 # [sarvam]  → SarvamSTTService + SarvamTTSService
 # [livekit] → LiveKitTransport (WebRTC)
-# [google]  → GoogleLLMService (Gemini 2.0 Flash)
-pipecat-ai[sarvam,livekit,google,openai,elevenlabs]>=0.0.105
+# [google]  → GoogleLLMService; [openai] → OpenAI/Groq; [elevenlabs] → EL TTS
+# PINNED to the exact version verified end-to-end locally. The old loose
+# ">=0.0.105" made pip backtrack across 0.0.x <-> 1.x and fail with
+# ResolutionImpossible on a clean Render build.
+pipecat-ai[sarvam,livekit,google,openai,elevenlabs]==1.5.0
+
+# ── LiveKit Agents worker runtime (WorkerOptions / cli) ──────────────────────
+# NOT a dependency of pipecat-ai — the worker imports `from livekit.agents ...`
+# directly, so it MUST be declared explicitly or a clean build has no worker CLI
+# (it only ran locally because it happened to be installed there).
+livekit-agents==1.5.1
 
 # ── Audio processing (required by Silero VAD in Pipecat) ─────────────────────
-# These are available via apt in Dockerfile.agent (libsndfile1, ffmpeg)
-# Listed here for completeness / local dev with those libs installed
+# libsndfile1 + ffmpeg come from apt in Dockerfile.agent.
 soundfile>=0.12.1
 
 # ── Full LiveKit RTC SDK (Pipecat LiveKitTransport) ───────────────────────────
