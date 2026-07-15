@@ -109,18 +109,25 @@ services:
         sync: false
 
   # ── Voice agent worker (Pipecat/LiveKit) ──────────────────────────────────
-  # Long-running background worker that registers with LiveKit and is dispatched
-  # into a room per call. MUST be a background_worker (NOT a web service): it
-  # holds a persistent WebSocket to LiveKit and must never spin down, which free
-  # web services do after inactivity. Background workers require a paid instance.
+  # Registers with LiveKit and is dispatched into a room per call. Runs as a
+  # WEB service (not background_worker) so it can use the FREE tier — the worker
+  # binds its built-in HTTP health server to $PORT (see backend/agent/__main__.py)
+  # to satisfy Render's port check.
+  #
+  # FREE-TIER CAVEAT: free web services spin down after ~15 min idle and cold-
+  # start on the next HTTP hit. A spun-down worker is deregistered from LiveKit
+  # and won't pick up a call until it wakes. Keep it warm with an external pinger
+  # (e.g. UptimeRobot/cron-job.org) hitting its URL every ~10 min. For guaranteed
+  # always-on, switch `plan` to a paid tier and `type` to `worker`.
+  #
   # agent_name is fixed in code (backend/agent/pipeline.py::AGENT_NAME) and MUST
   # match backend/routers/web_calls.py::AGENT_NAME.
-  - type: worker
+  - type: web
     name: lifodial-agent
     runtime: docker
     dockerfilePath: ./Dockerfile.agent
     region: singapore
-    plan: starter            # background workers are not available on free
+    plan: free
     envVars:
       - key: ENVIRONMENT
         value: production

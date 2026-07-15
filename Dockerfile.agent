@@ -1,6 +1,7 @@
 # Dockerfile.agent — Pipecat voice agent worker
-# This is NOT deployed on Render. It runs as a separate agent worker
-# (locally, on a VPS, or as a Render Background Worker service).
+# Deployable as a Render web service (free tier ok — the worker binds its HTTP
+# health server to $PORT; see backend/agent/__main__.py), a Render background
+# worker (paid), a VPS, or locally.
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -23,5 +24,6 @@ RUN pip install --no-cache-dir -r requirements.agent.txt
 
 COPY backend/ ./backend/
 
-# Pipecat LiveKit agent worker entrypoint
-CMD ["python", "-m", "backend.agent.pipeline", "start"]
+# Pipecat LiveKit agent worker entrypoint. `backend.agent` (its __main__) binds
+# the health server to $PORT and runs the loud-fatal preflight.
+CMD ["python", "-m", "backend.agent", "start"]

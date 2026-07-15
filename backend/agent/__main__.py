@@ -23,6 +23,8 @@ Environment variables required (.env):
   DATABASE_URL       postgresql+asyncpg://...
 """
 
+import os
+
 from livekit.agents import WorkerOptions, cli
 
 from backend.agent.pipeline import AGENT_NAME, entrypoint, prewarm, _preflight_or_die
@@ -31,6 +33,9 @@ from backend.config import settings
 if __name__ == "__main__":
     # Fail loudly if the worker can't register with LiveKit (audit FIX 1.4).
     _preflight_or_die()
+    # Bind the built-in HTTP health server to Render's $PORT so this can run as a
+    # Render web service (incl. free tier — no background_worker type there).
+    port = int(os.environ.get("PORT") or 8081)
     # The livekit-agents CLI normally reads LIVEKIT_URL/API_KEY/API_SECRET from OS
     # environment variables. Pass them explicitly from the app settings (which load
     # the project .env) so `python -m backend.agent start` works without a separate
@@ -43,5 +48,7 @@ if __name__ == "__main__":
             ws_url=settings.livekit_url or None,
             api_key=settings.livekit_api_key or None,
             api_secret=settings.livekit_api_secret or None,
+            host="0.0.0.0",
+            port=port,
         )
     )
