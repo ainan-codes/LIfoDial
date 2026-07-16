@@ -148,9 +148,14 @@ dispatched during that window fail or wait through a cold start.
   in-process reads and do not touch the call path.
 
 **Pinger:** `.github/workflows/keepalive.yml` pings the backend `/health` and
-the worker `/` every 5 minutes (GitHub cron is best-effort and can lag several
-minutes, so 5 min leaves margin under the 15-min window; recommended interval
-if using an external pinger instead: ≤10 min).
+the worker `/`, scheduled `*/5` (every 5 min). **However — measured on this
+repo (2026-07-16) — GitHub throttles the schedule to roughly one run every
+~2 hours**, which is nowhere near the 15-min spin-down window. Treat the
+GitHub workflow as a registration health monitor, NOT a reliable keep-warm.
+For actual keep-warm, point an external pinger (e.g. UptimeRobot free tier,
+5-min interval; or cron-job.org) at BOTH URLs with an interval ≤10 min:
+- `https://lifodial.onrender.com/health`
+- `https://lifodial-agent.onrender.com/`
 
 **Honest caveat — the pinger reduces but does NOT eliminate cold-start risk:**
 - If a ping fails or GitHub delays the cron, the worker can still spin down;
