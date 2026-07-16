@@ -130,6 +130,38 @@ curl http://localhost/health
                 └────────────┘   └───────────┘
 ```
 
+## Voice Worker Keep-Warm (Render free tier)
+
+The production voice worker (`lifodial-agent` on Render, free plan) spins down
+after ~15 min without **inbound HTTP** — its LiveKit WebSocket does NOT count
+as activity. A spun-down worker is deregistered from LiveKit, so inbound calls
+dispatched during that window fail or wait through a cold start.
+
+**Ping URL:** `https://lifodial-agent.onrender.com/`
+- Returns `200 OK` only when the worker process is healthy **and** its LiveKit
+  connection is up; `503` otherwise. The ping therefore doubles as a LiveKit
+  registration check.
+- `https://lifodial-agent.onrender.com/worker` returns JSON status
+  (`agent_name`, `worker_load`, `active_jobs`, `sdk_version`).
+- Both are served by the livekit-agents built-in health server (bound to
+  Render's `$PORT` in `backend/agent/__main__.py`); handlers are trivial
+  in-process reads and do not touch the call path.
+
+**Pinger:** `.github/workflows/keepalive.yml` pings the backend `/health` and
+the worker `/` every 5 minutes (GitHub cron is best-effort and can lag several
+minutes, so 5 min leaves margin under the 15-min window; recommended interval
+if using an external pinger instead: ≤10 min).
+
+**Honest caveat — the pinger reduces but does NOT eliminate cold-start risk:**
+- If a ping fails or GitHub delays the cron, the worker can still spin down;
+  a call arriving then hits a ~60–120 s cold start (measured: 52.8 s) or fails.
+- Free instances also share 750 instance-hours/month across services.
+
+**For a real clinic going live:** flip the worker to always-on in
+`render.yaml` — service `lifodial-agent` (~line 125): change `plan: free` to a
+paid tier and `type: web` to `type: worker` (the comment above that block says
+the same). Then the keep-warm ping for the worker becomes unnecessary.
+
 ## Key Endpoints
 | Endpoint | Description |
 |---|---|

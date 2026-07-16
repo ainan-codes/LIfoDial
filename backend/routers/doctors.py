@@ -1,4 +1,3 @@
-import uuid
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
@@ -18,9 +17,12 @@ class DoctorCreate(BaseModel):
     name: str
     specialization: str
 
+# NOTE: ids are str, not uuid.UUID — the DB columns are varchar(36) and
+# comparing a Python UUID against them makes Postgres raise
+# "operator does not exist: character varying = uuid".
 class DoctorResponse(BaseModel):
-    id: uuid.UUID
-    tenant_id: uuid.UUID
+    id: str
+    tenant_id: str
     name: str
     specialization: str
     his_doctor_id: str | None
@@ -32,8 +34,8 @@ class DoctorResponse(BaseModel):
 # ALL operations MUST filter by tenant_id (multi-tenant rule)
 
 @router.post("/tenants/{tenant_id}/doctors", response_model=DoctorResponse, status_code=status.HTTP_201_CREATED)
-async def add_doctor(tenant_id: uuid.UUID, payload: DoctorCreate, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
-    user.require_owns(str(tenant_id))
+async def add_doctor(tenant_id: str, payload: DoctorCreate, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(tenant_id)
     # Verify tenant exists
     tenant = await db.scalar(select(Tenant).where(Tenant.id == tenant_id))
     if not tenant:
@@ -50,8 +52,8 @@ async def add_doctor(tenant_id: uuid.UUID, payload: DoctorCreate, user: CurrentU
     return doctor
 
 @router.get("/tenants/{tenant_id}/doctors", response_model=list[DoctorResponse])
-async def list_doctors(tenant_id: uuid.UUID, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
-    user.require_owns(str(tenant_id))
+async def list_doctors(tenant_id: str, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(tenant_id)
     result = await db.execute(
         select(Doctor).where(Doctor.tenant_id == tenant_id)
     )
@@ -59,8 +61,8 @@ async def list_doctors(tenant_id: uuid.UUID, user: CurrentUser = None, db: Async
     return list(doctors)
 
 @router.delete("/tenants/{tenant_id}/doctors/{doctor_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_doctor(tenant_id: uuid.UUID, doctor_id: uuid.UUID, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
-    user.require_owns(str(tenant_id))
+async def delete_doctor(tenant_id: str, doctor_id: str, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(tenant_id)
     result = await db.execute(
         select(Doctor).where(
             Doctor.id == doctor_id,

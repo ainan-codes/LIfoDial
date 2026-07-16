@@ -1,4 +1,3 @@
-import uuid
 import random
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -24,8 +23,11 @@ class TenantUpdate(BaseModel):
     clinic_name: str | None = None
     google_sheets_webhook_url: str | None = None
 
+# NOTE: ids are str, not uuid.UUID — the DB columns are varchar(36) and
+# comparing a Python UUID against them makes Postgres raise
+# "operator does not exist: character varying = uuid".
 class TenantResponse(BaseModel):
-    id: uuid.UUID
+    id: str
     clinic_name: str
     language: str
     ai_number: str | None
@@ -131,8 +133,8 @@ async def create_tenant(payload: TenantCreate, user: SuperAdmin = None, db: Asyn
         )
 
 @router.get("/{id}")
-async def get_tenant(id: uuid.UUID, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
-    user.require_owns(str(id))
+async def get_tenant(id: str, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(id)
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
     if not tenant:
@@ -140,7 +142,7 @@ async def get_tenant(id: uuid.UUID, user: CurrentUser = None, db: AsyncSession =
     return tenant
 
 @router.post("/{id}/assign-number", response_model=AssignNumberResponse)
-async def assign_number(id: uuid.UUID, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
+async def assign_number(id: str, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
     if not tenant:
@@ -163,8 +165,8 @@ async def assign_number(id: uuid.UUID, user: SuperAdmin = None, db: AsyncSession
     )
 
 @router.get("/{id}/forwarding-instructions")
-async def get_forwarding_instructions(id: uuid.UUID, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
-    user.require_owns(str(id))
+async def get_forwarding_instructions(id: str, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    user.require_owns(id)
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
     if not tenant:
@@ -183,7 +185,7 @@ async def get_forwarding_instructions(id: uuid.UUID, user: CurrentUser = None, d
 
 
 @router.delete("/{id}", status_code=204)
-async def delete_tenant(id: uuid.UUID, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
+async def delete_tenant(id: str, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
     """Delete a clinic and all associated agents."""
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
@@ -193,16 +195,16 @@ async def delete_tenant(id: uuid.UUID, user: SuperAdmin = None, db: AsyncSession
     # Delete associated agents first (FK constraint)
     from backend.models.agent_config import AgentConfig
     from sqlalchemy import delete as sa_delete
-    await db.execute(sa_delete(AgentConfig).where(AgentConfig.tenant_id == str(id)))
+    await db.execute(sa_delete(AgentConfig).where(AgentConfig.tenant_id == id))
 
     await db.delete(tenant)
     await db.commit()
 
 
 @router.put("/{id}")
-async def update_tenant(id: uuid.UUID, payload: TenantUpdate, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+async def update_tenant(id: str, payload: TenantUpdate, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
     """Update a tenant/clinic's profile details including webhook settings."""
-    user.require_owns(str(id))
+    user.require_owns(id)
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
     if not tenant:

@@ -22,7 +22,8 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 @router.post("/{id}/upload-voice", status_code=status.HTTP_201_CREATED)
 async def upload_voice_sample(
-    id: uuid.UUID,
+    # str, not uuid.UUID — tenant ids are varchar(36) in the DB ("varchar = uuid" 500)
+    id: str,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
     user: CurrentUser = None,
@@ -64,7 +65,7 @@ async def upload_voice_sample(
 
 
 @router.get("/{id}/voice-status")
-async def get_voice_status(id: uuid.UUID, db: AsyncSession = Depends(get_db), user: CurrentUser = None):
+async def get_voice_status(id: str, db: AsyncSession = Depends(get_db), user: CurrentUser = None):
     """
     Returns the processing status of an uploaded voice sample for a tenant.
     """
