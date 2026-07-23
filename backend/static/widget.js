@@ -365,13 +365,14 @@
 
     if (STYLE === 'call-only' || STYLE === 'icon') {
       btn.classList.add('icon-only');
-      // call-only stays a phone glyph (it's a call action); icon style shows the avatar.
-      btn.innerHTML = STYLE === 'call-only' ? SVG.phone : avatarHTML(28, SVG.headphone);
+      // Show a call/phone glyph so the launcher reads as a "call" affordance.
+      // Falls back to the per-agent avatar image only when one is configured.
+      btn.innerHTML = STYLE === 'call-only' ? SVG.phone : avatarHTML(28, SVG.phone);
     } else if (STYLE === 'minimal') {
       btn.style.cssText += 'padding:7px 14px;font-size:12px;border-radius:50px';
-      btn.innerHTML = `${avatarHTML(22, SVG.headphone)}<span id="lfd-trigger-label">${label}</span>`;
+      btn.innerHTML = `${avatarHTML(22, SVG.phone)}<span id="lfd-trigger-label">${label}</span>`;
     } else { // full
-      btn.innerHTML = `${avatarHTML(22, SVG.headphone)}<span id="lfd-trigger-label">${label}</span>`;
+      btn.innerHTML = `${avatarHTML(22, SVG.phone)}<span id="lfd-trigger-label">${label}</span>`;
     }
 
     // Notification badge
