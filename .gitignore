@@ -71,12 +71,24 @@ logs/
 
 # SQLite dev database
 *.db
+*.sqlite
+*.sqlite3
+
+# Audio scratch/recordings — no .wav is a code-needed fixture (checked 2026-07-16);
+# real voice uploads live in Supabase Storage, not the repo.
+*.wav
+*.wav.json
+
+# Quarantine area for cleanup candidates awaiting confirmed deletion
+_quarantine/
 
 # Temporary developer scripts
 scratch/
 test_db_conn.py
 test_gemini.py
+test_asyncpg*.py
 push_render_env.ps1
+cleanup_unimportant.ps1
 
 # Any dotenv variant except the example (belt-and-suspenders with the block above)
 .env.*
