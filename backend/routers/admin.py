@@ -93,24 +93,27 @@ def generate_ai_number():
 @router.post("/clinics")
 async def create_clinic(data: ClinicCreate, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
     try:
-        slug = data.clinic_name.lower().replace(" ", "")
         gen_pass = generate_password()
         ai_num = generate_ai_number()
-        
+        # Store the real admin email (normalised) — the value the admin actually
+        # logs in with. Do NOT invent an admin@<slug>.lifodial.com address; that
+        # synthetic email never matched the stored login (audit P2).
+        admin_email = (data.admin_email or "").strip().lower() or None
+
         new_tenant = Tenant(
             clinic_name=data.clinic_name,
             admin_name=data.admin_name,
-            admin_email=data.admin_email,
+            admin_email=admin_email,
             location=data.location,
             language=data.language,
             ai_number=ai_num,
             admin_password=hash_password(gen_pass),
             is_active=True
         )
-        
+
         db.add(new_tenant)
         await db.flush()
-        
+
         default_doctors = [
             Doctor(tenant_id=new_tenant.id, name="Dr. Sharma", specialization="General Physician"),
             Doctor(tenant_id=new_tenant.id, name="Dr. Reddy", specialization="Pediatrician"),
@@ -118,12 +121,13 @@ async def create_clinic(data: ClinicCreate, user: SuperAdmin = None, db: AsyncSe
         ]
         db.add_all(default_doctors)
         await db.commit()
-        
+
         return {
             "tenant_id": new_tenant.id,
             "ai_number": ai_num,
             "login_credentials": {
-                "email": f"admin@{slug}.lifodial.com",
+                # Echo the email actually stored — the value the admin logs in with.
+                "email": new_tenant.admin_email,
                 "password": gen_pass
             }
         }
@@ -418,14 +422,14 @@ async def approve_onboarding_request(req_id: str, user: SuperAdmin = None, db: A
             raise HTTPException(status_code=400, detail=f"Request is already {req.status}")
 
         # Create the clinic tenant
-        slug = req.clinic_name.lower().replace(" ", "")
         gen_pass = generate_password()
         ai_num = generate_ai_number()
-        
+        admin_email = (req.email or "").strip().lower() or None
+
         new_tenant = Tenant(
             clinic_name=req.clinic_name,
             admin_name=req.contact_name,
-            admin_email=req.email,
+            admin_email=admin_email,
             location=req.location or "",
             language="en",
             ai_number=ai_num,
@@ -451,7 +455,9 @@ async def approve_onboarding_request(req_id: str, user: SuperAdmin = None, db: A
             "status": "approved",
             "tenant_id": new_tenant.id,
             "credentials": {
-                "email": f"admin@{slug}.lifodial.com",
+                # Echo the email actually stored (from the onboarding request),
+                # not a synthetic admin@<slug>.lifodial.com address.
+                "email": new_tenant.admin_email,
                 "password": gen_pass,
                 "ai_number": ai_num,
             }
@@ -493,8 +499,13 @@ async def list_all_appointments(
 ):
     """Super admin view of ALL appointments across all clinics."""
     try:
-        stmt = select(Appointment, Tenant).join(
+        # Outer-join Doctor so each row shows the real doctor name (was hardcoded
+        # "—"). Outer (not inner) so an appointment whose doctor was removed still
+        # lists rather than vanishing.
+        stmt = select(Appointment, Tenant, Doctor).join(
             Tenant, Appointment.tenant_id == Tenant.id
+        ).outerjoin(
+            Doctor, Appointment.doctor_id == Doctor.id
         ).order_by(Appointment.slot_time.desc())
 
         if status:
@@ -508,16 +519,22 @@ async def list_all_appointments(
         return [
             {
                 "id": str(apt.id),
-                "patient_name": f"Patient {str(apt.patient_phone)[-4:]}",  # privacy
+                # Show the real captured patient name when present; otherwise fall
+                # back to a privacy-masked label derived from the phone.
+                "patient_name": (
+                    apt.patient_name.strip()
+                    if apt.patient_name and apt.patient_name.strip()
+                    else f"Patient {str(apt.patient_phone)[-4:]}"
+                ),
                 "patient_phone": (apt.patient_phone[:-4] + "****") if len(apt.patient_phone or "") > 4 else "****",
                 "clinic_name": tenant.clinic_name,
                 "doctor_id": str(apt.doctor_id),
-                "doctor_name": "—",  # would need join on Doctor
+                "doctor_name": (doctor.name if doctor else "—"),
                 "slot_time": apt.slot_time.isoformat(),
                 "status": apt.status,
                 "channel": "AI Call",
             }
-            for apt, tenant in rows
+            for apt, tenant, doctor in rows
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

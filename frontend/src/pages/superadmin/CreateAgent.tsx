@@ -702,9 +702,16 @@ function Step5({ state, selectedClinicName }: { state: WizardState; selectedClin
 
 // ── Success screen ────────────────────────────────────────────────────────────
 
-function SuccessScreen({ agentId, password, navigate }: { agentId: string; password: string; navigate: (to: string) => void }) {
+function SuccessScreen(
+  { agentId, credentials, navigate }:
+  { agentId: string; credentials: { email?: string; password?: string } | null; navigate: (to: string) => void }
+) {
   const [copied, setCopied] = useState(false);
-  const creds = `Email: admin@clinic.lifodial.com\nPassword: ${password}`;
+  const email = credentials?.email || '';
+  const password = credentials?.password || '';
+  // New-clinic path returns real credentials; existing-clinic path returns none.
+  const hasCreds = !!(email && password);
+  const creds = `Email: ${email}\nPassword: ${password}`;
 
   return (
     <div style={{ textAlign: 'center', padding: '40px 0' }}>
@@ -714,23 +721,31 @@ function SuccessScreen({ agentId, password, navigate }: { agentId: string; passw
       <h2 style={{ fontSize: '22px', fontWeight: 700, color: '#fff', marginBottom: '6px' }}>Agent Created Successfully!</h2>
       <p style={{ fontSize: '14px', color: '#666', marginBottom: '28px' }}>Your AI receptionist is configured and ready to test.</p>
 
-      <div style={{ background: '#111', border: '1px solid rgba(251,191,36,0.3)', borderRadius: '12px', padding: '20px', marginBottom: '24px', textAlign: 'left' }}>
-        <div style={{ fontSize: '12px', fontWeight: 700, color: '#FBBF24', marginBottom: '10px', letterSpacing: '0.06em' }}>CLINIC LOGIN CREDENTIALS</div>
-        <div style={{ fontFamily: 'monospace', fontSize: '13px', color: '#fff', lineHeight: 1.8 }}>
-          <div>Email: <span style={{ color: '#3ECF8E' }}>admin@clinic.lifodial.com</span></div>
-          <div>Password: <span style={{ color: '#3ECF8E' }}>{password}</span></div>
+      {hasCreds ? (
+        <div style={{ background: '#111', border: '1px solid rgba(251,191,36,0.3)', borderRadius: '12px', padding: '20px', marginBottom: '24px', textAlign: 'left' }}>
+          <div style={{ fontSize: '12px', fontWeight: 700, color: '#FBBF24', marginBottom: '10px', letterSpacing: '0.06em' }}>CLINIC LOGIN CREDENTIALS</div>
+          <div style={{ fontFamily: 'monospace', fontSize: '13px', color: '#fff', lineHeight: 1.8 }}>
+            <div>Email: <span style={{ color: '#3ECF8E' }}>{email}</span></div>
+            <div>Password: <span style={{ color: '#3ECF8E' }}>{password}</span></div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '10px' }}>
+            <AlertTriangle size={12} color="#FBBF24" />
+            <span style={{ fontSize: '11px', color: '#FBBF24' }}>Copy now — the password is shown only once</span>
+          </div>
+          <button
+            onClick={() => { navigator.clipboard.writeText(creds); setCopied(true); setTimeout(() => setCopied(false), 2000); }}
+            style={{ marginTop: '10px', padding: '7px 14px', borderRadius: '8px', fontSize: '12px', background: '#1A1A1A', border: '1px solid #2E2E2E', color: '#A1A1A1', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
+          >
+            {copied ? <><Check size={12} color="#3ECF8E" /> Copied!</> : <><Copy size={12} /> Copy Credentials</>}
+          </button>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '10px' }}>
-          <AlertTriangle size={12} color="#FBBF24" />
-          <span style={{ fontSize: '11px', color: '#FBBF24' }}>Copy now — shown only once</span>
+      ) : (
+        <div style={{ background: '#111', border: '1px solid #2E2E2E', borderRadius: '12px', padding: '16px 20px', marginBottom: '24px', textAlign: 'left' }}>
+          <div style={{ fontSize: '13px', color: '#A1A1A1', lineHeight: 1.6 }}>
+            This agent was added to an existing clinic. Use that clinic's existing login credentials to sign in.
+          </div>
         </div>
-        <button
-          onClick={() => { navigator.clipboard.writeText(creds); setCopied(true); setTimeout(() => setCopied(false), 2000); }}
-          style={{ marginTop: '10px', padding: '7px 14px', borderRadius: '8px', fontSize: '12px', background: '#1A1A1A', border: '1px solid #2E2E2E', color: '#A1A1A1', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
-        >
-          {copied ? <><Check size={12} color="#3ECF8E" /> Copied!</> : <><Copy size={12} /> Copy Credentials</>}
-        </button>
-      </div>
+      )}
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
         <button onClick={() => navigate(`/superadmin/agents/${agentId}?tab=test`)} style={{ padding: '12px', borderRadius: '10px', background: '#3ECF8E', color: '#000', border: 'none', fontWeight: 600, fontSize: '14px', cursor: 'pointer' }}>🎤 Test Agent in Browser</button>
@@ -757,7 +772,12 @@ export default function CreateAgent() {
   const [selectedClinicName, setSelectedClinicName] = useState('');
   const [clinicsLoading, setClinicsLoading] = useState(false);
   const [clinicsError, setClinicsError] = useState('');
-  const tempPw = 'Lf8#mK2p';
+  // Real clinic credentials returned by POST /agents for a new clinic (null when
+  // attaching to an existing clinic). Replaces the old hardcoded email/password.
+  const [credentials, setCredentials] = useState<{ email?: string; password?: string } | null>(null);
+  // True once the admin manually edits the System Prompt — stops template
+  // auto-fill from overwriting their text (audit P4).
+  const [promptEdited, setPromptEdited] = useState(false);
 
   // Debounced type-ahead search against the backend, re-run on every keystroke
   // (and once on mount with an empty query to show an initial list).
@@ -783,6 +803,38 @@ export default function CreateAgent() {
     return () => clearTimeout(handle);
   }, [clinicQuery]);
 
+  // Pre-fill the System Prompt from the selected template, rendered with the
+  // clinic's name, when the admin reaches the Agent step. Selecting a template
+  // used to leave the field empty, so the created agent had a blank system
+  // prompt (audit P4). A manual edit (promptEdited) stops auto-fill; a richer,
+  // fully LLM-authored prompt is available via "Generate with LLM" after create.
+  React.useEffect(() => {
+    if (step !== 1 || promptEdited || state.template === 'custom') return;
+    const clinicName = state.clinic_selection === 'new' ? state.new_clinic_name : selectedClinicName;
+    const language = state.clinic_selection === 'new' ? state.new_language : state.tts_language;
+    let cancelled = false;
+    fetchWithAuth('/agents/render-template-prompt', {
+      method: 'POST',
+      body: JSON.stringify({
+        template: state.template,
+        language: language || 'en-IN',
+        clinic_name: clinicName || 'the clinic',
+        agent_name: state.agent_name || 'Receptionist',
+      }),
+    })
+      .then((data: any) => {
+        if (cancelled || !data) return;
+        setState(prev => ({
+          ...prev,
+          system_prompt: data.system_prompt || prev.system_prompt,
+          first_message: prev.first_message || data.first_message || prev.first_message,
+        }));
+      })
+      .catch(() => { /* non-fatal — leave the field as the admin left it */ });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, state.template]);
+
   const onChange = (key: keyof WizardState | 'open_voice_modal', value: any) => {
     if (key === 'open_voice_modal') {
       setShowVoiceModal(value);
@@ -791,6 +843,27 @@ export default function CreateAgent() {
     if (key === 'tenant_id') {
       const picked = clinicResults.find(c => c.id === value);
       setSelectedClinicName(picked?.name || '');
+      // Default the agent's voice language to the selected clinic's language.
+      setState(prev => ({ ...prev, tenant_id: value, ...(picked?.language ? { tts_language: picked.language } : {}) }));
+      return;
+    }
+    if (key === 'new_language') {
+      // Clinic primary language drives the agent's default TTS language (audit
+      // P4). A later explicit voice pick still overrides it (handleSelectVoice).
+      setState(prev => ({ ...prev, new_language: value, tts_language: value }));
+      return;
+    }
+    if (key === 'template') {
+      // Switching template re-enables auto-fill so the prompt follows it.
+      setPromptEdited(false);
+      setState(prev => ({ ...prev, template: value }));
+      return;
+    }
+    if (key === 'system_prompt') {
+      // A manual edit stops template auto-fill from clobbering the admin's text.
+      setPromptEdited(true);
+      setState(prev => ({ ...prev, system_prompt: value }));
+      return;
     }
     setState(prev => ({ ...prev, [key as keyof WizardState]: value }));
   };
@@ -840,6 +913,7 @@ export default function CreateAgent() {
         return;
       }
       setCreatedId(data.agent_id);
+      setCredentials(data.clinic_credentials || null);
       setDone(true);
     } catch (e: any) {
       // fetchWithAuth throws with the backend's `detail` message (409 duplicate
@@ -872,7 +946,7 @@ export default function CreateAgent() {
       </button>
 
       {done && createdId ? (
-        <SuccessScreen agentId={createdId} password={tempPw} navigate={navigate} />
+        <SuccessScreen agentId={createdId} credentials={credentials} navigate={navigate} />
       ) : (
         <>
           <ProgressBar current={step} />

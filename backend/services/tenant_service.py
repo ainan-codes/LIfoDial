@@ -21,15 +21,22 @@ async def create_tenant(
     phone: str | None = None,
     location: str | None = None,
     language: str = "en-IN",
+    admin_password: str | None = None,
 ) -> Tenant:
     """
     Insert a new Tenant row and flush it (does not commit — caller controls
     the transaction boundary so this can participate in a larger atomic
     operation, e.g. clinic+agent creation together).
 
+    ``admin_password`` MUST already be hashed (see backend.security.hash_password)
+    — passing it here is what makes the clinic login actually work. It used to be
+    left NULL, so wizard-created clinics could never log in even though the
+    success screen showed a password (audit P2).
+
     Raises sqlalchemy.exc.IntegrityError if a clinic with the same name
     (case-insensitive) already exists — see the unique index on
-    lower(clinic_name) added by the multi-agent-per-clinic migration.
+    lower(clinic_name) added by the multi-agent-per-clinic migration — or the
+    same admin_email (see the unique index on lower(admin_email)).
     """
     tenant = Tenant(
         id=str(uuid.uuid4()),
@@ -40,6 +47,7 @@ async def create_tenant(
         location=location,
         language=language,
         status="active",
+        admin_password=admin_password,
     )
     session.add(tenant)
     await session.flush()
