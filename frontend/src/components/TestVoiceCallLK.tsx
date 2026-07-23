@@ -32,27 +32,25 @@ export default function TestVoiceCallLK({
   const [wsUrl, setWsUrl] = useState('');
   const [phase, setPhase] = useState<'connecting' | 'live' | 'error' | 'demo'>('connecting');
   const [error, setError] = useState('');
+  // No mic is NOT fatal — we still connect in listen-only mode so the agent can
+  // be heard and tested (you just can't speak back).
+  const [micAvailable, setMicAvailable] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
     const connect = async () => {
       try {
-        // Request mic BEFORE connecting — otherwise LiveKit connects with no
-        // published audio track and STT silently receives nothing.
+        // Try to grab the mic BEFORE connecting so LiveKit publishes an audio
+        // track for STT. If there's no mic (or permission is denied), DON'T
+        // abort — fall back to listen-only so the agent is still testable
+        // (previously this hard-blocked with "No microphone found").
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           stream.getTracks().forEach(t => t.stop());
         } catch (micErr: any) {
           if (cancelled) return;
-          setError(
-            micErr?.name === 'NotAllowedError'
-              ? 'Microphone permission denied. Allow mic access and try again.'
-              : micErr?.name === 'NotFoundError'
-              ? 'No microphone found. Connect a mic and try again.'
-              : `Microphone error: ${micErr?.message || micErr}`
-          );
-          setPhase('error');
-          return;
+          console.warn('Mic unavailable — connecting listen-only:', micErr?.name || micErr);
+          setMicAvailable(false);
         }
 
         // Same endpoint as real web calls — test_mode flags it for no-billing and
@@ -122,19 +120,19 @@ export default function TestVoiceCallLK({
         token={token}
         serverUrl={wsUrl}
         connect={true}
-        audio={true}
+        audio={micAvailable}
         video={false}
         onDisconnected={onClose}
         style={{ flex: 1, display: 'flex', flexDirection: 'column' }}
       >
-        <TestCallUI agent={agent} agentName={agentName} />
+        <TestCallUI agent={agent} agentName={agentName} micAvailable={micAvailable} />
         <RoomAudioRenderer />
       </LiveKitRoom>
     </div>
   );
 }
 
-function TestCallUI({ agent, agentName }: { agent?: any; agentName?: string }) {
+function TestCallUI({ agent, agentName, micAvailable }: { agent?: any; agentName?: string; micAvailable?: boolean }) {
   const { state, audioTrack } = useVoiceAssistant();
   const stateConfig: Record<string, { label: string; color: string }> = {
     connecting: { label: 'Connecting…', color: '#F59E0B' },
@@ -159,11 +157,18 @@ function TestCallUI({ agent, agentName }: { agent?: any; agentName?: string }) {
         />
       </div>
       <div style={{ fontSize: 14, fontWeight: 600, color }}>{label}</div>
-      <div style={{ fontSize: 12, color: '#666', textAlign: 'center' }}>
-        Speak naturally — you can interrupt {agentName || 'the agent'} mid-sentence.
-      </div>
+      {micAvailable === false ? (
+        <div style={{ fontSize: 12, color: '#F59E0B', textAlign: 'center', maxWidth: 320, lineHeight: 1.5 }}>
+          🔇 No microphone detected — <strong>listen-only mode</strong>. You'll hear {agentName || 'the agent'}
+          greet and respond, but can't speak back. Connect a mic for a full two-way conversation.
+        </div>
+      ) : (
+        <div style={{ fontSize: 12, color: '#666', textAlign: 'center' }}>
+          Speak naturally — you can interrupt {agentName || 'the agent'} mid-sentence.
+        </div>
+      )}
       <div className="lk-test-controls">
-        <VoiceAssistantControlBar controls={{ leave: true, microphone: true }} saveUserChoices={false} />
+        <VoiceAssistantControlBar controls={{ leave: true, microphone: micAvailable !== false }} saveUserChoices={false} />
       </div>
     </div>
   );
