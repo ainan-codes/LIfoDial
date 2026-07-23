@@ -60,6 +60,7 @@ from livekit import api as livekit_api
 # ── Local processors ──────────────────────────────────────────────────────────
 from backend.agent.processors.booking_processor import BookingProcessor
 from backend.agent.processors.call_logger_processor import CallLoggerProcessor
+from backend.agent.processors.transcript_publisher import LiveKitTranscriptPublisher
 
 # ── App config ────────────────────────────────────────────────────────────────
 from backend.config import settings
@@ -762,6 +763,12 @@ async def entrypoint(ctx) -> None:
     #
     #   audio in → STT → context_in → booking → LLM → context_out → logger → TTS → audio out
     #
+    # Mirrors the agent's spoken text into the room as transcriptions so the
+    # browser Test widget shows a live transcript (transparent passthrough,
+    # fully guarded — see LiveKitTranscriptPublisher). Placed right after TTS so
+    # it sees TTSTextFrames (the text actually being spoken).
+    transcript_publisher = LiveKitTranscriptPublisher(transport)
+
     pipeline = Pipeline([
         transport.input(),                       # Audio in from LiveKit room
         stt,                                     # Speech → TranscriptionFrame
@@ -771,6 +778,7 @@ async def entrypoint(ctx) -> None:
         context_aggregator.assistant(),          # Stores assistant reply in context
         call_logger,                             # Metrics + call record updates (transparent)
         tts,                                     # LLMResponseFrame → TTSAudioRawFrame
+        transcript_publisher,                    # Mirror agent text → room transcript (transparent)
         resilience,                              # Never-silence: ErrorFrame → spoken fallback
         transport.output(),                      # Audio out to LiveKit room
     ])
