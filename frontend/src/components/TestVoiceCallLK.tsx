@@ -27,6 +27,10 @@ const SLOW_MS = 12_000;
 // After this long, stop pretending and offer a retry (accommodates free-tier
 // worker cold starts, which can take ~30–60s, without being infinite).
 const TIMEOUT_MS = 45_000;
+// How long to wait for the agent worker to JOIN the room before showing the
+// cold-start notice. The free-tier worker cold start is ~52.8s measured, so 12s
+// was far too eager (it fired on every call). Match the real cold-start window.
+const AGENT_WAIT_MS = 60_000;
 
 export default function TestVoiceCallLK({
   agent,
@@ -171,28 +175,32 @@ export default function TestVoiceCallLK({
 }
 
 function TestCallUI({ agentName, micAvailable, onRetry }: { agentName?: string; micAvailable?: boolean; onRetry?: () => void }) {
-  const { state, audioTrack, agentTranscriptions } = useVoiceAssistant();
+  const { state, audioTrack, agentTranscriptions, agent } = useVoiceAssistant();
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  const stateConfig: Record<string, { label: string; color: string }> = {
-    connecting: { label: 'Connecting…', color: '#F59E0B' },
-    initializing: { label: 'Initializing…', color: '#F59E0B' },
+  // Readiness MUST come from the agent PARTICIPANT + its audio track — NOT from
+  // `state`. This worker runs a raw pipecat PipelineTask, which never emits the
+  // `lk.agent.state` participant attribute the SDK needs to advance `state` past
+  // "connecting". Gating on `state` (the earlier rewrite did) left a warm, actively
+  // speaking agent stuck reading "connecting"/"waiting" forever.
+  const agentReady = !!agent && !!audioTrack;
+
+  const liveStates: Record<string, { label: string; color: string }> = {
     listening: { label: '🎤 Listening', color: '#3B82F6' },
     thinking: { label: '💭 Thinking', color: '#F59E0B' },
     speaking: { label: '🔊 Speaking', color: '#3ECF8E' },
-    idle: { label: '● Ready', color: '#888' },
-    disconnected: { label: 'Disconnected', color: '#ef4444' },
+    idle: { label: '● Ready — speak', color: '#3ECF8E' },
   };
-  const { label, color } = stateConfig[state] || stateConfig.idle;
+  const { label, color } = agentReady
+    ? (liveStates[state] || { label: '● Live — speak', color: '#3ECF8E' })
+    : { label: 'Connecting to the agent…', color: '#F59E0B' };
 
-  // The agent has "arrived" once the pipeline reaches a live conversational state.
-  const agentReady = ['listening', 'thinking', 'speaking', 'idle'].includes(state);
   const [waitedLong, setWaitedLong] = useState(false);
   useEffect(() => {
     if (agentReady) { setWaitedLong(false); return; }
-    const t = setTimeout(() => setWaitedLong(true), SLOW_MS);
+    const t = setTimeout(() => setWaitedLong(true), AGENT_WAIT_MS);
     return () => clearTimeout(t);
-  }, [agentReady, state]);
+  }, [agentReady]);
 
   // Auto-scroll transcript to the newest line.
   useEffect(() => {
@@ -250,7 +258,7 @@ function TestCallUI({ agentName, micAvailable, onRetry }: { agentName?: string; 
               ? (micAvailable === false
                   ? 'Listening for the agent… (transcript appears as it speaks)'
                   : 'Say hello — the transcript appears here as you and the agent speak.')
-              : 'Connecting the transcript…'}
+              : 'Waiting for the agent to join the call…'}
           </div>
         )}
       </div>

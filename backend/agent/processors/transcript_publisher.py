@@ -16,6 +16,7 @@ Only the AGENT's speech is published (attributed to the worker's local
 participant). That is what the Test widget renders. Caller-side transcript would
 need the user's mic track and is a separate follow-up.
 """
+import asyncio
 import logging
 
 from pipecat.frames.frames import Frame, TTSTextFrame
@@ -37,12 +38,21 @@ class LiveKitTranscriptPublisher(FrameProcessor):
         if isinstance(frame, TTSTextFrame):
             text = (getattr(frame, "text", "") or "").strip()
             if text:
-                try:
-                    await self._publish(text)
-                except Exception as e:  # never break the call
-                    log.debug("Transcript publish skipped: %s", e)
-        # Always forward the frame unchanged.
+                # FIRE-AND-FORGET: publishing is a LiveKit round trip and is purely
+                # cosmetic (drives the browser test transcript). It must NEVER gate
+                # audio — awaiting it here stalled every TTS text frame (and the
+                # audio queued behind it) by one publish RTT, delaying the first
+                # spoken word and stuttering every turn. Schedule it in the
+                # background and forward the frame immediately.
+                asyncio.create_task(self._safe_publish(text))
+        # Always forward the frame unchanged, without waiting on the publish.
         await self.push_frame(frame, direction)
+
+    async def _safe_publish(self, text: str) -> None:
+        try:
+            await self._publish(text)
+        except Exception as e:  # never propagate into the call
+            log.warning("Transcript publish failed (non-fatal): %s", e)
 
     def _resolve_room(self):
         """Best-effort access to the LiveKit room across pipecat's transport

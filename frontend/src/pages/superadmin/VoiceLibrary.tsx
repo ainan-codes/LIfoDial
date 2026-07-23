@@ -100,10 +100,13 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
     loadConfiguredProviders();
   }, []);
 
-  // Stop currently playing audio on unmount or when playingId changes
+  // Stop audio only on unmount. (Do NOT depend on playingId: playVoice sets
+  // audioRef + playingId and THEN awaits audio.play(); a playingId-scoped cleanup
+  // fired stopAudio() on the just-created element, pausing it mid-play — the classic
+  // "play() request was interrupted by a call to pause()" that made previews fail.)
   useEffect(() => {
     return () => stopAudio();
-  }, [playingId]);
+  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
   const stopAudio = () => {
     if (audioRef.current) {
