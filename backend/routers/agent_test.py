@@ -27,6 +27,11 @@ from backend.models.agent_config import AgentConfig
 from backend.models.api_key_config import ApiKeyConfig
 from backend.config import settings
 from backend.security import decode_access_token
+from backend.agent.booking_rules import (
+    BOOKING_RULES_BLOCK,
+    BOOKING_RESULT_TRUE,
+    BOOKING_RESULT_FALSE,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -1987,113 +1992,259 @@ async def openai_transcribe(api_key: str, audio_bytes: bytes) -> tuple[str, str]
         return "", ""
 
 
-async def sync_and_log_appointment(action: str, name: str, phone: str, date: str, time: str, doctor: str, notes: str, tenant_id: str, webhook_url: str | None, websocket: WebSocket = None):
-    """
-    Sequentially handles:
-    1. Replicating the Book/Reschedule/Cancel request to Supabase / local DB.
-    2. Extracting the database-generated UUID of the appointment.
-    3. Logging the details (including ID, Status, and Notes) to the clinic's Google Sheets webhook.
-    """
-    try:
-        from backend.services.his import sync_appointment_to_db
-        from backend.services.sheets import log_booking_to_sheets
-        
-        if websocket:
-            try:
-                await websocket.send_json({
-                    "type": "tool_call",
-                    "tool": "Database & Google Sheets Sync",
-                    "status": "started",
-                    "payload": {
-                        "action": action,
-                        "name": name,
-                        "phone": phone,
-                        "date": date,
-                        "time": time,
-                        "doctor": doctor,
-                        "notes": notes,
-                    }
-                })
-            except Exception:
-                pass
-        
-        # 1. DB Sync (wait for it to get the generated UUID)
-        db_res = await sync_appointment_to_db(
-            action=action,
-            name=name,
-            phone=phone,
-            date_str=date,
-            time_str=time,
-            doctor_name=doctor,
-            tenant_id=tenant_id,
-            notes=notes
-        )
-        
-        appointment_id = "N/A"
-        status = "cancelled" if action == "CANCEL" else "confirmed"
-        notes_saved = notes
-        
-        if db_res:
-            appointment_id = db_res.get("appointment_id", "N/A")
-            status = db_res.get("status", "confirmed")
-            notes_saved = db_res.get("notes") or notes
-            
-        # 2. Log to Google Sheets
-        sheets_success = await log_booking_to_sheets(
-            action=action,
-            name=name,
-            phone=phone,
-            date=date,
-            time=time,
-            doctor=doctor,
-            appointment_id=appointment_id,
-            status=status,
-            notes=notes_saved,
-            webhook_url=webhook_url
-        )
+async def sync_and_log_appointment(action: str, name: str, phone: str, date: str, time: str, doctor: str, notes: str, tenant_id: str, webhook_url: str | None, websocket: WebSocket = None, call_id: str | None = None) -> dict:
+    """AWAIT a Book/Reschedule/Cancel, then log only REAL successes to Sheets.
 
-        if websocket:
-            try:
-                await websocket.send_json({
-                    "type": "tool_call",
-                    "tool": "Database & Google Sheets Sync",
-                    "status": "success" if sheets_success else "failed",
-                    "payload": {
-                        "action": action,
-                        "name": name,
-                        "phone": phone,
-                        "date": date,
-                        "time": time,
-                        "doctor": doctor,
-                        "notes": notes_saved,
-                    },
-                    "result": {
-                        "appointment_id": appointment_id,
-                        "status": status,
-                        "db_sync": "success" if db_res else "failed",
-                        "sheets_sync": "success" if sheets_success else "failed"
-                    }
-                })
-            except Exception:
-                pass
+    Returns the execute_booking_action() result dict::
+
+        {success, reason, appointment_id, doctor_name, available_doctors, slot}
+
+    The caller MUST gate any user-facing confirmation on ``result["success"]``.
+    This is the chat-path half of audit FIX 4 — this function used to be fired
+    with asyncio.create_task() and never awaited, so the chat confirmed the
+    appointment regardless of whether the write actually happened.
+    """
+    from backend.services.his import execute_booking_action
+    from backend.services.sheets import log_booking_to_sheets
+
+    if websocket:
+        try:
+            await websocket.send_json({
+                "type": "tool_call",
+                "tool": "Database & Google Sheets Sync",
+                "status": "started",
+                "payload": {"action": action, "name": name, "phone": phone,
+                            "date": date, "time": time, "doctor": doctor, "notes": notes},
+            })
+        except Exception:
+            pass
+
+    try:
+        res = await execute_booking_action(
+            action=action, tenant_id=tenant_id, name=name, phone=phone,
+            date_str=date, time_str=time, doctor_name=doctor, notes=notes,
+            call_id=call_id,
+        )
     except Exception as e:
-        logger.error(f"Error in sync_and_log_appointment background task: {e}", exc_info=True)
-        if websocket:
-            try:
-                await websocket.send_json({
-                    "type": "tool_call",
-                    "tool": "Database & Google Sheets Sync",
-                    "status": "failed",
-                    "result": {"error": str(e)}
-                })
-            except Exception:
-                pass
+        logger.error(f"Error in sync_and_log_appointment DB step: {e}", exc_info=True)
+        res = {"success": False, "reason": "db_error", "appointment_id": None,
+               "doctor_name": None, "available_doctors": [], "slot": ""}
+
+    appointment_id = res.get("appointment_id") or "N/A"
+    status = ("cancelled" if (action or "").upper() == "CANCEL" else "confirmed") if res["success"] else "failed"
+
+    # Log to Sheets ONLY when the appointment really changed. Logging a failed or
+    # fabricated booking would recreate the exact inconsistency this fix removes.
+    sheets_success = False
+    if res["success"]:
+        try:
+            sheets_success = await log_booking_to_sheets(
+                action=action, name=name, phone=phone, date=date, time=time,
+                doctor=res.get("doctor_name") or doctor, appointment_id=appointment_id,
+                status=status, notes=notes, webhook_url=webhook_url,
+            )
+        except Exception as e:
+            logger.error(f"Sheets log failed: {e}", exc_info=True)
+
+    if websocket:
+        try:
+            await websocket.send_json({
+                "type": "tool_call",
+                "tool": "Database & Google Sheets Sync",
+                "status": "success" if res["success"] else "failed",
+                "payload": {"action": action, "name": name, "phone": phone,
+                            "date": date, "time": time, "doctor": doctor, "notes": notes},
+                "result": {"appointment_id": appointment_id, "status": status,
+                           "reason": res.get("reason", ""),
+                           "db_sync": "success" if res["success"] else "failed",
+                           "sheets_sync": "success" if sheets_success else "skipped"},
+            })
+        except Exception:
+            pass
+
+    return res
 
 
 # ── LLM Logic ─────────────────────────────────────────────────────────────────
 
 # Store conversation history per session (in-memory for now)
 _conversation_history: dict[str, list] = {}
+
+# Matches the [ACTION: BOOK|Name|Phone|Date|Time|Doctor|Notes] tag the LLM emits.
+_ACTION_RE = re.compile(
+    r'\[ACTION:\s*(BOOK|RESCHEDULE|CANCEL)\|(.*?)\|(.*?)\|(.*?)\|(.*?)\|(.*?)(?:\|(.*?))?\]'
+)
+
+
+async def _dispatch_llm(provider: str, api_key: str, system_prompt: str,
+                        history: list, model: str, max_tokens: int) -> str:
+    """Single entry point to the provider adapters, used for BOTH the first pass
+    and the honest regeneration pass so they stay identical."""
+    if provider == "gemini":
+        return await call_gemini(api_key, system_prompt, history, model, max_tokens=max_tokens)
+    if provider == "openai":
+        return await call_openai(api_key, system_prompt, history, model, max_tokens=max_tokens)
+    if provider == "anthropic":
+        return await call_anthropic(api_key, system_prompt, history, model, max_tokens=max_tokens)
+    if provider == "groq":
+        return await call_groq(api_key, system_prompt, history, model, max_tokens=max_tokens)
+    if provider == "deepseek":
+        return await call_openai(api_key, system_prompt, history, model,
+                                 max_tokens=max_tokens, base_url="https://api.deepseek.com/v1")
+    raise Exception(f"Unknown LLM provider: {provider}")
+
+
+async def _resolve_tenant_webhook(agent: AgentConfig, db: AsyncSession) -> str | None:
+    webhook = getattr(agent, "webhook_url", None)
+    if webhook:
+        return webhook
+    try:
+        from backend.models.tenant import Tenant
+        t = (await db.execute(select(Tenant).where(Tenant.id == agent.tenant_id))).scalar_one_or_none()
+        if t and t.google_sheets_webhook_url:
+            return t.google_sheets_webhook_url
+    except Exception as e:
+        logger.error("Failed to fetch tenant webhook url: %s", e)
+    return None
+
+
+def _booking_result_message(action: str, res: dict) -> str:
+    """Build the authoritative [BOOKING_RESULT ...] system line injected before
+    the honest regeneration pass — the chat analogue of what BookingProcessor
+    injects into the voice pipeline's LLM context."""
+    action = (action or "").upper()
+    verb = {"BOOK": "booking", "RESCHEDULE": "reschedule",
+            "CANCEL": "cancellation"}.get(action, "request")
+    if res.get("success"):
+        detail = f" (appointment id {res.get('appointment_id')}"
+        if res.get("doctor_name"):
+            detail += f", doctor {res['doctor_name']}"
+        if res.get("slot"):
+            detail += f", {res['slot']}"
+        detail += ")"
+        return (f"{BOOKING_RESULT_TRUE} The {verb} is saved in the system{detail}. "
+                "Confirm this to the patient in ONE short sentence, in their language.")
+
+    reason = res.get("reason", "")
+    if reason == "disabled":
+        return (f"{BOOKING_RESULT_FALSE} This clinic has the {verb} feature turned off, so nothing "
+                "was changed. Do NOT say it was done. Politely tell the patient you can't do that here "
+                "and offer to connect them to the clinic's staff.")
+    if reason in ("doctor_not_found", "doctor_required"):
+        docs = ", ".join(res.get("available_doctors") or [])
+        avail = (f" The doctors available at this clinic are: {docs}."
+                 if docs else " There are no doctors listed at this clinic yet.")
+        req = ("The doctor the patient asked for is not available at this clinic"
+               if reason == "doctor_not_found" else "No specific available doctor was chosen")
+        return (f"{BOOKING_RESULT_FALSE} {req}, so NOTHING was booked. Do NOT say it is booked.{avail} "
+                "Ask the patient which of the available doctors they'd like, or offer to connect them to staff.")
+    if reason == "not_found":
+        return (f"{BOOKING_RESULT_FALSE} No matching appointment was found for that name and phone number, "
+                "so nothing was changed. Do NOT say it was done. Ask the patient to re-check their name and "
+                "phone number.")
+    return (f"{BOOKING_RESULT_FALSE} The {verb} could NOT be saved due to a system error. Do NOT say it was "
+            "done. Apologize briefly and offer to try again.")
+
+
+# Honest, non-confirming fallbacks used ONLY if the regeneration LLM call itself
+# errors out. Success strings are safe to localise (the row really exists);
+# failures fall back to a plain message that clearly does not confirm anything.
+_SUCCESS_FALLBACKS = {
+    "BOOK": {"en-IN": "Your appointment is confirmed.",
+             "hi-IN": "आपका अपॉइंटमेंट कन्फर्म हो गया है।",
+             "ml-IN": "നിങ്ങളുടെ അപ്പോയിന്റ്മെന്റ് സ്ഥിരീകരിച്ചു."},
+    "RESCHEDULE": {"en-IN": "Your appointment has been rescheduled.",
+                   "hi-IN": "आपका अपॉइंटमेंट रीशेड्यूल कर दिया गया है।"},
+    "CANCEL": {"en-IN": "Your appointment has been cancelled.",
+               "hi-IN": "आपका अपॉइंटमेंट रद्द कर दिया गया है।"},
+}
+
+
+def _deterministic_booking_reply(action: str, res: dict, user_language: str) -> str:
+    lang = (user_language or "en-IN").strip() or "en-IN"
+    if res.get("success"):
+        table = _SUCCESS_FALLBACKS.get((action or "").upper(), _SUCCESS_FALLBACKS["BOOK"])
+        return table.get(lang, table["en-IN"])
+    if res.get("reason") in ("doctor_not_found", "doctor_required"):
+        docs = ", ".join(res.get("available_doctors") or [])
+        if docs:
+            return f"I'm sorry, that doctor isn't available at this clinic. We have: {docs}. Who would you like to see?"
+        return "I'm sorry, I couldn't find that doctor at this clinic, so I haven't booked anything. Could you clarify?"
+    if res.get("reason") == "not_found":
+        return ("I couldn't find a matching appointment for that name and phone number, so nothing was "
+                "changed. Could you re-check those details?")
+    if res.get("reason") == "disabled":
+        return "I'm sorry, I'm not able to do that here. Let me connect you with the clinic's staff."
+    return "I'm sorry, I couldn't complete that just now, so nothing was changed. Would you like me to try again?"
+
+
+async def _handle_booking_action(
+    response: str, *, agent: AgentConfig, db: AsyncSession, history: list,
+    provider: str, api_key: str, model: str, max_tokens: int,
+    base_system_prompt: str, user_language: str, websocket: WebSocket = None,
+) -> str:
+    """If the model emitted an [ACTION:] tag, AWAIT the real DB write and return
+    an honest reply generated with the true outcome injected. No tag → return
+    the response unchanged.
+
+    This is the chat/embed analogue of BookingProcessor: the premature phase-1
+    text is discarded, so the patient only ever sees a reply produced AFTER the
+    booking outcome is known.
+    """
+    m = _ACTION_RE.search(response or "")
+    if not m:
+        return response
+
+    g = m.groups()
+    b_action = (g[0] or "").strip().upper()
+    b_name = (g[1] or "").strip()
+    b_phone = (g[2] or "").strip()
+    b_date = (g[3] or "").strip()
+    b_time = (g[4] or "").strip()
+    b_doctor = (g[5] or "").strip()
+    b_notes = (g[6].strip() if (len(g) > 6 and g[6] is not None) else "N/A")
+
+    # Capability gate — the chat path used to book even when the clinic admin had
+    # the tool switched off. BOOK/RESCHEDULE need can_book_appointments; CANCEL
+    # needs can_cancel_appointments.
+    can_book = bool(getattr(agent, "can_book_appointments", True))
+    can_cancel = bool(getattr(agent, "can_cancel_appointments", True))
+    allowed = can_book if b_action in ("BOOK", "RESCHEDULE") else (
+        can_cancel if b_action == "CANCEL" else False)
+
+    if not allowed:
+        res = {"success": False, "reason": "disabled", "appointment_id": None,
+               "doctor_name": None, "available_doctors": [], "slot": ""}
+    else:
+        webhook = await _resolve_tenant_webhook(agent, db)
+        res = await sync_and_log_appointment(
+            action=b_action, name=b_name, phone=b_phone, date=b_date, time=b_time,
+            doctor=b_doctor, notes=b_notes, tenant_id=str(agent.tenant_id),
+            webhook_url=webhook, websocket=websocket,
+        )
+
+    result_line = _booking_result_message(b_action, res)
+
+    # Regenerate the user-facing reply with the REAL outcome injected, under the
+    # shared honesty rules. history still ends at the user's message — the
+    # phase-1 assistant text was intentionally NOT appended.
+    regen_system = (
+        base_system_prompt
+        + "\n\n--- SYSTEM UPDATE (AUTHORITATIVE — obey exactly) ---\n"
+        + result_line + "\n"
+        + BOOKING_RULES_BLOCK
+    )
+    try:
+        final = await _dispatch_llm(provider, api_key, regen_system, history, model, max_tokens)
+        final = _ACTION_RE.sub("", final or "")
+        final = re.sub(r'\[BOOKING_RESULT[^\]]*\]', "", final).strip()
+        if final:
+            return final
+    except Exception as e:
+        logger.error("Honest booking regeneration failed (%s) — using deterministic reply: %s", provider, e)
+
+    return _deterministic_booking_reply(b_action, res, user_language)
+
 
 async def generate_llm_response(
     agent: AgentConfig, 
@@ -2224,20 +2375,20 @@ async def generate_llm_response(
         "5. GREETING RULE: You have ALREADY greeted the user with the opening message. "
         "Do NOT repeat the welcome greeting. If the user says Hello or Hi, respond naturally "
         "as a conversation continuation, NOT a new greeting.\n"
-        "6. ACTION RULE: If the user wants to BOOK, RESCHEDULE, or CANCEL an appointment, strictly follow these conditions:\n"
-        "   - BOOK: Politely collect their Name, Phone number, preferred Date, preferred Time, and the Doctor's name (if known).\n"
-        f"     *Note: You must ALWAYS convert relative dates like 'today', 'tomorrow', 'day after tomorrow', 'next Monday', or specific weekdays into the actual calendar date in DD/MM/YYYY format based on the reference date: Today is {current_day_str}, {current_date_str}. Never output relative date words like 'tomorrow' in the ACTION tag. Only use DD/MM/YYYY format.*\n"
-        "   - RESCHEDULE or CANCEL: To secure and verify their request, you MUST smartly ask for BOTH their Name and Phone number. Do NOT trigger the action until you have collected and confirmed both details.\n"
-        "   - NOTES: Capture any symptoms, reasons for the visit/reschedule/cancellation, or special requests they mention (or use 'N/A' if none).\n"
-        "You MUST always provide a polite, natural conversational response to the patient (in their language) confirming the action, and then append exactly ONE of these tags at the very end of your response (do not output ONLY the tag):\n"
+        "6. APPOINTMENT ACTIONS (BOOK / RESCHEDULE / CANCEL): Collect the required details, then SIGNAL the action with a tag. You must NEVER tell the patient the appointment is booked, rescheduled, or cancelled in the same turn — the system actually performs the action and replies to you with a [BOOKING_RESULT ...] message, and only THEN may you confirm (see the BOOKING RULES below).\n"
+        "   - BOOK: collect Name, Phone number, preferred Date, preferred Time, and the Doctor's name.\n"
+        f"     *Convert relative dates ('today', 'tomorrow', 'day after tomorrow', 'next Monday', weekdays) into an actual DD/MM/YYYY date using the reference date: Today is {current_day_str}, {current_date_str}. Never output relative date words in the tag — only DD/MM/YYYY.*\n"
+        "   - RESCHEDULE or CANCEL: you MUST ask for and confirm BOTH the patient's Name and Phone number before signalling the action.\n"
+        "   - NOTES: capture symptoms/reasons/special requests, or 'N/A' if none.\n"
+        "   When (and only when) you have the required details, append exactly ONE of these tags at the very END of your reply:\n"
         "   - [ACTION: BOOK|Name|Phone|Date|Time|Doctor|Notes]\n"
         "   - [ACTION: RESCHEDULE|Name|Phone|Date|Time|Doctor|Notes]\n"
         "   - [ACTION: CANCEL|Name|Phone|Date|Time|Doctor|Notes]\n"
-        "   (For reschedule and cancel, you MUST specify the verified Name and Phone, using 'N/A' for fields like Date/Time/Doctor if they are not being changed or aren't relevant).\n"
+        "   (Use 'N/A' for fields that are not being changed.) The text before the tag must ask the patient to hold on for a moment while you complete it — it must NOT claim the action is already done.\n"
         "--- END MANDATORY INSTRUCTIONS ---\n"
     )
-    
-    system_prompt = base_prompt + kb_context + guardrail
+
+    system_prompt = base_prompt + kb_context + guardrail + BOOKING_RULES_BLOCK
     
     # Add user message to history
     history.append({"role": "user", "content": user_message})
@@ -2278,103 +2429,22 @@ async def generate_llm_response(
     max_tokens = int(agent.max_response_tokens or 150)
 
     try:
-        if llm_provider == "gemini":
-            response = await call_gemini(api_key, system_prompt, history,
-                                          agent_model, max_tokens=max_tokens)
-        elif llm_provider == "openai":
-            response = await call_openai(api_key, system_prompt, history,
-                                          agent_model, max_tokens=max_tokens)
-        elif llm_provider == "anthropic":
-            response = await call_anthropic(api_key, system_prompt, history,
-                                             agent_model, max_tokens=max_tokens)
-        elif llm_provider == "groq":
-            response = await call_groq(api_key, system_prompt, history,
-                                        agent_model, max_tokens=max_tokens)
-        elif llm_provider == "deepseek":
-            response = await call_openai(api_key, system_prompt, history,
-                                          agent_model, max_tokens=max_tokens,
-                                          base_url="https://api.deepseek.com/v1")
+        if llm_provider in ("gemini", "openai", "anthropic", "groq", "deepseek"):
+            response = await _dispatch_llm(llm_provider, api_key, system_prompt,
+                                           history, agent_model, max_tokens)
         else:
             response = generate_demo_response(agent, user_message, history)
-        
-        # Intercept Action Trigger (BOOK/RESCHEDULE/CANCEL)
-        action_match = re.search(r'\[ACTION:\s*(BOOK|RESCHEDULE|CANCEL)\|(.*?)\|(.*?)\|(.*?)\|(.*?)\|(.*?)(?:\|(.*?))?\]', response)
-        if action_match:
-            groups = action_match.groups()
-            b_action = groups[0].strip()
-            b_name = groups[1].strip()
-            b_phone = groups[2].strip()
-            b_date = groups[3].strip()
-            b_time = groups[4].strip()
-            b_doctor = groups[5].strip()
-            b_notes = groups[6].strip() if groups[6] is not None else "N/A"
-            
-            tenant_webhook_url = getattr(agent, 'webhook_url', None)
-            if not tenant_webhook_url:
-                try:
-                    from backend.models.tenant import Tenant
-                    t_res = await db.execute(select(Tenant).where(Tenant.id == agent.tenant_id))
-                    tenant = t_res.scalar_one_or_none()
-                    if tenant and tenant.google_sheets_webhook_url:
-                        tenant_webhook_url = tenant.google_sheets_webhook_url
-                except Exception as e:
-                    logger.error(f"Failed to fetch tenant webhook url: {e}")
 
-            # Fire off unified background task for DB sync + Sheets logging sequentially
-            asyncio.create_task(sync_and_log_appointment(
-                action=b_action,
-                name=b_name,
-                phone=b_phone,
-                date=b_date,
-                time=b_time,
-                doctor=b_doctor,
-                notes=b_notes,
-                tenant_id=agent.tenant_id,
-                webhook_url=tenant_webhook_url,
-                websocket=websocket
-            ))
-            response = re.sub(r'\[ACTION:.*?\]', '', response).strip()
-            
-            # Fallback if the agent ONLY returned the tag and no conversational text
-            if not response:
-                lang = (user_language or "en-IN").strip()
-                action_fallbacks = {
-                    "BOOK": {
-                        "en-IN": "I have successfully booked your appointment.",
-                        "hi-IN": "मैंने आपका अपॉइंटमेंट सफलतापूर्वक बुक कर लिया है।",
-                        "ml-IN": "ഞാൻ നിങ്ങളുടെ അപ്പോയിന്റ്മെന്റ് വിജയകരമായി ബുക്ക് ചെയ്തിട്ടുണ്ട്.",
-                        "ta-IN": "உங்கள் சந்திப்பு வெற்றிகரமாக முன்பதிவு செய்யப்பட்டுள்ளது.",
-                        "te-IN": "మీ అపాయింట్‌మెంట్ విజయవంతంగా బుక్ చేయబడింది.",
-                        "kn-IN": "ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಯಶಸ್ವಿಯಾಗಿ ಬುಕ್ ಆಗಿದೆ.",
-                        "bn-IN": "আমি সফলভাবে আপনার অ্যাপয়েন্টমেন্ট বুক করেছি।",
-                        "gu-IN": "મેં સફળતાપૂર્વક તમારી એપોઇન્ટમેન્ટ બુક કરી છે.",
-                        "ar-SA": "لقد قمت بحجز موعدك بنجاح."
-                    },
-                    "RESCHEDULE": {
-                        "en-IN": "I have successfully rescheduled your appointment.",
-                        "hi-IN": "मैंने आपका अपॉइंटमेंट सफलतापूर्वक रीशेड्यूल कर लिया है।",
-                        "ml-IN": "ഞാൻ നിങ്ങളുടെ അപ്പോയിന്റ്മെന്റ് വിജയകരമായി പുനഃക്രമീകരിച്ചിട്ടുണ്ട്.",
-                        "ta-IN": "உங்கள் சந்திப்பு வெற்றிகரமாக மாற்றியமைக்கப்பட்டுள்ளது.",
-                        "te-IN": "మీ అపాయింట్‌మెంట్ విజయవంతంగా రీషెడ్యూల్ చేయబడింది.",
-                        "kn-IN": "ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಯಶಸ್ವಿಯಾಗಿ ಮರುನಿಗದಿಪಡಿಸಲಾಗಿದೆ.",
-                        "bn-IN": "আমি সফলভাবে আপনার অ্যাপয়েন্টमेंट পুনর্নির্ধারণ করেছি।",
-                        "gu-IN": "મેં સફળતાપૂર્વक તમારી એપોઇન્ટમેન્ટ ફરીથી શેડ્યૂલ કરી છે.",
-                        "ar-SA": "لقد قمت بإعادة جدولة موعدك بنجاح."
-                    },
-                    "CANCEL": {
-                        "en-IN": "I have successfully cancelled your appointment.",
-                        "hi-IN": "मैंने आपका अपॉइंटमेंट सफलतापूर्वक रद्द कर दिया है।",
-                        "ml-IN": "ഞാൻ നിങ്ങളുടെ അപ്പോയിന്റ്മെന്റ് വിജയകരമായി റദ്ദാക്കിയിട്ടുണ്ട്.",
-                        "ta-IN": "உங்கள் சந்திப்பு வெற்றிகரமாக ரத்து செய்யப்பட்டுள்ளது.",
-                        "te-IN": "మీ అపాయింట్‌మెంట్ విజయవంతంగా రద్దు చేయబడింది.",
-                        "kn-IN": "ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಯಶಸ್ವಿಯಾಗಿ ರದ್ದುಗೊಂಡಿದೆ.",
-                        "bn-IN": "আমি সফলভাবে আপনার অ্যাপয়েন্টমেন্ট বাতিল করেছি।",
-                        "gu-IN": "મેં સફળતાપૂર્વક તમારી એપોઇન્ટમેન્ટ રદ કરી છે.",
-                        "ar-SA": "لقد قمت بإلغاء موعدك بنجاح."
-                    }
-                }
-                act_dict = action_fallbacks.get(b_action, action_fallbacks["BOOK"])
-                response = act_dict.get(lang, act_dict["en-IN"])
+        # Honest booking (audit FIX 4): if the model emitted an [ACTION:] tag,
+        # AWAIT the real DB write and regenerate the reply with the true outcome
+        # injected. A confirmation is never spoken before the row exists — the
+        # same guarantee the voice pipeline's BookingProcessor provides.
+        response = await _handle_booking_action(
+            response, agent=agent, db=db, history=history,
+            provider=llm_provider, api_key=api_key, model=agent_model,
+            max_tokens=max_tokens, base_system_prompt=system_prompt,
+            user_language=user_language, websocket=websocket,
+        )
 
         # Add response to history
         history.append({"role": "assistant", "content": response})
@@ -2458,42 +2528,13 @@ async def generate_llm_response(
                     else:
                         continue
 
-                    # Intercept Action Trigger for fallback
-                    action_match = re.search(r'\[ACTION:\s*(BOOK|RESCHEDULE|CANCEL)\|(.*?)\|(.*?)\|(.*?)\|(.*?)\|(.*?)(?:\|(.*?))?\]', response)
-                    if action_match:
-                        groups = action_match.groups()
-                        b_action = groups[0].strip()
-                        b_name = groups[1].strip()
-                        b_phone = groups[2].strip()
-                        b_date = groups[3].strip()
-                        b_time = groups[4].strip()
-                        b_doctor = groups[5].strip()
-                        b_notes = groups[6].strip() if groups[6] is not None else "N/A"
-                        
-                        tenant_webhook_url = None
-                        try:
-                            from backend.models.tenant import Tenant
-                            t_res = await db.execute(select(Tenant).where(Tenant.id == agent.tenant_id))
-                            tenant = t_res.scalar_one_or_none()
-                            if tenant and tenant.google_sheets_webhook_url:
-                                tenant_webhook_url = tenant.google_sheets_webhook_url
-                        except Exception as e:
-                            logger.error(f"Failed to fetch tenant webhook url: {e}")
-
-                        # Fire off unified background task for DB sync + Sheets logging sequentially
-                        asyncio.create_task(sync_and_log_appointment(
-                            action=b_action,
-                            name=b_name,
-                            phone=b_phone,
-                            date=b_date,
-                            time=b_time,
-                            doctor=b_doctor,
-                            notes=b_notes,
-                            tenant_id=agent.tenant_id,
-                            webhook_url=tenant_webhook_url,
-                            websocket=websocket
-                        ))
-                        response = re.sub(r'\[ACTION:.*?\]', '', response).strip()
+                    # Same honest booking handling as the primary path.
+                    response = await _handle_booking_action(
+                        response, agent=agent, db=db, history=history,
+                        provider=fb_provider, api_key=fb_key, model=fb_model,
+                        max_tokens=max_tokens, base_system_prompt=system_prompt,
+                        user_language=user_language, websocket=websocket,
+                    )
 
                     history.append({"role": "assistant", "content": response})
                     if len(history) > 20:

@@ -399,6 +399,11 @@ async def _commit_booking_to_db(
             result.get("doctor_name"),
             slot_time,
         )
+        # Record the booking on the call itself so platform analytics reflect
+        # reality: Overview's resolution rate and the All Calls status read
+        # call_records.outcome, which was never set on a successful booking → a
+        # clinic with real bookings showed 0% resolution (audit P3).
+        await _mark_call_booked(call_record_id)
         return True, result
     except Exception as exc:
         logger.error(
@@ -407,3 +412,33 @@ async def _commit_booking_to_db(
             exc_info=True,
         )
         return False, {}
+
+
+async def _mark_call_booked(call_record_id: Optional[str]) -> None:
+    """Flag the call as having produced a booking (outcome='booked',
+    booking_successful=True).
+
+    Overview's resolution rate counts call_records whose outcome is
+    booked/resolved, and the All Calls status column maps 'booked' → 'Booked'.
+    Nothing wrote outcome on a successful booking before, so resolution always
+    read 0% even when bookings existed (audit P3). Best-effort: a failure here
+    never affects the caller's booking, which already succeeded.
+    """
+    if not call_record_id:
+        return
+    try:
+        from sqlalchemy import update
+
+        from backend.db import AsyncSessionLocal
+        from backend.models.call_record import CallRecord
+
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(CallRecord)
+                .where(CallRecord.id == call_record_id)
+                .values(outcome="booked", booking_successful=True)
+            )
+            await db.commit()
+        logger.info("[BookingProcessor] Marked call %s outcome=booked", call_record_id)
+    except Exception as exc:
+        logger.error("[BookingProcessor] Failed to mark call %s booked: %s", call_record_id, exc)

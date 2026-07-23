@@ -108,19 +108,10 @@ def _kb_context_block(tenant: dict) -> str:
 # honesty contract that pairs with BookingProcessor._commit_and_inject_result:
 # the DB write is awaited and its outcome arrives as a [BOOKING_RESULT] system
 # message BEFORE the LLM generates — so the model must never claim success on
-# its own (audit FIX 4).
-_BOOKING_RULES_BLOCK = (
-    "\n\n--- APPOINTMENT BOOKING RULES (STRICT) ---\n"
-    "1. When the caller wants an appointment, ask which doctor and what day/time "
-    "they want. Never invent or assume a time yourself.\n"
-    "2. Once they give a time, repeat the doctor + time back and ask them to confirm.\n"
-    "3. NEVER say an appointment is booked, confirmed, or scheduled unless a system "
-    "message starting with [BOOKING_RESULT success=true] appears. Until then, say it "
-    "is not yet confirmed.\n"
-    "4. If a [BOOKING_RESULT success=false] message appears, apologize, say the "
-    "booking could not be saved, and offer to try again.\n"
-    "--- END BOOKING RULES ---"
-)
+# its own (audit FIX 4). Defined once in backend/agent/booking_rules.py and
+# shared with the chat/embed path (agent_test.py) so the two implementations
+# cannot drift apart again.
+from backend.agent.booking_rules import BOOKING_RULES_BLOCK as _BOOKING_RULES_BLOCK
 
 
 def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
