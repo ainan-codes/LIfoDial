@@ -2187,7 +2187,7 @@ export default function AgentDetail() {
               <div style={{ padding: '40px', border: `1px dashed rgba(255,255,255,0.2)`, borderRadius: '12px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', background: 'rgba(255,255,255,0.01)', cursor: 'pointer' }}>
                 <Upload size={24} color="#888" />
                 <div style={{ color: '#fff', fontSize: '14px', fontWeight: 500 }}>Drop files here or click to browse</div>
-                <div style={{ color: 'rgba(255,255,255,0.45)', fontSize: '12px' }}>PDF · TXT · DOCX · CSV · MD (Max 50MB)</div>
+                <div style={{ color: 'rgba(255,255,255,0.45)', fontSize: '12px' }}>PDF · TXT · DOCX · CSV · MD (Max 60MB)</div>
               </div>
               <div style={{ marginTop: '20px' }}>
                 <Label>Search Test</Label>

@@ -1,6 +1,5 @@
 import {
     CheckCircle,
-    Edit2,
     Globe,
     Loader2,
     Phone, Plus, Search,
@@ -10,62 +9,25 @@ import {
 import React, { useEffect, useState } from 'react';
 import fetchWithAuth from '../../api/client';
 
-// ── Fixture Phone Numbers ─────────────────────────────────────────────────────
+// ── Options ───────────────────────────────────────────────────────────────────
+// (Audit P2: the old FIXTURE_PHONE_NUMBERS seed — 4 fake numbers on clinics that
+// don't exist — was removed. The table now renders ONLY real rows from
+// GET /phone-numbers, and an honest empty state when there are none.)
 
-const FIXTURE_PHONE_NUMBERS = [
-  {
-    id: 'pn-001',
-    number: '+91 90001 23456',
-    country: 'India',
-    country_code: 'IN',
-    provider: 'Vobiz',
-    agent_id: 'agent-001',
-    agent_name: 'Apollo Mumbai Receptionist',
-    is_active: true,
-    is_assigned: true,
-    sip_domain: 'sip.vobiz.com',
-    created_at: '2026-03-15T10:00:00Z',
-  },
-  {
-    id: 'pn-002',
-    number: '+91 90001 34567',
-    country: 'India',
-    country_code: 'IN',
-    provider: 'Vobiz',
-    agent_id: 'agent-002',
-    agent_name: 'Aster Kochi Receptionist',
-    is_active: true,
-    is_assigned: true,
-    sip_domain: 'sip.vobiz.com',
-    created_at: '2026-03-16T10:00:00Z',
-  },
-  {
-    id: 'pn-003',
-    number: '+971 50001 1234',
-    country: 'UAE',
-    country_code: 'AE',
-    provider: 'Custom SIP',
-    agent_id: 'agent-003',
-    agent_name: 'Al Zahra Dubai Receptionist',
-    is_active: true,
-    is_assigned: true,
-    sip_domain: 'sip.twilio.com',
-    created_at: '2026-03-20T10:00:00Z',
-  },
-  {
-    id: 'pn-004',
-    number: '+91 90001 45678',
-    country: 'India',
-    country_code: 'IN',
-    provider: 'Exotel',
-    agent_id: null,
-    agent_name: null,
-    is_active: true,
-    is_assigned: false,
-    sip_domain: null,
-    created_at: '2026-04-01T10:00:00Z',
-  },
-];
+interface PhoneRow {
+  id: string;
+  number: string;
+  country: string;
+  country_code?: string;
+  provider?: string;
+  agent_id?: string | null;
+  agent_name?: string | null;
+  tenant_id?: string | null;
+  is_active: boolean;
+  is_assigned: boolean;
+  sip_domain?: string | null;
+  created_at?: string | null;
+}
 
 const COUNTRY_OPTIONS = [
   { code: 'IN', name: 'India', flag: '🇮🇳', prefix: '+91' },
@@ -85,29 +47,50 @@ const FLAG_MAP: Record<string, string> = {
 // ── Page Component ───────────────────────────────────────────────────────────
 
 export default function PhoneNumbers() {
-  const [numbers, setNumbers] = useState(FIXTURE_PHONE_NUMBERS);
+  const [numbers, setNumbers] = useState<PhoneRow[]>([]);
   const [search, setSearch] = useState('');
   const [showAddModal, setShowAddModal] = useState(false);
-  const [agents, setAgents] = useState<{ id: string; name: string }[]>([]);
+  const [agents, setAgents] = useState<{ id: string; name: string; tenant_id: string }[]>([]);
+  const [clinics, setClinics] = useState<{ id: string; name: string }[]>([]);
 
-  // Fetch real data from API (fall back to fixtures)
+  // Real data only — the table reflects the actual phone_numbers table (audit P2).
   useEffect(() => {
     fetchWithAuth('/phone-numbers')
-      .then((data) => {
-        if (Array.isArray(data) && data.length > 0) setNumbers(data);
-      })
-      .catch(() => {/* use fixtures */});
+      .then((data) => { setNumbers(Array.isArray(data) ? (data as PhoneRow[]) : []); })
+      .catch(() => setNumbers([]));
 
     fetchWithAuth('/agents')
       .then((data) => {
         if (Array.isArray(data)) {
           setAgents(data.map((a: any) => ({
-            id: a.id, name: a.agent_name || a.name || 'Agent',
+            id: a.id, name: a.agent_name || a.name || 'Agent', tenant_id: a.tenant_id,
           })));
         }
       })
       .catch(() => {});
+
+    // Real clinics for the Add-Number clinic selector (replaces the hardcoded
+    // 'tenant-001' the modal used to POST — the reason assignment never worked).
+    fetchWithAuth('/tenants')
+      .then((data) => {
+        if (Array.isArray(data)) {
+          setClinics(data.map((c: any) => ({ id: c.id, name: c.clinic_name || c.name || 'Clinic' })));
+        }
+      })
+      .catch(() => {});
   }, []);
+
+  const handleDelete = async (pn: PhoneRow) => {
+    if (!window.confirm(`Delete ${pn.number}? This removes the number assignment.`)) return;
+    const prev = numbers;
+    setNumbers((cur) => cur.filter((n) => n.id !== pn.id));  // optimistic
+    try {
+      await fetchWithAuth(`/phone-numbers/${pn.id}`, { method: 'DELETE' });
+    } catch {
+      setNumbers(prev);  // restore on failure
+      window.alert('Failed to delete the number. Please try again.');
+    }
+  };
 
   const filtered = numbers.filter((n) =>
     n.number.toLowerCase().includes(search.toLowerCase()) ||
@@ -241,10 +224,7 @@ export default function PhoneNumbers() {
                 </td>
                 <td style={{ padding: '12px 16px' }}>
                   <div style={{ display: 'flex', gap: '4px' }}>
-                    <button style={actionBtnStyle} title="Edit">
-                      <Edit2 size={13} />
-                    </button>
-                    <button style={actionBtnStyle} title="Delete">
+                    <button style={actionBtnStyle} title="Delete" onClick={() => handleDelete(pn)}>
                       <Trash2 size={13} />
                     </button>
                   </div>
@@ -266,6 +246,7 @@ export default function PhoneNumbers() {
       {showAddModal && (
         <AddNumberModal
           agents={agents}
+          clinics={clinics}
           onClose={() => setShowAddModal(false)}
           onAdded={(pn) => {
             setNumbers((prev) => [pn, ...prev]);
@@ -281,17 +262,25 @@ export default function PhoneNumbers() {
 
 function AddNumberModal({
   agents,
+  clinics,
   onClose,
   onAdded,
 }: {
-  agents: { id: string; name: string }[];
+  agents: { id: string; name: string; tenant_id: string }[];
+  clinics: { id: string; name: string }[];
   onClose: () => void;
   onAdded: (pn: any) => void;
 }) {
   const [country, setCountry] = useState('IN');
   const [number, setNumber] = useState('');
   const [provider, setProvider] = useState('Vobiz');
+  const [tenantId, setTenantId] = useState('');
   const [agentId, setAgentId] = useState('');
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  // Only agents belonging to the selected clinic — the backend rejects a POST
+  // whose agent_id belongs to a different tenant (audit P2 root cause).
+  const clinicAgents = agents.filter((a) => a.tenant_id === tenantId);
   const [sipDomain, setSipDomain] = useState('');
   const [sipUri, setSipUri] = useState('');
   const [sipAccountSid, setSipAccountSid] = useState('');
@@ -320,8 +309,9 @@ function AddNumberModal({
   };
 
   const handleSubmit = async () => {
-    if (!number.trim()) return;
+    if (!number.trim() || !tenantId) return;
     setSaving(true);
+    setSaveError(null);
 
     try {
       const data = await fetchWithAuth('/phone-numbers', {
@@ -336,38 +326,28 @@ function AddNumberModal({
           sip_uri: sipUri || null,
           sip_username: sipAccountSid || null,
           sip_password: sipAuthToken || null,
-          tenant_id: 'tenant-001', // default for demo
+          tenant_id: tenantId,  // the REAL selected clinic (was hardcoded 'tenant-001')
         }),
       });
 
+      // Trust the server row. Do NOT fabricate a local row on failure — a failed
+      // save must surface as an error, not look like it worked (audit: honesty).
       onAdded({
         id: data.id,
-        number: number.trim(),
+        number: data.number ?? number.trim(),
         country: selectedCountry.name,
         country_code: country,
         provider,
+        tenant_id: tenantId,
         agent_id: agentId || null,
         agent_name: agents.find((a) => a.id === agentId)?.name || null,
-        is_active: true,
+        is_active: data.is_active ?? true,
         is_assigned: !!agentId,
         sip_domain: sipDomain || null,
-        created_at: new Date().toISOString(),
+        created_at: data.created_at ?? new Date().toISOString(),
       });
-    } catch {
-      // Fallback to local add
-      onAdded({
-        id: 'pn-' + Date.now(),
-        number: number.trim(),
-        country: selectedCountry.name,
-        country_code: country,
-        provider,
-        agent_id: agentId || null,
-        agent_name: agents.find((a) => a.id === agentId)?.name || null,
-        is_active: true,
-        is_assigned: !!agentId,
-        sip_domain: sipDomain || null,
-        created_at: new Date().toISOString(),
-      });
+    } catch (e: any) {
+      setSaveError(e?.message || 'Failed to save the number. Please check the details and try again.');
     } finally {
       setSaving(false);
     }
@@ -433,16 +413,32 @@ function AddNumberModal({
             </div>
           </div>
 
-          {/* Assign to Agent */}
+          {/* Clinic (required) — the number is assigned to a REAL clinic. */}
+          <div style={{ marginBottom: '16px' }}>
+            <label style={labelStyle}>Clinic *</label>
+            <select
+              value={tenantId}
+              onChange={(e) => { setTenantId(e.target.value); setAgentId(''); }}
+              style={inputStyle}
+            >
+              <option value="">Select clinic...</option>
+              {clinics.map((c) => (
+                <option key={c.id} value={c.id}>{c.name}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Assign to Agent — scoped to the selected clinic's agents. */}
           <div style={{ marginBottom: '16px' }}>
             <label style={labelStyle}>Assign to Agent</label>
             <select
               value={agentId}
               onChange={(e) => setAgentId(e.target.value)}
               style={inputStyle}
+              disabled={!tenantId}
             >
-              <option value="">Select agent...</option>
-              {agents.map((a) => (
+              <option value="">{tenantId ? 'Unassigned (clinic only)' : 'Select a clinic first…'}</option>
+              {clinicAgents.map((a) => (
                 <option key={a.id} value={a.id}>{a.name}</option>
               ))}
             </select>
@@ -528,6 +524,13 @@ function AddNumberModal({
         </div>
 
         {/* Footer */}
+        {saveError && (
+          <div style={{ padding: '0 20px', marginBottom: '4px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#F87171', fontSize: '12px' }}>
+              <WifiOff size={13} /> {saveError}
+            </div>
+          </div>
+        )}
         <div style={{
           display: 'flex', justifyContent: 'flex-end', gap: '8px',
           padding: '16px 20px', borderTop: '1px solid #1A1A1A',
@@ -539,13 +542,14 @@ function AddNumberModal({
           }}>Cancel</button>
           <button
             onClick={handleSubmit}
-            disabled={saving || !number.trim()}
+            disabled={saving || !number.trim() || !tenantId}
+            title={!tenantId ? 'Select a clinic first' : ''}
             style={{
               padding: '8px 20px', borderRadius: '8px',
               background: '#3ECF8E', color: '#000', border: 'none',
               cursor: saving ? 'wait' : 'pointer',
               fontSize: '13px', fontWeight: 600,
-              opacity: (!number.trim() || saving) ? 0.5 : 1,
+              opacity: (!number.trim() || !tenantId || saving) ? 0.5 : 1,
             }}
           >
             {saving ? 'Adding...' : 'Add Phone Number'}

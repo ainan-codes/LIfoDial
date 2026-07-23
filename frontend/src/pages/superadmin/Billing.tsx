@@ -1,7 +1,29 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useSAStore, BillingPlan, PlanTier } from '../../store/saStore';
-import { PlanBadge, StatusBadge, StatCard } from '../../components/superadmin/SAShared';
-import { IndianRupee, TrendingUp, Receipt, ToggleLeft, ToggleRight, Edit2, Check } from 'lucide-react';
+import { PlanBadge, StatCard } from '../../components/superadmin/SAShared';
+import { IndianRupee, TrendingUp, Receipt, ToggleLeft, ToggleRight, Edit2, Check, Building2, Wallet, AlertCircle } from 'lucide-react';
+import fetchWithAuth from '../../api/client';
+
+// Shape returned by GET /admin/billing — every field is a real query result.
+interface BillingData {
+  has_paid_billing: boolean;
+  billing_note: string;
+  total_clinics: number;
+  active_clinics: number;
+  clinics_by_plan: Record<string, number>;
+  paid_plan_clinics: number;
+  mrr: number;
+  total_collected: number;
+  credits: { total_added: number; total_used: number; outstanding_balance: number };
+  recent_transactions: Array<{
+    id: string; clinic_name: string; type: string; amount: number;
+    balance_after: number | null; description: string | null; created_at: string | null;
+  }>;
+}
+
+const inr = (n: number) => `₹${n.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+const fmtDate = (iso: string | null) =>
+  iso ? new Date(iso).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
 
 function PlanCard({ plan }: { plan: BillingPlan }) {
   const { updatePlanPrice, togglePlanAvailability, addToast } = useSAStore();
@@ -81,23 +103,29 @@ function PlanCard({ plan }: { plan: BillingPlan }) {
   );
 }
 
-const MRR_HISTORY = [
-  { month: 'Nov', Free: 0, Pro: 15000, Enterprise: 40000 },
-  { month: 'Dec', Free: 0, Pro: 20000, Enterprise: 60000 },
-  { month: 'Jan', Free: 0, Pro: 30000, Enterprise: 80000 },
-  { month: 'Feb', Free: 0, Pro: 35000, Enterprise: 100000 },
-  { month: 'Mar', Free: 0, Pro: 40000, Enterprise: 119000 },
-  { month: 'Apr', Free: 0, Pro: 45000, Enterprise: 140000 },
-];
-
 export default function Billing() {
-  const { billingPlans, invoices, clinics, getMRR, getActiveCount } = useSAStore();
+  const { billingPlans } = useSAStore();
+  const [data, setData] = useState<BillingData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  const mrr = getMRR();
-  const paidSum = invoices.filter(i => i.status === 'Paid').reduce((s, i) => s + i.amount, 0);
-  const overdueSum = invoices.filter(i => i.status === 'Overdue').reduce((s, i) => s + i.amount, 0);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetchWithAuth('/admin/billing');
+        if (alive) setData(res as BillingData);
+      } catch (e: any) {
+        if (alive) setError(e?.message || 'Failed to load billing data');
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
 
-  const maxBar = Math.max(...MRR_HISTORY.map(d => d.Pro + d.Enterprise));
+  const planEntries = data ? Object.entries(data.clinics_by_plan) : [];
+  const maxPlanCount = Math.max(1, ...planEntries.map(([, n]) => n));
 
   return (
     <div style={{ padding: '32px' }}>
@@ -106,89 +134,100 @@ export default function Billing() {
         <p style={{ color: '#888', fontSize: '13px', marginTop: '4px' }}>Manage plans, pricing, and revenue</p>
       </div>
 
-      {/* Stats */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '16px', marginBottom: '28px' }}>
-        <StatCard label="MRR" value={`₹${(mrr / 1000).toFixed(0)}k`} icon={IndianRupee} />
-        <StatCard label="Total Collected" value={`₹${(paidSum / 1000).toFixed(0)}k`} icon={TrendingUp} />
-        <StatCard label="Overdue" value={`₹${(overdueSum / 1000).toFixed(0)}k`} icon={Receipt} />
-        <StatCard label="Active Clinics" value={getActiveCount()} icon={IndianRupee} />
-      </div>
-
-      {/* Plan Cards */}
-      <div style={{ marginBottom: '28px' }}>
-        <h2 style={{ fontSize: '14px', fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '16px' }}>
-          Plan Configuration
-        </h2>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '16px' }}>
-          {billingPlans.map(p => <PlanCard key={p.id} plan={p} />)}
+      {loading && <p style={{ color: '#888', fontSize: '13px' }}>Loading billing data…</p>}
+      {error && (
+        <div style={{ backgroundColor: '#2A1A1A', border: '1px solid #7f1d1d', borderRadius: '10px', padding: '14px 18px', color: '#fca5a5', fontSize: '13px', marginBottom: '20px' }}>
+          Could not load billing data: {error}
         </div>
-      </div>
+      )}
 
-      {/* Revenue Chart */}
-      <div style={{ backgroundColor: '#1A1A1A', border: '1px solid #2E2E2E', borderRadius: '12px', padding: '24px', marginBottom: '24px' }}>
-        <h2 style={{ fontSize: '13px', fontWeight: 700, color: '#fff', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '20px' }}>
-          Revenue by Plan (6 Months)
-        </h2>
-        <div style={{ display: 'flex', alignItems: 'flex-end', gap: '24px', height: '120px' }}>
-          {MRR_HISTORY.map(d => (
-            <div key={d.month} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px', height: '100%', justifyContent: 'flex-end' }}>
-              <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '2px', justifyContent: 'flex-end', height: '100%' }}>
-                <div style={{ width: '100%', height: `${(d.Enterprise / maxBar) * 100}%`, backgroundColor: '#3ECF8E', borderRadius: '3px 3px 0 0', opacity: 0.85 }} />
-                <div style={{ width: '100%', height: `${(d.Pro / maxBar) * 100}%`, backgroundColor: '#60a5fa', borderRadius: '3px 3px 0 0', opacity: 0.85 }} />
-              </div>
-              <span style={{ fontSize: '11px', color: '#555', marginTop: '4px' }}>{d.month}</span>
+      {data && (
+        <>
+          {/* Honest state banner — no subscription/invoice billing exists yet. */}
+          {!data.has_paid_billing && (
+            <div style={{ backgroundColor: '#1A2230', border: '1px solid #2c4a6e', borderRadius: '10px', padding: '14px 18px', marginBottom: '24px', display: 'flex', gap: '10px', alignItems: 'flex-start' }}>
+              <AlertCircle size={16} style={{ color: '#60a5fa', flexShrink: 0, marginTop: '1px' }} />
+              <span style={{ color: '#9db8d6', fontSize: '12.5px', lineHeight: 1.5 }}>{data.billing_note}</span>
             </div>
-          ))}
-        </div>
-        <div style={{ display: 'flex', gap: '20px', marginTop: '12px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <div style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: '#3ECF8E' }} />
-            <span style={{ fontSize: '12px', color: '#888' }}>Enterprise</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <div style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: '#60a5fa' }} />
-            <span style={{ fontSize: '12px', color: '#888' }}>Pro</span>
-          </div>
-        </div>
-      </div>
+          )}
 
-      {/* Invoice Table */}
-      <div style={{ backgroundColor: '#1A1A1A', border: '1px solid #2E2E2E', borderRadius: '12px', overflow: 'hidden' }}>
-        <div style={{ padding: '20px 24px', borderBottom: '1px solid #2E2E2E', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <h2 style={{ fontSize: '13px', fontWeight: 700, color: '#fff', textTransform: 'uppercase', letterSpacing: '0.06em', margin: 0 }}>Invoice History</h2>
-        </div>
-        <table style={{ width: '100%', fontSize: '13px', borderCollapse: 'collapse' }}>
-          <thead style={{ backgroundColor: '#0F0F0F' }}>
-            <tr>
-              {['Invoice', 'Clinic', 'Date', 'Amount', 'Status', 'Action'].map(h => (
-                <th key={h} style={{ padding: '12px 24px', textAlign: 'left', color: '#888', fontWeight: 600, fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {invoices.map(inv => {
-              const clinic = clinics.find(c => c.id === inv.clinic_id);
-              return (
-                <tr key={inv.id} style={{ borderTop: '1px solid #2E2E2E' }}>
-                  <td style={{ padding: '14px 24px', color: '#888', fontFamily: 'monospace', fontSize: '12px' }}>{inv.id}</td>
-                  <td style={{ padding: '14px 24px', color: '#fff', fontWeight: 600 }}>{clinic?.name ?? 'Unknown'}</td>
-                  <td style={{ padding: '14px 24px', color: '#888' }}>{inv.date}</td>
-                  <td style={{ padding: '14px 24px', color: '#fff', fontFamily: 'monospace' }}>₹{inv.amount.toLocaleString('en-IN')}</td>
-                  <td style={{ padding: '14px 24px' }}><StatusBadge status={inv.status} /></td>
-                  <td style={{ padding: '14px 24px' }}>
-                    <button
-                      onClick={() => useSAStore.getState().addToast(`Invoice ${inv.id} download started`, 'info')}
-                      style={{ fontSize: '12px', backgroundColor: '#2E2E2E', color: '#888', border: 'none', borderRadius: '6px', padding: '5px 12px', cursor: 'pointer', fontWeight: 600 }}
-                    >
-                      ↓ PDF
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+          {/* Stats — every value is a real query result. */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '16px', marginBottom: '28px' }}>
+            <StatCard label="Active Clinics" value={`${data.active_clinics} / ${data.total_clinics}`} icon={Building2} />
+            <StatCard label="Credits Collected" value={inr(data.credits.total_added)} icon={TrendingUp} />
+            <StatCard label="Credits Used" value={inr(data.credits.total_used)} icon={Receipt} />
+            <StatCard label="Outstanding Balance" value={inr(data.credits.outstanding_balance)} icon={Wallet} />
+          </div>
+
+          {/* Plan Configuration — plan definitions (pricing not yet billed). */}
+          <div style={{ marginBottom: '28px' }}>
+            <h2 style={{ fontSize: '14px', fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '8px' }}>
+              Plan Configuration
+            </h2>
+            <p style={{ color: '#666', fontSize: '12px', marginBottom: '16px' }}>
+              Plan definitions only — prices are not yet tied to a billing/payment system, so they do not generate charges.
+            </p>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '16px' }}>
+              {billingPlans.map(p => <PlanCard key={p.id} plan={p} />)}
+            </div>
+          </div>
+
+          {/* Clinics by Plan — real counts (replaces the fabricated revenue chart). */}
+          <div style={{ backgroundColor: '#1A1A1A', border: '1px solid #2E2E2E', borderRadius: '12px', padding: '24px', marginBottom: '24px' }}>
+            <h2 style={{ fontSize: '13px', fontWeight: 700, color: '#fff', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '20px' }}>
+              Clinics by Plan
+            </h2>
+            {data.paid_plan_clinics === 0 ? (
+              <p style={{ color: '#888', fontSize: '13px', margin: 0 }}>
+                All {data.total_clinics} clinic{data.total_clinics === 1 ? '' : 's'} are on the Free plan — no subscription revenue yet.
+              </p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                {planEntries.map(([plan, count]) => (
+                  <div key={plan} style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <span style={{ width: '90px', color: '#888', fontSize: '12px' }}>{plan}</span>
+                    <div style={{ flex: 1, height: '18px', backgroundColor: '#0F0F0F', borderRadius: '4px', overflow: 'hidden' }}>
+                      <div style={{ width: `${(count / maxPlanCount) * 100}%`, height: '100%', backgroundColor: plan.toLowerCase() === 'free' ? '#555' : '#3ECF8E' }} />
+                    </div>
+                    <span style={{ width: '40px', textAlign: 'right', color: '#fff', fontSize: '12px', fontFamily: 'monospace' }}>{count}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Credit ledger — real transactions (replaces the fabricated invoices). */}
+          <div style={{ backgroundColor: '#1A1A1A', border: '1px solid #2E2E2E', borderRadius: '12px', overflow: 'hidden' }}>
+            <div style={{ padding: '20px 24px', borderBottom: '1px solid #2E2E2E', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h2 style={{ fontSize: '13px', fontWeight: 700, color: '#fff', textTransform: 'uppercase', letterSpacing: '0.06em', margin: 0 }}>Credit Transactions</h2>
+            </div>
+            {data.recent_transactions.length === 0 ? (
+              <p style={{ padding: '20px 24px', color: '#888', fontSize: '13px', margin: 0 }}>No credit transactions yet.</p>
+            ) : (
+              <table style={{ width: '100%', fontSize: '13px', borderCollapse: 'collapse' }}>
+                <thead style={{ backgroundColor: '#0F0F0F' }}>
+                  <tr>
+                    {['Clinic', 'Type', 'Amount', 'Balance After', 'Date'].map(h => (
+                      <th key={h} style={{ padding: '12px 24px', textAlign: 'left', color: '#888', fontWeight: 600, fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.recent_transactions.map(txn => (
+                    <tr key={txn.id} style={{ borderTop: '1px solid #2E2E2E' }}>
+                      <td style={{ padding: '14px 24px', color: '#fff', fontWeight: 600 }}>{txn.clinic_name}</td>
+                      <td style={{ padding: '14px 24px', color: '#888' }}>{txn.type}</td>
+                      <td style={{ padding: '14px 24px', color: txn.amount < 0 ? '#fca5a5' : '#3ECF8E', fontFamily: 'monospace' }}>{inr(txn.amount)}</td>
+                      <td style={{ padding: '14px 24px', color: '#fff', fontFamily: 'monospace' }}>{txn.balance_after !== null ? inr(txn.balance_after) : '—'}</td>
+                      <td style={{ padding: '14px 24px', color: '#888' }}>{fmtDate(txn.created_at)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }

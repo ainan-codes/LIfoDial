@@ -882,7 +882,20 @@ export default function CreateAgent() {
   };
 
   const canNext = () => {
-    if (step === 0) return state.clinic_selection === 'new' ? !!state.new_clinic_name : !!state.tenant_id;
+    if (step === 0) {
+      if (state.clinic_selection !== 'new') return !!state.tenant_id;
+      // New clinic: enforce the fields a functioning clinic actually needs
+      // (audit P5). admin_email is login-critical — the backend refuses to
+      // create a clinic without it and the clinic login matches on it — so a
+      // clinic-name-only "Continue" produced clinics that could never log in.
+      const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((state.new_admin_email || '').trim());
+      return !!(
+        state.new_clinic_name?.trim() &&
+        state.new_admin_name?.trim() &&
+        emailOk &&
+        state.new_location?.trim()
+      );
+    }
     return true;
   };
 
