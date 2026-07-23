@@ -23,7 +23,7 @@ import {
 import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import TestAgentModal from '../../components/TestAgentModal';
-import { AgentStatus, FIXTURE_AGENTS, FixtureAgent } from '../../fixtures/data';
+import { AgentStatus, FixtureAgent } from '../../fixtures/data';
 import fetchWithAuth from '../../api/client';
 
 // ── Status config ────────────────────────────────────────────────────────────

@@ -12,7 +12,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Body, UploadFile, File
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete as sa_delete, select
+from sqlalchemy import delete as sa_delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -515,6 +515,45 @@ async def preview_prompt(payload: PreviewPromptPayload, user: CurrentUser = None
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── POST /agents/render-template-prompt ───────────────────────────────────────
+
+class RenderTemplatePayload(BaseModel):
+    template: str = "clinic_receptionist"
+    language: str = "en-IN"
+    clinic_name: str = "the clinic"
+    agent_name: str = "Receptionist"
+
+
+@router.post("/agents/render-template-prompt")
+async def render_template_prompt(payload: RenderTemplatePayload, user: CurrentUser = None) -> dict:
+    """Return the starter system prompt + first message for a template, rendered
+    with the clinic's name/context (no LLM call, no existing agent required).
+
+    The Create-Agent wizard calls this when a template is selected so the System
+    Prompt field is pre-filled with a real starter prompt — selecting a template
+    used to leave it empty, so the created agent had a blank system_prompt
+    (audit P4). For a richer, fully LLM-authored prompt the admin can still use
+    "Generate with LLM" on the agent detail page after creation.
+    """
+    try:
+        tmpl = get_template(payload.template, payload.language)
+        ctx = {
+            "clinic_name": (payload.clinic_name or "the clinic").strip() or "the clinic",
+            "agent_name": (payload.agent_name or "Receptionist").strip() or "Receptionist",
+            "clinic_location": "India",
+            "working_hours": "Mon-Sat 9AM-7PM",
+            "emergency_number": "108",
+            "doctors_list": "the clinic's doctors",
+        }
+        return {
+            "system_prompt": render_prompt(tmpl.get("system_prompt", ""), ctx),
+            "first_message": render_prompt(tmpl.get("first_message", ""), ctx),
+        }
+    except Exception as e:
+        logger.exception("render-template-prompt error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── POST /agents/{agent_id}/generate-system-prompt ────────────────────────────
 # Streams a fresh, clinic-specific system prompt using the agent's configured
 # LLM provider (falling back to any other provider that has a configured key).
@@ -983,6 +1022,30 @@ async def create_agent(payload: AgentCreatePayload, user: SuperAdmin = None) -> 
             if payload.clinic_selection == "new" and payload.new_clinic:
                 nc = payload.new_clinic
                 import secrets
+                from backend.security import hash_password
+
+                # A clinic login is identified by its admin email, so it must be
+                # present and unique. Without this, tenant.admin_email is NULL and
+                # clinic_login can never match — the wizard's shown password was
+                # unusable (audit P2).
+                if not (nc.admin_email or "").strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Admin email is required to create a clinic login.",
+                    )
+                email_norm = nc.admin_email.strip().lower()
+                dup = await session.execute(
+                    select(Tenant.id).where(func.lower(Tenant.admin_email) == email_norm)
+                )
+                if dup.scalar_one_or_none():
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"A clinic with admin email '{email_norm}' already exists. "
+                            "Use a different email, or attach this agent to that existing clinic."
+                        ),
+                    )
+
                 raw_password = "Lf" + secrets.token_urlsafe(6)
                 try:
                     new_tenant = await create_tenant_row(
@@ -993,19 +1056,23 @@ async def create_agent(payload: AgentCreatePayload, user: SuperAdmin = None) -> 
                         phone=nc.phone,
                         location=nc.location,
                         language=nc.language,
+                        # Persist the hashed generated password so the credentials
+                        # shown on screen actually work at clinic login.
+                        admin_password=hash_password(raw_password),
                     )
                 except IntegrityError:
                     await session.rollback()
                     raise HTTPException(
                         status_code=409,
                         detail=(
-                            f"A clinic named '{nc.clinic_name}' already exists. "
-                            "Choose it from Existing Clinic instead."
+                            f"A clinic named '{nc.clinic_name}' already exists, or its admin "
+                            "email is already in use. Choose it from Existing Clinic instead."
                         ),
                     )
                 tenant_id = new_tenant.id
                 clinic_credentials = {
-                    "email": nc.admin_email,
+                    # The exact stored (normalised) email the admin must log in with.
+                    "email": email_norm,
                     "password": raw_password,
                     "note": "Shown only once — store securely.",
                 }

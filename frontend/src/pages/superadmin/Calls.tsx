@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import { useSAStore, CallLog } from '../../store/saStore';
+import React, { useState, useEffect } from 'react';
+import { CallLog } from '../../store/saStore';
+import fetchWithAuth from '../../api/client';
 import { StatusBadge, EmptyState } from '../../components/superadmin/SAShared';
 import { Search, Filter, Phone, Clock, PlayCircle, Eye } from 'lucide-react';
 
@@ -61,15 +62,58 @@ function CallTranscriptDrawer({ call, onClose }: { call: CallLog; onClose: () =>
 }
 
 export default function SACalls() {
-  const { callLogs } = useSAStore();
+  const [callLogs, setCallLogs] = useState<CallLog[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
   const [search, setSearch] = useState('');
   const [selectedCall, setSelectedCall] = useState<CallLog | null>(null);
+
+  // Real network-wide calls from call_records (via /api/call_logs). No fixtures:
+  // an empty table renders an honest empty state, never City Dental / Metro Care.
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError('');
+    fetchWithAuth('/api/call_logs?limit=50')
+      .then((data: any) => {
+        if (cancelled) return;
+        const items = Array.isArray(data?.items) ? data.items : [];
+        setCallLogs(items.map((r: any): CallLog => ({
+          id: r.id,
+          clinic_name: r.clinic_name || '—',
+          phone: r.phone || r.caller_number || '—',
+          date: r.date || r.created_at || '—',
+          duration: r.duration || '—',
+          intent: r.intent || '—',
+          status: r.status || 'Pending',
+          language: r.language || '—',
+          transcript: Array.isArray(r.transcript)
+            ? r.transcript.map((m: any) => ({
+                role: (m.role === 'user' || m.role === 'patient') ? 'patient' : 'ai',
+                text: m.text ?? m.content ?? '',
+                time: m.time ?? '',
+              }))
+            : [],
+        })));
+      })
+      .catch((e: any) => { if (!cancelled) setError(e?.message || 'Failed to load calls'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
 
   const filtered = callLogs.filter(c =>
     c.clinic_name.toLowerCase().includes(search.toLowerCase()) ||
     c.phone.includes(search) ||
     c.id.toLowerCase().includes(search.toLowerCase())
   );
+
+  const emptyMessage = error
+    ? error
+    : loading
+    ? 'Loading calls…'
+    : callLogs.length === 0
+    ? 'No calls yet'
+    : 'No calls match your search';
 
   return (
     <div style={{ padding: '32px', display: 'flex', gap: '20px', height: '100%', overflow: 'hidden' }}>
@@ -100,7 +144,7 @@ export default function SACalls() {
         {/* Table */}
         <div style={{ backgroundColor: '#1A1A1A', border: '1px solid #2E2E2E', borderRadius: '12px', overflow: 'hidden', flex: 1, overflowY: 'auto' }}>
           {filtered.length === 0 ? (
-            <EmptyState icon={Phone} message="No calls match your search" />
+            <EmptyState icon={Phone} message={emptyMessage} />
           ) : (
             <table style={{ width: '100%', fontSize: '13px', borderCollapse: 'collapse' }}>
               <thead style={{ backgroundColor: '#0F0F0F', position: 'sticky', top: 0, zIndex: 1 }}>

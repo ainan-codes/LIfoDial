@@ -44,11 +44,20 @@ async def incoming_call(payload: VoiceIncomingRequest, db: AsyncSession = Depend
     tenant = result.scalar_one_or_none()
     
     if not tenant:
-        # Fallback for dev/demo if specific number isn't assigned yet
-        logger.warning(f"No exact match for {payload.called_number}. Trying to find *any* active tenant for demo.")
-        result = await db.execute(select(Tenant).where(Tenant.is_active == True).limit(1))
-        tenant = result.scalar_one_or_none()
-        
+        # SECURITY: never attach an unmatched inbound number to an arbitrary
+        # tenant in production — that cross-wires one clinic's call into another
+        # clinic's account. The "any active tenant" fallback is dev/demo only.
+        from backend.config import settings
+        if settings.environment.lower() == "production":
+            logger.warning(
+                "No tenant matches called_number %s — rejecting call (no fallback in production).",
+                payload.called_number,
+            )
+        else:
+            logger.warning(f"No exact match for {payload.called_number}. Dev fallback to any active tenant.")
+            result = await db.execute(select(Tenant).where(Tenant.is_active == True).limit(1))
+            tenant = result.scalar_one_or_none()
+
     if not tenant:
         raise HTTPException(status_code=404, detail="No active tenant found to route this call.")
         

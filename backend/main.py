@@ -487,9 +487,14 @@ def _fmt_call_duration(secs) -> str:
     return f"{m}:{s:02d}"
 
 
-def _call_record_to_row(rec) -> dict:
+def _call_record_to_row(rec, clinic_name: str | None = None) -> dict:
     """Shape a CallRecord into the row the dashboard table renders. Every field
-    comes from the real row — no fixtures, no fabricated placeholders."""
+    comes from the real row — no fixtures, no fabricated placeholders.
+
+    ``clinic_name`` is filled in for the superadmin network-wide view (which
+    spans clinics); the per-tenant dashboard leaves it None. Extra keys
+    (clinic_name/phone/date/language) are harmless to callers that ignore them.
+    """
     outcome = (rec.outcome or "").lower()
     status_map = {
         "booked": "Booked", "transferred": "Transferred", "resolved": "Resolved",
@@ -502,13 +507,21 @@ def _call_record_to_row(rec) -> dict:
             "completed": "Resolved", "failed": "Failed", "in_progress": "Pending",
             "transferred": "Transferred", "voicemail": "Pending",
         }.get((rec.status or "").lower(), "Pending")
+    caller = rec.patient_number_masked or rec.patient_number or "—"
+    when = rec.created_at.strftime("%d %b %Y, %H:%M") if rec.created_at else "—"
+    transcript = rec.transcript if isinstance(rec.transcript, list) else []
     return {
         "id": rec.id,
-        "caller_number": rec.patient_number_masked or rec.patient_number or "—",
+        "clinic_name": clinic_name or "—",
+        "caller_number": caller,
+        "phone": caller,
         "intent": rec.intent_detected or "—",
         "duration": _fmt_call_duration(rec.duration_seconds),
-        "created_at": rec.created_at.strftime("%d %b %Y, %H:%M") if rec.created_at else "—",
+        "created_at": when,
+        "date": when,
+        "language": rec.detected_language or "—",
         "status": display_status,
+        "transcript": transcript,
     }
 
 
@@ -532,7 +545,18 @@ async def recent_call_logs(limit: int = 5, user=Depends(get_current_user)) -> di
             stmt = stmt.where(CallRecord.tenant_id == user.tenant_id)
         rows = (await db.execute(stmt)).scalars().all()
 
-    return {"items": [_call_record_to_row(r) for r in rows]}
+        # Resolve clinic names so the superadmin network view shows which clinic
+        # each call belongs to (a single JOIN-equivalent batch lookup).
+        name_by_tid: dict = {}
+        tids = {r.tenant_id for r in rows if r.tenant_id}
+        if tids:
+            from backend.models.tenant import Tenant
+            tn = (await db.execute(
+                select(Tenant.id, Tenant.clinic_name).where(Tenant.id.in_(tids))
+            )).all()
+            name_by_tid = {tid: cn for tid, cn in tn}
+
+    return {"items": [_call_record_to_row(r, name_by_tid.get(r.tenant_id)) for r in rows]}
 
 @app.post("/admin/reset-db", tags=["superadmin"])
 async def reset_db(_user=Depends(require_superadmin)):

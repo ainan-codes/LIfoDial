@@ -57,10 +57,25 @@ export default function SAAppointments() {
     setError(null);
     try {
       const data = await fetchWithAuth(`/admin/appointments`);
-      setAppointments(data);
-    } catch (e) {
-      // Fallback to rich mock data so the page is always useful
-      setAppointments(MOCK_APPOINTMENTS);
+      const rows = Array.isArray(data) ? data : [];
+      // Normalise the backend's lowercase status ("confirmed") to the Title-case
+      // the UI compares against — this is what makes the summary cards count
+      // correctly instead of all reading 0.
+      setAppointments(rows.map((a: any): SAAppointment => ({
+        id: a.id,
+        patient_name: a.patient_name || '—',
+        patient_phone: a.patient_phone || '—',
+        clinic_name: a.clinic_name || '—',
+        doctor_name: a.doctor_name || '—',
+        slot_time: a.slot_time,
+        status: normalizeStatus(a.status),
+        channel: a.channel === 'Manual' ? 'Manual' : 'AI Call',
+        duration: a.duration,
+      })));
+    } catch (e: any) {
+      // No mock fallback — show an honest error and an empty table.
+      setError(e?.message || 'Failed to load appointments');
+      setAppointments([]);
     } finally {
       setLoading(false);
     }
@@ -178,7 +193,7 @@ export default function SAAppointments() {
       {/* Error banner */}
       {error && (
         <div style={{ backgroundColor: '#EF444410', border: '1px solid #EF444430', borderRadius: '8px', padding: '12px 16px', color: '#EF4444', fontSize: '13px' }}>
-          ⚠️ Could not fetch live data: {error}. Showing cached data.
+          ⚠️ Could not load appointments: {error}
         </div>
       )}
 
@@ -314,16 +329,16 @@ function formatDateTime(iso: string): string {
   }
 }
 
-// ── Rich Mock Data (used if backend has no data yet) ─────────────────────────
-const MOCK_APPOINTMENTS: SAAppointment[] = [
-  { id: 'a1', patient_name: 'Priya Sharma', patient_phone: '+91 98765 4****', clinic_name: 'Apollo Multispeciality Mumbai', doctor_name: 'Dr. Mehta', slot_time: '2026-04-06T09:30:00', status: 'Confirmed', channel: 'AI Call', duration: '3m 12s' },
-  { id: 'a2', patient_name: 'Ravi Kumar', patient_phone: '+91 91234 5****', clinic_name: 'Aster Medicity Kochi', doctor_name: 'Dr. Pillai', slot_time: '2026-04-06T10:00:00', status: 'Confirmed', channel: 'AI Call', duration: '2m 44s' },
-  { id: 'a3', patient_name: 'Fatima Al-Hassan', patient_phone: '+971 50 123 4***', clinic_name: 'Al Zahra Hospital Dubai', doctor_name: 'Dr. Ahmed', slot_time: '2026-04-06T11:15:00', status: 'Pending', channel: 'Manual' },
-  { id: 'a4', patient_name: 'Arjun Nair', patient_phone: '+91 70000 1****', clinic_name: 'Max Super Speciality Delhi', doctor_name: 'Dr. Singh', slot_time: '2026-04-05T15:00:00', status: 'Completed', channel: 'AI Call', duration: '4m 01s' },
-  { id: 'a5', patient_name: 'Meera Iyer', patient_phone: '+91 99887 6****', clinic_name: 'Apollo Multispeciality Mumbai', doctor_name: 'Dr. Kapoor', slot_time: '2026-04-05T14:30:00', status: 'Cancelled', channel: 'AI Call', duration: '1m 20s' },
-  { id: 'a6', patient_name: 'Omar Al-Rashidi', patient_phone: '+971 55 987 6***', clinic_name: 'Al Zahra Hospital Dubai', doctor_name: 'Dr. Khalid', slot_time: '2026-04-05T12:00:00', status: 'Completed', channel: 'AI Call', duration: '5m 30s' },
-  { id: 'a7', patient_name: 'Sunita Reddy', patient_phone: '+91 80001 2****', clinic_name: 'Aster Medicity Kochi', doctor_name: 'Dr. Thomas', slot_time: '2026-04-05T09:00:00', status: 'No-Show', channel: 'Manual' },
-  { id: 'a8', patient_name: 'Vikram Joshi', patient_phone: '+91 77777 8****', clinic_name: 'Max Super Speciality Delhi', doctor_name: 'Dr. Gupta', slot_time: '2026-04-04T16:00:00', status: 'Completed', channel: 'AI Call', duration: '3m 55s' },
-  { id: 'a9', patient_name: 'Aisha Mohammed', patient_phone: '+971 52 456 7***', clinic_name: 'Al Zahra Hospital Dubai', doctor_name: 'Dr. Hamdan', slot_time: '2026-04-04T10:30:00', status: 'Confirmed', channel: 'AI Call', duration: '2m 10s' },
-  { id: 'a10', patient_name: 'Deepak Verma', patient_phone: '+91 96505 1****', clinic_name: 'Apollo Multispeciality Mumbai', doctor_name: 'Dr. Mehta', slot_time: '2026-04-07T11:00:00', status: 'Pending', channel: 'Manual' },
-];
+// Map the backend's lowercase appointment status to the Title-case union the UI
+// uses (counts, filters, StatusBadge). Without this the summary cards compared
+// 'confirmed' !== 'Confirmed' and every card read 0.
+function normalizeStatus(s: string): SAAppointment['status'] {
+  const map: Record<string, SAAppointment['status']> = {
+    confirmed: 'Confirmed', pending: 'Pending', cancelled: 'Cancelled',
+    canceled: 'Cancelled', completed: 'Completed',
+    'no-show': 'No-Show', no_show: 'No-Show', noshow: 'No-Show',
+  };
+  const key = (s || '').trim().toLowerCase();
+  if (map[key]) return map[key];
+  return ((key.charAt(0).toUpperCase() + key.slice(1)) || 'Pending') as SAAppointment['status'];
+}

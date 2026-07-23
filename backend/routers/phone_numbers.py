@@ -102,6 +102,11 @@ async def create_phone_number(body: dict, user: CurrentUser = None, db: AsyncSes
         )
         agent = agent_result.scalar_one_or_none()
         if agent:
+            # SECURITY: only assign the number to an agent the caller owns.
+            # Without this, a clinic could pass another tenant's agent_id and
+            # overwrite that agent's ai_number (cross-tenant write / IDOR).
+            if str(agent.tenant_id) != str(pn.tenant_id):
+                raise HTTPException(404, "Agent not found")
             agent.ai_number = number
 
     return {"id": pn.id, "number": pn.number, "status": "created"}
@@ -122,6 +127,18 @@ async def update_phone_number(
     if not pn:
         raise HTTPException(404, "Phone number not found")
     user.require_owns(pn.tenant_id)
+
+    # SECURITY: if repointing the number at an agent, verify that agent belongs
+    # to the same tenant — otherwise a clinic could attach its number to another
+    # tenant's agent (unvalidated cross-tenant reference).
+    new_agent_id = body.get("agent_id")
+    if "agent_id" in body and new_agent_id:
+        agent_res = await db.execute(
+            select(AgentConfig).where(AgentConfig.id == new_agent_id)
+        )
+        agent = agent_res.scalar_one_or_none()
+        if not agent or str(agent.tenant_id) != str(pn.tenant_id):
+            raise HTTPException(404, "Agent not found")
 
     for field in ["agent_id", "provider", "sip_uri", "sip_username",
                    "sip_password", "sip_domain", "is_active"]:

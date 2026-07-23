@@ -19,6 +19,7 @@ import React, { useState } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { clearSession } from '../../api/auth';
 import { ToastContainer } from './SAShared';
+import { useSAStore } from '../../store/saStore';
 
 const SA_NAV = [
   // ─── ORG SETTINGS ───
@@ -42,16 +43,26 @@ const SA_NAV = [
 /** Build breadcrumb segments from pathname */
 function useBreadcrumbs() {
   const location = useLocation();
+  const entityLabels = useSAStore(s => s.entityLabels);
   const segments = location.pathname.split('/').filter(Boolean);
   // ['superadmin', 'agents', 'some-id', 'voice'] etc.
+  const isUuid = (s: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-/i.test(s);
   const crumbs: { label: string; path: string }[] = [];
   let built = '';
-  for (const seg of segments) {
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
     built += `/${seg}`;
     const nav = SA_NAV.find(n => n.path === built);
-    const label = nav
-      ? nav.label
-      : seg.charAt(0).toUpperCase() + seg.slice(1).replace(/-/g, ' ');
+    let label: string;
+    if (nav) {
+      label = nav.label;
+    } else if (isUuid(seg)) {
+      // Never surface a raw UUID (audit P5). Prefer the entity's real name
+      // (set by the detail page); fall back to its type from the prior segment.
+      label = entityLabels[seg] || (segments[i - 1] === 'agents' ? 'Agent' : 'Details');
+    } else {
+      label = seg.charAt(0).toUpperCase() + seg.slice(1).replace(/-/g, ' ');
+    }
     crumbs.push({ label, path: built });
   }
   return crumbs;

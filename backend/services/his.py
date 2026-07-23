@@ -1,5 +1,6 @@
 import logging
-from typing import List, Dict, Any
+import re
+from typing import List, Dict, Any, Optional
 from sqlalchemy import select
 from datetime import datetime, timedelta, timezone
 import json
@@ -168,7 +169,26 @@ async def send_to_sheets_webhook(webhook_url: str | None, payload: dict):
         logger.error(f"Error pushing to Google Sheets: {e}", exc_info=True)
 
 
-async def create_appointment(tenant_id: str, doctor_id: str, slot_time: str, patient_phone: str, call_id: str | None = None) -> dict:
+async def create_appointment(
+    tenant_id: str,
+    doctor_id: str,
+    slot_time: str,
+    patient_phone: str,
+    call_id: str | None = None,
+    slot_date: str | None = None,
+    patient_name: str | None = None,
+) -> dict:
+    """Create an appointment row and return its details.
+
+    AWAITED by every path that books (voice pipeline via BookingProcessor, and
+    the chat/embed path via execute_booking_action) — a confirmation must never
+    be spoken before this returns a real appointment_id (audit FIX 4).
+
+    ``slot_date`` and ``patient_name`` are optional so the original voice caller
+    (which passes only slot_time) keeps working unchanged; the chat path passes
+    a separate date and the patient's name so appointment rows carry the real
+    name instead of a placeholder.
+    """
     # Future HIS Integration: POST to /appointments
     # if settings.oxzygen_base_url: ...
 
@@ -216,8 +236,9 @@ async def create_appointment(tenant_id: str, doctor_id: str, slot_time: str, pat
         appointment = Appointment(
             tenant_id=tenant_id,
             doctor_id=doctor_id,
-            slot_time=parse_slot_datetime(None, slot_time),
+            slot_time=parse_slot_datetime(slot_date, slot_time),
             patient_phone=patient_phone,
+            patient_name=(patient_name.strip() if patient_name and patient_name.strip() else None),
             status="confirmed",
             call_id=call_id,
         )
@@ -292,17 +313,23 @@ async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: s
                 stmt = select(Doctor).where(Doctor.tenant_id == tenant_id, Doctor.name.ilike(f"%{doctor_name}%"))
                 result = await session.execute(stmt)
                 doctor = result.scalars().first()
-                
+
                 if not doctor:
-                    doc_stmt = select(Doctor).where(Doctor.tenant_id == tenant_id)
-                    doctor = (await session.execute(doc_stmt)).scalars().first()
-                    
-                # We need a fallback ID if absolutely no doctors exist
-                doctor_id = doctor.id if doctor else "00000000-0000-0000-0000-000000000000"
-                
+                    # Honest refusal: never book against an arbitrary "first"
+                    # doctor or a zero-UUID placeholder just because the
+                    # requested name didn't match (audit FIX — the old fallback
+                    # here is exactly what let the chat path "confirm" an
+                    # appointment for a doctor that doesn't exist). Callers must
+                    # treat None as "not booked".
+                    logger.warning(
+                        "BOOK requested for doctor %r with no match in tenant %s — refusing (no fabrication).",
+                        doctor_name, tenant_id,
+                    )
+                    return None
+
                 new_appt = Appointment(
                     tenant_id=tenant_id,
-                    doctor_id=doctor_id,
+                    doctor_id=doctor.id,
                     slot_time=parse_slot_datetime(date_str, time_str),
                     patient_phone=phone_clean,
                     patient_name=name_clean,
@@ -320,3 +347,153 @@ async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: s
     except Exception as e:
         logger.error(f"DB Sync error for {action}: {e}", exc_info=True)
         return None
+
+
+# ── Unified booking service (shared by voice + chat/embed paths) ───────────────
+#
+# The chat/embed path previously did its own thing: fire-and-forget DB writes,
+# an arbitrary/zero-UUID doctor fallback, and a hardcoded "successfully booked"
+# reply that ignored whether the write worked. execute_booking_action() gives
+# that path the SAME awaited, doctor-validated, honest booking behaviour the
+# voice pipeline already had (audit FIX 4), so a confirmation can only ever be
+# reported when a real row exists.
+
+# Doctor-field values that mean "no specific doctor named" rather than a real name.
+_NO_DOCTOR_TOKENS = {
+    "", "n/a", "na", "none", "null", "-", "any", "anyone", "any doctor",
+    "no preference", "not sure", "dont know", "don't know", "whoever",
+}
+
+
+async def find_doctor_for_booking(
+    tenant_id: str, doctor_name: str | None
+) -> tuple[Optional[Doctor], List[str]]:
+    """Resolve a REAL doctor for this tenant by (fuzzy) name/specialization match.
+
+    Returns ``(matched_doctor_or_None, [all doctor display names])``. Unlike the
+    old BOOK fallback, this NEVER substitutes an arbitrary doctor or a zero-UUID
+    placeholder — an unknown or unspecified name yields ``(None, names)`` so the
+    caller can refuse/redirect honestly (audit FIX: no fabricated bookings).
+    """
+    async with AsyncSessionLocal() as session:
+        docs = (
+            await session.execute(select(Doctor).where(Doctor.tenant_id == tenant_id))
+        ).scalars().all()
+
+    names = [d.name for d in docs if d.name]
+    q = (doctor_name or "").strip().lower()
+    if q in _NO_DOCTOR_TOKENS:
+        return None, names
+
+    # 1. Substring match either direction ("sharma" ~ "Dr. Anjali Sharma").
+    for d in docs:
+        dn = (d.name or "").lower()
+        if dn and (q in dn or dn in q):
+            return d, names
+
+    # 2. Significant word overlap (ignore short/filler words).
+    q_words = {w for w in re.split(r"\W+", q) if len(w) > 2 and w not in {"doctor"}}
+    if q_words:
+        for d in docs:
+            dn_words = {w for w in re.split(r"\W+", (d.name or "").lower()) if len(w) > 2}
+            if q_words & dn_words:
+                return d, names
+        # 3. Specialization match ("cardiologist" ~ doctor whose spec is Cardiology).
+        for d in docs:
+            spec_words = {w for w in re.split(r"\W+", (d.specialization or "").lower()) if len(w) > 2}
+            if spec_words & q_words:
+                return d, names
+
+    return None, names
+
+
+async def execute_booking_action(
+    *,
+    action: str,
+    tenant_id: str,
+    name: str,
+    phone: str,
+    date_str: str,
+    time_str: str,
+    doctor_name: str,
+    notes: str | None = None,
+    call_id: str | None = None,
+) -> dict:
+    """Perform a Book / Reschedule / Cancel and report the REAL outcome.
+
+    Returns::
+
+        {
+          "success": bool,
+          "reason": str,                 # "" on success; else why it failed
+          "appointment_id": str | None,
+          "doctor_name": str | None,
+          "available_doctors": list[str],
+          "slot": str,
+        }
+
+    BOOK routes through create_appointment() — the same idempotent, awaited
+    writer the voice pipeline uses — and only after a real doctor is resolved.
+    CANCEL/RESCHEDULE go through sync_appointment_to_db(), which returns None
+    when no matching appointment exists; that surfaces here as success=False so
+    the caller refuses instead of fabricating a confirmation.
+    """
+    act = (action or "").upper().strip()
+    slot = " ".join(
+        p.strip() for p in (date_str, time_str)
+        if p and p.strip() and p.strip().lower() != "n/a"
+    ).strip()
+    base = {
+        "success": False, "reason": "unknown_action", "appointment_id": None,
+        "doctor_name": None, "available_doctors": [], "slot": slot,
+    }
+
+    if act == "BOOK":
+        doctor, available = await find_doctor_for_booking(tenant_id, doctor_name)
+        base["available_doctors"] = available
+        if not doctor:
+            named = (doctor_name or "").strip().lower() not in _NO_DOCTOR_TOKENS
+            base["reason"] = "doctor_not_found" if named else "doctor_required"
+            return base
+        try:
+            result = await create_appointment(
+                tenant_id=tenant_id,
+                doctor_id=str(doctor.id),
+                slot_time=time_str,
+                slot_date=date_str,
+                patient_phone=phone,
+                patient_name=name,
+                call_id=call_id,
+            )
+        except Exception as e:
+            logger.error("execute_booking_action BOOK failed: %s", e, exc_info=True)
+            result = None
+        if not result or not result.get("appointment_id"):
+            base["reason"] = "db_error"
+            base["doctor_name"] = doctor.name
+            return base
+        return {
+            "success": True, "reason": "", "appointment_id": result["appointment_id"],
+            "doctor_name": result.get("doctor_name") or doctor.name,
+            "available_doctors": available, "slot": slot,
+        }
+
+    if act in ("CANCEL", "RESCHEDULE"):
+        try:
+            result = await sync_appointment_to_db(
+                action=act, name=name, phone=phone, date_str=date_str,
+                time_str=time_str, doctor_name=doctor_name, tenant_id=tenant_id,
+                notes=notes,
+            )
+        except Exception as e:
+            logger.error("execute_booking_action %s failed: %s", act, e, exc_info=True)
+            result = None
+        if not result or not result.get("appointment_id"):
+            base["reason"] = "not_found"
+            return base
+        return {
+            "success": True, "reason": "", "appointment_id": result["appointment_id"],
+            "doctor_name": None, "available_doctors": [], "slot": slot,
+        }
+
+    return base

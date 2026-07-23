@@ -141,6 +141,11 @@ interface SAStore {
   getMRR: () => number;
   getTotalCalls: () => number;
   getTotalBookings: () => number;
+
+  // Friendly labels for id URL segments (e.g. agentId → agent name) so the
+  // breadcrumb shows a name instead of a raw UUID (audit P5).
+  entityLabels: Record<string, string>;
+  setEntityLabel: (id: string, label: string) => void;
 }
 
 let toastIdCounter = 0;
@@ -155,10 +160,15 @@ export const useSAStore = create<SAStore>((set, get) => ({
     { id: 'al1', severity: 'warning', message: 'High latency detected in us-east-1 region', timestamp: '10 mins ago' },
     { id: 'al2', severity: 'critical', message: 'Database connection pool near capacity', timestamp: '1 hour ago' },
   ],
-  callLogs: [
-    { id: 'c1', clinic_name: 'City Dental', phone: '+91 98765 43210', date: 'Today, 10:30 AM', duration: '2m 15s', intent: 'Appointment Booking', status: 'Success', language: 'en-IN', transcript: [] },
-    { id: 'c2', clinic_name: 'Metro Care', phone: '+91 91234 56789', date: 'Today, 09:15 AM', duration: '4m 30s', intent: 'Reschedule', status: 'Failed', language: 'hi-IN', transcript: [] },
-  ],
+  // No fixture calls — the All Calls page (Calls.tsx) fetches real rows from
+  // /api/call_logs (call_records) and shows an honest empty state when there
+  // are none. The old City Dental / Metro Care rows were pure fixtures.
+  callLogs: [],
+  entityLabels: {},
+  setEntityLabel: (id, label) =>
+    set((s) => (s.entityLabels[id] === label
+      ? s
+      : { entityLabels: { ...s.entityLabels, [id]: label } })),
   invoices: [
     { id: 'inv1', clinic_id: '1', date: 'Oct 01, 2026', amount: 4999, status: 'Paid' },
     { id: 'inv2', clinic_id: '2', date: 'Oct 01, 2026', amount: 0, status: 'Paid' },

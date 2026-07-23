@@ -30,10 +30,10 @@ import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import fetchWithAuth, { API_URL } from '../../api/client';
 import { getToken } from '../../api/auth';
 import TestAgentModal from '../../components/TestAgentModal';
-import { FIXTURE_AGENTS } from '../../fixtures/data';
 import VoiceLibrary from './VoiceLibrary';
 import SimulationTab from './agent_detail/SimulationTab';
 import AgentHealthTab from './agent_detail/AgentHealthTab';
+import { useSAStore } from '../../store/saStore';
 
 const ACCENT = '#00D4AA';
 const BG = '#0a0a0a';
@@ -911,6 +911,13 @@ export default function AgentDetail() {
   const timerRef = useRef<any>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
+  // Publish this agent's name so the breadcrumb shows it instead of the raw
+  // UUID taken from the URL (audit P5).
+  const setEntityLabel = useSAStore(s => s.setEntityLabel);
+  useEffect(() => {
+    if (agentId && agent?.agent_name) setEntityLabel(agentId, agent.agent_name);
+  }, [agentId, agent?.agent_name, setEntityLabel]);
+
   // Play Sample player state machine (idle | loading | playing | error)
   const [samplePlayer, setSamplePlayer] = useState<'idle' | 'loading' | 'playing' | 'error'>('idle');
   const [sampleProgress, setSampleProgress] = useState(0); // 0..1 of duration
@@ -1034,45 +1041,6 @@ export default function AgentDetail() {
   const isDeadProvider = (cat: string, current?: string) =>
     !!current && Object.keys(configuredProviders).length > 0 && !configuredIds(cat).includes(current);
 
-  const toFallbackAgent = useCallback((id?: string) => {
-    const found = FIXTURE_AGENTS.find(a => a.id === id) || FIXTURE_AGENTS[0];
-    if (!found) return null;
-
-    return {
-      id: found.id,
-      agent_name: found.name,
-      clinic_name: found.clinic_name,
-      status: found.status,
-      llm_provider: found.llm_provider || 'gemini',
-      llm_model: found.llm_model || 'gemini-2.5-flash',
-      first_message_mode: 'assistant-speaks-first',
-      first_message: found.first_message || 'Hello, how can I help you today?',
-      system_prompt: 'You are a helpful AI clinic receptionist.',
-      max_response_tokens: 300,
-      tts_provider: found.tts_provider || 'sarvam',
-      tts_voice: found.tts_voice || 'meera',
-      tts_language: found.tts_language || 'en-IN',
-      tts_model: found.tts_model || 'bulbul:v3',
-      tts_pitch: 0,
-      tts_pace: 1,
-      tts_loudness: 1,
-      tts_input_preprocessing: 1,
-      tts_stability: 0.5,
-      tts_clarity: 0.75,
-      tts_style: 0,
-      tts_use_speaker_boost: 1,
-      tts_speed: 1,
-      tts_optimize_streaming_latency: 1,
-      tts_filler_injection: 0,
-      stt_provider: found.stt_provider || 'sarvam',
-      stt_model: found.stt_model || 'saaras:v3',
-      transcriber_keywords: [],
-      end_call_phrases: ['thank you', 'goodbye'],
-      tools_enabled: [],
-      clinic_info: {},
-    };
-  }, []);
-
   const loadAgent = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
@@ -1089,19 +1057,13 @@ export default function AgentDetail() {
       setAgent(data);
     } catch (e: any) {
       console.error('Agent detail load failed:', e);
-      const fallback = toFallbackAgent(agentId);
-      if (fallback) {
-        setAgent(fallback);
-        setLoadError('Live agent API unavailable. Showing local fallback data.');
-      } else {
-        setAgent(null);
-        setLoadError('Unable to load this agent. Please try again.');
-      }
+      setAgent(null);
+      setLoadError('Unable to load this agent. Please try again.');
     } finally {
       clearTimeout(timeout);
       setLoading(false);
     }
-  }, [agentId, toFallbackAgent]);
+  }, [agentId]);
 
   useEffect(() => {
     loadAgent();
@@ -1702,8 +1664,16 @@ export default function AgentDetail() {
           >
             <Phone size={14} /> Test Agent
           </button>
-          <button 
+          <button
             onClick={async () => {
+              // Unpublishing takes a live receptionist offline for real patients —
+              // confirm first (audit P5). Publishing needs no confirmation.
+              if (agent.status === 'ACTIVE') {
+                const ok = window.confirm(
+                  `This will stop ${agent.agent_name || 'this agent'} from taking calls. Continue?`
+                );
+                if (!ok) return;
+              }
               await saveAllManual();
               const newStatus = agent.status === 'ACTIVE' ? 'CONFIGURED' : 'ACTIVE';
               updateField('status', newStatus);
