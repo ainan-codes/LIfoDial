@@ -701,28 +701,14 @@ CONTEXT:
 
 
 async def _resolve_llm_key(session: AsyncSession, provider: str) -> str | None:
-    """DB-configured key first (encrypted, admin-managed), then .env fallback."""
-    result = await session.execute(
-        select(ApiKeyConfig).where(
-            ApiKeyConfig.provider == provider,
-            ApiKeyConfig.is_active == True,  # noqa: E712
-        ).limit(1)
-    )
-    cfg = result.scalars().first()
-    if cfg and cfg.api_key_enc:
-        raw = cfg.get_key_raw()
-        if raw:
-            return raw
+    """DB-configured key first (encrypted, admin-managed), then .env fallback.
 
-    env_map = {
-        "gemini": settings.gemini_api_key or os.getenv("GEMINI_API_KEY"),
-        "openai": settings.openai_api_key or os.getenv("OPENAI_API_KEY"),
-        "anthropic": settings.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY"),
-        "groq": settings.groq_api_key or os.getenv("GROQ_API_KEY"),
-        "deepseek": settings.deepseek_api_key or os.getenv("DEEPSEEK_API_KEY"),
-    }
-    env_key = env_map.get(provider)
-    return env_key.strip() if env_key else None
+    Delegates to the shared resolver so the agent runtime, System Health, and the
+    AI Platform page all answer "is this provider configured?" from ONE code path
+    (audit P3). Same precedence as before (DB active row → env).
+    """
+    from backend.services.provider_status import resolve_provider_key
+    return await resolve_provider_key(session, provider)
 
 
 async def _stream_openai_compatible(api_key: str, base_url: str, model: str, prompt: str):

@@ -316,6 +316,100 @@ async def platform_overview(user: SuperAdmin = None, db: AsyncSession = Depends(
     }
 
 
+@router.get("/billing")
+async def billing_overview(user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
+    """
+    Real billing/revenue figures for the superadmin Billing page (audit P1).
+
+    HONESTY CONTRACT: there is NO subscription/invoice/payment table in this
+    system and no payment integration (the `stripe` dep is unused; plan prices
+    existed only as a frontend mock). So this endpoint NEVER fabricates
+    invoices, MRR, or plan revenue. It returns:
+      • real clinic counts (total / active / by plan label) from `tenants`;
+      • the real prepaid CREDIT ledger from `clinic_credits` /
+        `credit_transactions` — the only actual money movement in the system;
+      • `has_paid_billing=False` and `mrr=0` so the UI can render an explicit
+        "no subscription billing yet" state instead of fake numbers.
+    `recent_transactions` is an INNER join to `tenants`, so a row can never show
+    for an unresolvable/"Unknown" clinic. No invoice table exists, so there are
+    no invoice records (future-dated or otherwise) to audit — the Oct-2026
+    invoice seen in the UI was a pure frontend fixture.
+    """
+    from backend.models.clinic_credits import ClinicCredits, CreditTransaction
+
+    tenants = (await db.execute(select(Tenant))).scalars().all()
+    total_clinics = len(tenants)
+    active_clinics = sum(1 for t in tenants if t.is_active)
+
+    # Real clinic counts grouped by their plan LABEL (Tenant.plan is a real
+    # column; its price is not — so we report counts, never fabricated revenue).
+    clinics_by_plan: dict[str, int] = {}
+    for t in tenants:
+        label = (t.plan or "Free").strip() or "Free"
+        clinics_by_plan[label] = clinics_by_plan.get(label, 0) + 1
+    paid_plan_clinics = sum(n for p, n in clinics_by_plan.items() if p.lower() != "free")
+
+    # Real prepaid-credit aggregates — the only actual money in the system.
+    credit_totals = (await db.execute(
+        select(
+            func.coalesce(func.sum(ClinicCredits.total_added), 0.0),
+            func.coalesce(func.sum(ClinicCredits.total_deducted), 0.0),
+            func.coalesce(func.sum(ClinicCredits.balance), 0.0),
+        )
+    )).one()
+    total_added, total_deducted, outstanding_balance = (
+        round(float(credit_totals[0]), 2),
+        round(float(credit_totals[1]), 2),
+        round(float(credit_totals[2]), 2),
+    )
+
+    # Real ledger to replace the fake "Invoice History". INNER join → clinic name
+    # always resolves; no "Unknown" rows possible.
+    txn_rows = (await db.execute(
+        select(CreditTransaction, Tenant.clinic_name)
+        .join(Tenant, CreditTransaction.tenant_id == Tenant.id)
+        .order_by(CreditTransaction.created_at.desc())
+        .limit(25)
+    )).all()
+    recent_transactions = [
+        {
+            "id": txn.id,
+            "clinic_name": clinic_name,
+            "type": txn.transaction_type,
+            "amount": round(float(txn.amount), 2),
+            "balance_after": round(float(txn.balance_after), 2) if txn.balance_after is not None else None,
+            "description": txn.description,
+            "created_at": txn.created_at.isoformat() if txn.created_at else None,
+        }
+        for txn, clinic_name in txn_rows
+    ]
+
+    return {
+        # Explicit honesty flags for the UI to branch on.
+        "has_paid_billing": False,
+        "billing_note": (
+            "No subscription/invoice billing is integrated yet. Figures below are "
+            "real: clinic counts from the tenants table and the prepaid credit "
+            "ledger. Subscription MRR and invoices do not exist in this system."
+        ),
+        # Real clinic figures.
+        "total_clinics": total_clinics,
+        "active_clinics": active_clinics,
+        "clinics_by_plan": clinics_by_plan,
+        "paid_plan_clinics": paid_plan_clinics,
+        # No subscription system → honest zeros, never fabricated.
+        "mrr": 0,
+        "total_collected": 0,
+        # Real prepaid-credit money movement.
+        "credits": {
+            "total_added": total_added,
+            "total_used": total_deducted,
+            "outstanding_balance": outstanding_balance,
+        },
+        "recent_transactions": recent_transactions,
+    }
+
+
 @router.patch("/clinics/{tenant_id}/status")
 async def update_clinic_status(tenant_id: str, data: StatusUpdate, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
     try:
@@ -661,26 +755,42 @@ async def system_health_status(user: SuperAdmin = None):
         except Exception as e:
             return name, "unreachable", f"Check failed: {str(e)[:80]}"
 
+    # Resolve each provider's EFFECTIVE key the same way the agent runtime does —
+    # an active DB ApiKeyConfig row (what the AI Platform page shows) first, then
+    # the process env — so System Health and AI Platform can never disagree
+    # (audit P3). A key added via the AI Platform UI lands in the DB, not this
+    # process's env, so the old env-only probe here falsely reported
+    # "Set GEMINI_API_KEY in env" while AI Platform correctly showed it ACTIVE.
+    from backend.services.provider_status import resolve_provider_key
+    async with AsyncSessionLocal() as _kdb:
+        gemini_key = await resolve_provider_key(_kdb, "gemini")
+        sarvam_key = await resolve_provider_key(_kdb, "sarvam")
+        groq_key = await resolve_provider_key(_kdb, "groq")
+        elevenlabs_key = await resolve_provider_key(_kdb, "elevenlabs")
+        vobiz_key = await resolve_provider_key(_kdb, "vobiz")
+        oxzygen_key = await resolve_provider_key(_kdb, "oxzygen")
+
     _probes = await asyncio.gather(
-        _probe("gemini", settings.gemini_api_key,
-               f"https://generativelanguage.googleapis.com/v1beta/models?key={settings.gemini_api_key}", {}),
-        _probe("sarvam", settings.sarvam_api_key,
-               "https://api.sarvam.ai/v1/models", {"api-subscription-key": settings.sarvam_api_key}),
-        _probe("groq", settings.groq_api_key,
-               "https://api.groq.com/openai/v1/models", {"Authorization": f"Bearer {settings.groq_api_key}"}),
-        _probe("elevenlabs", settings.elevenlabs_api_key,
-               "https://api.elevenlabs.io/v1/models", {"xi-api-key": settings.elevenlabs_api_key}),
+        _probe("gemini", gemini_key or "",
+               f"https://generativelanguage.googleapis.com/v1beta/models?key={gemini_key or ''}", {}),
+        _probe("sarvam", sarvam_key or "",
+               "https://api.sarvam.ai/v1/models", {"api-subscription-key": sarvam_key or ""}),
+        _probe("groq", groq_key or "",
+               "https://api.groq.com/openai/v1/models", {"Authorization": f"Bearer {groq_key or ''}"}),
+        _probe("elevenlabs", elevenlabs_key or "",
+               "https://api.elevenlabs.io/v1/models", {"xi-api-key": elevenlabs_key or ""}),
     )
     for name, status, detail in _probes:
         results[name] = status
         results[f"{name}_detail"] = detail
 
-    # No cheap unauthenticated probe for these — report key presence honestly.
+    # No cheap unauthenticated probe for these — report key presence honestly
+    # (also DB-first, so a key configured via AI Platform counts).
     def _key_status(value: str) -> str:
         return "connected" if value and value.strip() else "missing_key"
 
-    results["vobiz"] = _key_status(settings.vobiz_account_sid)
-    results["oxzygen"] = _key_status(settings.oxzygen_api_key)
+    results["vobiz"] = _key_status(vobiz_key)
+    results["oxzygen"] = _key_status(oxzygen_key)
     # HIS/Oxzygen has no integration code behind it yet — surface that honestly.
     results["his_implemented"] = False
 
