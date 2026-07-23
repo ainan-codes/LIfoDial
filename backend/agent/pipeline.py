@@ -497,6 +497,29 @@ async def entrypoint(ctx) -> None:
     if test_mode:
         log.info("TEST MODE call — publish gate bypassed for agent_id=%s", agent_id)
 
+    # ── Pre-call credit gate (audit P4) ─────────────────────────────────────
+    # A real (non-test) call must not start unless the clinic's prepaid balance
+    # covers the worst-case cost of a full-length call. Declining here — before
+    # _create_call_record() / ctx.connect() — guarantees a call can never drive
+    # the balance negative (the bug that left a clinic at ₹-1.50: deduction ran
+    # post-call with no floor and nothing checked the balance up front). Same
+    # decline-before-connect shape as the publish gate above; test_mode bypasses
+    # it just like the publish gate.
+    if tenant_id and not test_mode:
+        from backend.db import AsyncSessionLocal
+        from backend.services.credit_service import CreditService
+
+        max_dur = int(agent_config.get("max_duration_seconds") or 300)
+        async with AsyncSessionLocal() as _credit_db:
+            gate = await CreditService.check_call_allowed(_credit_db, tenant_id, max_dur)
+        if not gate["allowed"]:
+            log.warning(
+                "Declining call: tenant=%s failed credit gate (reason=%s balance=₹%.2f "
+                "required=₹%.2f) — not joining room %s",
+                tenant_id, gate["reason"], gate["balance"], gate["required"], room_name,
+            )
+            return
+
     # ── Create call record ─────────────────────────────────────────────────
     call_meta = {
         "caller_phone": caller_phone,

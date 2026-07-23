@@ -59,6 +59,41 @@ class CreditService:
         return credits.balance >= required
 
     @staticmethod
+    async def check_call_allowed(
+        db: AsyncSession,
+        tenant_id: str,
+        max_duration_seconds: int = 300,
+    ) -> dict:
+        """Pre-call credit gate (audit P4).
+
+        A real call may start ONLY when the clinic's prepaid balance covers the
+        *worst-case* cost of a full-length call (rate × ceil(max_duration/60)).
+        Gating on the worst case — not just one minute — is what guarantees a
+        call can never drive the balance negative: billing is post-call and
+        atomic, so a 1-minute gate would still let a 5-minute call overdraw.
+
+        Also honours the ClinicCredits.is_active suspension flag.
+
+        Returns a dict (never raises) so callers can log the exact reason:
+          {allowed, reason, balance, required, rate_per_minute, is_active}
+        reason ∈ {"ok", "insufficient_balance", "credit_suspended"}.
+        """
+        credits = await CreditService.get_or_create_balance(db, tenant_id)
+        minutes = math.ceil(max_duration_seconds / 60) if max_duration_seconds > 0 else 1
+        required = round(credits.rate_per_minute * minutes, 2)
+        base = {
+            "balance": round(credits.balance, 2),
+            "required": required,
+            "rate_per_minute": credits.rate_per_minute,
+            "is_active": credits.is_active,
+        }
+        if not credits.is_active:
+            return {"allowed": False, "reason": "credit_suspended", **base}
+        if credits.balance < required:
+            return {"allowed": False, "reason": "insufficient_balance", **base}
+        return {"allowed": True, "reason": "ok", **base}
+
+    @staticmethod
     async def deduct_call_credits(
         db: AsyncSession,
         tenant_id: str,
@@ -101,24 +136,44 @@ class CreditService:
         )
         balance_after = round(refreshed.scalar_one(), 2)
 
+        # Defence-in-depth behind the pre-call gate (check_call_allowed): the
+        # gate should make this impossible, but if a deduction ever drives the
+        # balance negative we record the real usage HONESTLY (never silently
+        # clamp to 0 — that would hide that it happened, audit P4) and suspend
+        # the clinic so the overdraw is visible and no further calls run until
+        # a top-up. Ledger amount/balance_after stay truthful.
+        overdrawn = balance_after < 0
+        description = f"Call {minutes}m ({duration_seconds}s) @ ₹{rate:.2f}/min"
+        if overdrawn:
+            description += " — OVERDRAWN, clinic auto-suspended (insufficient credit)"
+            await db.execute(
+                update(ClinicCredits)
+                .where(ClinicCredits.tenant_id == tenant_id)
+                .values(is_active=False)
+            )
+
         txn = CreditTransaction(
             tenant_id=tenant_id,
             transaction_type="call_deduction",
             amount=-cost,
             balance_after=balance_after,
-            description=(
-                f"Call {minutes}m ({duration_seconds}s) @ ₹{rate:.2f}/min"
-            ),
+            description=description,
             call_id=call_id,
             performed_by="system",
         )
         db.add(txn)
         await db.commit()
 
-        logger.info(
-            "Credit deduction: tenant=%s cost=₹%.2f balance=₹%.2f call=%s",
-            tenant_id, cost, balance_after, call_id,
-        )
+        if overdrawn:
+            logger.warning(
+                "Credit OVERDRAWN: tenant=%s cost=₹%.2f balance=₹%.2f call=%s — clinic suspended",
+                tenant_id, cost, balance_after, call_id,
+            )
+        else:
+            logger.info(
+                "Credit deduction: tenant=%s cost=₹%.2f balance=₹%.2f call=%s",
+                tenant_id, cost, balance_after, call_id,
+            )
 
         return {
             "deducted": cost,
