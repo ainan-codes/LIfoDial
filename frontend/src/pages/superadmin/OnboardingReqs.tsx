@@ -35,19 +35,24 @@ function timeAgo(iso: string): string {
 function ApproveModal({ req, onClose, onDone }: { req: OnboardingRequest; onClose: () => void; onDone: () => void }) {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const handleApprove = async () => {
     setLoading(true);
+    setError(null);
     try {
       const data = await fetchWithAuth(`/admin/onboarding-requests/${req.id}/approve`, {
         method: 'PATCH',
       });
+      // Show the REAL credentials the backend generated + persisted. NEVER
+      // fabricate an admin@<slug>.lifodial.com login here: that fake address was
+      // never stored, so it always failed at sign-in — this was the source of the
+      // "credentials shown but login invalid" bug (and the double credentials, one
+      // real + one fabricated). A failed approval is now an error, not fake success.
       setResult(data);
       onDone();
-    } catch (e) {
-      // Optimistic fallback
-      setResult({ status: 'approved', credentials: { email: `admin@${req.clinic_name.toLowerCase().replace(/ /g, '')}.lifodial.com`, password: '••••••••' } });
-      onDone();
+    } catch (e: any) {
+      setError(e?.message || 'Approval failed — the clinic was NOT created. Please retry.');
     } finally {
       setLoading(false);
     }
@@ -98,6 +103,9 @@ function ApproveModal({ req, onClose, onDone }: { req: OnboardingRequest; onClos
       <p style={{ color: '#888', fontSize: '13px', marginBottom: '20px', lineHeight: 1.6 }}>
         Approving will create an active clinic account and auto-assign the <strong style={{ color: '#3ECF8E' }}>{req.plan}</strong> plan. Access credentials will be generated.
       </p>
+      {error && (
+        <p style={{ color: '#F87171', fontSize: '13px', marginBottom: '16px', lineHeight: 1.5 }}>{error}</p>
+      )}
       <div style={{ display: 'flex', gap: '12px' }}>
         <button onClick={onClose} style={{ flex: 1, padding: '10px', backgroundColor: '#2E2E2E', color: '#888', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 600 }}>Cancel</button>
         <SpinBtn onClick={handleApprove} loading={loading} style={{ flex: 1 }}>
