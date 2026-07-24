@@ -1,11 +1,13 @@
 import { useState, useEffect } from 'react'
 import {
   LiveKitRoom,
-  useVoiceAssistant,
   BarVisualizer,
   RoomAudioRenderer,
-  VoiceAssistantControlBar,
+  useRemoteParticipants,
+  useTracks,
+  useConnectionState,
 } from '@livekit/components-react'
+import { Track, ConnectionState } from 'livekit-client'
 import '@livekit/components-styles'
 import fetchWithAuth from '../api/client'
 
@@ -16,6 +18,11 @@ interface Agent {
   tts_language: string
   tts_voice: string
   llm_model: string
+}
+
+function isAgentParticipant(p: any) {
+  const id: string = p?.identity || ''
+  return id.startsWith('lifodial-agent')
 }
 
 export function WebCallModal({ 
@@ -48,12 +55,8 @@ export function WebCallModal({
   useEffect(() => {
     const getToken = async () => {
       try {
-        // ── CRITICAL: Request microphone BEFORE connecting ──
-        // Without this, LiveKit connects but no audio track is published,
-        // causing STT to silently fail.
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-          // Release the stream immediately — LiveKit will re-acquire it
           stream.getTracks().forEach(t => t.stop())
         } catch (micErr: any) {
           setError(
@@ -134,20 +137,47 @@ export function WebCallModal({
 }
 
 function CallUI({ agent, duration, formatTime, onClose }: { agent: Agent, duration: number, formatTime: (s: number) => string, onClose: () => void }) {
-  const { state: agentState, audioTrack } = useVoiceAssistant()
+  const connState = useConnectionState()
+  const remoteParticipants = useRemoteParticipants()
+
+  const agentParticipant = remoteParticipants.find(isAgentParticipant) ?? null
+
+  const allAudioTracks = useTracks([Track.Source.Microphone], { updateOnlyOn: [] })
+  const agentAudioTrack = allAudioTracks.find(
+    (t) => t.participant && isAgentParticipant(t.participant)
+  ) ?? null
+
+  const [agentState, setAgentState] = useState<string>('connecting')
+
+  useEffect(() => {
+    if (!agentParticipant) {
+      setAgentState('connecting')
+      return
+    }
+    const attrs = (agentParticipant as any).attributes || {}
+    setAgentState(attrs['lk.agent.state'] || 'idle')
+
+    const handler = () => {
+      const updated = (agentParticipant as any).attributes || {}
+      setAgentState(updated['lk.agent.state'] || 'idle')
+    }
+    agentParticipant.on('attributesChanged', handler)
+    return () => { agentParticipant.off('attributesChanged', handler) }
+  }, [agentParticipant])
+
+  const agentReady = !!agentParticipant && connState === ConnectionState.Connected
   
   const stateConfig: Record<string, { label: string, color: string }> = {
     "connecting": { label: "Connecting...", color: "#F59E0B" },
     "listening": { label: "🎤 Listening", color: "#3B82F6" },
     "thinking": { label: "💭 Processing", color: "#F59E0B" },
     "speaking": { label: "🔊 Speaking", color: "#3ECF8E" },
-    "idle": { label: "● Ready", color: "#666" },
-    "initializing": { label: "Initializing...", color: "#F59E0B" },
-    "disconnected": { label: "Disconnected", color: "#ef4444" }
+    "idle": { label: "● Ready", color: "#3ECF8E" },
   }
   
-  const { label, color } = stateConfig[agentState] || 
-    stateConfig["idle"]
+  const { label, color } = agentReady
+    ? (stateConfig[agentState] || { label: "● Live", color: "#3ECF8E" })
+    : { label: "Connecting...", color: "#F59E0B" }
   
   const langLabel = ({
     "hi-IN": "🇮🇳 Hindi", "ta-IN": "🇮🇳 Tamil",
@@ -175,19 +205,24 @@ function CallUI({ agent, duration, formatTime, onClose }: { agent: Agent, durati
       
       {/* Visualizer */}
       <div className="call-visualizer">
-        <BarVisualizer
-          state={agentState}
-          trackRef={audioTrack}
-          barCount={36}
-          options={{ minHeight: 4 }}
-          style={{
-            "--lk-va-bar-width": "4px",
-            "--lk-va-bar-gap": "3px",
-            "--lk-fg": color,
-            height: "80px",
-            width: "100%",
-          } as React.CSSProperties}
-        />
+        {agentReady && agentAudioTrack ? (
+          <BarVisualizer
+            trackRef={agentAudioTrack}
+            barCount={36}
+            options={{ minHeight: 4 }}
+            style={{
+              "--lk-va-bar-width": "4px",
+              "--lk-va-bar-gap": "3px",
+              "--lk-fg": color,
+              height: "80px",
+              width: "100%",
+            } as React.CSSProperties}
+          />
+        ) : (
+          <div style={{ height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <div style={{ width: 36, height: 36, border: '3px solid #1f1f1f', borderTopColor: color, borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
+          </div>
+        )}
         <p className="call-state-label" style={{ color }}>
           {label}
         </p>
@@ -201,15 +236,21 @@ function CallUI({ agent, duration, formatTime, onClose }: { agent: Agent, durati
       </div>
       
       {/* Controls */}
-      <div className="call-controls" onClick={onClose}>
-        <VoiceAssistantControlBar
-          controls={{ leave: true, microphone: true }}
-          saveUserChoices={false}
-        />
+      <div className="call-controls" style={{ display: 'flex', justifyContent: 'center', margin: '16px 0' }}>
+        <button
+          onClick={onClose}
+          style={{
+            padding: '10px 28px', borderRadius: 40, border: '1px solid #ef4444',
+            background: 'rgba(239,68,68,0.1)', color: '#ef4444',
+            fontWeight: 600, fontSize: 14, cursor: 'pointer',
+          }}
+        >
+          Disconnect Call
+        </button>
       </div>
       
       {/* Mic hint */}
-      {agentState === "idle" && (
+      {agentReady && (
         <p className="mic-hint">
           Speak naturally — the AI will respond
         </p>
