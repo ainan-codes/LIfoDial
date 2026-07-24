@@ -155,6 +155,11 @@ class CallLoggerProcessor(FrameProcessor):
 
             elif isinstance(frame, TTSStartedFrame):
                 self._last_tts_start = time.time()
+                # FIX: reset idle clock when the AGENT speaks too, not just when the
+                # user speaks. Previously the 10s clock ran through the 4-5s greeting
+                # and fired ~5s after the greeting ended, killing every call on the
+                # first turn before the caller had a chance to respond.
+                self.last_activity_ts = time.time()
 
             elif isinstance(frame, MetricsFrame):
                 self._on_metrics(frame)

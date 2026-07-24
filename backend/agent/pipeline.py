@@ -530,6 +530,14 @@ async def entrypoint(ctx) -> None:
     call_record_id = await _create_call_record(tenant_id, agent_id, call_meta)
     call_meta["call_record_id"] = call_record_id
 
+    # ── Connect to LiveKit room (REQUIRED by livekit-agents) ───────────────
+    # ctx.connect() MUST be called here. Without it livekit-agents never marks
+    # the dispatched job as accepted and fires the 15s dispatch alarm
+    # ("Agent never joined room"). Pipecat's LiveKitTransport opens its own
+    # WebRTC track connection separately — ctx.connect() and LiveKitTransport
+    # are complementary, not alternatives.
+    await ctx.connect(auto_subscribe=False)  # auto_subscribe=False: transport handles subscriptions
+
     # ── Generate agent token ───────────────────────────────────────────────
     agent_token = _generate_agent_token(room_name)
 
@@ -815,20 +823,27 @@ async def entrypoint(ctx) -> None:
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(transport_ref, participant_id: str) -> None:
         """
-        Greet the caller — but only if the agent is set to speak first.
-        With first_message_mode='wait', the agent stays silent and waits for the
-        caller to speak (matching the browser-test path behavior). Previously the
-        greeting always played regardless of this setting.
+        Greet the caller and start the silence watchdog.
 
-        recording_consent_plan handling (Advanced tab — previously stored but
-        never acted on):
-          - "none": no change to greeting behavior.
-          - "inform": consent notice is prepended to the first message.
-          - "require": consent notice is asked as a yes/no question BEFORE
-            anything else; the caller's answer is intercepted by
-            CallLoggerProcessor (see begin_consent_gate) rather than treated
-            as normal conversation. A "no" ends the call politely.
+        IMPORTANT: silence watchdog starts HERE (not at room-connect) so the
+        agent greeting time (~4-5s) is not counted toward the silence timeout.
+        Previously last_activity_ts was set at __init__ and the 10s clock started
+        at call-connect — the greeting ate ~5s, leaving callers only ~5s to speak
+        before the call was axed.
         """
+        # Reset activity clock to NOW (participant just joined, greeting about to play)
+        call_logger.last_activity_ts = time.time()
+
+        # Start the silence watchdog NOW — after participant joins — so greeting
+        # time is excluded from the idle clock.
+        if not _silence_watchdog_task:  # only start once
+            _silence_watchdog_task.append(
+                asyncio.create_task(
+                    _enforce_silence_timeout(task, call_logger, silence_timeout_seconds, end_call_message)
+                )
+            )
+            watchdog_tasks.append(_silence_watchdog_task[0])
+
         if recording_consent_plan == "require":
             log.info("Participant joined: %s — asking for recording consent before proceeding.", participant_id)
             call_logger.begin_consent_gate(
@@ -847,13 +862,10 @@ async def entrypoint(ctx) -> None:
 
         if first_message_mode == "wait":
             log.info("Participant joined: %s — mode=wait, staying silent until caller speaks.", participant_id)
-            # Seed the greeting into context so the LLM knows its intended opener,
-            # but do NOT synthesize/speak it.
             context.add_message({"role": "assistant", "content": effective_first_message})
             return
         log.info("Participant joined: %s — speaking first message.", participant_id)
         context.add_message({"role": "assistant", "content": effective_first_message})
-        # Queue the first greeting as a TextFrame to be synthesized directly by TTS (no self-talk trigger)
         await task.queue_frames([TextFrame(effective_first_message)])
 
     @transport.event_handler("on_participant_disconnected")
@@ -869,12 +881,11 @@ async def entrypoint(ctx) -> None:
             log.warning("Could not delete room %s on disconnect (non-fatal): %s", room_name, _del_err)
 
     # ── Call-length watchdogs (Call Behavior tab) ───────────────────────────
-    # Both settings previously round-tripped to the DB with no runtime effect —
-    # max_duration_seconds had no enforcement timer, and silence_timeout_seconds
-    # was never compared against actual call activity.
     end_call_message = agent_config.get("end_call_message") or "Thank you for calling. Goodbye!"
     max_duration_seconds = int(agent_config.get("max_duration_seconds", 300) or 300)
-    silence_timeout_seconds = int(agent_config.get("silence_timeout_seconds", 10) or 10)
+    # FIX: default 30s (was 10s) and clamp to ≥20s so the greeting (4-5s) plus
+    # a reasonable pause never trips the timeout on a normal call.
+    silence_timeout_seconds = max(int(agent_config.get("silence_timeout_seconds", 30) or 30), 20)
 
     # Give the logger a way to end the call directly (used for end_call_phrases
     # detection — see CallLoggerProcessor._on_user_speech).
@@ -883,9 +894,13 @@ async def entrypoint(ctx) -> None:
     # Let the never-silence guard inject a spoken phrase via the source on error.
     resilience.bind_task(task)
 
+    # Silence watchdog is started AFTER the first participant joins (see
+    # on_first_participant_joined below) so the greeting time is not counted.
+    # max_duration watchdog starts immediately (measures total call wall-time).
+    _silence_watchdog_task: list = []  # mutable container so the closure can populate it
+
     watchdog_tasks = [
         asyncio.create_task(_enforce_max_duration(task, max_duration_seconds, end_call_message)),
-        asyncio.create_task(_enforce_silence_timeout(task, call_logger, silence_timeout_seconds, end_call_message)),
     ]
 
     # ── Run ────────────────────────────────────────────────────────────────
