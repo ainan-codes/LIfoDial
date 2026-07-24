@@ -133,14 +133,15 @@ async def create_web_call_token(
     try:
         from livekit import api as livekit_api
 
-        # Create room with metadata (closed cleanly via async with)
+        # Create room with metadata & agent dispatch (closed cleanly via async with)
         async with livekit_api.LiveKitAPI(lk_url, lk_key, lk_secret) as lk:
             await lk.room.create_room(
                 livekit_api.CreateRoomRequest(
                     name=room_name,
                     metadata=metadata,
-                    empty_timeout=300,
+                    empty_timeout=15,  # Vanish empty rooms in 15s (instead of 300s)
                     max_participants=2,
+                    agents=[livekit_api.RoomAgentDispatch(agent_name=AGENT_NAME)],
                 )
             )
 

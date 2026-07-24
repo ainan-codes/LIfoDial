@@ -861,9 +861,15 @@ async def entrypoint(ctx) -> None:
 
     @transport.event_handler("on_participant_disconnected")
     async def on_participant_disconnected(transport_ref, participant_id: str) -> None:
-        """End the pipeline when the caller hangs up."""
-        log.info("Participant disconnected: %s — ending pipeline.", participant_id)
+        """End the pipeline when the caller hangs up and delete the room instantly."""
+        log.info("Participant disconnected: %s — ending pipeline and deleting room %s.", participant_id, room_name)
         await task.cancel()
+        try:
+            async with livekit_api.LiveKitAPI(settings.livekit_url, settings.livekit_api_key, settings.livekit_api_secret) as lk:
+                await lk.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name))
+                log.info("Deleted LiveKit room %s on disconnect ✓", room_name)
+        except Exception as _del_err:
+            log.warning("Could not delete room %s on disconnect (non-fatal): %s", room_name, _del_err)
 
     # ── Call-length watchdogs (Call Behavior tab) ───────────────────────────
     # Both settings previously round-tripped to the DB with no runtime effect —
