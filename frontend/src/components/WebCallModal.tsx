@@ -3,9 +3,11 @@ import {
   LiveKitRoom,
   BarVisualizer,
   RoomAudioRenderer,
+  StartAudio,
   useRemoteParticipants,
   useTracks,
   useConnectionState,
+  useRoomContext,
 } from '@livekit/components-react'
 import { Track, ConnectionState } from 'livekit-client'
 import '@livekit/components-styles'
@@ -22,7 +24,7 @@ interface Agent {
 
 function isAgentParticipant(p: any) {
   const id: string = p?.identity || ''
-  return id.startsWith('lifodial-agent')
+  return id.startsWith('lifodial-agent') || id.startsWith('agent-')
 }
 
 export function WebCallModal({ 
@@ -137,15 +139,26 @@ export function WebCallModal({
 }
 
 function CallUI({ agent, duration, formatTime, onClose }: { agent: Agent, duration: number, formatTime: (s: number) => string, onClose: () => void }) {
+  const room = useRoomContext()
   const connState = useConnectionState()
   const remoteParticipants = useRemoteParticipants()
 
-  const agentParticipant = remoteParticipants.find(isAgentParticipant) ?? null
+  useEffect(() => {
+    if (connState === ConnectionState.Connected && room) {
+      room.startAudio().catch((e) => console.warn('Audio auto-start notice:', e))
+    }
+  }, [connState, room])
 
-  const allAudioTracks = useTracks([Track.Source.Microphone], { updateOnlyOn: [] })
-  const agentAudioTrack = allAudioTracks.find(
-    (t) => t.participant && isAgentParticipant(t.participant)
-  ) ?? null
+  const agentParticipant = remoteParticipants.find(isAgentParticipant) ?? remoteParticipants[0] ?? null
+
+  const allTracks = useTracks(undefined, { updateOnlyOn: [] })
+  const agentAudioTrack = allTracks.find(
+    (t) =>
+      t.publication &&
+      t.publication.kind === 'audio' &&
+      t.participant &&
+      (isAgentParticipant(t.participant) || remoteParticipants.includes(t.participant))
+  )?.publication ?? null
 
   const [agentState, setAgentState] = useState<string>('connecting')
 
@@ -165,7 +178,7 @@ function CallUI({ agent, duration, formatTime, onClose }: { agent: Agent, durati
     return () => { agentParticipant.off('attributesChanged', handler) }
   }, [agentParticipant])
 
-  const agentReady = !!agentParticipant && connState === ConnectionState.Connected
+  const agentReady = (!!agentParticipant || remoteParticipants.length > 0) && connState === ConnectionState.Connected
   
   const stateConfig: Record<string, { label: string, color: string }> = {
     "connecting": { label: "Connecting...", color: "#F59E0B" },
@@ -188,6 +201,11 @@ function CallUI({ agent, duration, formatTime, onClose }: { agent: Agent, durati
   
   return (
     <div className="call-ui">
+      {/* Autoplay unblock button */}
+      <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 8 }}>
+        <StartAudio label="🔊 Click to Unmute / Enable Agent Audio" style={{ background: '#3ECF8E', color: '#000', padding: '6px 16px', borderRadius: 20, fontWeight: 700, border: 'none', cursor: 'pointer' }} />
+      </div>
+
       {/* Header */}
       <div className="call-header">
         <div className="call-info">
@@ -205,9 +223,9 @@ function CallUI({ agent, duration, formatTime, onClose }: { agent: Agent, durati
       
       {/* Visualizer */}
       <div className="call-visualizer">
-        {agentReady && agentAudioTrack ? (
+        {agentReady && agentAudioTrack && agentParticipant ? (
           <BarVisualizer
-            trackRef={agentAudioTrack}
+            trackRef={{ participant: agentParticipant, publication: agentAudioTrack } as any}
             barCount={36}
             options={{ minHeight: 4 }}
             style={{

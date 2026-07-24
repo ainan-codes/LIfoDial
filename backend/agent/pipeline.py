@@ -534,14 +534,13 @@ async def entrypoint(ctx) -> None:
     call_record_id = await _create_call_record(tenant_id, agent_id, call_meta)
     call_meta["call_record_id"] = call_record_id
 
-    # ── Connect to LiveKit room ───────────────────────────────────────────────
-    # NOTE: We do NOT call ctx.connect() here. The livekit-agents framework
-    # dispatches this job and expects ONE agent participant. ctx.connect() would
-    # add a second participant without agent=True, giving 3 total (user +
-    # framework-ghost + Pipecat agent), breaking useVoiceAssistant detection.
-    # LiveKitTransport with agent=True token is the sole connection.
+    # ── Connect to LiveKit room (REQUIRED by livekit-agents framework) ────────
+    # ctx.connect() MUST be called here so livekit-agents worker framework marks
+    # the dispatched job as accepted with LiveKit Cloud. auto_subscribe=False so
+    # Pipecat's LiveKitTransport handles audio stream subscriptions cleanly.
+    await ctx.connect(auto_subscribe=False)
 
-    # ── Generate agent token (agent=True grant so useVoiceAssistant finds us) ──
+    # ── Generate agent token ───────────────────────────────────────────────
     agent_token = _generate_agent_token(room_name)
 
     # ── Resolve TTS voice & model ──────────────────────────────────────────

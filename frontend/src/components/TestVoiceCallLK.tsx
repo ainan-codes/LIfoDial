@@ -4,9 +4,11 @@ import {
   LiveKitRoom,
   BarVisualizer,
   RoomAudioRenderer,
+  StartAudio,
   useRemoteParticipants,
   useTracks,
   useConnectionState,
+  useRoomContext,
 } from '@livekit/components-react';
 import { Track, ConnectionState } from 'livekit-client';
 import '@livekit/components-styles';
@@ -18,7 +20,7 @@ const AGENT_WAIT_MS = 45_000;
 
 function isAgentParticipant(p: any) {
   const id: string = p?.identity || '';
-  return id.startsWith('lifodial-agent');
+  return id.startsWith('lifodial-agent') || id.startsWith('agent-');
 }
 
 function TestCallUI({
@@ -34,18 +36,30 @@ function TestCallUI({
   onDisconnect: () => void;
   onRetry?: () => void;
 }) {
+  const room = useRoomContext();
   const connState = useConnectionState();
   const remoteParticipants = useRemoteParticipants();
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // Find agent participant by identity prefix
-  const agentParticipant = remoteParticipants.find(isAgentParticipant) ?? null;
+  // Auto-start audio context when connected to overcome browser autoplay blocks
+  useEffect(() => {
+    if (connState === ConnectionState.Connected && room) {
+      room.startAudio().catch((e) => console.warn('Audio auto-start notice:', e));
+    }
+  }, [connState, room]);
 
-  // Find agent's microphone audio track ref via useTracks
-  const allAudioTracks = useTracks([Track.Source.Microphone], { updateOnlyOn: [] });
-  const agentAudioTrack = allAudioTracks.find(
-    (t) => t.participant && isAgentParticipant(t.participant)
-  ) ?? null;
+  // Find agent participant by identity prefix (lifodial-agent-* or agent-*)
+  const agentParticipant = remoteParticipants.find(isAgentParticipant) ?? remoteParticipants[0] ?? null;
+
+  // Find agent's audio track ref via useTracks (no restrictive source filter)
+  const allTracks = useTracks(undefined, { updateOnlyOn: [] });
+  const agentAudioTrack = allTracks.find(
+    (t) =>
+      t.publication &&
+      t.publication.kind === 'audio' &&
+      t.participant &&
+      (isAgentParticipant(t.participant) || remoteParticipants.includes(t.participant))
+  )?.publication ?? null;
 
   const [transcript] = useState<{ id: string; role: string; text: string }[]>([]);
   const [agentState, setAgentState] = useState<string>('connecting');
@@ -66,7 +80,7 @@ function TestCallUI({
     return () => { agentParticipant.off('attributesChanged', handler); };
   }, [agentParticipant]);
 
-  const agentReady = !!agentParticipant && connState === ConnectionState.Connected;
+  const agentReady = (!!agentParticipant || remoteParticipants.length > 0) && connState === ConnectionState.Connected;
 
   const liveStates: Record<string, { label: string; color: string }> = {
     listening: { label: '🎤 Listening', color: '#3B82F6' },
@@ -91,6 +105,11 @@ function TestCallUI({
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, padding: '16px', gap: 12 }}>
+      {/* Autoplay unblock button if browser blocks audio */}
+      <div style={{ alignSelf: 'center' }}>
+        <StartAudio label="🔊 Click to Unmute / Enable Agent Audio" style={{ background: '#3ECF8E', color: '#000', padding: '6px 16px', borderRadius: 20, fontWeight: 700, border: 'none', cursor: 'pointer' }} />
+      </div>
+
       {/* Agent avatar + visualizer */}
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
         {avatarUrl ? (
@@ -120,10 +139,10 @@ function TestCallUI({
           </div>
         )}
 
-        {agentReady && agentAudioTrack ? (
+        {agentReady && agentAudioTrack && agentParticipant ? (
           <div style={{ width: '100%', maxWidth: 320 }}>
             <BarVisualizer
-              trackRef={agentAudioTrack}
+              trackRef={{ participant: agentParticipant, publication: agentAudioTrack } as any}
               barCount={28}
               options={{ minHeight: 4 }}
               style={{ '--lk-fg': color, height: '56px', width: '100%' } as React.CSSProperties}
