@@ -50,17 +50,32 @@ async def upload_voice_sample(
     save_path.write_bytes(content)
     logger.info(f"Voice sample saved for tenant {id}: {save_path}")
 
-    # Upload to Sarvam voice cloning API
+    # Attempt real voice cloning. clone_voice returns None when no real cloning
+    # backend is wired (Sarvam voice cloning is not implemented yet), so we do
+    # NOT fabricate a voice id or claim success — that would show a "Custom Voice
+    # Active" state the agent never actually uses.
     voice_id = await clone_voice(content)
 
-    # Update tenant status
+    if not voice_id:
+        return {
+            "status": "received",
+            "cloning_available": False,
+            "voice_id": None,
+            "message": (
+                "Sample uploaded. Custom voice cloning isn't enabled yet — your "
+                "agent keeps using its configured voice until we activate it."
+            ),
+        }
+
+    # Real clone succeeded — persist it.
     tenant.custom_voice_id = voice_id
     await db.commit()
 
     return {
         "status": "active",
+        "cloning_available": True,
         "voice_id": voice_id,
-        "message": "Voice sample successfully cloned and is now active."
+        "message": "Voice sample successfully cloned and is now active.",
     }
 
 

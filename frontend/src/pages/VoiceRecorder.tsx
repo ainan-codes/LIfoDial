@@ -98,8 +98,11 @@ export default function VoiceRecorder() {
     try {
       const res = await fetch(`${API_URL}/api/tenants/${TENANT_ID}/upload-voice`, { method: 'POST', body: fd });
       const data = await res.json();
-      if (res.ok) { setUploaded(true); setVoiceStatus('custom'); }
-      else alert(data.message || 'Upload failed');
+      // Only claim a custom voice when the backend actually cloned one. When
+      // cloning isn't available it returns 200 with status:"received" — surface
+      // that honestly instead of showing a fake "Voice Cloned" success.
+      if (res.ok && data.status === 'active') { setUploaded(true); setVoiceStatus('custom'); }
+      else alert(data.message || data.detail || 'Upload failed');
     } catch { alert('Network error during upload'); }
   };
 
