@@ -2,6 +2,7 @@
 backend/routers/web_calls.py — Web call token generation + outbound call endpoints.
 Enables browser-based voice calls to AI agents via LiveKit.
 """
+import asyncio
 import json
 import uuid
 import logging
@@ -25,6 +26,75 @@ router = APIRouter(prefix="/agents", tags=["web-calls"])
 # Must match WorkerOptions(agent_name=...) in backend/agent/__main__.py and
 # pipeline.py so LiveKit dispatches OUR worker into the room.
 AGENT_NAME = "lifodial-inbound-agent"
+
+# Retained refs so dispatch-watchers aren't GC'd mid-flight (audit R3:
+# fire-and-forget create_task can be collected before it runs).
+_dispatch_watchers: set = set()
+
+# How long to wait for the dispatched worker to actually join before declaring
+# the dispatch failed. A healthy join to a warm worker is 1-3s; 15s clears that
+# comfortably without holding an alarm too long. (On 2026-07-24 a worker-redeploy
+# downtime window left rooms agent-less and it went unnoticed until someone
+# checked the LiveKit dashboard — this watchdog exists so that can't recur.)
+_AGENT_JOIN_DEADLINE_SECONDS = 15
+
+
+async def _alert_if_agent_absent(
+    room_name: str, call_id: str, agent_id: str, tenant_id: str,
+    lk_url: str, lk_key: str, lk_secret: str,
+) -> None:
+    """~15s after a room is created, verify the dispatched Pipecat worker joined.
+    If not, emit a LOUD alarm (ERROR log + Sentry) so 'room created but no agent
+    joined' is never again silent. Best-effort; never affects the call itself.
+
+    Heuristic: the only human joins with identity 'user-...' (set on the token
+    below), so any participant whose identity is NOT 'user-*' is the agent.
+    """
+    try:
+        await asyncio.sleep(_AGENT_JOIN_DEADLINE_SECONDS)
+        from livekit import api as livekit_api
+
+        parts = []
+        room_gone = False
+        async with livekit_api.LiveKitAPI(lk_url, lk_key, lk_secret) as lk:
+            try:
+                res = await lk.room.list_participants(
+                    livekit_api.ListParticipantsRequest(room=room_name)
+                )
+                parts = list(res.participants)
+            except Exception:
+                # Room already vanished (empty_timeout) → nobody sustained a join.
+                room_gone = True
+
+        agent_present = any(
+            not (getattr(p, "identity", "") or "").startswith("user-") for p in parts
+        )
+        if agent_present:
+            return
+
+        msg = (
+            f"[DISPATCH-ALARM] Agent never joined room '{room_name}' within "
+            f"{_AGENT_JOIN_DEADLINE_SECONDS}s (call_id={call_id} agent_id={agent_id} "
+            f"tenant_id={tenant_id} participants={len(parts)} room_gone={room_gone}). "
+            f"Worker is likely down/deregistered or agent_name mismatched — callers "
+            f"in this room hear silence."
+        )
+        logger.error(msg)
+        try:
+            import sentry_sdk
+            sentry_sdk.capture_message(msg, level="error")
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # never let the watchdog crash anything
+        logger.warning("[DISPATCH-ALARM] watcher error for %s: %s", room_name, e)
+
+
+def _spawn_dispatch_watcher(**kwargs) -> None:
+    task = asyncio.create_task(_alert_if_agent_absent(**kwargs))
+    _dispatch_watchers.add(task)
+    task.add_done_callback(_dispatch_watchers.discard)
 
 
 @router.post("/{agent_id}/web-call-token")
@@ -184,6 +254,13 @@ async def create_web_call_token(
         status="in_progress",
     )
     db.add(call)
+
+    # Watchdog: alarm LOUDLY if the dispatched worker never actually joins this
+    # room (logs + Sentry). Non-blocking; the token is returned immediately.
+    _spawn_dispatch_watcher(
+        room_name=room_name, call_id=call_id, agent_id=agent_id,
+        tenant_id=str(agent.tenant_id), lk_url=lk_url, lk_key=lk_key, lk_secret=lk_secret,
+    )
 
     return {
         "token": jwt_token,
