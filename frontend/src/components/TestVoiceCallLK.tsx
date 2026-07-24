@@ -36,11 +36,13 @@ export default function TestVoiceCallLK({
   agent,
   agentId,
   agentName,
+  avatarUrl,
   onClose,
 }: {
   agent?: any;
   agentId?: string;
   agentName?: string;
+  avatarUrl?: string;
   onClose?: () => void;
 }) {
   const [token, setToken] = useState('');
@@ -167,14 +169,14 @@ export default function TestVoiceCallLK({
         onDisconnected={onClose}
         style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}
       >
-        <TestCallUI agentName={agentName} micAvailable={micAvailable} onRetry={retry} />
+        <TestCallUI agentName={agentName} avatarUrl={avatarUrl} micAvailable={micAvailable} onRetry={retry} />
         <RoomAudioRenderer />
       </LiveKitRoom>
     </div>
   );
 }
 
-function TestCallUI({ agentName, micAvailable, onRetry }: { agentName?: string; micAvailable?: boolean; onRetry?: () => void }) {
+function TestCallUI({ agentName, avatarUrl, micAvailable, onRetry }: { agentName?: string; avatarUrl?: string; micAvailable?: boolean; onRetry?: () => void }) {
   const { state, audioTrack, agentTranscriptions, agent } = useVoiceAssistant();
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -211,8 +213,35 @@ function TestCallUI({ agentName, micAvailable, onRetry }: { agentName?: string; 
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, padding: '16px', gap: 12 }}>
-      {/* Visualizer + status (compact so the transcript gets the room) */}
+      {/* Agent avatar + visualizer (compact so transcript gets the room) */}
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+        {/* Agent avatar / identity badge */}
+        {avatarUrl ? (
+          <img
+            src={avatarUrl}
+            alt={agentName || 'Agent'}
+            style={{
+              width: 48, height: 48, borderRadius: '50%',
+              objectFit: 'cover',
+              border: `2px solid ${color}`,
+              boxShadow: `0 0 12px ${color}44`,
+              transition: 'border-color 0.3s, box-shadow 0.3s',
+            }}
+            onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+          />
+        ) : (
+          <div style={{
+            width: 48, height: 48, borderRadius: '50%',
+            background: `${color}18`,
+            border: `2px solid ${color}`,
+            boxShadow: `0 0 12px ${color}44`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 22,
+            transition: 'border-color 0.3s, box-shadow 0.3s',
+          }}>
+            🎧
+          </div>
+        )}
         <div style={{ width: '100%', maxWidth: 320 }}>
           <BarVisualizer
             state={state}

@@ -323,6 +323,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     import asyncio
     asyncio.ensure_future(_warmup())
 
+    # ── Storage bucket init (idempotent, enforces size + MIME limits) ────────
+    # Non-blocking — if Supabase is unreachable the app still boots.
+    try:
+        from backend.services.storage import ensure_public_bucket, ensure_private_bucket
+        asyncio.ensure_future(ensure_public_bucket())
+        asyncio.ensure_future(ensure_private_bucket())
+    except Exception as _storage_err:
+        logger.warning("Storage bucket init failed (non-fatal): %s", _storage_err)
+
     yield
     logger.info("Lifodial shut down cleanly")
 

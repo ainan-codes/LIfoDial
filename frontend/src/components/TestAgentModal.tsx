@@ -1291,6 +1291,7 @@ export default function TestAgentModal({ agent, agentId: directId, agentName: di
   const agentId = agent?.id || directId;
   const agentName = agent?.name || agent?.agent_name || directName || 'Agent';
   const clinicName = agent?.clinic_name || '';
+  const avatarUrl = agent?.avatar_url || '';
   const storageKey = `lifodial-test-tab-${agentId}`;
   const [mode, setMode] = useState<Mode>(defaultMode || (localStorage.getItem(storageKey) as Mode) || 'chat');
   const [isOpen, setIsOpen] = useState(false);
@@ -1366,9 +1367,22 @@ export default function TestAgentModal({ agent, agentId: directId, agentName: di
         }}>
           {/* Top row: icon + name + close */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', height: '56px' }}>
-            <div style={{ width: '32px', height: '32px', borderRadius: '8px', background: 'rgba(62,207,142,0.1)', border: '1px solid #3ECF8E30', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-              <Headphones size={17} color="#3ECF8E" />
-            </div>
+            {avatarUrl ? (
+              <img
+                src={avatarUrl}
+                alt={agentName}
+                style={{
+                  width: '32px', height: '32px', borderRadius: '8px',
+                  objectFit: 'cover', border: '1px solid rgba(62,207,142,0.2)',
+                  flexShrink: 0,
+                }}
+                onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+              />
+            ) : (
+              <div style={{ width: '32px', height: '32px', borderRadius: '8px', background: 'rgba(62,207,142,0.1)', border: '1px solid #3ECF8E30', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                <Headphones size={17} color="#3ECF8E" />
+              </div>
+            )}
             <div style={{ flex: 1, overflow: 'hidden' }}>
               <p style={{ color: '#fff', fontWeight: 700, margin: 0, fontSize: '14px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{agentName}</p>
               {clinicName && <p style={{ color: '#555', fontSize: '11px', margin: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{clinicName}</p>}
@@ -1415,7 +1429,7 @@ export default function TestAgentModal({ agent, agentId: directId, agentName: di
             // Voice now runs on the SAME real-time LiveKit + Pipecat pipeline as
             // production calls (test_mode) — streaming + native barge-in. The old
             // batch WebSocket VoiceMode harness (below in this file) is retired.
-            <TestVoiceCallLK agent={agent} agentId={agentId} agentName={agentName} onClose={onClose} />
+            <TestVoiceCallLK agent={agent} agentId={agentId} agentName={agentName} avatarUrl={avatarUrl} onClose={onClose} />
           ) : (
             <ChatMode agent={agent} agentId={agentId} agentName={agentName} onClose={onClose} />
           )}
