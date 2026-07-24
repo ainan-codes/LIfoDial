@@ -133,17 +133,16 @@ async def create_web_call_token(
     try:
         from livekit import api as livekit_api
 
-        lk = livekit_api.LiveKitAPI(lk_url, lk_key, lk_secret)
-
-        # Create room with metadata
-        await lk.room.create_room(
-            livekit_api.CreateRoomRequest(
-                name=room_name,
-                metadata=metadata,
-                empty_timeout=300,
-                max_participants=2,
+        # Create room with metadata (closed cleanly via async with)
+        async with livekit_api.LiveKitAPI(lk_url, lk_key, lk_secret) as lk:
+            await lk.room.create_room(
+                livekit_api.CreateRoomRequest(
+                    name=room_name,
+                    metadata=metadata,
+                    empty_timeout=300,
+                    max_participants=2,
+                )
             )
-        )
 
         # Generate browser token for admin/patient, WITH an explicit agent
         # dispatch so the Pipecat worker (registered under AGENT_NAME) is pulled

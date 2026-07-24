@@ -721,11 +721,10 @@ async def system_health_status(user: SuperAdmin = None):
         livekit_detail = "Keys present but LiveKit did not respond / rejected them"
         try:
             from livekit import api as _lk
-            _client = _lk.LiveKitAPI(settings.livekit_url, settings.livekit_api_key, settings.livekit_api_secret)
-            await asyncio.wait_for(_client.room.list_rooms(_lk.ListRoomsRequest()), timeout=6)
-            await _client.aclose()
-            livekit_status = "connected"
-            livekit_detail = "Live API reachable, credentials valid ✓"
+            async with _lk.LiveKitAPI(settings.livekit_url, settings.livekit_api_key, settings.livekit_api_secret) as _client:
+                await asyncio.wait_for(_client.room.list_rooms(_lk.ListRoomsRequest()), timeout=6)
+                livekit_status = "connected"
+                livekit_detail = "Live API reachable, credentials valid ✓"
         except Exception as e:
             livekit_detail = f"Keys present but check failed: {str(e)[:80]}"
     results["livekit"] = livekit_status

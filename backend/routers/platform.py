@@ -827,12 +827,10 @@ async def test_livekit(user: SuperAdmin = None, db: AsyncSession = Depends(get_d
     if not (url and api_key and secret):
         return {"ok": False, "detail": "LiveKit URL, API key, and secret must all be set."}
     try:
-        from livekit import api as _lk
-        client = _lk.LiveKitAPI(url, api_key, secret)
         import asyncio as _aio
-        res = await _aio.wait_for(client.room.list_rooms(_lk.ListRoomsRequest()), timeout=8)
-        await client.aclose()
-        return {"ok": True, "detail": f"Connected ✓ ({len(res.rooms)} active room(s))"}
+        async with _lk.LiveKitAPI(url, api_key, secret) as client:
+            res = await _aio.wait_for(client.room.list_rooms(_lk.ListRoomsRequest()), timeout=8)
+            return {"ok": True, "detail": f"Connected ✓ ({len(res.rooms)} active room(s))"}
     except Exception as e:
         return {"ok": False, "detail": f"Connection failed: {str(e)[:150]}"}
 
