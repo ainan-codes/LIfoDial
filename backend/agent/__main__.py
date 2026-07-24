@@ -25,21 +25,14 @@ Environment variables required (.env):
 
 import os
 
-from livekit.agents import WorkerOptions, cli
+from livekit.agents import WorkerOptions, JobExecutorType, cli
 
 from backend.agent.pipeline import AGENT_NAME, entrypoint, prewarm, _preflight_or_die
 from backend.config import settings
 
 if __name__ == "__main__":
-    # Fail loudly if the worker can't register with LiveKit (audit FIX 1.4).
     _preflight_or_die()
-    # Bind the built-in HTTP health server to Render's $PORT so this can run as a
-    # Render web service (incl. free tier — no background_worker type there).
     port = int(os.environ.get("PORT") or 8081)
-    # The livekit-agents CLI normally reads LIVEKIT_URL/API_KEY/API_SECRET from OS
-    # environment variables. Pass them explicitly from the app settings (which load
-    # the project .env) so `python -m backend.agent start` works without a separate
-    # manual export step — the worker uses the same creds as the backend.
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
@@ -50,13 +43,9 @@ if __name__ == "__main__":
             api_secret=settings.livekit_api_secret or None,
             host="0.0.0.0",
             port=port,
-            # ── Resource-constrained (Render free: 0.1 CPU / 512MB) tuning ──
-            # Defaults crash-loop the free instance: the heavy cold import
-            # (pipecat + numba JIT + Silero VAD) blows the 10s init timeout, 4
-            # prewarmed processes exhaust RAM, and a low-CPU box reads as
-            # "overloaded" (load_threshold 0.7) so it refuses all jobs.
-            initialize_process_timeout=120.0,
-            num_idle_processes=1,
+            job_executor_type=JobExecutorType.THREAD,
+            initialize_process_timeout=60.0,
+            num_idle_processes=0,
             load_threshold=float("inf"),
         )
     )

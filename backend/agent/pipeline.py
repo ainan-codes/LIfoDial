@@ -1003,12 +1003,9 @@ def _preflight_or_die() -> None:
 
 if __name__ == "__main__":
     import os as _os
-    from livekit.agents import WorkerOptions, cli
+    from livekit.agents import WorkerOptions, JobExecutorType, cli
 
     _preflight_or_die()
-    # Bind the worker's built-in HTTP health server to Render's injected $PORT so
-    # this can run as a Render *web service* (incl. the free tier, which has no
-    # background_worker type). host=0.0.0.0 so Render's health probe reaches it.
     _port = int(_os.environ.get("PORT") or 8081)
     cli.run_app(
         WorkerOptions(
@@ -1020,9 +1017,9 @@ if __name__ == "__main__":
             api_secret=settings.livekit_api_secret or None,
             host="0.0.0.0",
             port=_port,
-            # Resource-constrained (Render free) tuning — see backend/agent/__main__.py.
-            initialize_process_timeout=120.0,
-            num_idle_processes=1,
+            job_executor_type=JobExecutorType.THREAD,
+            initialize_process_timeout=60.0,
+            num_idle_processes=0,
             load_threshold=float("inf"),
         )
     )
