@@ -889,12 +889,13 @@ style-src 'unsafe-inline';`;
 
 function getLlmFallbackModels(provider: string): string[] {
   const map: Record<string, string[]> = {
-    gemini: ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'],
-    openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo'],
-    anthropic: ['claude-3-5-sonnet-20241022', 'claude-3-haiku-20240307'],
-    groq: ['llama-3.3-70b-versatile', 'mixtral-8x7b-32768'],
+    gemini: ['gemini-2.5-flash', 'gemini-2.5-flash-8b', 'gemini-2.0-flash', 'gemini-1.5-pro'],
+    openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'o3-mini'],
+    anthropic: ['claude-sonnet-4-5', 'claude-haiku-4-5', 'claude-3-5-sonnet-20241022', 'claude-3-haiku-20240307'],
+    groq: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'gemma2-9b-it', 'deepseek-r1-distill-llama-70b', 'compound-beta-mini'],
     deepseek: ['deepseek-chat', 'deepseek-reasoner'],
-    mistral: ['mistral-large-latest', 'mistral-small-latest'],
+    mistral: ['mistral-large-latest', 'mistral-small-latest', 'open-mistral-nemo'],
+    cerebras: ['llama-3.3-70b', 'llama3.1-8b'],
   };
   return map[provider] || ['gemini-2.5-flash'];
 }

@@ -2427,6 +2427,25 @@ async def generate_llm_response(
             old_model, llm_provider, agent_model,
         )
 
+    # Sanitize decommissioned Groq models → current equivalent at dispatch time.
+    # This handles stale DB rows that still store the old name even after the user
+    # updated the dropdown (the dropdown shows the new name but llm_model in DB
+    # may not have been saved yet, or the agent was created before the deprecation).
+    _DECOMMISSIONED_GROQ = {
+        "mixtral-8x7b-32768",
+        "llama3-8b-8192",
+        "llama3-70b-8192",
+        "llama-3.1-70b-versatile",   # retired from free tier
+        "gemma-7b-it",               # retired
+    }
+    if llm_provider == "groq" and agent_model in _DECOMMISSIONED_GROQ:
+        new_model = "llama-3.3-70b-versatile"
+        logger.warning(
+            "Groq model '%s' is decommissioned — auto-upgrading to '%s'",
+            agent_model, new_model,
+        )
+        agent_model = new_model
+
     # Admin-configured response length cap (AgentDetail.tsx "Max Tokens" field).
     # Was previously ignored here — every provider call hardcoded 150 regardless
     # of this setting, so the UI field had no effect on the in-browser tester.
@@ -2475,6 +2494,10 @@ async def generate_llm_response(
             or "unsupported_country" in err_low
             or "permission_denied" in err_low
             or "failed_precondition" in err_low
+            or "model_decommissioned" in err_low      # Groq/OpenAI retired model
+            or "decommissioned" in err_low            # generic form
+            or "no longer supported" in err_low       # Groq error wording
+            or "deprecated" in err_low
             or " 400" in err_msg_pad(error_msg)  # see helper
             or " 401" in err_msg_pad(error_msg)
             or " 403" in err_msg_pad(error_msg)
