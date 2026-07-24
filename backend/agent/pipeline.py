@@ -530,9 +530,6 @@ async def entrypoint(ctx) -> None:
     call_record_id = await _create_call_record(tenant_id, agent_id, call_meta)
     call_meta["call_record_id"] = call_record_id
 
-    # ── Connect to LiveKit room ────────────────────────────────────────────
-    await ctx.connect()
-
     # ── Generate agent token ───────────────────────────────────────────────
     agent_token = _generate_agent_token(room_name)
 
