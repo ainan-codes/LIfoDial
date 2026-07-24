@@ -67,7 +67,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Also registers new models for auto-create
     from backend.models import bulk_call  # noqa: ensure BulkCallCampaign is loaded
     await init_db()
-    print("[OK] Session store ready (in-memory)")
+
+    # Resolve the session-store backend once at startup (connects to Redis if
+    # REDIS_URL is a real server, else stays in-memory) so logs + the System
+    # Health card report the truth from the first request.
+    from backend import redis_client as _rc
+    await _rc.ping()
+    print(f"[OK] Session store ready ({_rc.BACKEND})")
 
     # Sync .env API keys into the database so they show in AI Platform
     try:

@@ -701,14 +701,16 @@ async def system_health_status(user: SuperAdmin = None):
     # than the old hardcoded "healthy / <1ms" card.
     try:
         from backend import redis_client as _rc
+        session_connected = await _rc.ping()  # resolves + verifies the backend
         backend_kind = getattr(_rc, "BACKEND", "in-memory")
     except Exception:
         backend_kind = "in-memory"
+        session_connected = True
     results["session_store"] = {
         "type": backend_kind,
-        "connected": True,
+        "connected": session_connected,
         "note": "In-process store (no Redis wired). Session state is per-worker and lost on restart."
-                if backend_kind == "in-memory" else "Redis connected.",
+                if backend_kind == "in-memory" else "Redis connected — sessions durable and shareable.",
     }
 
     # ── LiveKit: real connectivity check, not just an env-var presence test ───

@@ -45,5 +45,10 @@ sentry-sdk[fastapi]>=2.20.0,<3.0
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 websockets>=12.0
 
+# ── Session store (optional Redis backend; auto-falls-back to in-memory) ─────
+# backend/redis_client.py uses this only when REDIS_URL is a real redis:// server;
+# if the package or server is absent it degrades to the in-process dict.
+redis>=5.0.0
+
 # ── Image processing (widget avatar resize/optimize) ─────────────────────────
 Pillow>=10.0.0
