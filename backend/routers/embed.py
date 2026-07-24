@@ -34,10 +34,14 @@ def _is_published(agent: AgentConfig) -> bool:
     return agent.status == "ACTIVE"
 
 # ── In-memory rate limits ──────────────────────────────────────────────────────
-# {session_id: [timestamps]}
+# NOTE: this state is per-process. Under multiple Render workers / after a
+# restart it does not hold globally — a Redis-backed limiter is the real fix
+# (tracked in the audit as part of moving shared state to Redis). This still
+# blunts single-instance abuse, which is what runs today.
+# {session_id: [message timestamps]}
 _session_messages: dict[str, list[float]] = defaultdict(list)
-# {agent_id: [timestamps]}
-_agent_sessions: dict[str, list[float]] = defaultdict(list)
+# {agent_id: {session_id: first_seen_ts}} — one entry per distinct session in the window
+_agent_sessions: dict[str, dict[str, float]] = defaultdict(dict)
 
 MAX_MESSAGES_PER_MINUTE = 10
 MAX_SESSIONS_PER_AGENT_PER_HOUR = 50
@@ -46,22 +50,26 @@ MAX_SESSIONS_PER_AGENT_PER_HOUR = 50
 def _check_rate_limit(agent_id: str, session_id: str) -> None:
     now = time.time()
 
-    # Per-session: max 10 messages per 60s
-    msgs = _session_messages[session_id]
-    _session_messages[session_id] = [t for t in msgs if now - t < 60]
-    if len(_session_messages[session_id]) >= MAX_MESSAGES_PER_MINUTE:
+    # Per-session: max 10 messages per 60s.
+    msgs = [t for t in _session_messages[session_id] if now - t < 60]
+    if len(msgs) >= MAX_MESSAGES_PER_MINUTE:
+        _session_messages[session_id] = msgs
         raise HTTPException(429, "Rate limit exceeded. Please wait before sending more messages.")
-    _session_messages[session_id].append(now)
+    msgs.append(now)
+    _session_messages[session_id] = msgs
 
-    # Per-agent: max 50 new sessions per hour
-    sessions = _agent_sessions[agent_id]
-    _agent_sessions[agent_id] = [t for t in sessions if now - t < 3600]
-    # Only count if this session hasn't been seen in last hour
-    known = session_id in {s for s in _session_messages}
-    if not known and len(_agent_sessions[agent_id]) >= MAX_SESSIONS_PER_AGENT_PER_HOUR:
-        raise HTTPException(429, "This agent has reached its hourly session limit.")
-    if not known:
-        _agent_sessions[agent_id].append(now)
+    # Per-agent: max 50 DISTINCT sessions per rolling hour. This is the backstop
+    # against a client rotating session_id to dodge the per-session cap above —
+    # each new session_id counts here. (The previous `known` check was dead: the
+    # session had just been recorded in _session_messages, so it was always True
+    # and this cap never fired.)
+    seen = _agent_sessions[agent_id]
+    for sid in [s for s, ts in seen.items() if now - ts >= 3600]:
+        del seen[sid]
+    if session_id not in seen:
+        if len(seen) >= MAX_SESSIONS_PER_AGENT_PER_HOUR:
+            raise HTTPException(429, "This agent has reached its hourly session limit.")
+        seen[session_id] = now
 
 
 def _cors_headers() -> dict:
