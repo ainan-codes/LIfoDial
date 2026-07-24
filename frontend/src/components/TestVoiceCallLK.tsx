@@ -244,14 +244,32 @@ export default function TestVoiceCallLK({
         onDisconnected={handleDisconnect}
         style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}
       >
-        <TestCallUI agentName={agentName} avatarUrl={avatarUrl} micAvailable={micAvailable} onDisconnect={handleDisconnect} />
+        <TestCallUI
+          agentName={agentName}
+          avatarUrl={avatarUrl}
+          micAvailable={micAvailable}
+          onDisconnect={handleDisconnect}
+          onRetry={() => { handleDisconnect(); startCall(); }}
+        />
         <RoomAudioRenderer />
       </LiveKitRoom>
     </div>
   );
 }
 
-function TestCallUI({ agentName, avatarUrl, micAvailable, onDisconnect }: { agentName?: string; avatarUrl?: string; micAvailable?: boolean; onDisconnect: () => void }) {
+function TestCallUI({
+  agentName,
+  avatarUrl,
+  micAvailable,
+  onDisconnect,
+  onRetry,
+}: {
+  agentName?: string;
+  avatarUrl?: string;
+  micAvailable?: boolean;
+  onDisconnect: () => void;
+  onRetry?: () => void;
+}) {
 
   const { state, audioTrack, agentTranscriptions, agent } = useVoiceAssistant();
   const scrollRef = useRef<HTMLDivElement | null>(null);
