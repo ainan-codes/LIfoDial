@@ -173,9 +173,12 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
 
 def _generate_agent_token(room_name: str) -> str:
     """
-    Generate a LiveKit access token for the agent to join a room.
+    Generate a LiveKit access token for the Pipecat agent to join a room.
 
-    The agent joins as 'lifodial-agent' with full publish permissions.
+    CRITICAL: agent=True MUST be set in VideoGrants. Without it the LiveKit
+    frontend SDK's useVoiceAssistant hook cannot identify this participant as
+    the AI agent — the UI waits forever 'for the agent to join the call' and
+    the call is completely silent even though the agent has technically joined.
     """
     token = livekit_api.AccessToken(
         settings.livekit_api_key,
@@ -190,6 +193,7 @@ def _generate_agent_token(room_name: str) -> str:
             can_publish=True,
             can_subscribe=True,
             can_publish_data=True,
+            agent=True,  # REQUIRED: marks this as the AI agent for useVoiceAssistant
         )
     )
     return token.to_jwt()
@@ -530,15 +534,14 @@ async def entrypoint(ctx) -> None:
     call_record_id = await _create_call_record(tenant_id, agent_id, call_meta)
     call_meta["call_record_id"] = call_record_id
 
-    # ── Connect to LiveKit room (REQUIRED by livekit-agents) ───────────────
-    # ctx.connect() MUST be called here. Without it livekit-agents never marks
-    # the dispatched job as accepted and fires the 15s dispatch alarm
-    # ("Agent never joined room"). Pipecat's LiveKitTransport opens its own
-    # WebRTC track connection separately — ctx.connect() and LiveKitTransport
-    # are complementary, not alternatives.
-    await ctx.connect(auto_subscribe=False)  # auto_subscribe=False: transport handles subscriptions
+    # ── Connect to LiveKit room ───────────────────────────────────────────────
+    # NOTE: We do NOT call ctx.connect() here. The livekit-agents framework
+    # dispatches this job and expects ONE agent participant. ctx.connect() would
+    # add a second participant without agent=True, giving 3 total (user +
+    # framework-ghost + Pipecat agent), breaking useVoiceAssistant detection.
+    # LiveKitTransport with agent=True token is the sole connection.
 
-    # ── Generate agent token ───────────────────────────────────────────────
+    # ── Generate agent token (agent=True grant so useVoiceAssistant finds us) ──
     agent_token = _generate_agent_token(room_name)
 
     # ── Resolve TTS voice & model ──────────────────────────────────────────
@@ -599,7 +602,9 @@ async def entrypoint(ctx) -> None:
 
     # ── Instantiate Pipecat services ───────────────────────────────────────
 
-    # Transport — connects Pipecat to the LiveKit room
+    # Transport — connects Pipecat to the LiveKit room.
+    # agent_token has agent=True in VideoGrants so the frontend useVoiceAssistant
+    # hook identifies this participant as the AI agent correctly.
     transport = LiveKitTransport(
         url=settings.livekit_url,
         token=agent_token,
@@ -610,9 +615,9 @@ async def entrypoint(ctx) -> None:
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    stop_secs=0.85,     # 850ms silence before turn ends (allows natural mid-turn pauses)
-                    start_secs=0.25,    # 250ms continuous speech to capture fast voice input
-                    confidence=0.6,     # 60% confidence threshold (balanced for clear speech vs clicks)
+                    stop_secs=0.85,
+                    start_secs=0.25,
+                    confidence=0.6,
                 )
             ),
         ),
