@@ -1831,7 +1831,11 @@ async def sarvam_transcribe(api_key: str, audio_bytes: bytes,
         original_mime = upload_mime
         original_name = upload_name
         try:
-            processed_bytes = _convert_to_wav_pcm(audio_bytes)
+            # ffmpeg transcode is blocking (subprocess + file I/O). Run it in a
+            # worker thread so it does NOT stall the event loop — otherwise every
+            # WebM/Opus turn serializes ALL concurrent calls (audit P2).
+            loop = asyncio.get_running_loop()
+            processed_bytes = await loop.run_in_executor(None, _convert_to_wav_pcm, audio_bytes)
             upload_name = "audio.wav"
             upload_mime = "audio/wav"
             logger.info("STT: Converted %s → WAV (%d → %d bytes)", 
