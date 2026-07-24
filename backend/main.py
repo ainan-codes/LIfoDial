@@ -39,6 +39,25 @@ _nf = _IgnoreNoiseFilter()
 for _uv in ("uvicorn.access", "uvicorn.error", "uvicorn", ""):
     logging.getLogger(_uv).addFilter(_nf)
 
+# ── Error monitoring (Sentry) ──────────────────────────────────────────────────
+# Initialized only when SENTRY_DSN is set (audit O1: previously declared in
+# render.yaml but never installed/initialized). Guarded import so the backend
+# still boots if the SDK isn't present. PII is NOT sent — this app handles
+# patient data, so send_default_pii stays False.
+if settings.sentry_dsn:
+    try:
+        import sentry_sdk
+
+        sentry_sdk.init(
+            dsn=settings.sentry_dsn,
+            environment=settings.environment,
+            traces_sample_rate=0.1,
+            send_default_pii=False,
+        )
+        logger.info("Sentry error monitoring initialized (env=%s)", settings.environment)
+    except Exception as _sentry_err:  # pragma: no cover - defensive
+        logger.warning("Sentry init failed (non-fatal): %s", _sentry_err)
+
 # ── Lifespan (startup / shutdown) ──────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:

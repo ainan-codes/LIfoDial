@@ -38,6 +38,9 @@ stripe==11.5.0
 
 # ── Analytics & monitoring ───────────────────────────────────────────────────
 posthog==3.8.3
+# Error monitoring. Wired in main.py only when SENTRY_DSN is set (audit O1:
+# previously declared in render.yaml but never installed or initialized).
+sentry-sdk[fastapi]>=2.20.0,<3.0
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 websockets>=12.0

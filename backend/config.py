@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     environment: str = "development"
     secret_key: str = "change_me"
 
+    # ── Error monitoring (Sentry) — optional; set SENTRY_DSN in prod env ─────
+    sentry_dsn: str = ""
+
     # ── Superadmin (platform owner) login — set these in prod env ───────────
     superadmin_email: str = "admin@lifodial.com"
     superadmin_password: str = ""  # if empty in prod, superadmin login is disabled
