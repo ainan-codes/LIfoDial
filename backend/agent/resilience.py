@@ -56,7 +56,7 @@ def _provider_from_model(model: str) -> Optional[str]:
     m = (model or "").lower()
     if m.startswith("gemini"):
         return "gemini"
-    if m.startswith(("llama", "mixtral", "gemma", "compound", "deepseek-r1")):
+    if m.startswith(("llama", "mixtral", "gemma", "compound", "deepseek-r1", "moonshard", "whisper")):
         return "groq"
     if m.startswith(("gpt-", "o1", "o3", "chatgpt")):
         return "openai"
@@ -79,11 +79,6 @@ async def _probe(provider: str, key: str) -> bool:
     if not key.strip():
         return False
     try:
-        # Tight timeouts: a dead/leaked key should be declared dead in ~1.5s, not
-        # 6s. Serialized probes with a 6s cap could add up to ~24s of dead air.
-        # NOTE: httpx.Timeout requires a default (1st positional) OR all four of
-        # connect/read/write/pool — passing only connect+read raises and made
-        # EVERY probe fail (no provider selected → agent job crashed).
         async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=1.5, read=3.0)) as c:
             if provider == "gemini":
                 r = await c.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={key}")
@@ -115,11 +110,12 @@ async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
     is honored), then the remaining providers in PROVIDER_ORDER. The configured
     model is kept only when its own provider wins; otherwise the fallback
     provider's default model is used.
-
-    Raises RuntimeError if NO provider is reachable — the caller decides whether
-    that's fatal (it should be: a call with no LLM can't function).
     """
     configured_model = agent_config.get("llm_model") or ""
+    # Auto-sanitize decommissioned models
+    if configured_model in {"mixtral-8x7b-32768", "llama3-8b-8192", "llama3-70b-8192", "gemma-7b-it"}:
+        configured_model = "llama-3.3-70b-versatile"
+
     preferred = _provider_from_model(configured_model) or "gemini"
 
     order: list[str] = [preferred] + [p for p in PROVIDER_ORDER if p != preferred]

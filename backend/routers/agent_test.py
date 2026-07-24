@@ -2410,7 +2410,7 @@ async def generate_llm_response(
         "gemini": ["gemini"],
         "openai": ["gpt-", "o1-", "o3-"],
         "anthropic": ["claude"],
-        "groq": ["llama", "mixtral", "gemma", "whisper"],
+        "groq": ["llama", "mixtral", "gemma", "whisper", "compound", "deepseek-r1", "moonshard"],
         "deepseek": ["deepseek"],
         "mistral": ["mistral"],
     }
