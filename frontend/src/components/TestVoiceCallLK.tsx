@@ -18,11 +18,6 @@ const SLOW_MS = 12_000;
 const TIMEOUT_MS = 60_000;
 const AGENT_WAIT_MS = 45_000;
 
-function isAgentParticipant(p: any) {
-  const id: string = p?.identity || '';
-  return id.startsWith('lifodial-agent') || id.startsWith('agent-');
-}
-
 function TestCallUI({
   agentName,
   avatarUrl,
@@ -48,18 +43,26 @@ function TestCallUI({
     }
   }, [connState, room]);
 
-  // Find agent participant by identity prefix (lifodial-agent-* or agent-*)
-  const agentParticipant = remoteParticipants.find(isAgentParticipant) ?? remoteParticipants[0] ?? null;
-
-  // Find agent's audio track ref via useTracks (no restrictive source filter)
+  // Find all audio tracks from remote participants
   const allTracks = useTracks(undefined, { updateOnlyOn: [] });
-  const agentAudioTrack = allTracks.find(
+  const audioTrackRef = allTracks.find(
     (t) =>
       t.publication &&
       t.publication.kind === 'audio' &&
       t.participant &&
-      (isAgentParticipant(t.participant) || remoteParticipants.includes(t.participant))
-  )?.publication ?? null;
+      t.participant.identity !== room?.localParticipant?.identity
+  ) ?? null;
+
+  // The agent participant MUST match the participant owning the audio track,
+  // or fallback to identity starting with 'lifodial-agent', then 'agent-', then first remote.
+  const agentParticipant =
+    audioTrackRef?.participant ??
+    remoteParticipants.find((p) => p.identity.startsWith('lifodial-agent')) ??
+    remoteParticipants.find((p) => p.identity.startsWith('agent-')) ??
+    remoteParticipants[0] ??
+    null;
+
+  const agentAudioTrack = audioTrackRef?.publication ?? null;
 
   const [transcript] = useState<{ id: string; role: string; text: string }[]>([]);
   const [agentState, setAgentState] = useState<string>('connecting');

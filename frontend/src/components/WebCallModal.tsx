@@ -22,11 +22,6 @@ interface Agent {
   llm_model: string
 }
 
-function isAgentParticipant(p: any) {
-  const id: string = p?.identity || ''
-  return id.startsWith('lifodial-agent') || id.startsWith('agent-')
-}
-
 export function WebCallModal({ 
   agent, 
   onClose 
@@ -149,16 +144,24 @@ function CallUI({ agent, duration, formatTime, onClose }: { agent: Agent, durati
     }
   }, [connState, room])
 
-  const agentParticipant = remoteParticipants.find(isAgentParticipant) ?? remoteParticipants[0] ?? null
-
+  // Find all audio tracks from remote participants
   const allTracks = useTracks(undefined, { updateOnlyOn: [] })
-  const agentAudioTrack = allTracks.find(
+  const audioTrackRef = allTracks.find(
     (t) =>
       t.publication &&
       t.publication.kind === 'audio' &&
       t.participant &&
-      (isAgentParticipant(t.participant) || remoteParticipants.includes(t.participant))
-  )?.publication ?? null
+      t.participant.identity !== room?.localParticipant?.identity
+  ) ?? null
+
+  const agentParticipant =
+    audioTrackRef?.participant ??
+    remoteParticipants.find((p) => p.identity.startsWith('lifodial-agent')) ??
+    remoteParticipants.find((p) => p.identity.startsWith('agent-')) ??
+    remoteParticipants[0] ??
+    null
+
+  const agentAudioTrack = audioTrackRef?.publication ?? null
 
   const [agentState, setAgentState] = useState<string>('connecting')
 
