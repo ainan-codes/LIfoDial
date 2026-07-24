@@ -1,3 +1,4 @@
+import { Headphones, Mic, Phone, PhoneOff, RotateCcw } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import {
   LiveKitRoom,
@@ -9,27 +10,8 @@ import {
 import '@livekit/components-styles';
 import fetchWithAuth from '../api/client';
 
-/**
- * TestVoiceCallLK — the "Test Agent" voice tab, running on the SAME real-time
- * LiveKit + Pipecat pipeline as production web/phone calls (test_mode=true).
- *
- * Restored in this file (audit regression fix):
- *  - Live TRANSCRIPT of the agent's speech (chat bubbles), which the pre-LiveKit
- *    WebSocket harness used to show and the LiveKit migration (2b22342) dropped.
- *  - A real TIMEOUT + error/retry on "Connecting…" so a cold-started worker or a
- *    failed connect never leaves an indefinite spinner.
- *  - Listen-only fallback when there's no microphone.
- *  - Mobile-responsive layout (transcript scrolls; controls wrap) at ~375px+.
- */
-
-// After this long still "connecting", warn the user it may be a cold start.
 const SLOW_MS = 12_000;
-// After this long, stop pretending and offer a retry (accommodates free-tier
-// worker cold starts, which can take ~30–60s, without being infinite).
 const TIMEOUT_MS = 45_000;
-// How long to wait for the agent worker to JOIN the room before showing the
-// cold-start notice. The free-tier worker cold start is ~52.8s measured, so 12s
-// was far too eager (it fired on every call). Match the real cold-start window.
 const AGENT_WAIT_MS = 60_000;
 
 export default function TestVoiceCallLK({
@@ -47,84 +29,171 @@ export default function TestVoiceCallLK({
 }) {
   const [token, setToken] = useState('');
   const [wsUrl, setWsUrl] = useState('');
-  const [phase, setPhase] = useState<'connecting' | 'live' | 'error' | 'demo'>('connecting');
+  const [phase, setPhase] = useState<'idle' | 'connecting' | 'live' | 'error' | 'demo'>('idle');
   const [error, setError] = useState('');
-  // No mic is NOT fatal — connect listen-only so the agent can still be heard/read.
   const [micAvailable, setMicAvailable] = useState(true);
-  // Connecting is taking a while (likely a free-tier cold start).
   const [slow, setSlow] = useState(false);
-  // Bumping this re-runs the connect effect (Retry).
   const [attempt, setAttempt] = useState(0);
 
-  useEffect(() => {
-    let cancelled = false;
+  const startCall = async () => {
     setPhase('connecting');
     setError('');
     setSlow(false);
 
-    const slowTimer = setTimeout(() => { if (!cancelled) setSlow(true); }, SLOW_MS);
+    const slowTimer = setTimeout(() => setSlow(true), SLOW_MS);
     const hardTimer = setTimeout(() => {
-      if (!cancelled) {
-        setError('Connection timed out. The voice service may be starting up (cold start). Please try again.');
-        setPhase('error');
-      }
+      setError('Connection timed out. The voice service may be starting up (cold start). Please try again.');
+      setPhase('error');
     }, TIMEOUT_MS);
 
-    const connect = async () => {
+    try {
       try {
-        // Try to grab the mic first (so LiveKit publishes audio for STT). Missing
-        // or denied mic is non-fatal → listen-only.
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          stream.getTracks().forEach(t => t.stop());
-          if (!cancelled) setMicAvailable(true);
-        } catch (micErr: any) {
-          if (cancelled) return;
-          console.warn('Mic unavailable — connecting listen-only:', micErr?.name || micErr);
-          setMicAvailable(false);
-        }
-
-        // Same endpoint as real web calls — test_mode flags no-billing and lets the
-        // worker bypass the publish gate so unpublished agents are testable.
-        const data = await fetchWithAuth(`/agents/${agentId}/web-call-token?test_mode=true`, { method: 'POST' });
-        if (cancelled) return;
-        if (data?.demo || !data?.token) {
-          setPhase('demo');
-          return;
-        }
-        setToken(data.token);
-        setWsUrl(data.wsUrl);
-        setPhase('live');
-      } catch (e: any) {
-        if (cancelled) return;
-        setError(e?.message || 'Failed to start the test call.');
-        setPhase('error');
-      } finally {
-        clearTimeout(hardTimer);
-        if (!cancelled) clearTimeout(slowTimer);
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach(t => t.stop());
+        setMicAvailable(true);
+      } catch (micErr: any) {
+        console.warn('Mic unavailable — connecting listen-only:', micErr?.name || micErr);
+        setMicAvailable(false);
       }
-    };
-    connect();
-    return () => { cancelled = true; clearTimeout(slowTimer); clearTimeout(hardTimer); };
-  }, [agentId, attempt]);
 
-  const retry = () => setAttempt(a => a + 1);
+      const data = await fetchWithAuth(`/agents/${agentId}/web-call-token?test_mode=true`, { method: 'POST' });
+      if (data?.demo || !data?.token) {
+        setPhase('demo');
+        return;
+      }
+      setToken(data.token);
+      setWsUrl(data.wsUrl);
+      setPhase('live');
+    } catch (e: any) {
+      setError(e?.message || 'Failed to start the test call.');
+      setPhase('error');
+    } finally {
+      clearTimeout(hardTimer);
+      clearTimeout(slowTimer);
+    }
+  };
+
+  const handleDisconnect = () => {
+    setToken('');
+    setWsUrl('');
+    setPhase('idle');
+  };
 
   const shell = (children: React.ReactNode) => (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '14px', padding: '20px', textAlign: 'center', color: '#fff' }}>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '14px', padding: '24px', textAlign: 'center', color: '#fff' }}>
       {children}
     </div>
   );
 
+  // ── PRE-CALL LANDING STATE (Idle — requires user to click Start Call) ─────
+  if (phase === 'idle') {
+    const language = agent?.stt_language || agent?.tts_language || agent?.language || 'en-IN';
+    const llmModel = (agent?.llm_model || 'gemini-2.5-flash').replace('gemini-', 'g-').replace('-versatile', '');
+    const ttsVoice = agent?.tts_voice || 'priya';
+
+    return shell(
+      <>
+        {/* Glow badge avatar */}
+        <div style={{ position: 'relative', margin: '12px 0' }}>
+          <div style={{
+            position: 'absolute', inset: -6, borderRadius: '50%',
+            background: 'radial-gradient(circle, rgba(62,207,142,0.4) 0%, rgba(62,207,142,0) 70%)',
+            animation: 'pulseGlow 2.5s infinite ease-in-out'
+          }} />
+          {avatarUrl ? (
+            <img
+              src={avatarUrl}
+              alt={agentName || 'Agent'}
+              style={{
+                position: 'relative', width: 72, height: 72, borderRadius: '50%',
+                objectFit: 'cover', border: '3px solid #3ECF8E',
+                boxShadow: '0 0 20px rgba(62,207,142,0.3)',
+              }}
+              onError={e => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+            />
+          ) : (
+            <div style={{
+              position: 'relative', width: 72, height: 72, borderRadius: '50%',
+              background: 'rgba(62,207,142,0.12)', border: '3px solid #3ECF8E',
+              boxShadow: '0 0 20px rgba(62,207,142,0.3)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}>
+              <Headphones size={36} color="#3ECF8E" />
+            </div>
+          )}
+        </div>
+
+        {/* Title */}
+        <div style={{ fontSize: 18, fontWeight: 700, color: '#ffffff' }}>
+          {agentName || 'AI Receptionist'}
+        </div>
+        <div style={{ fontSize: 12, color: '#888', maxWidth: 300, lineHeight: 1.5 }}>
+          Real-time AI voice testing via Pipecat + LiveKit pipeline
+        </div>
+
+        {/* Config Badges */}
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'center', margin: '6px 0' }}>
+          <span style={{ fontSize: 11, padding: '3px 10px', borderRadius: 12, background: 'rgba(62,207,142,0.1)', border: '1px solid rgba(62,207,142,0.3)', color: '#3ECF8E', fontWeight: 600 }}>
+            🌐 {language}
+          </span>
+          <span style={{ fontSize: 11, padding: '3px 10px', borderRadius: 12, background: 'rgba(96,165,250,0.1)', border: '1px solid rgba(96,165,250,0.3)', color: '#60A5FA', fontWeight: 600 }}>
+            ⚡ {llmModel}
+          </span>
+          <span style={{ fontSize: 11, padding: '3px 10px', borderRadius: 12, background: 'rgba(167,139,250,0.1)', border: '1px solid rgba(167,139,250,0.3)', color: '#A78BFA', fontWeight: 600 }}>
+            🎙️ {ttsVoice}
+          </span>
+        </div>
+
+        {/* Green Start Call Button */}
+        <button
+          onClick={startCall}
+          style={{
+            marginTop: 12,
+            padding: '14px 32px',
+            borderRadius: 40,
+            background: '#3ECF8E',
+            color: '#051b11',
+            fontWeight: 700,
+            fontSize: 15,
+            border: 'none',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            boxShadow: '0 0 24px rgba(62,207,142,0.4)',
+            transition: 'all 0.2s ease',
+          }}
+          onMouseEnter={e => {
+            e.currentTarget.style.transform = 'scale(1.04)';
+            e.currentTarget.style.boxShadow = '0 0 32px rgba(62,207,142,0.6)';
+          }}
+          onMouseLeave={e => {
+            e.currentTarget.style.transform = 'scale(1)';
+            e.currentTarget.style.boxShadow = '0 0 24px rgba(62,207,142,0.4)';
+          }}
+        >
+          <Mic size={20} color="#051b11" /> Start Voice Call
+        </button>
+
+        <style>{`
+          @keyframes pulseGlow {
+            0%, 100% { transform: scale(1); opacity: 0.5; }
+            50% { transform: scale(1.15); opacity: 0.9; }
+          }
+        `}</style>
+      </>
+    );
+  }
+
   if (phase === 'connecting') {
     return shell(
       <>
-        <div style={{ width: 34, height: 34, border: '3px solid #2e2e2e', borderTopColor: '#3ECF8E', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
-        <div style={{ fontSize: 14, fontWeight: 600 }}>Connecting to {agentName || 'agent'}…</div>
-        <div style={{ fontSize: 12, color: '#666' }}>Setting up the live pipeline</div>
+        <div style={{ width: 36, height: 36, border: '3px solid #1f1f1f', borderTopColor: '#3ECF8E', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
+        <div style={{ fontSize: 15, fontWeight: 600 }}>Connecting to {agentName || 'agent'}…</div>
+        <div style={{ fontSize: 12, color: '#666' }}>Setting up LiveKit WebRTC pipeline</div>
         {slow && (
           <div style={{ fontSize: 12, color: '#F59E0B', maxWidth: 320, lineHeight: 1.5, marginTop: 4 }}>
-            Taking longer than expected — the voice service may be starting up (free-tier cold start can take ~30–60s). Please wait…
+            Starting worker instance (Render cold start can take ~20-30s). Please wait…
           </div>
         )}
       </>
@@ -138,8 +207,12 @@ export default function TestVoiceCallLK({
         <div style={{ fontSize: 14, fontWeight: 600 }}>Couldn’t start the test call</div>
         <div style={{ fontSize: 12, color: '#888', maxWidth: 300 }}>{error}</div>
         <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-          <button onClick={retry} style={{ padding: '6px 16px', borderRadius: 8, border: 'none', background: '#3ECF8E', color: '#000', fontWeight: 600, cursor: 'pointer' }}>Retry</button>
-          {onClose && <button onClick={onClose} style={{ padding: '6px 16px', borderRadius: 8, border: '1px solid #2e2e2e', background: 'none', color: '#fff', cursor: 'pointer' }}>Close</button>}
+          <button onClick={startCall} style={{ padding: '8px 20px', borderRadius: 8, border: 'none', background: '#3ECF8E', color: '#000', fontWeight: 600, cursor: 'pointer' }}>
+            <RotateCcw size={14} style={{ display: 'inline', marginRight: 6 }} /> Retry
+          </button>
+          <button onClick={handleDisconnect} style={{ padding: '8px 20px', borderRadius: 8, border: '1px solid #2e2e2e', background: 'none', color: '#fff', cursor: 'pointer' }}>
+            Back
+          </button>
         </div>
       </>
     );
@@ -151,9 +224,11 @@ export default function TestVoiceCallLK({
         <div style={{ fontSize: 28 }}>🔌</div>
         <div style={{ fontSize: 14, fontWeight: 600 }}>LiveKit not configured</div>
         <div style={{ fontSize: 12, color: '#888', maxWidth: 320 }}>
-          Set <code>LIVEKIT_URL</code>, <code>LIVEKIT_API_KEY</code>, and <code>LIVEKIT_API_SECRET</code> in
-          <code>.env</code>, and run the agent worker (<code>python -m backend.agent start</code>) to test voice on the real pipeline.
+          Set <code>LIVEKIT_URL</code>, <code>LIVEKIT_API_KEY</code>, and <code>LIVEKIT_API_SECRET</code> in <code>.env</code>.
         </div>
+        <button onClick={handleDisconnect} style={{ padding: '8px 20px', borderRadius: 8, border: '1px solid #2e2e2e', background: 'none', color: '#fff', cursor: 'pointer', marginTop: 12 }}>
+          Back
+        </button>
       </>
     );
   }
@@ -166,17 +241,18 @@ export default function TestVoiceCallLK({
         connect={true}
         audio={micAvailable}
         video={false}
-        onDisconnected={onClose}
+        onDisconnected={handleDisconnect}
         style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}
       >
-        <TestCallUI agentName={agentName} avatarUrl={avatarUrl} micAvailable={micAvailable} onRetry={retry} />
+        <TestCallUI agentName={agentName} avatarUrl={avatarUrl} micAvailable={micAvailable} onDisconnect={handleDisconnect} />
         <RoomAudioRenderer />
       </LiveKitRoom>
     </div>
   );
 }
 
-function TestCallUI({ agentName, avatarUrl, micAvailable, onRetry }: { agentName?: string; avatarUrl?: string; micAvailable?: boolean; onRetry?: () => void }) {
+function TestCallUI({ agentName, avatarUrl, micAvailable, onDisconnect }: { agentName?: string; avatarUrl?: string; micAvailable?: boolean; onDisconnect: () => void }) {
+
   const { state, audioTrack, agentTranscriptions, agent } = useVoiceAssistant();
   const scrollRef = useRef<HTMLDivElement | null>(null);
 

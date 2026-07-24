@@ -75,253 +75,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await _rc.ping()
     print(f"[OK] Session store ready ({_rc.BACKEND})")
 
-    # Sync .env API keys into the database so they show in AI Platform
-    try:
-        from backend.routers.platform import sync_keys_from_env
-        from backend.db import AsyncSessionLocal
-        async with AsyncSessionLocal() as db:
-            synced = await sync_keys_from_env(db)
-            if synced:
-                print(f"[OK] Synced {synced} API key(s) from .env into AI Platform")
-    except Exception as e:
-        logger.warning("Env key sync failed (non-fatal): %s", e)
-
-    # ── Migrate deprecated Gemini model references in existing agents ──────────
-    try:
-        from backend.db import AsyncSessionLocal
-        from sqlalchemy import text
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                text("UPDATE agent_configs SET llm_model = 'gemini-2.5-flash' WHERE llm_model = 'gemini-2.0-flash'")
-            )
-            migrated = result.rowcount
-            if migrated:
-                await db.commit()
-                logger.info("[STARTUP] Migrated %d agent(s) from gemini-2.0-flash → gemini-2.5-flash", migrated)
-    except Exception as e:
-        logger.warning("Model migration failed (non-fatal): %s", e)
-
-    # ── Fix agent names: rename voice-like names to professional clinic names ──
-    try:
-        from backend.db import AsyncSessionLocal
-        from sqlalchemy import text
-        # Mapping: old voice-like name → new professional name (keyed by agent ID)
-        AGENT_NAME_FIXES = {
-            "agent-001": ("Priya",  "Apollo Receptionist"),
-            "agent-002": ("Kavya",  "Aster Receptionist"),
-            "agent-003": ("Riya",   "Max Receptionist"),
-            "agent-004": ("Shreya", "Manipal Receptionist"),
-            "agent-005": ("Layla",  "Al Zahra Receptionist"),
-        }
-        async with AsyncSessionLocal() as db:
-            fixed = 0
-            for agent_id, (old_name, new_name) in AGENT_NAME_FIXES.items():
-                result = await db.execute(
-                    text(
-                        "UPDATE agent_configs SET agent_name = :new_name "
-                        "WHERE id = :id AND agent_name = :old_name"
-                    ),
-                    {"new_name": new_name, "id": agent_id, "old_name": old_name},
-                )
-                fixed += result.rowcount
-
-                # Also update system_prompt to remove "You are <VoiceName>," phrasing
-                await db.execute(
-                    text(
-                        "UPDATE agent_configs SET system_prompt = REPLACE(system_prompt, "
-                        "'You are ' || :old_name || ',', "
-                        "'You are') "
-                        "WHERE id = :id AND system_prompt LIKE '%You are ' || :old_name || ',%'"
-                    ),
-                    {"old_name": old_name, "id": agent_id},
-                )
-
-                # Also fix first_message references like "Main Priya hoon" or "I am Riya"
-                await db.execute(
-                    text(
-                        "UPDATE agent_configs SET first_message = REPLACE(first_message, "
-                        ":old_phrase, :new_phrase) "
-                        "WHERE id = :id AND first_message LIKE :like_pattern"
-                    ),
-                    {
-                        "old_phrase": f"Main {old_name} hoon",
-                        "new_phrase": "Main aapki AI receptionist hoon",
-                        "id": agent_id,
-                        "like_pattern": f"%Main {old_name} hoon%",
-                    },
-                )
-                await db.execute(
-                    text(
-                        "UPDATE agent_configs SET first_message = REPLACE(first_message, "
-                        ":old_phrase, :new_phrase) "
-                        "WHERE id = :id AND first_message LIKE :like_pattern"
-                    ),
-                    {
-                        "old_phrase": f"I am {old_name}",
-                        "new_phrase": "I am your AI receptionist",
-                        "id": agent_id,
-                        "like_pattern": f"%I am {old_name}%",
-                    },
-                )
-                # Fix "Naanu <Name>" (Kannada)
-                await db.execute(
-                    text(
-                        "UPDATE agent_configs SET first_message = REPLACE(first_message, "
-                        ":old_phrase, :new_phrase) "
-                        "WHERE id = :id AND first_message LIKE :like_pattern"
-                    ),
-                    {
-                        "old_phrase": f"Naanu {old_name}",
-                        "new_phrase": "Naanu nimma AI receptionist",
-                        "id": agent_id,
-                        "like_pattern": f"%Naanu {old_name}%",
-                    },
-                )
-                # Fix Arabic "أنا ليلى" → "أنا موظفة الاستقبال الذكية"
-                if old_name == "Layla":
-                    await db.execute(
-                        text(
-                            "UPDATE agent_configs SET first_message = REPLACE(first_message, "
-                            "'أنا ليلى،', 'أنا موظفة الاستقبال الذكية.') "
-                            "WHERE id = :id AND first_message LIKE '%أنا ليلى،%'"
-                        ),
-                        {"id": agent_id},
-                    )
-                # Fix Malayalam "ഞാൻ Kavya ആണ്" → "ഞാൻ നിങ്ങളുടെ AI റിസപ്ഷനിസ്റ്റ് ആണ്"
-                if old_name == "Kavya":
-                    await db.execute(
-                        text(
-                            "UPDATE agent_configs SET first_message = REPLACE(first_message, "
-                            "'ഞാൻ Kavya ആണ്', 'ഞാൻ നിങ്ങളുടെ AI റിസപ്ഷനിസ്റ്റ് ആണ്') "
-                            "WHERE id = :id AND first_message LIKE '%ഞാൻ Kavya ആണ്%'"
-                        ),
-                        {"id": agent_id},
-                    )
-            if fixed:
-                await db.commit()
-                logger.info("[STARTUP] Renamed %d agent(s) from voice-like names to professional names", fixed)
-    except Exception as e:
-        logger.warning("Agent name migration failed (non-fatal): %s", e)
-
-    # ── Dynamic voice/language/model self-healing migration ──────────────────
-    # This runs on EVERY startup and auto-corrects ANY misconfigured agent,
-    # regardless of how it was created. Future-proof: no hardcoded language lists.
-    try:
-        from backend.db import AsyncSessionLocal
-        from sqlalchemy import text
-
-        # Valid Sarvam languages (kept in sync with agent_test.py)
-        VALID_SARVAM_LANGS = {
-            "as-IN", "bn-IN", "brx-IN", "doi-IN", "en-IN", "gu-IN",
-            "hi-IN", "kn-IN", "kok-IN", "ks-IN", "mai-IN", "ml-IN",
-            "mni-IN", "mr-IN", "ne-IN", "od-IN", "pa-IN", "sa-IN",
-            "sat-IN", "sd-IN", "ta-IN", "te-IN", "ur-IN",
-        }
-
-        # Legacy v2 → v3 voice mapping
-        VOICE_REMAP = {
-            "meera": "shreya", "pavithra": "kavitha", "maitreyi": "priya",
-            "arvind": "rahul", "amol": "aditya", "amartya": "rohan",
-            "diya": "ritu", "neel": "amit", "misha": "simran", "vian": "shubh",
-        }
-
-        # Deprecated LLM models
-        DEPRECATED_LLM_MODELS = {
-            "gemini-2.0-flash": "gemini-2.5-flash",
-            "gemini-1.0-pro": "gemini-1.5-pro",
-        }
-
-        # Model prefixes per provider (for mismatch detection)
-        PROVIDER_MODEL_PREFIXES = {
-            "gemini": ["gemini"],
-            "openai": ["gpt-", "o1-", "o3-"],
-            "groq": ["llama", "mixtral", "gemma"],
-            "anthropic": ["claude"],
-            "deepseek": ["deepseek"],
-        }
-        PROVIDER_DEFAULTS = {
-            "gemini": "gemini-2.5-flash",
-            "openai": "gpt-4o-mini",
-            "groq": "llama-3.3-70b-versatile",
-            "anthropic": "claude-haiku-4-5",
-            "deepseek": "deepseek-chat",
-        }
-
-        async with AsyncSessionLocal() as db:
-            fixes = 0
-
-            # 1. Remap legacy v2 voices
-            for old_voice, new_voice in VOICE_REMAP.items():
-                r = await db.execute(
-                    text(
-                        "UPDATE agent_configs SET tts_voice = :new "
-                        "WHERE LOWER(tts_voice) = :old AND "
-                        "(tts_model = 'bulbul:v3' OR tts_model IS NULL OR tts_model = '')"
-                    ),
-                    {"new": new_voice, "old": old_voice},
-                )
-                fixes += r.rowcount
-
-            # 2. Dynamically fix ALL unsupported tts_language codes
-            # Fetch all distinct languages in use
-            rows = await db.execute(text("SELECT DISTINCT tts_language FROM agent_configs WHERE tts_language IS NOT NULL"))
-            all_langs = [r[0] for r in rows.fetchall() if r[0]]
-            for lang in all_langs:
-                if lang.strip() not in VALID_SARVAM_LANGS:
-                    r = await db.execute(
-                        text("UPDATE agent_configs SET tts_language = 'en-IN' WHERE tts_language = :old"),
-                        {"old": lang},
-                    )
-                    if r.rowcount:
-                        logger.info("[STARTUP] Remapped unsupported language '%s' → 'en-IN' (%d agents)", lang, r.rowcount)
-                    fixes += r.rowcount
-
-            # 3. Fix deprecated LLM models
-            for old_model, new_model in DEPRECATED_LLM_MODELS.items():
-                r = await db.execute(
-                    text("UPDATE agent_configs SET llm_model = :new WHERE llm_model = :old"),
-                    {"new": new_model, "old": old_model},
-                )
-                fixes += r.rowcount
-
-            # 4. Fix model-provider mismatches dynamically
-            # Query all agents and check if their model matches their provider
-            rows = await db.execute(
-                text("SELECT id, llm_provider, llm_model FROM agent_configs WHERE llm_provider IS NOT NULL AND llm_model IS NOT NULL")
-            )
-            for row in rows.fetchall():
-                aid, provider, model = row[0], row[1], row[2]
-                if provider in PROVIDER_MODEL_PREFIXES:
-                    valid_prefixes = PROVIDER_MODEL_PREFIXES[provider]
-                    if not any(model.lower().startswith(p) for p in valid_prefixes):
-                        default = PROVIDER_DEFAULTS.get(provider, "gemini-2.5-flash")
-                        await db.execute(
-                            text("UPDATE agent_configs SET llm_model = :new WHERE id = :id"),
-                            {"new": default, "id": aid},
-                        )
-                        logger.info("[STARTUP] Fixed model-provider mismatch for agent %s: '%s'/'%s' → '%s'", aid, provider, model, default)
-                        fixes += 1
-
-            # 5. Ensure all Sarvam TTS agents use bulbul:v3
-            r = await db.execute(
-                text(
-                    "UPDATE agent_configs SET tts_model = 'bulbul:v3' "
-                    "WHERE (tts_provider = 'sarvam' OR tts_provider IS NULL) "
-                    "AND tts_model != 'bulbul:v3' AND tts_model IS NOT NULL"
-                )
-            )
-            fixes += r.rowcount
-
-            if fixes:
-                await db.commit()
-                logger.info("[STARTUP] Auto-healed %d agent configuration(s)", fixes)
-    except Exception as e:
-        logger.warning("Voice/language fix migration failed (non-fatal): %s", e)
-
-    # ── API Warmup — eliminate cold-start latency ───────────────────────────
-    # Run in background (non-blocking) so startup doesn't stall
+    # Schedule background startup migrations & setup without delaying HTTP readiness
     import asyncio
-    asyncio.ensure_future(_warmup())
+    asyncio.create_task(_run_startup_migrations())
+    asyncio.create_task(_warmup())
+
 
     # ── Storage bucket init (idempotent, enforces size + MIME limits) ────────
     # Non-blocking — if Supabase is unreachable the app still boots.
@@ -336,7 +94,80 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Lifodial shut down cleanly")
 
 
+async def _run_startup_migrations() -> None:
+    """Run DB syncs and agent model auto-healing migrations non-blockingly."""
+    try:
+        from backend.routers.platform import sync_keys_from_env
+        from backend.db import AsyncSessionLocal
+        from sqlalchemy import text
+
+        async with AsyncSessionLocal() as db:
+            synced = await sync_keys_from_env(db)
+            if synced:
+                logger.info("[STARTUP] Synced %d API key(s) from .env into AI Platform", synced)
+
+            # 1. Migrate deprecated Gemini model references
+            await db.execute(
+                text("UPDATE agent_configs SET llm_model = 'gemini-2.5-flash' WHERE llm_model = 'gemini-2.0-flash'")
+            )
+
+            # 2. Fix agent names: rename voice-like names to professional clinic names
+            AGENT_NAME_FIXES = {
+                "agent-001": ("Priya",  "Apollo Receptionist"),
+                "agent-002": ("Kavya",  "Aster Receptionist"),
+                "agent-003": ("Riya",   "Max Receptionist"),
+                "agent-004": ("Shreya", "Manipal Receptionist"),
+                "agent-005": ("Layla",  "Al Zahra Receptionist"),
+            }
+            for agent_id, (old_name, new_name) in AGENT_NAME_FIXES.items():
+                await db.execute(
+                    text("UPDATE agent_configs SET agent_name = :new_name WHERE id = :id AND agent_name = :old_name"),
+                    {"new_name": new_name, "id": agent_id, "old_name": old_name},
+                )
+
+            # 3. Valid Sarvam languages & legacy voice remap
+            VALID_SARVAM_LANGS = {
+                "as-IN", "bn-IN", "brx-IN", "doi-IN", "en-IN", "gu-IN",
+                "hi-IN", "kn-IN", "kok-IN", "ks-IN", "mai-IN", "ml-IN",
+                "mni-IN", "mr-IN", "ne-IN", "od-IN", "pa-IN", "sa-IN",
+                "sat-IN", "sd-IN", "ta-IN", "te-IN", "ur-IN",
+            }
+            VOICE_REMAP = {
+                "meera": "shreya", "pavithra": "kavitha", "maitreyi": "priya",
+                "arvind": "rahul", "amol": "aditya", "amartya": "rohan",
+                "diya": "ritu", "neel": "amit", "misha": "simran", "vian": "shubh",
+            }
+            for old_voice, new_voice in VOICE_REMAP.items():
+                await db.execute(
+                    text("UPDATE agent_configs SET tts_voice = :new WHERE LOWER(tts_voice) = :old AND (tts_model = 'bulbul:v3' OR tts_model IS NULL OR tts_model = '')"),
+                    {"new": new_voice, "old": old_voice},
+                )
+
+            # 4. Fix unsupported tts_language codes
+            rows = await db.execute(text("SELECT DISTINCT tts_language FROM agent_configs WHERE tts_language IS NOT NULL"))
+            for (lang,) in rows.fetchall():
+                if lang and lang.strip() not in VALID_SARVAM_LANGS:
+                    await db.execute(
+                        text("UPDATE agent_configs SET tts_language = 'en-IN' WHERE tts_language = :old"),
+                        {"old": lang},
+                    )
+
+            # 5. Ensure all Sarvam TTS agents use bulbul:v3
+            await db.execute(
+                text(
+                    "UPDATE agent_configs SET tts_model = 'bulbul:v3' "
+                    "WHERE (tts_provider = 'sarvam' OR tts_provider IS NULL) "
+                    "AND tts_model != 'bulbul:v3' AND tts_model IS NOT NULL"
+                )
+            )
+            await db.commit()
+            logger.info("[STARTUP] Background migrations completed successfully.")
+    except Exception as exc:
+        logger.warning("Startup background migration error (non-fatal): %s", exc)
+
+
 async def _warmup() -> None:
+
     """Pre-warm DB connection pool, Sarvam API, and Gemini API.
     Failures are non-fatal — logged and swallowed.
     """
