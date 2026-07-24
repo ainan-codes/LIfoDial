@@ -81,7 +81,10 @@ async def _probe(provider: str, key: str) -> bool:
     try:
         # Tight timeouts: a dead/leaked key should be declared dead in ~1.5s, not
         # 6s. Serialized probes with a 6s cap could add up to ~24s of dead air.
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=1.5, read=3.0)) as c:
+        # NOTE: httpx.Timeout requires a default (1st positional) OR all four of
+        # connect/read/write/pool — passing only connect+read raises and made
+        # EVERY probe fail (no provider selected → agent job crashed).
+        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=1.5, read=3.0)) as c:
             if provider == "gemini":
                 r = await c.get(f"https://generativelanguage.googleapis.com/v1beta/models?key={key}")
             elif provider == "groq":

@@ -61,8 +61,12 @@ async def _get_client():
     _resolved = True
 
     url = (settings.redis_url or "").strip()
-    if not url or not url.startswith(("redis://", "rediss://")):
-        log.info("[SESSION] no real REDIS_URL configured — using in-memory session store")
+    # Treat the localhost default as "not configured" — otherwise every boot on
+    # Render (no local redis) logs a scary "connection refused" warning even
+    # though the in-memory fallback is working exactly as intended.
+    _DEFAULT_LOCAL = url in ("redis://localhost:6379", "redis://localhost:6379/0", "redis://127.0.0.1:6379")
+    if not url or _DEFAULT_LOCAL or not url.startswith(("redis://", "rediss://")):
+        log.info("[SESSION] no remote REDIS_URL configured — using in-memory session store")
         return None
     try:
         import redis.asyncio as aioredis
