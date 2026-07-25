@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from pipecat.frames.frames import ErrorFrame, TextFrame
+from pipecat.frames.frames import ErrorFrame, TTSSpeakFrame
 from pipecat.processors.frame_processor import FrameDirection
 
 from backend.agent import resilience as R
@@ -69,7 +69,11 @@ class _SpyTask:
         self.spoken = []
     async def queue_frames(self, frames):
         for f in frames:
-            if isinstance(f, TextFrame):
+            # Must be TTSSpeakFrame specifically: a bare TextFrame queued at the
+            # task source is NOT synthesized by TTSService outside an LLM response
+            # turn, so asserting on TextFrame here would pass while the caller
+            # actually heard silence.
+            if isinstance(f, TTSSpeakFrame):
                 self.spoken.append(f.text)
 
 

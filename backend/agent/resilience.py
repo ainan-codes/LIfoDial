@@ -16,7 +16,7 @@ Two guarantees, split by where the failure happens:
    If the chosen provider (LLM or TTS) throws AFTER the call is underway
    (429, timeout, network blip), Pipecat emits an ErrorFrame. This processor
    catches it and speaks a short reassurance phrase in the agent's language via
-   the same proven TextFrame→TTS path the greeting uses — so a failed turn is
+   the same proven TTSSpeakFrame→TTS path the greeting uses — so a failed turn is
    never dead air. Debounced + capped so a hard-down provider can't loop.
 
 Reuses the test path's provider preference order (groq→openai→...); it does not
@@ -32,7 +32,7 @@ from typing import Optional
 
 import httpx
 
-from pipecat.frames.frames import ErrorFrame, Frame, TextFrame
+from pipecat.frames.frames import ErrorFrame, Frame, TTSSpeakFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from backend.config import settings
@@ -241,9 +241,11 @@ class ResilienceProcessor(FrameProcessor):
         self._last_spoken_ts = now
         self._count += 1
         try:
-            # Same mechanism the first-message greeting uses: a TextFrame injected
-            # at the source is synthesized straight by TTS.
-            await self._task.queue_frames([TextFrame(self._phrase)])
+            # Same mechanism the first-message greeting uses: a TTSSpeakFrame
+            # injected at the source is synthesized straight by TTS. (A bare
+            # TextFrame is NOT — it only gets flushed as part of an LLM response
+            # turn, which is exactly the thing that just failed.)
+            await self._task.queue_frames([TTSSpeakFrame(self._phrase, append_to_context=False)])
             log.info("[RESILIENCE] spoke fallback phrase (#%d) instead of silence.", self._count)
         except Exception as e:
             log.error("[RESILIENCE] failed to queue fallback phrase: %s", e)

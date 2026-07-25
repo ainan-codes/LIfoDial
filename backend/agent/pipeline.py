@@ -41,7 +41,7 @@ from loguru import logger as pipecat_logger
 # ── Pipecat core ──────────────────────────────────────────────────────────────
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import TextFrame
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -175,10 +175,14 @@ def _generate_agent_token(room_name: str) -> str:
     """
     Generate a LiveKit access token for the Pipecat agent to join a room.
 
-    CRITICAL: agent=True MUST be set in VideoGrants. Without it the LiveKit
-    frontend SDK's useVoiceAssistant hook cannot identify this participant as
-    the AI agent — the UI waits forever 'for the agent to join the call' and
-    the call is completely silent even though the agent has technically joined.
+    NOTE: agent=True in VideoGrants does NOT make LiveKit report this participant
+    with kind=AGENT — verified empirically against LiveKit Cloud (livekit 1.1.3):
+    a token carrying the agent grant still joins as kind=0/STANDARD. Only the
+    livekit-agents job participant (from ctx.connect()) gets kind=AGENT, and it
+    publishes no tracks. That is why the frontend cannot rely on
+    useVoiceAssistant/kind to find the speaking agent and instead resolves it from
+    the subscribed audio track's participant (see TestVoiceCallLK.tsx). The grant
+    is kept because it is harmless and semantically correct.
     """
     token = livekit_api.AccessToken(
         settings.livekit_api_key,
@@ -453,12 +457,26 @@ async def entrypoint(ctx) -> None:
     # (SIP inbound, or a programmatic create_dispatch) carries it. Without this
     # fallback, explicit-dispatch jobs saw tenant/agent = None and ran on
     # defaults.
+    # ORDER MATTERS. ctx.room is a *not-yet-connected* rtc.Room at this point
+    # (ctx.connect() happens further down), so ctx.room.metadata is ALWAYS "" here
+    # — reading it first meant tenant_id/agent_id were silently None on every
+    # single call, and the agent ran the whole conversation on hardcoded defaults:
+    # wrong clinic name, no DB first_message, no knowledge base, no publish/credit
+    # gate, and no CallRecord ("No call_record_id — skipping finalization").
+    # ctx.job.room.metadata is the room's metadata as delivered with the job
+    # dispatch and IS populated before connect — that's the authoritative source.
     metadata: dict = {}
     _raw_meta = ""
     try:
-        _raw_meta = (getattr(ctx.room, "metadata", "") or "").strip()
-        if not _raw_meta:
-            _raw_meta = (getattr(getattr(ctx, "job", None), "metadata", "") or "").strip()
+        _job = getattr(ctx, "job", None)
+        for _candidate in (
+            getattr(getattr(_job, "room", None), "metadata", ""),  # dispatch payload (reliable pre-connect)
+            getattr(ctx.room, "metadata", ""),                     # only set post-connect
+            getattr(_job, "metadata", ""),                         # explicit create_dispatch metadata
+        ):
+            _raw_meta = (_candidate or "").strip()
+            if _raw_meta:
+                break
         metadata = json.loads(_raw_meta or "{}")
     except (json.JSONDecodeError, AttributeError):
         pass
@@ -784,13 +802,32 @@ async def entrypoint(ctx) -> None:
         context_aggregator.user(),               # Accumulates user turns into LLMContext
         booking_processor,                       # Booking state machine (transparent)
         llm,                                     # LLMContext → LLMResponseFrame (streaming)
-        context_aggregator.assistant(),          # Stores assistant reply in context
-        call_logger,                             # Metrics + call record updates (transparent)
         tts,                                     # LLMResponseFrame → TTSAudioRawFrame
+        call_logger,                             # Metrics + call record updates (transparent)
         transcript_publisher,                    # Mirror agent text → room transcript (transparent)
         resilience,                              # Never-silence: ErrorFrame → spoken fallback
         transport.output(),                      # Audio out to LiveKit room
+        context_aggregator.assistant(),          # Stores assistant reply in context — MUST BE LAST
     ])
+    # ⚠️ context_aggregator.assistant() MUST be the LAST processor — never between
+    # the LLM and TTS. LLMAssistantAggregator.process_frame() CONSUMES
+    # LLMFullResponseStartFrame / LLMFullResponseEndFrame / TextFrame without
+    # pushing them downstream (it buffers them to build the assistant context
+    # message). Sitting it directly after the LLM therefore swallowed 100% of the
+    # LLM's output text before it could reach `tts` — so the agent joined the
+    # room, published an audio track, and then never spoke a single word on any
+    # turn, including the greeting. That was the sole cause of the "room is
+    # created but there's no conversation" bug. Verified against
+    # pipecat-ai 1.5.0 (processors/aggregators/llm_response_universal.py:1493-1498
+    # and _handle_text at :1935 — all return without push_frame).
+    #
+    # call_logger also moved to AFTER `tts`: it reacts to TTSStartedFrame (resets
+    # the silence-timeout idle clock when the AGENT speaks) and to the TTS
+    # MetricsFrame (TTFB latency). Both are pushed DOWNSTREAM by `tts`, so while
+    # call_logger sat upstream of it neither ever arrived — the idle-clock reset
+    # added in c594ea6 was dead code and TTS latency was never recorded.
+    # TranscriptionFrame / End / Cancel still reach it: they propagate downstream
+    # from stt and the task source respectively.
 
     # ── Build & run the task ───────────────────────────────────────────────
     task = PipelineTask(
@@ -857,7 +894,9 @@ async def entrypoint(ctx) -> None:
                 ),
                 resume_message=first_message if first_message_mode != "wait" else None,
             )
-            await task.queue_frames([TextFrame(f"{_CONSENT_NOTICE} Is that okay with you?")])
+            await task.queue_frames([
+                TTSSpeakFrame(f"{_CONSENT_NOTICE} Is that okay with you?", append_to_context=False)
+            ])
             return
 
         effective_first_message = first_message
@@ -869,8 +908,15 @@ async def entrypoint(ctx) -> None:
             context.add_message({"role": "assistant", "content": effective_first_message})
             return
         log.info("Participant joined: %s — speaking first message.", participant_id)
+        # TTSSpeakFrame (not TextFrame): TTSService handles TTSSpeakFrame as a
+        # standalone utterance and synthesizes it immediately. A bare TextFrame
+        # queued at the task source is only ever flushed as part of an LLM
+        # response turn, so the greeting never got spoken.
+        # append_to_context=False because we add it to the context ourselves above.
         context.add_message({"role": "assistant", "content": effective_first_message})
-        await task.queue_frames([TextFrame(effective_first_message)])
+        await task.queue_frames([
+            TTSSpeakFrame(effective_first_message, append_to_context=False)
+        ])
 
     @transport.event_handler("on_participant_disconnected")
     async def on_participant_disconnected(transport_ref, participant_id: str) -> None:

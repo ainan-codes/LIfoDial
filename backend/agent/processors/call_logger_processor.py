@@ -25,8 +25,8 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     MetricsFrame,
-    TextFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
     TTSStartedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -48,7 +48,9 @@ async def speak_and_end_call(task, message: str) -> None:
     """
     try:
         if message:
-            await task.queue_frames([TextFrame(message)])
+            # TTSSpeakFrame, not TextFrame — only TTSSpeakFrame is synthesized as a
+            # standalone utterance outside an LLM response turn.
+            await task.queue_frames([TTSSpeakFrame(message, append_to_context=False)])
             # Rough speaking-time estimate (~14 chars/sec) so we don't hang up
             # mid-sentence, clamped to a sane range for very short/long messages.
             estimated_seconds = min(max(len(message) / 14.0, 1.5), 12.0)
@@ -237,7 +239,9 @@ class CallLoggerProcessor(FrameProcessor):
                 # reply shouldn't trap the caller in a re-prompt loop.
                 logger.info("Recording consent granted — resuming normal flow.")
                 if self._consent_resume_message and self.task is not None:
-                    asyncio.create_task(self.task.queue_frames([TextFrame(self._consent_resume_message)]))
+                    asyncio.create_task(self.task.queue_frames([
+                        TTSSpeakFrame(self._consent_resume_message, append_to_context=False)
+                    ]))
             return
 
         # End-call phrase detection — was previously stored (Call Behavior tab)

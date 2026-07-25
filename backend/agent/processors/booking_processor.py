@@ -20,7 +20,7 @@ import logging
 import re
 from typing import Optional
 
-from pipecat.frames.frames import Frame, LLMContextFrame, TextFrame, TranscriptionFrame
+from pipecat.frames.frames import Frame, LLMContextFrame, TranscriptionFrame, TTSSpeakFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 logger = logging.getLogger(__name__)
@@ -206,9 +206,11 @@ class BookingProcessor(FrameProcessor):
         Speak an emergency message as soon as an emergency keyword is detected,
         gated on can_transfer_emergency.
 
-        NOTE — scope: this pushes a TextFrame straight to TTS (the same
+        NOTE — scope: this pushes a TTSSpeakFrame straight to TTS (the same
         mechanism the first-message greeting uses via task.queue_frames, so it
-        is known to flow through the LLM stage untouched). It does NOT perform
+        is known to flow through the LLM stage untouched). A bare TextFrame does
+        NOT work here — TTSService only synthesizes it as part of an LLM response
+        turn, so the emergency message was silently dropped. It does NOT perform
         an actual SIP/telephony call transfer — no such capability exists
         anywhere in this codebase yet (no LiveKit SIP transfer call, no
         Exotel/Twilio integration). A real transfer would need that telephony
@@ -231,7 +233,7 @@ class BookingProcessor(FrameProcessor):
                 "This sounds like a medical emergency. Please call your local "
                 "emergency number or go to your nearest emergency room right away."
             )
-        await self.push_frame(TextFrame(message), FrameDirection.DOWNSTREAM)
+        await self.push_frame(TTSSpeakFrame(message), FrameDirection.DOWNSTREAM)
         logger.warning("Emergency message queued for TTS: '%s'", message)
 
     def _try_extract_name(self, text: str, text_lower: str) -> None:

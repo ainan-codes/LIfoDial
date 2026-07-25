@@ -210,7 +210,12 @@ async def create_web_call_token(
                     name=room_name,
                     metadata=metadata,
                     empty_timeout=15,  # Vanish empty rooms in 15s (instead of 300s)
-                    max_participants=2,
+                    # THREE participants join a web call, not two: the browser
+                    # caller, the livekit-agents job participant from ctx.connect()
+                    # (identity 'agent-AJ_*', kind=AGENT, publishes no tracks), and
+                    # Pipecat's LiveKitTransport (identity 'lifodial-agent-*'),
+                    # which is the one that actually carries the agent's audio.
+                    max_participants=3,
                     agents=[livekit_api.RoomAgentDispatch(agent_name=AGENT_NAME)],
                 )
             )
