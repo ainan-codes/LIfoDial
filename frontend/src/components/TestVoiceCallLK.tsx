@@ -182,7 +182,10 @@ function TestCallUI({
   // User speech via RoomEvent.DataReceived (topic: 'lifodial-transcript')
   useEffect(() => {
     if (!room) return;
-    const handler = (payload: Uint8Array, participant?: Participant, _reliable?: boolean, _topic?: string) => {
+    // Untyped trailing params (kind/topic/encryptionType) — unused here, and
+    // typing them to match RoomEvent.DataReceived's real signature exactly
+    // isn't worth the churn since room.on() infers the handler contextually.
+    const handler = (payload: Uint8Array, ..._rest: unknown[]) => {
       try {
         const text = new TextDecoder().decode(payload);
         const data = JSON.parse(text);
@@ -370,7 +373,7 @@ function TestCallUI({
       </div>
 
       {/* Debug info (dev) */}
-      {process.env.NODE_ENV !== 'production' && remoteParticipants.length > 0 && (
+      {import.meta.env.DEV && remoteParticipants.length > 0 && (
         <div style={{ fontSize: 10, color: '#333', lineHeight: 1.4 }}>
           {remoteParticipants.map((p) => (
             <span key={p.identity} style={{ marginRight: 6 }}>
