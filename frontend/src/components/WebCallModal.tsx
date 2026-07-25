@@ -9,7 +9,7 @@ import {
   useConnectionState,
   useRoomContext,
 } from '@livekit/components-react'
-import { Track, ConnectionState } from 'livekit-client'
+import { Track, ConnectionState, RoomEvent } from 'livekit-client'
 import '@livekit/components-styles'
 import fetchWithAuth from '../api/client'
 
@@ -144,24 +144,44 @@ function CallUI({ agent, duration, formatTime, onClose }: { agent: Agent, durati
     }
   }, [connState, room])
 
-  // Find all audio tracks from remote participants
-  const allTracks = useTracks(undefined, { updateOnlyOn: [] })
-  const audioTrackRef = allTracks.find(
+  // Find agent's audio track — re-renders on all relevant RoomEvents
+  // updateOnlyOn:[] was the bug (disabled all re-renders → track never found)
+  const allTracks = useTracks(
+    [Track.Source.Microphone, Track.Source.ScreenShareAudio, Track.Source.Unknown],
+    {
+      onlySubscribed: false,
+      updateOnlyOn: [
+        RoomEvent.TrackSubscribed,
+        RoomEvent.TrackUnsubscribed,
+        RoomEvent.ParticipantConnected,
+        RoomEvent.ParticipantDisconnected,
+        RoomEvent.TrackPublished,
+        RoomEvent.TrackUnpublished,
+      ],
+    }
+  )
+
+  // Agent track: prefer identity starting with 'lifodial-agent', else any remote audio
+  const agentTrackRef = allTracks.find(
     (t) =>
-      t.publication &&
-      t.publication.kind === 'audio' &&
+      t.participant &&
+      t.participant.identity !== room?.localParticipant?.identity &&
+      t.participant.identity.startsWith('lifodial-agent')
+  ) ??
+  allTracks.find(
+    (t) =>
       t.participant &&
       t.participant.identity !== room?.localParticipant?.identity
   ) ?? null
 
   const agentParticipant =
-    audioTrackRef?.participant ??
+    agentTrackRef?.participant ??
     remoteParticipants.find((p) => p.identity.startsWith('lifodial-agent')) ??
-    remoteParticipants.find((p) => p.identity.startsWith('agent-')) ??
     remoteParticipants[0] ??
     null
 
-  const agentAudioTrack = audioTrackRef?.publication ?? null
+  // Full TrackReference for BarVisualizer (not just .publication)
+  const agentAudioTrackRef = agentTrackRef
 
   const [agentState, setAgentState] = useState<string>('connecting')
 
@@ -226,9 +246,9 @@ function CallUI({ agent, duration, formatTime, onClose }: { agent: Agent, durati
       
       {/* Visualizer */}
       <div className="call-visualizer">
-        {agentReady && agentAudioTrack && agentParticipant ? (
+        {agentReady && agentAudioTrackRef ? (
           <BarVisualizer
-            trackRef={{ participant: agentParticipant, publication: agentAudioTrack } as any}
+            trackRef={agentAudioTrackRef}
             barCount={36}
             options={{ minHeight: 4 }}
             style={{
