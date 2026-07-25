@@ -96,14 +96,28 @@ services:
       - key: LIVEKIT_API_SECRET
         sync: false
 
-      # ── Agent worker pre-warm / keep-warm ─────────────────────────────────────
-      # Public URL of the lifodial-agent service. This always-on (starter) service
-      # pings it inside Render's ~15min idle window (backend/services/agent_worker.py)
-      # and pre-warms it before dispatching a call. Without it the free-tier worker
-      # deregisters from LiveKit and calls land in agent-less rooms — measured ~55s
-      # cold start against a 15s dispatch deadline.
+      # ── Agent worker pre-warm ─────────────────────────────────────────────────
+      # Public URL of the lifodial-agent service. backend/services/agent_worker.py
+      # wakes the worker BEFORE dispatching a call, so a room is never created
+      # while the free-tier worker is spun down and deregistered from LiveKit
+      # (measured ~55s cold start against a 25s dispatch deadline → agent-less
+      # rooms and silent callers).
+      #
+      # ⚠️ 2026-07-25: this blueprint does NOT govern the live services. The real
+      # API service on Render is named `LIfoDial` (srv-d7m7tnho3t8c73e19q30), not
+      # `lifodial-api`, and it runs on plan FREE, not starter. Because the names
+      # don't match, editing envVars here changes NOTHING in production — the live
+      # values are managed manually / via the Render API. This var was set on the
+      # real service with:
+      #   PUT /v1/services/srv-d7m7tnho3t8c73e19q30/env-vars/AGENT_WORKER_URL
+      # Keep this block for parity, but treat the dashboard as the source of truth.
       - key: AGENT_WORKER_URL
         value: https://lifodial-agent.onrender.com
+      # Keep-warm is OFF by default: both services are on the free plan, and one
+      # always-on free service (~730h/mo) would exhaust the 750h ACCOUNT-WIDE
+      # allowance and suspend everything. Enable only on a paid plan.
+      - key: AGENT_WORKER_KEEP_WARM
+        value: "false"
 
       # ── Vobiz (optional telephony — India PSTN) ───────────────────────────────
       - key: VOBIZ_ACCOUNT_SID

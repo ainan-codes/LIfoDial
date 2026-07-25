@@ -175,6 +175,20 @@ async def keep_warm_loop() -> None:
         )
         return
 
+    # OFF by default — see Settings.agent_worker_keep_warm. On Render's free plan
+    # holding the worker awake 24/7 (~730h) against a 750h ACCOUNT-WIDE allowance
+    # would suspend every service on the account. Pre-warm already prevents
+    # agent-less rooms, so this is a paid-plan-only optimisation that trades the
+    # ~55s first-call delay for instance-hours.
+    if not settings.agent_worker_keep_warm:
+        log.info(
+            "Agent-worker keep-warm is DISABLED (AGENT_WORKER_KEEP_WARM=false). Calls still "
+            "pre-warm the worker on demand, so rooms won't be agent-less — but the first "
+            "call after ~15min idle will wait ~55s for the free instance to boot. Set "
+            "AGENT_WORKER_KEEP_WARM=true once the services are on a paid plan."
+        )
+        return
+
     log.info(
         "Agent-worker keep-warm started (every %.0fs -> %s)",
         KEEP_WARM_INTERVAL_SECONDS, worker_base_url(),
