@@ -865,17 +865,38 @@ async def entrypoint(ctx) -> None:
     # browser Test widget shows a live transcript (transparent passthrough,
     # fully guarded — see LiveKitTranscriptPublisher). Placed right after TTS so
     # it sees TTSTextFrames (the text actually being spoken).
-    transcript_publisher = LiveKitTranscriptPublisher(transport)
+    # TWO publisher instances, one per side of the conversation. They cannot be a
+    # single processor because the two frame types they mirror only exist at
+    # opposite ends of the pipeline:
+    #
+    #   • user_transcript_publisher MUST sit between `stt` and
+    #     context_aggregator.user(). The user aggregator CONSUMES both
+    #     TranscriptionFrame and InterimTranscriptionFrame without pushing them
+    #     downstream (pipecat 1.5.0, llm_response_universal.py:794-799 — final
+    #     transcriptions go to _handle_transcription() with no push_frame, and the
+    #     interim branch is a bare `pass` whose own comment says "not pushed
+    #     downstream, same as final TranscriptionFrame"). While the publisher sat
+    #     AFTER the aggregator it received zero user transcriptions for the whole
+    #     call, so the browser never got a DataReceived event and the caller saw
+    #     nothing at all while speaking. STT was fine; only the mirror was dead.
+    #     This is the same swallowing bug as context_aggregator.assistant() below,
+    #     at the other end of the pipeline.
+    #
+    #   • agent_transcript_publisher MUST sit after `tts`, because TTSTextFrame is
+    #     pushed downstream BY the TTS service — nothing upstream of it can see one.
+    user_transcript_publisher = LiveKitTranscriptPublisher(transport)
+    agent_transcript_publisher = LiveKitTranscriptPublisher(transport)
 
     pipeline = Pipeline([
         transport.input(),                       # Audio in from LiveKit room
-        stt,                                     # Speech → TranscriptionFrame
+        stt,                                     # Speech → Transcription/InterimTranscriptionFrame
+        user_transcript_publisher,               # Mirror USER text → room data channel (transparent)
         context_aggregator.user(),               # Accumulates user turns into LLMContext
         booking_processor,                       # Booking state machine (transparent)
         llm,                                     # LLMContext → LLMResponseFrame (streaming)
         tts,                                     # LLMResponseFrame → TTSAudioRawFrame
         call_logger,                             # Metrics + call record updates (transparent)
-        transcript_publisher,                    # Mirror agent text → room transcript (transparent)
+        agent_transcript_publisher,              # Mirror AGENT text → room transcript (transparent)
         resilience,                              # Never-silence: ErrorFrame → spoken fallback
         transport.output(),                      # Audio out to LiveKit room
         context_aggregator.assistant(),          # Stores assistant reply in context — MUST BE LAST

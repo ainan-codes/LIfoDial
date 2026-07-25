@@ -43,6 +43,9 @@ const SLOW_MS = 12_000;
 const TIMEOUT_MS = 150_000;
 const AGENT_WAIT_MS = 45_000;
 const TRANSCRIPT_TOPIC = 'lifodial-transcript';
+// Stable id for the single in-progress user bubble. Interim STT results overwrite
+// this entry in place; the final result promotes it to a committed message.
+const LIVE_USER_ID = 'user-live';
 
 interface TranscriptEntry {
   id: string;
@@ -138,6 +141,10 @@ function TestCallUI({
   // ── Live transcript ────────────────────────────────────────────────────────
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const pendingAgentRef = useRef<Map<string, string>>(new Map());
+  // Newest user-transcript seq seen, for discarding out-of-order publishes.
+  const lastUserSeqRef = useRef(0);
+  // Counter giving each committed user utterance a stable, unique key.
+  const userFinalCountRef = useRef(0);
 
   // Agent speech via RoomEvent.TranscriptionReceived
   useEffect(() => {
@@ -196,18 +203,53 @@ function TestCallUI({
     // isn't worth the churn since room.on() infers the handler contextually.
     const handler = (payload: Uint8Array, ..._rest: unknown[]) => {
       try {
-        const text = new TextDecoder().decode(payload);
-        const data = JSON.parse(text);
-        if (data.role === 'user' && data.text?.trim()) {
-          const entry: TranscriptEntry = {
-            id: `user-${Date.now()}-${Math.random()}`,
-            role: 'user',
-            text: data.text.trim(),
-            final: true,
-            ts: Date.now(),
-          };
-          setTranscript((prev) => [...prev, entry]);
+        const data = JSON.parse(new TextDecoder().decode(payload));
+        if (data.role !== 'user') return;
+        const text = (data.text ?? '').trim();
+        if (!text) return;
+
+        // Publishes are fired as background tasks agent-side, so a slow interim
+        // can land after its own final. Drop anything older than the newest seen
+        // or finished text would be overwritten by a stale partial.
+        const seq = typeof data.seq === 'number' ? data.seq : 0;
+        if (seq) {
+          if (seq < lastUserSeqRef.current) return;
+          lastUserSeqRef.current = seq;
         }
+
+        // Agent builds before the interim-transcript change omit `final`; treat a
+        // missing flag as final so an older worker still renders correctly.
+        const isFinal = data.final !== false;
+
+        setTranscript((prev) => {
+          const liveIdx = prev.findIndex((e) => e.id === LIVE_USER_ID);
+
+          if (isFinal) {
+            // Promote the in-progress bubble to a committed one (keeping its
+            // position) so the next utterance starts a fresh live bubble.
+            const committed: TranscriptEntry = {
+              id: `user-final-${++userFinalCountRef.current}`,
+              role: 'user', text, final: true, ts: Date.now(),
+            };
+            if (liveIdx >= 0) {
+              const updated = [...prev];
+              updated[liveIdx] = committed;
+              return updated;
+            }
+            return [...prev, committed];
+          }
+
+          // Interim: update one bubble in place rather than appending per result.
+          const live: TranscriptEntry = {
+            id: LIVE_USER_ID, role: 'user', text, final: false, ts: Date.now(),
+          };
+          if (liveIdx >= 0) {
+            const updated = [...prev];
+            updated[liveIdx] = live;
+            return updated;
+          }
+          return [...prev, live];
+        });
       } catch {
         // ignore malformed JSON
       }

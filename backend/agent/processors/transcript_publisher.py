@@ -22,7 +22,12 @@ import asyncio
 import json
 import logging
 
-from pipecat.frames.frames import Frame, TTSTextFrame, TranscriptionFrame
+from pipecat.frames.frames import (
+    Frame,
+    InterimTranscriptionFrame,
+    TTSTextFrame,
+    TranscriptionFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 log = logging.getLogger(__name__)
@@ -39,6 +44,12 @@ class LiveKitTranscriptPublisher(FrameProcessor):
         super().__init__()
         self._transport = transport
         self._counter = 0
+        # Monotonic sequence for user-transcript messages. Publishes are fired as
+        # background tasks (so the pipeline is never blocked on the network), which
+        # means a slow interim publish could otherwise land AFTER the final one and
+        # overwrite finished text with a stale partial. The frontend drops any
+        # message whose seq is older than the newest it has seen.
+        self._user_seq = 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -50,12 +61,24 @@ class LiveKitTranscriptPublisher(FrameProcessor):
             if text:
                 asyncio.create_task(self._safe_publish_agent(text))
 
-        elif isinstance(frame, TranscriptionFrame):
+        elif isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
             # User speech from STT: publish as data channel message
-            # (shows up as RoomEvent.DataReceived in the frontend)
+            # (shows up as RoomEvent.DataReceived in the frontend).
+            #
+            # InterimTranscriptionFrame is what makes this feel real-time — words
+            # appear WHILE the caller is still speaking instead of only after
+            # end-of-utterance. Deepgram emits these when interim_results=True.
+            # This processor MUST sit between `stt` and context_aggregator.user()
+            # to see either frame type at all — the aggregator consumes both
+            # without pushing them downstream (pipecat 1.5.0,
+            # llm_response_universal.py:794-799).
             text = (getattr(frame, "text", "") or "").strip()
             if text:
-                asyncio.create_task(self._safe_publish_user(text))
+                is_final = isinstance(frame, TranscriptionFrame)
+                self._user_seq += 1
+                asyncio.create_task(
+                    self._safe_publish_user(text, is_final, self._user_seq)
+                )
 
         # Always forward the frame unchanged, without waiting on the publish.
         await self.push_frame(frame, direction)
@@ -66,9 +89,9 @@ class LiveKitTranscriptPublisher(FrameProcessor):
         except Exception as e:
             log.warning("Agent transcript publish failed (non-fatal): %s", e)
 
-    async def _safe_publish_user(self, text: str) -> None:
+    async def _safe_publish_user(self, text: str, final: bool, seq: int) -> None:
         try:
-            await self._publish_user_data(text)
+            await self._publish_user_data(text, final, seq)
         except Exception as e:
             log.warning("User transcript publish failed (non-fatal): %s", e)
 
@@ -124,13 +147,23 @@ class LiveKitTranscriptPublisher(FrameProcessor):
         )
         await room.local_participant.publish_transcription(transcription)
 
-    async def _publish_user_data(self, text: str):
+    async def _publish_user_data(self, text: str, final: bool = True, seq: int = 0):
         """Publish user speech via LiveKit data channel as JSON.
-        Frontend receives this as RoomEvent.DataReceived with topic 'lifodial-transcript'."""
+        Frontend receives this as RoomEvent.DataReceived with topic 'lifodial-transcript'.
+
+        `final` distinguishes a committed utterance from a live partial so the
+        frontend can update one bubble in place instead of appending a new bubble
+        per interim result. `seq` lets it discard out-of-order publishes.
+        """
         room = self._resolve_room()
         if room is None or getattr(room, "local_participant", None) is None:
             return
-        payload = json.dumps({"role": "user", "text": text}).encode("utf-8")
+        payload = json.dumps({
+            "role": "user",
+            "text": text,
+            "final": final,
+            "seq": seq,
+        }).encode("utf-8")
         await room.local_participant.publish_data(
             payload,
             topic=_TRANSCRIPT_TOPIC,
