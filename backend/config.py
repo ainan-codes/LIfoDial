@@ -53,6 +53,14 @@ class Settings(BaseSettings):
     livekit_api_key: str = ""
     livekit_api_secret: str = ""
 
+    # ── Pipecat agent worker (cold-start pre-warm) ─────────────────────────
+    # Public HTTPS base URL of the `lifodial-agent` Render service, e.g.
+    # https://lifodial-agent.onrender.com — used by backend/services/agent_worker.py
+    # to wake the free-tier worker BEFORE dispatching a call into a room and to
+    # keep it warm on a timer. Leave blank to disable both (dispatch then behaves
+    # exactly as it did before, i.e. cold starts cause agent-less rooms).
+    agent_worker_url: str = ""
+
     # ── Sarvam AI ──────────────────────────────────────────────────────────
     sarvam_api_key: str = ""
 

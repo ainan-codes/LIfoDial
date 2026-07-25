@@ -80,6 +80,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     asyncio.create_task(_run_startup_migrations())
     asyncio.create_task(_warmup())
 
+    # Keep the free-tier Pipecat agent worker from spinning down. This service is
+    # `plan: starter` (always on), so it is the right place to ping the free
+    # `lifodial-agent` service inside Render's ~15min idle window. Without this,
+    # the worker deregisters from LiveKit and the next call lands in an
+    # agent-less room (~55s cold start vs a 15s dispatch deadline) — the
+    # [DISPATCH-ALARM] in routers/web_calls.py. No-ops when AGENT_WORKER_URL is
+    # unset. Ref held so the task isn't garbage-collected mid-flight.
+    from backend.services.agent_worker import keep_warm_loop
+    app.state._agent_keepwarm_task = asyncio.create_task(keep_warm_loop())
+
 
     # ── Storage bucket init (idempotent, enforces size + MIME limits) ────────
     # Non-blocking — if Supabase is unreachable the app still boots.

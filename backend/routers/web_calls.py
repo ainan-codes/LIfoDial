@@ -36,7 +36,12 @@ _dispatch_watchers: set = set()
 # comfortably without holding an alarm too long. (On 2026-07-24 a worker-redeploy
 # downtime window left rooms agent-less and it went unnoticed until someone
 # checked the LiveKit dashboard — this watchdog exists so that can't recur.)
-_AGENT_JOIN_DEADLINE_SECONDS = 15
+#
+# 2026-07-25: raised 15 -> 25. The room is now only created AFTER the worker
+# answers HTTP (see agent_worker.ensure_worker_awake below), but a just-woken
+# free instance still needs a few seconds to re-register with LiveKit and accept
+# the job. 15s was tight enough to alarm on healthy-but-freshly-woken workers.
+_AGENT_JOIN_DEADLINE_SECONDS = 25
 
 
 async def _alert_if_agent_absent(
@@ -72,12 +77,30 @@ async def _alert_if_agent_absent(
         if agent_present:
             return
 
+        # Report whether the worker URL is even configured, and whether we
+        # believed it warm at dispatch time. Without this the alarm blamed
+        # "down/deregistered or agent_name mismatched" for what was actually a
+        # free-tier cold start, which sent debugging down the wrong path.
+        from backend.services import agent_worker
+
+        if not agent_worker.is_configured():
+            cause = (
+                "AGENT_WORKER_URL is NOT set, so the worker was never pre-warmed — on "
+                "Render's free plan it deregisters from LiveKit after ~15min idle and "
+                "takes ~55s to cold start. Set AGENT_WORKER_URL on lifodial-api."
+            )
+        else:
+            cause = (
+                "Worker was pre-warmed but still didn't join — it may be crash-looping "
+                "on boot, or agent_name may not match WorkerOptions(agent_name=...). "
+                f"Check {agent_worker.worker_base_url()}/worker and the service logs."
+            )
+
         msg = (
             f"[DISPATCH-ALARM] Agent never joined room '{room_name}' within "
             f"{_AGENT_JOIN_DEADLINE_SECONDS}s (call_id={call_id} agent_id={agent_id} "
             f"tenant_id={tenant_id} participants={len(parts)} room_gone={room_gone}). "
-            f"Worker is likely down/deregistered or agent_name mismatched — callers "
-            f"in this room hear silence."
+            f"Callers in this room hear silence. {cause}"
         )
         logger.error(msg)
         try:
@@ -205,6 +228,22 @@ async def create_web_call_token(
             "test_mode": test_mode,
             "message": "LiveKit not configured — web call will use demo mode",
         }
+
+    # ── Wake the worker BEFORE creating the room ────────────────────────────
+    # `lifodial-agent` is on Render's free plan and spins down after ~15min idle;
+    # a spun-down worker is DEREGISTERED from LiveKit, so RoomAgentDispatch has
+    # nothing to dispatch to and the caller hears silence. Measured cold start is
+    # ~55s against a 15s join deadline, so the first call after any idle period
+    # failed 100% of the time — that is the [DISPATCH-ALARM] above.
+    #
+    # Blocking here (instead of dispatching hopefully) means the room is only
+    # ever created once the worker can actually accept the job. Warm calls cost
+    # ~0.2s. Never fatal: if the probe fails we still dispatch, the watchdog
+    # still alarms, and behaviour is exactly what it was before.
+    from backend.services import agent_worker
+
+    if agent_worker.is_configured():
+        await agent_worker.ensure_worker_awake()
 
     try:
         from livekit import api as livekit_api

@@ -35,7 +35,12 @@ import '@livekit/components-styles';
 import fetchWithAuth from '../api/client';
 
 const SLOW_MS = 12_000;
-const TIMEOUT_MS = 60_000;
+// Must exceed the backend's worker pre-warm budget (WARM_TIMEOUT_SECONDS = 90s in
+// backend/services/agent_worker.py). /web-call-token now blocks while a
+// spun-down free-tier agent worker cold-starts (measured ~55s) so the room is
+// never created before the worker can join it. At the old 60s the browser gave up
+// mid-warm and the user saw a timeout for a call that was about to succeed.
+const TIMEOUT_MS = 150_000;
 const AGENT_WAIT_MS = 45_000;
 const TRANSCRIPT_TOPIC = 'lifodial-transcript';
 

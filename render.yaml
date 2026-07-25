@@ -96,6 +96,15 @@ services:
       - key: LIVEKIT_API_SECRET
         sync: false
 
+      # ── Agent worker pre-warm / keep-warm ─────────────────────────────────────
+      # Public URL of the lifodial-agent service. This always-on (starter) service
+      # pings it inside Render's ~15min idle window (backend/services/agent_worker.py)
+      # and pre-warms it before dispatching a call. Without it the free-tier worker
+      # deregisters from LiveKit and calls land in agent-less rooms — measured ~55s
+      # cold start against a 15s dispatch deadline.
+      - key: AGENT_WORKER_URL
+        value: https://lifodial-agent.onrender.com
+
       # ── Vobiz (optional telephony — India PSTN) ───────────────────────────────
       - key: VOBIZ_ACCOUNT_SID
         sync: false
