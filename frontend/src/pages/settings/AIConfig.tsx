@@ -484,27 +484,51 @@ export default function AIConfig() {
   const [saved, setSaved]   = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // ── Load from localStorage ─────────────────────────────────────────────────
+  // ── Load from localStorage + DB agent config ───────────────────────────────
   useEffect(() => {
     try {
       const s = localStorage.getItem(LOCAL_KEY);
-      if (!s) return;
-      const p = JSON.parse(s);
-      if (p.keys)        setKeys(p.keys);
-      if (p.sttProvider) setSttProvider(p.sttProvider);
-      if (p.sttModel)    setSttModel(p.sttModel);
-      if (p.llmProvider) setLlmProvider(p.llmProvider);
-      if (p.llmModel)    setLlmModel(p.llmModel);
-      if (p.ttsProvider) setTtsProvider(p.ttsProvider);
-      if (p.ttsModel)    setTtsModel(p.ttsModel);
-      if (p.elVoice)     setSelectedELVoice(p.elVoice);
-      if (p.advVad)      setAdvVad(p.advVad);
-      if (p.advMinSpeech)setAdvMinSpeech(p.advMinSpeech);
-      if (p.advTemp)     setAdvTemp(p.advTemp);
-      if (p.advTokens)   setAdvTokens(p.advTokens);
-      if (p.advBackchannel !== undefined) setAdvBackchannel(p.advBackchannel);
-      if (p.advInterrupt  !== undefined)  setAdvInterrupt(p.advInterrupt);
+      if (s) {
+        const p = JSON.parse(s);
+        if (p.keys)        setKeys(p.keys);
+        if (p.sttProvider) setSttProvider(p.sttProvider);
+        if (p.sttModel)    setSttModel(p.sttModel);
+        if (p.llmProvider) setLlmProvider(p.llmProvider);
+        if (p.llmModel)    setLlmModel(p.llmModel);
+        if (p.ttsProvider) setTtsProvider(p.ttsProvider);
+        if (p.ttsModel)    setTtsModel(p.ttsModel);
+        if (p.elVoice)     setSelectedELVoice(p.elVoice);
+        if (p.advVad)      setAdvVad(p.advVad);
+        if (p.advMinSpeech)setAdvMinSpeech(p.advMinSpeech);
+        if (p.advTemp)     setAdvTemp(p.advTemp);
+        if (p.advTokens)   setAdvTokens(p.advTokens);
+        if (p.advBackchannel !== undefined) setAdvBackchannel(p.advBackchannel);
+        if (p.advInterrupt  !== undefined)  setAdvInterrupt(p.advInterrupt);
+      }
     } catch { /* ignore */ }
+
+    // Also sync from backend AgentConfig DB so UI reflects active agent DB settings
+    async function loadAgentFromDB() {
+      try {
+        const agents = await fetchWithAuth('/agents');
+        if (agents && agents.length > 0) {
+          const tenantId = localStorage.getItem('lifodial-tenant-id') || '';
+          const myAgent = tenantId ? agents.find((a: any) => a.tenant_id === tenantId) || agents[0] : agents[0];
+          if (myAgent) {
+            if (myAgent.stt_provider) setSttProvider(myAgent.stt_provider);
+            if (myAgent.stt_model)    setSttModel(myAgent.stt_model);
+            if (myAgent.llm_provider) setLlmProvider(myAgent.llm_provider);
+            if (myAgent.llm_model)    setLlmModel(myAgent.llm_model);
+            if (myAgent.tts_provider) setTtsProvider(myAgent.tts_provider);
+            if (myAgent.tts_model)    setTtsModel(myAgent.tts_model);
+            localStorage.setItem('lifodial-agent-id', myAgent.id);
+          }
+        }
+      } catch (e) {
+        console.warn('Could not load agent from DB in AIConfig:', e);
+      }
+    }
+    loadAgentFromDB();
   }, []);
 
   // ── Test a key ─────────────────────────────────────────────────────────────
@@ -532,7 +556,7 @@ export default function AIConfig() {
       advVad, advMinSpeech, advBackchannel, advInterrupt, advTemp, advTokens,
     }));
 
-    // Push keys to backend
+    // Push keys to backend platform config
     const keyPushes = Object.entries(keys).filter(([, v]) => v.trim()).map(async ([pid, val]) => {
       const meta = PROVIDER_META[pid];
       if (!meta) return;
@@ -541,6 +565,37 @@ export default function AIConfig() {
         body: JSON.stringify({ provider: pid, category: meta.category, api_key: val, is_active: true }),
       }).catch(() => {});
     });
+
+    // Patch active agent DB record so backend pipeline uses updated providers
+    try {
+      let agentId = localStorage.getItem('lifodial-agent-id') || '';
+      if (!agentId) {
+        const agents = await fetchWithAuth('/agents');
+        if (agents && agents.length > 0) {
+          const tenantId = localStorage.getItem('lifodial-tenant-id') || '';
+          const myAgent = tenantId ? agents.find((a: any) => a.tenant_id === tenantId) || agents[0] : agents[0];
+          agentId = myAgent.id;
+          localStorage.setItem('lifodial-agent-id', agentId);
+        }
+      }
+      if (agentId) {
+        await fetchWithAuth(`/agents/${agentId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            stt_provider: sttProvider,
+            stt_model: sttModel,
+            llm_provider: llmProvider,
+            llm_model: llmModel,
+            tts_provider: ttsProvider,
+            tts_model: ttsModel,
+            tts_voice: selectedELVoice?.name || undefined,
+          }),
+        });
+      }
+    } catch (e) {
+      console.warn('Failed to patch agent in DB:', e);
+    }
+
     await Promise.allSettled(keyPushes);
 
     setSaving(false);

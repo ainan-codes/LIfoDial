@@ -1,32 +1,39 @@
 """
 backend/agent/processors/transcript_publisher.py
 
-Mirrors the agent's spoken text into the LiveKit room as transcription segments
-so the browser Test Agent widget (useVoiceAssistant().agentTranscriptions) can
-render a LIVE transcript. Pipecat 1.5.0's LiveKit transport does not publish any
-transcriptions itself, so we bridge it here.
+Mirrors BOTH the agent's spoken text AND the user's transcribed speech into the
+LiveKit room so the browser widget can render a live dual-sided transcript.
 
-SAFETY (this touches the real-time voice pipeline):
+Two channels:
+  1. Agent speech (TTSTextFrame) → room.local_participant.publish_transcription()
+     → received as RoomEvent.TranscriptionReceived on the frontend from the
+       agent participant identity
+  2. User speech (TranscriptionFrame from STT) → room.local_participant.publish_data()
+     → JSON payload {"role":"user","text":"..."} on topic "lifodial-transcript"
+     → received as RoomEvent.DataReceived on the frontend
+
+SAFETY:
   • Transparent passthrough — EVERY frame is pushed downstream unchanged.
   • Every LiveKit publish is wrapped in try/except and can never raise into the
     pipeline, so a failure here cannot stall, mangle, or drop a live call.
   • If the room / agent audio track can't be resolved, it simply no-ops.
-
-Only the AGENT's speech is published (attributed to the worker's local
-participant). That is what the Test widget renders. Caller-side transcript would
-need the user's mic track and is a separate follow-up.
 """
 import asyncio
+import json
 import logging
 
-from pipecat.frames.frames import Frame, TTSTextFrame
+from pipecat.frames.frames import Frame, TTSTextFrame, TranscriptionFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 log = logging.getLogger(__name__)
 
+# Data channel topic for user transcript messages (listened to in frontend)
+_TRANSCRIPT_TOPIC = "lifodial-transcript"
+
 
 class LiveKitTranscriptPublisher(FrameProcessor):
-    """Publishes TTSTextFrame text to the room as agent transcription segments."""
+    """Publishes both TTSTextFrame (agent) and TranscriptionFrame (user) to the
+    LiveKit room so the frontend can display a live dual-sided transcript."""
 
     def __init__(self, transport):
         super().__init__()
@@ -35,24 +42,35 @@ class LiveKitTranscriptPublisher(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
         if isinstance(frame, TTSTextFrame):
+            # Agent speech: publish via LiveKit transcription protocol
+            # (shows up as RoomEvent.TranscriptionReceived attributed to agent participant)
             text = (getattr(frame, "text", "") or "").strip()
             if text:
-                # FIRE-AND-FORGET: publishing is a LiveKit round trip and is purely
-                # cosmetic (drives the browser test transcript). It must NEVER gate
-                # audio — awaiting it here stalled every TTS text frame (and the
-                # audio queued behind it) by one publish RTT, delaying the first
-                # spoken word and stuttering every turn. Schedule it in the
-                # background and forward the frame immediately.
-                asyncio.create_task(self._safe_publish(text))
+                asyncio.create_task(self._safe_publish_agent(text))
+
+        elif isinstance(frame, TranscriptionFrame):
+            # User speech from STT: publish as data channel message
+            # (shows up as RoomEvent.DataReceived in the frontend)
+            text = (getattr(frame, "text", "") or "").strip()
+            if text:
+                asyncio.create_task(self._safe_publish_user(text))
+
         # Always forward the frame unchanged, without waiting on the publish.
         await self.push_frame(frame, direction)
 
-    async def _safe_publish(self, text: str) -> None:
+    async def _safe_publish_agent(self, text: str) -> None:
         try:
-            await self._publish(text)
-        except Exception as e:  # never propagate into the call
-            log.warning("Transcript publish failed (non-fatal): %s", e)
+            await self._publish_agent_transcription(text)
+        except Exception as e:
+            log.warning("Agent transcript publish failed (non-fatal): %s", e)
+
+    async def _safe_publish_user(self, text: str) -> None:
+        try:
+            await self._publish_user_data(text)
+        except Exception as e:
+            log.warning("User transcript publish failed (non-fatal): %s", e)
 
     def _resolve_room(self):
         """Best-effort access to the LiveKit room across pipecat's transport
@@ -82,7 +100,9 @@ class LiveKitTranscriptPublisher(FrameProcessor):
             pass
         return ""
 
-    async def _publish(self, text: str):
+    async def _publish_agent_transcription(self, text: str):
+        """Publish agent speech via LiveKit's transcription protocol.
+        Frontend receives this as RoomEvent.TranscriptionReceived."""
         from livekit import rtc
 
         room = self._resolve_room()
@@ -103,3 +123,16 @@ class LiveKitTranscriptPublisher(FrameProcessor):
             segments=[segment],
         )
         await room.local_participant.publish_transcription(transcription)
+
+    async def _publish_user_data(self, text: str):
+        """Publish user speech via LiveKit data channel as JSON.
+        Frontend receives this as RoomEvent.DataReceived with topic 'lifodial-transcript'."""
+        room = self._resolve_room()
+        if room is None or getattr(room, "local_participant", None) is None:
+            return
+        payload = json.dumps({"role": "user", "text": text}).encode("utf-8")
+        await room.local_participant.publish_data(
+            payload,
+            topic=_TRANSCRIPT_TOPIC,
+            reliable=True,
+        )

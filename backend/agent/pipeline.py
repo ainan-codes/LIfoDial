@@ -54,6 +54,12 @@ from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.transports.livekit.transport import LiveKitParams, LiveKitTransport
 
+# Deepgram lazy import (requires deepgram-sdk; guarded so missing dep doesn't
+# crash the worker if Deepgram is not the configured provider)
+def _import_deepgram_stt():
+    from pipecat.services.deepgram.stt import DeepgramSTTService
+    return DeepgramSTTService
+
 # ── Pipecat LiveKit token helper ──────────────────────────────────────────────
 from livekit import api as livekit_api
 
@@ -632,17 +638,48 @@ async def entrypoint(ctx) -> None:
             vad_enabled=True,
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    stop_secs=0.85,
-                    start_secs=0.25,
-                    confidence=0.6,
+                    # Optimized for lower latency:
+                    # stop_secs 0.6 (was 0.85) → end-of-speech detected 250ms sooner
+                    # start_secs 0.2 (was 0.25) → speech onset detected ~50ms sooner
+                    # confidence 0.55 (was 0.6) → slightly more sensitive (fewer missed starts)
+                    stop_secs=0.6,
+                    start_secs=0.2,
+                    confidence=0.55,
                 )
             ),
         ),
     )
 
-    # STT — Sarvam AI, OpenAI Whisper, or ElevenLabs Realtime
+    # STT — Deepgram (real-time streaming), Sarvam AI, OpenAI Whisper, or ElevenLabs
     stt_provider = agent_config.get("stt_provider", "sarvam")
-    if stt_provider in ("openai", "whisper"):
+    if stt_provider == "deepgram":
+        # Deepgram Nova-3: real-time streaming with ~200ms TTFB (vs ~800ms Sarvam batch).
+        # Best for English; supports Hindi/Tamil/Telugu with nova-2.
+        log.info("Instantiating Deepgram STT (nova-3)...")
+        DeepgramSTTService = _import_deepgram_stt()
+        # Map our BCP-47 language code to Deepgram's language code
+        _dg_lang_map = {
+            "en-IN": "en-IN", "en-US": "en-US", "en-GB": "en-GB",
+            "hi-IN": "hi",     "ta-IN": "ta",     "te-IN": "te",
+            "kn-IN": "kn",     "ml-IN": "ml",     "mr-IN": "mr",
+            "bn-IN": "bn",     "pa-IN": "pa",     "gu-IN": "gu",
+        }
+        dg_lang = _dg_lang_map.get(stt_language, "en-IN")
+        # Use nova-2 for Indic languages (nova-3 is English-optimized)
+        dg_model = "nova-3" if dg_lang.startswith("en") else "nova-2"
+        stt = DeepgramSTTService(
+            api_key=settings.deepgram_api_key,
+            settings=DeepgramSTTService.Settings(
+                model=dg_model,
+                language=dg_lang,
+                smart_format=True,
+                interim_results=True,
+                endpointing=300,  # 300ms silence before utterance finalized
+                punctuate=True,
+                utterance_end_ms=1000,
+            ),
+        )
+    elif stt_provider in ("openai", "whisper"):
         log.info("Instantiating OpenAI Whisper STT...")
         stt = OpenAISTTService(
             api_key=settings.openai_api_key,

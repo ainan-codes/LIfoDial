@@ -154,7 +154,9 @@ async def create_web_call_token(
     prefix = "testcall" if test_mode else "webcall"
     room_name = f"{prefix}-{agent_id[:8]}-{uuid.uuid4().hex[:8]}"
 
-    # Room metadata — agent reads this to configure itself
+    # Room metadata — agent reads this to configure itself.
+    # Include ALL provider fields so the pipeline doesn't have to re-query the DB
+    # (it still loads from DB, but this is the quick fallback).
     metadata = json.dumps({
         "tenant_id": str(agent.tenant_id),
         "agent_id": agent_id,
@@ -164,8 +166,12 @@ async def create_web_call_token(
         "tts_voice": agent.tts_voice,
         "tts_language": agent.tts_language,
         "tts_model": agent.tts_model,
+        "tts_provider": getattr(agent, "tts_provider", "sarvam") or "sarvam",
         "stt_model": agent.stt_model,
+        "stt_language": getattr(agent, "stt_language", None) or agent.tts_language,
+        "stt_provider": getattr(agent, "stt_provider", "sarvam") or "sarvam",
         "llm_model": agent.llm_model,
+        "llm_provider": getattr(agent, "llm_provider", "groq") or "groq",
         "call_type": "test" if test_mode else "web",
         "test_mode": test_mode,
     })
