@@ -151,6 +151,15 @@ services:
         sync: false
       - key: ELEVENLABS_API_KEY
         sync: false
+      # REQUIRED whenever any agent has stt_provider='deepgram'. Missing here is
+      # NOT a loud failure: DeepgramSTTService constructs fine with api_key=""
+      # and only 401s at the websocket handshake, so the agent still greets via
+      # TTS and then never transcribes a single word — a silently DEAF agent.
+      # (pipeline.py now degrades to Sarvam + logs CRITICAL if this is unset.)
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: ASSEMBLYAI_API_KEY
+        sync: false
 
   # ── Frontend (React / Vite — built as static site) ────────────────────────
   - type: web

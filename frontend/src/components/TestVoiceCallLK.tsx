@@ -60,6 +60,10 @@ function TestCallUI({
   onDisconnect: () => void;
   onRetry?: () => void;
 }) {
+  // NOTE: mic state is read from the room itself (below) rather than taken from
+  // the parent's `micAvailable` pre-flight — the pre-flight only proves
+  // getUserMedia *could* open a device, not that LiveKitRoom actually published
+  // the track. The publication is the only thing the agent can hear.
   const room = useRoomContext();
   const connState = useConnectionState();
   const remoteParticipants = useRemoteParticipants();
@@ -215,6 +219,44 @@ function TestCallUI({
     }
   }, [transcript]);
 
+  // ── Mic publication state ─────────────────────────────────────────────────
+  // Without this the widget had NO signal that the caller's mic was dead: if
+  // getUserMedia was denied, <LiveKitRoom audio={false}> connected happily, the
+  // agent greeted, and nothing was ever heard — indistinguishable from a broken
+  // STT key. Read the actual local mic publication so the failure is visible and
+  // recoverable in-place.
+  const [micLive, setMicLive] = useState(false);
+  const [micBusy, setMicBusy] = useState(false);
+  useEffect(() => {
+    if (!room) return;
+    const update = () => {
+      const pub = room.localParticipant.getTrackPublication(Track.Source.Microphone);
+      setMicLive(!!pub?.track && !pub.isMuted);
+    };
+    update();
+    const events = [
+      RoomEvent.LocalTrackPublished,
+      RoomEvent.LocalTrackUnpublished,
+      RoomEvent.TrackMuted,
+      RoomEvent.TrackUnmuted,
+      RoomEvent.Connected,
+    ] as const;
+    events.forEach((e) => room.on(e, update));
+    return () => { events.forEach((e) => room.off(e, update)); };
+  }, [room]);
+
+  const enableMic = useCallback(async () => {
+    if (!room) return;
+    setMicBusy(true);
+    try {
+      await room.localParticipant.setMicrophoneEnabled(true);
+    } catch (e) {
+      console.error('Could not enable microphone:', e);
+    } finally {
+      setMicBusy(false);
+    }
+  }, [room]);
+
   // ── UI state ──────────────────────────────────────────────────────────────
   const agentReady =
     connState === ConnectionState.Connected &&
@@ -254,6 +296,35 @@ function TestCallUI({
               borderRadius: 20, fontWeight: 700, border: 'none', cursor: 'pointer', fontSize: 13,
             }}
           />
+        </div>
+      )}
+
+      {/* Mic-dead warning — the agent literally cannot hear you in this state */}
+      {connState === ConnectionState.Connected && !micLive && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+          justifyContent: 'center', textAlign: 'left',
+          background: 'rgba(239,68,68,0.12)', border: '1px solid rgba(239,68,68,0.45)',
+          borderRadius: 8, padding: '8px 10px', fontSize: 11, color: '#FCA5A5',
+          lineHeight: 1.45,
+        }}>
+          <span style={{ flex: 1, minWidth: 150 }}>
+            <strong>Microphone is not live.</strong> The agent can speak but cannot
+            hear you. Allow mic access for this site, then re-enable.
+          </span>
+          <button
+            onClick={enableMic}
+            disabled={micBusy}
+            style={{
+              padding: '5px 12px', borderRadius: 14, border: '1px solid #EF4444',
+              background: 'rgba(239,68,68,0.18)', color: '#FCA5A5',
+              fontWeight: 700, fontSize: 11,
+              cursor: micBusy ? 'default' : 'pointer', whiteSpace: 'nowrap',
+              opacity: micBusy ? 0.6 : 1,
+            }}
+          >
+            {micBusy ? 'Enabling…' : '🎤 Enable mic'}
+          </button>
         </div>
       )}
 

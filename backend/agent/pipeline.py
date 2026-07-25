@@ -652,6 +652,40 @@ async def entrypoint(ctx) -> None:
 
     # STT — Deepgram (real-time streaming), Sarvam AI, OpenAI Whisper, or ElevenLabs
     stt_provider = agent_config.get("stt_provider", "sarvam")
+
+    # ── Deaf-agent guard ────────────────────────────────────────────────────
+    # NONE of the STT services raise when handed an empty api_key — they build
+    # fine and only fail later at the websocket/HTTP handshake with a 401. The
+    # pipeline keeps running, TTS still has its own key, so the agent joins the
+    # room, speaks its greeting, and then never transcribes a single word. That
+    # silent failure mode is what made "voice input is not taken at all" so hard
+    # to see: the only symptom is the ABSENCE of transcription.
+    #
+    # This is the exact bug that shipped when stt_provider was switched to
+    # deepgram while DEEPGRAM_API_KEY was never added to the agent worker's env
+    # (render.yaml's lifodial-agent service). So: verify the selected provider's
+    # key up front, shout if it's missing, and degrade to a provider that can
+    # actually hear rather than running the whole call deaf.
+    _stt_keys = {
+        "deepgram":   settings.deepgram_api_key,
+        "openai":     settings.openai_api_key,
+        "whisper":    settings.openai_api_key,
+        "elevenlabs": settings.elevenlabs_api_key,
+        "sarvam":     settings.sarvam_api_key,
+    }
+    if not (_stt_keys.get(stt_provider) or "").strip():
+        _fallback = "sarvam" if (settings.sarvam_api_key or "").strip() else None
+        log.critical(
+            "STT provider '%s' is selected but its API key is MISSING/EMPTY. The STT "
+            "socket will 401 and the agent would greet the caller and then never hear "
+            "a word (silently deaf). %s",
+            stt_provider,
+            f"Falling back to '{_fallback}' STT for room={room_name}." if _fallback
+            else "No fallback STT key available either — this call WILL have no speech input.",
+        )
+        if _fallback:
+            stt_provider = _fallback
+
     if stt_provider == "deepgram":
         # Deepgram Nova-3: real-time streaming with ~200ms TTFB (vs ~800ms Sarvam batch).
         # Best for English; supports Hindi/Tamil/Telugu with nova-2.
