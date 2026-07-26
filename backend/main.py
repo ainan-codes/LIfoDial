@@ -277,6 +277,7 @@ if _extra:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_CORS_ORIGINS,
+    allow_origin_regex=r"https://.*\.ngrok.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

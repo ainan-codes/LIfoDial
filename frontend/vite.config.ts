@@ -9,6 +9,15 @@ export default defineConfig({
     react(),
   ],
   server: {
-    allowedHosts: ['.ngrok-free.dev', '.ngrok-free.app', '.ngrok.io'],
+    host: true,
+    allowedHosts: true,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ''),
+        ws: true,
+      },
+    },
   },
 })

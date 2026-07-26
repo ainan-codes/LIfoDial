@@ -32,7 +32,7 @@ export default function Login() {
       // there is NO client-side credential check and NO fail-open path.
       let res = await fetch(`${API_URL}/auth/superadmin-login`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
         body: JSON.stringify({ email: trimmedEmail, password }),
       });
 
@@ -45,7 +45,7 @@ export default function Login() {
 
       res = await fetch(`${API_URL}/auth/clinic-login`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
         body: JSON.stringify({ email: trimmedEmail, password }),
       });
 
@@ -62,9 +62,11 @@ export default function Login() {
         return;
       }
 
-      setError('Invalid email or password.');
-    } catch {
-      setError('Could not reach the server. Please try again.');
+      const errData = await res.json().catch(() => ({}));
+      setError(errData.detail || 'Invalid email or password.');
+    } catch (err: any) {
+      console.error('Login request error:', err);
+      setError(`Could not reach the server (${err?.message || 'Network Error'}).`);
     } finally {
       setLoading(false);
     }

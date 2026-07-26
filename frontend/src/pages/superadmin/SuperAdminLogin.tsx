@@ -17,7 +17,7 @@ export default function SuperAdminLogin() {
     try {
       const res = await fetch(`${API_URL}/auth/superadmin-login`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
         body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
       });
       if (res.ok) {
@@ -25,10 +25,12 @@ export default function SuperAdminLogin() {
         setSession({ token: data.access_token, role: 'superadmin', email: email.trim().toLowerCase() });
         navigate('/superadmin/dashboard', { replace: true });
       } else {
-        setError('Invalid credentials');
+        const errData = await res.json().catch(() => ({}));
+        setError(errData.detail || 'Invalid credentials');
       }
-    } catch {
-      setError('Could not reach the server.');
+    } catch (err: any) {
+      console.error('SuperAdmin login error:', err);
+      setError(`Could not reach the server (${err?.message || 'Network Error'}).`);
     } finally {
       setLoading(false);
     }

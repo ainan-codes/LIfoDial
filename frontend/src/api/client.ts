@@ -5,7 +5,17 @@
  */
 import { getToken, clearSession } from './auth';
 
-export const API_URL = import.meta.env.VITE_API_URL || 'https://lifodial.onrender.com';
+const getDynamicApiUrl = () => {
+  if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
+  if (typeof window !== 'undefined') {
+    const origin = window.location.origin;
+    if (origin.includes('ngrok')) return `${origin}/api`;
+    if (origin.includes('localhost') || origin.includes('127.0.0.1')) return 'http://localhost:8000';
+  }
+  return 'https://lifodial.onrender.com';
+};
+
+export const API_URL = getDynamicApiUrl();
 
 // Derive WebSocket URL from API URL
 const _wsBase = API_URL.replace(/^http/, 'ws');
@@ -25,6 +35,7 @@ export async function fetchWithAuth(endpoint: string, options: RequestInit = {})
     ...options,
     headers: {
       'Content-Type': 'application/json',
+      'ngrok-skip-browser-warning': 'true',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...options.headers,
     },
