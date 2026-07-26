@@ -98,6 +98,10 @@ async def _push(proc, frame):
 
     proc.push_frame = capture  # type: ignore[method-assign]
     await proc.process_frame(frame, DOWN)
+    # BotStoppedSpeakingFrame finishes in a task (it drains LiveKit playout
+    # first), so yield until that has run.
+    for _ in range(6):
+        await asyncio.sleep(0)
     return pushed
 
 
@@ -337,6 +341,54 @@ async def test_hangup_happens_only_once():
     await log.note_user_utterance("bye")          # duplicate final transcript
     await asyncio.sleep(0.05)
     assert len(task.spoken) == 1
+
+
+@pytest.mark.asyncio
+async def test_hangup_waits_for_livekit_to_finish_playing_not_just_writing():
+    """The flaw a live call exposed: BotStoppedSpeakingFrame means pipecat finished
+    WRITING audio, but LiveKit still holds up to ~1s queued. Ending there clipped
+    the goodbye. The call must wait for the playout drain."""
+    log = _logger()
+    task = _RecordingTask()
+    log.task = task
+
+    drained = asyncio.Event()
+
+    async def slow_drain():
+        await drained.wait()
+
+    log.set_playout_drain(slow_drain)
+
+    await _push(log, TTSStartedFrame())
+    await _push(log, TTSTextFrame(aggregated_by="sentence", text="Thank you for calling. Goodbye!"))
+    await _push(log, BotStartedSpeakingFrame())
+    await _push(log, BotStoppedSpeakingFrame())
+
+    assert log.bot_speaking is True, "caller is still hearing buffered audio"
+    assert task.cancelled is False, "must not hang up while audio is still playing"
+
+    drained.set()
+    for _ in range(8):
+        await asyncio.sleep(0)
+    assert log.bot_speaking is False
+    assert task.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_a_failing_playout_drain_cannot_stall_the_call():
+    log = _logger()
+    task = _RecordingTask()
+    log.task = task
+
+    async def broken_drain():
+        raise RuntimeError("transport internals moved")
+
+    log.set_playout_drain(broken_drain)
+
+    await _push(log, BotStartedSpeakingFrame())
+    await _push(log, BotStoppedSpeakingFrame())
+    assert log.bot_speaking is False, "a drain failure must not pin the timer forever"
+    assert await log.wait_playback_complete(timeout=0.05) is True
 
 
 @pytest.mark.asyncio

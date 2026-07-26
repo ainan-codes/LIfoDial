@@ -1232,9 +1232,14 @@ async def entrypoint(ctx) -> None:
     # a reasonable pause never trips the timeout on a normal call.
     silence_timeout_seconds = max(int(agent_config.get("silence_timeout_seconds", 30) or 30), 20)
 
-    # Give the logger a way to end the call directly (used for end_call_phrases
+    # Give the logger a way to end the call directly (used for closing-intent
     # detection — see CallLoggerProcessor._on_user_speech).
     call_logger.task = task
+
+    # …and a way to know when audio has genuinely finished playing, so the silence
+    # timer restarts and a goodbye hangs up only after the caller has heard the
+    # whole sentence.
+    call_logger.set_playout_drain(_make_playout_drain(transport))
 
     # Let the never-silence guard inject a spoken phrase via the source on error.
     resilience.bind_task(task)
@@ -1275,6 +1280,39 @@ async def entrypoint(ctx) -> None:
             log.error("Error awaiting finalization for room=%s: %s", room_name, exc)
 
     log.info("Pipeline finished for room=%s", room_name)
+
+
+def _make_playout_drain(transport, timeout: float = 6.0):
+    """Build an awaitable that waits for LiveKit to finish PLAYING queued audio.
+
+    pipecat's BotStoppedSpeakingFrame fires when the output transport has written
+    the last audio chunk, but LiveKit's rtc.AudioSource is constructed with a
+    1000ms queue and capture_frame() self-paces against it — so up to a second of
+    speech can still be unplayed at that moment. Hanging up or restarting the
+    silence timer there clips the tail of the agent's last sentence (measured on a
+    live call: a ~2s goodbye reported "stopped speaking" 1.26s in).
+
+    rtc.AudioSource.wait_for_playout() is the real end-of-audio signal. Reaching
+    it means touching pipecat's private transport internals, which is why every
+    step is guarded and a failure simply means "don't wait" — the same
+    best-effort approach LiveKitTranscriptPublisher takes to resolve the room.
+    """
+    async def drain() -> None:
+        try:
+            output = transport.output()
+            source = getattr(getattr(output, "_client", None), "_audio_source", None)
+            if source is None or not hasattr(source, "wait_for_playout"):
+                return
+            queued = getattr(source, "queued_duration", 0) or 0
+            if queued <= 0:
+                return
+            await asyncio.wait_for(source.wait_for_playout(), timeout=timeout)
+        except asyncio.TimeoutError:
+            log.warning("LiveKit playout drain exceeded %.0fs — continuing.", timeout)
+        except Exception as exc:
+            log.debug("LiveKit playout drain unavailable (non-critical): %s", exc)
+
+    return drain
 
 
 async def _monitor_event_loop_lag(

@@ -226,6 +226,16 @@ class CallLoggerProcessor(FrameProcessor):
         self._playback_complete = asyncio.Event()
         self._playback_complete.set()  # nothing is playing at construction
 
+        # Set by pipeline.py: awaits the LiveKit AudioSource actually draining.
+        # BotStoppedSpeakingFrame only means pipecat finished WRITING audio to the
+        # transport — LiveKit's AudioSource is created with a 1000ms queue, so up
+        # to a second of speech can still be unplayed at that point. Verified on a
+        # live call: a ~2s goodbye reported "stopped speaking" 1.26s after TTS
+        # started, and hanging up there clipped the tail. This drains the real
+        # queue (rtc.AudioSource.wait_for_playout) so "finished playing" means the
+        # caller actually heard it.
+        self._playout_drain = None
+
         # Text of the agent utterance currently being spoken, accumulated from
         # TTSTextFrames so a closing phrase can be recognised in the agent's OWN
         # words (the LLM says "Thank you for calling. Goodbye!" of its own accord —
@@ -317,12 +327,11 @@ class CallLoggerProcessor(FrameProcessor):
                 self._playback_complete.clear()
 
             elif isinstance(frame, BotStoppedSpeakingFrame):
-                # Real end of playback. Caller silence is measured from HERE — not
-                # from when the agent started talking.
-                self.bot_speaking = False
-                self.last_activity_ts = time.time()
-                self._playback_complete.set()
-                await self._maybe_end_after_agent_goodbye()
+                # pipecat has finished WRITING the audio; LiveKit may still be
+                # playing up to a second of it. Finish off in a task so the frame
+                # is not held up, and keep bot_speaking True until the queue has
+                # actually drained — the caller is still listening until then.
+                asyncio.create_task(self._on_playback_finished())
 
             elif isinstance(frame, MetricsFrame):
                 self._on_metrics(frame)
@@ -355,6 +364,32 @@ class CallLoggerProcessor(FrameProcessor):
         except asyncio.TimeoutError:
             logger.warning("Finalization did not complete within %.0fs.", timeout)
             return False
+
+    def set_playout_drain(self, drain) -> None:
+        """Install the LiveKit playout-drain awaitable (see _playout_drain)."""
+        self._playout_drain = drain
+
+    async def _drain_playout(self) -> None:
+        """Wait for audio already handed to LiveKit to finish playing. Best effort:
+        any failure here must not stall the call, so it degrades to returning."""
+        if self._playout_drain is None:
+            return
+        try:
+            await self._playout_drain()
+        except Exception as exc:
+            logger.debug("Playout drain unavailable (non-critical): %s", exc)
+
+    async def _on_playback_finished(self) -> None:
+        """Runs after BotStoppedSpeakingFrame, once LiveKit has really drained.
+
+        Only here is the caller no longer listening, so only here does the
+        silence timer get to start counting and an agent goodbye get to hang up.
+        """
+        await self._drain_playout()
+        self.bot_speaking = False
+        self.last_activity_ts = time.time()
+        self._playback_complete.set()
+        await self._maybe_end_after_agent_goodbye()
 
     async def wait_playback_complete(self, timeout: float = 25.0) -> bool:
         """Await the end of the agent's current audio playback.
@@ -398,7 +433,9 @@ class CallLoggerProcessor(FrameProcessor):
 
         self._ending_call = True
         logger.info("Agent said goodbye ('%s') — ending call now.", spoken[:80])
-        # Playback already drained, so no closing message to speak: just end.
+        # Called from _on_playback_finished, i.e. the LiveKit queue has already
+        # drained and the caller has heard the whole message. Nothing left to say,
+        # so end straight away without waiting for any further caller input.
         asyncio.create_task(self.task.cancel())
 
     # ── Internal handlers ─────────────────────────────────────────────────────
