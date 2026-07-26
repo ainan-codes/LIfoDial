@@ -46,8 +46,15 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.processors.audio.vad_processor import VADProcessor
+from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import (
+    SpeechTimeoutUserTurnStopStrategy,
+)
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSModel, SarvamTTSService
 from pipecat.services.openai.stt import OpenAISTTService
@@ -732,8 +739,28 @@ async def entrypoint(ctx) -> None:
                 _dg_requested, dg_model, room_name,
             )
         # nova-3 takes only "en*" or "multi" as its language.
-        if dg_model.startswith("nova-3") and not dg_lang.startswith("en"):
-            dg_lang = "multi"
+        #
+        # Prefer "multi" even for English: nova-3 multilingual code-switches inside
+        # ONE socket, so a caller moving English → Hindi mid-call costs NOTHING.
+        # Pinning "en-IN" instead would force LanguageSwitchProcessor to send an
+        # STTUpdateSettingsFrame, and Deepgram's _update_settings reconnects the
+        # websocket — ~200-400ms deaf right at the moment the caller switched.
+        #
+        # nova-3 multilingual does NOT cover every language this product serves
+        # (Tamil/Telugu/Malayalam/Kannada/Bengali/Gujarati/Punjabi/Marathi/Odia are
+        # nova-2-only), so for those an explicit nova-3 choice is downgraded to
+        # nova-2 rather than silently transcribing nothing.
+        _NOVA3_MULTI_LANGS = {"en", "hi"}  # of ours; nova-3 multi also covers es/fr/de/it/nl/pt/ja/ru
+        if dg_model.startswith("nova-3"):
+            _base = dg_lang.split("-")[0]
+            if _base in _NOVA3_MULTI_LANGS:
+                dg_lang = "multi"
+            else:
+                log.warning(
+                    "nova-3 does not support %s — falling back to nova-2 for room=%s",
+                    dg_lang, room_name,
+                )
+                dg_model = "nova-2"
         log.info("Deepgram STT: model=%s language=%s", dg_model, dg_lang)
         stt = DeepgramSTTService(
             api_key=settings.deepgram_api_key,
@@ -811,7 +838,43 @@ async def entrypoint(ctx) -> None:
             {"role": "system", "content": system_prompt},
         ]
     )
-    context_aggregator = LLMContextAggregatorPair(context)
+    # ── Turn-stop strategy — cheap timer, not a local transformer ───────────
+    # pipecat 1.5 defaults the STOP strategy to TurnAnalyzerUserTurnStopStrategy,
+    # which runs the Local Smart Turn v3 ONNX transformer over the utterance audio
+    # to decide semantically whether the caller is done. It is a good default on a
+    # real CPU. This worker runs on Render's FREE plan (0.1 CPU), where that
+    # inference is a synchronous block inside the event loop — and the live logs
+    # show what it costs: bursts of
+    #
+    #   "libwebrtc audio_stream queue overflow; dropped 400 queued frames"
+    #
+    # right after each utterance. Dropped inbound frames plus a stalled loop is
+    # exactly the reported symptom set: TTS that stutters mid-sentence and
+    # barge-in that "doesn't stop" (the InterruptionFrame cannot be processed
+    # while the loop is blocked, so the caller keeps hearing buffered audio).
+    #
+    # SpeechTimeoutUserTurnStopStrategy replaces it with two plain timers: no
+    # model load per job, no inference per utterance. End-of-turn becomes
+    # stop_secs (0.2) + user_speech_timeout (0.6) ≈ 0.8s, predictable.
+    #
+    # Semantic turn detection is strictly better once there is CPU for it, so this
+    # is a flag, not a deletion: set AGENT_SMART_TURN=true after moving off the
+    # free plan to get it back.
+    if settings.agent_smart_turn:
+        log.info("Turn detection: Local Smart Turn v3 (semantic) — AGENT_SMART_TURN is on")
+        user_params = LLMUserAggregatorParams()
+    else:
+        log.info("Turn detection: speech-timeout timers (cheap) — set AGENT_SMART_TURN=true to use Smart Turn v3")
+        user_params = LLMUserAggregatorParams(
+            user_turn_strategies=UserTurnStrategies(
+                # start=[...] intentionally omitted — the default
+                # [VADUserTurnStartStrategy, TranscriptionUserTurnStartStrategy]
+                # is what fires barge-in, and must stay.
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6)],
+            ),
+        )
+
+    context_aggregator = LLMContextAggregatorPair(context, user_params=user_params)
 
     # ── VAD — barge-in / interruption (pipecat 1.5.0 wiring) ────────────────
     # This is the piece that was silently missing. In 1.5.0 VAD is neither a
@@ -835,11 +898,25 @@ async def entrypoint(ctx) -> None:
     vad = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(
             params=VADParams(
-                # Tuned for low-latency barge-in:
                 # start_secs 0.2  → speech onset (and interruption) at ~200ms
-                # stop_secs  0.6  → end-of-speech 250ms sooner than the 0.85 default
                 # confidence 0.55 → slightly more sensitive, fewer missed starts
-                stop_secs=0.6,
+                #
+                # ⚠️ stop_secs MUST stay at pipecat 1.5's 0.2 default. It was set to
+                # 0.6 here as a "latency optimisation" carried over from 0.x, where
+                # stop_secs directly gated end-of-turn. In 1.5 the turn machinery
+                # subtracts stop_secs from the STT p99 latency budget, and the
+                # worker logged exactly what goes wrong:
+                #
+                #   "VAD stop_secs (0.6s) >= STT p99 latency (0.35s). STT wait
+                #    timeout collapsed to 0s, which may cause delayed turn
+                #    detection specified by the user_turn_stop_timeout parameter"
+                #
+                # With the budget collapsed to 0 the turn fell through to the
+                # user_turn_stop_timeout fallback (5s default), which is precisely
+                # the stall seen on live calls: VAD stopped 15:38:22.7, turn
+                # inference only fired 15:38:27.5 — 4.8s of dead air per turn.
+                # Raising this "for latency" costs latency.
+                stop_secs=0.2,
                 start_secs=0.2,
                 confidence=0.55,
             )

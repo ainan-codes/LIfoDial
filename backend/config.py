@@ -73,6 +73,16 @@ class Settings(BaseSettings):
     # unreliable anyway.
     agent_worker_keep_warm: bool = False
 
+    # Semantic end-of-turn detection (pipecat's Local Smart Turn v3 ONNX model).
+    # DEFAULT OFF while the agent worker is on Render's free plan (0.1 CPU): the
+    # per-utterance inference blocks the event loop there, which shows up as
+    # "libwebrtc audio_stream queue overflow; dropped N queued frames" on live
+    # calls, stuttering TTS and barge-in that reacts late. With it off, end-of-turn
+    # uses plain timers (VAD stop_secs + user_speech_timeout ≈ 0.8s).
+    # Turn this ON after upgrading the instance — semantic detection is better at
+    # not cutting callers off mid-thought.
+    agent_smart_turn: bool = False
+
     # ── Sarvam AI ──────────────────────────────────────────────────────────
     sarvam_api_key: str = ""
 
