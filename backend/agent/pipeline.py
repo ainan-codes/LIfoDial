@@ -47,6 +47,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSModel, SarvamTTSService
 from pipecat.services.openai.stt import OpenAISTTService
@@ -66,6 +67,7 @@ from livekit import api as livekit_api
 # ── Local processors ──────────────────────────────────────────────────────────
 from backend.agent.processors.booking_processor import BookingProcessor
 from backend.agent.processors.call_logger_processor import CallLoggerProcessor
+from backend.agent.processors.language_switcher import LanguageSwitchProcessor
 from backend.agent.processors.transcript_publisher import LiveKitTranscriptPublisher
 
 # ── App config ────────────────────────────────────────────────────────────────
@@ -132,7 +134,18 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
       2. Rendered prompt_templates entry for agent_config['template']
       3. Hardcoded fallback
     """
-    kb_block = _kb_context_block(tenant) + _BOOKING_RULES_BLOCK
+    # Pairs with LanguageSwitchProcessor: that processor retunes STT/TTS when the
+    # caller changes language, but the words themselves come from the LLM, so the
+    # model has to be told to follow the caller. Appended to every prompt path
+    # (custom, template, fallback) so a clinic's own prompt can't lose it.
+    _LANGUAGE_MIRROR_RULE = (
+        "\n\n--- LANGUAGE ---\n"
+        "Always reply in the SAME language the caller used in their most recent message, "
+        "even if that changes part-way through the call. Never announce the switch or "
+        "comment on which language is being spoken — just answer in it.\n"
+    )
+
+    kb_block = _kb_context_block(tenant) + _BOOKING_RULES_BLOCK + _LANGUAGE_MIRROR_RULE
 
     custom_prompt = (agent_config.get("system_prompt") or "").strip()
     if custom_prompt:
@@ -635,23 +648,25 @@ async def entrypoint(ctx) -> None:
         params=LiveKitParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(
-                params=VADParams(
-                    # Optimized for lower latency:
-                    # stop_secs 0.6 (was 0.85) → end-of-speech detected 250ms sooner
-                    # start_secs 0.2 (was 0.25) → speech onset detected ~50ms sooner
-                    # confidence 0.55 (was 0.6) → slightly more sensitive (fewer missed starts)
-                    stop_secs=0.6,
-                    start_secs=0.2,
-                    confidence=0.55,
-                )
-            ),
+            # ⚠️ Do NOT put vad_enabled / vad_analyzer here. Those were pipecat
+            # 0.x transport params; in 1.5.0 LiveKitParams has neither field and
+            # pydantic silently DROPS unknown kwargs — so the Silero analyzer
+            # that used to be configured here was never instantiated and the
+            # tuned VADParams were dead config. VAD is now a real pipeline
+            # processor (see VADProcessor below), which is how 1.5.0 wires it.
         ),
     )
 
     # STT — Deepgram (real-time streaming), Sarvam AI, OpenAI Whisper, or ElevenLabs
     stt_provider = agent_config.get("stt_provider", "sarvam")
+
+    # Set by the branches below and consumed by LanguageSwitchProcessor: whether a
+    # mid-call language change has to be pushed into the STT service, and how to
+    # translate our BCP-47 code into that provider's code. Left False for models
+    # that already detect language themselves (Sarvam saaras, Deepgram nova-3
+    # "multi") — reconnecting a healthy socket would only add deaf time.
+    stt_needs_language_switch = False
+    stt_language_translator = None
 
     # ── Deaf-agent guard ────────────────────────────────────────────────────
     # NONE of the STT services raise when handed an empty api_key — they build
@@ -689,7 +704,7 @@ async def entrypoint(ctx) -> None:
     if stt_provider == "deepgram":
         # Deepgram Nova-3: real-time streaming with ~200ms TTFB (vs ~800ms Sarvam batch).
         # Best for English; supports Hindi/Tamil/Telugu with nova-2.
-        log.info("Instantiating Deepgram STT (nova-3)...")
+        log.info("Instantiating Deepgram streaming STT...")
         DeepgramSTTService = _import_deepgram_stt()
         # Map our BCP-47 language code to Deepgram's language code
         _dg_lang_map = {
@@ -699,8 +714,27 @@ async def entrypoint(ctx) -> None:
             "bn-IN": "bn",     "pa-IN": "pa",     "gu-IN": "gu",
         }
         dg_lang = _dg_lang_map.get(stt_language, "en-IN")
-        # Use nova-2 for Indic languages (nova-3 is English-optimized)
-        dg_model = "nova-3" if dg_lang.startswith("en") else "nova-2"
+        # Honour the model picked in the UI (nova-2-phonecall, nova-2-medical, …).
+        # agent_config["stt_model"] is shared with Sarvam and defaults to a
+        # "saaras:*" value, so only accept strings that are actually Deepgram
+        # model names; anything else falls back to the language-based default:
+        # nova-3 for English, nova-2 for Indic (nova-3 is English-optimised).
+        _dg_default = "nova-3" if dg_lang.startswith("en") else "nova-2"
+        _dg_requested = (agent_config.get("stt_model") or "").strip()
+        dg_model = (
+            _dg_requested
+            if _dg_requested.startswith(("nova-", "nova", "base", "enhanced"))
+            else _dg_default
+        )
+        if _dg_requested and dg_model != _dg_requested:
+            log.info(
+                "STT model %r is not a Deepgram model — using %s for room=%s",
+                _dg_requested, dg_model, room_name,
+            )
+        # nova-3 takes only "en*" or "multi" as its language.
+        if dg_model.startswith("nova-3") and not dg_lang.startswith("en"):
+            dg_lang = "multi"
+        log.info("Deepgram STT: model=%s language=%s", dg_model, dg_lang)
         stt = DeepgramSTTService(
             api_key=settings.deepgram_api_key,
             settings=DeepgramSTTService.Settings(
@@ -713,6 +747,15 @@ async def entrypoint(ctx) -> None:
                 utterance_end_ms=1000,
             ),
         )
+        # nova-3 on "multi" already code-switches inside one socket, so only the
+        # language-pinned models need a mid-call STT retune.
+        stt_needs_language_switch = dg_lang != "multi"
+
+        def stt_language_translator(code: str, _model: str = dg_model) -> str:
+            # nova-3 accepts only "en*" or "multi"; older models take real codes.
+            if _model.startswith("nova-3"):
+                return "en" if code.startswith("en") else "multi"
+            return _dg_lang_map.get(code, "")
     elif stt_provider in ("openai", "whisper"):
         log.info("Instantiating OpenAI Whisper STT...")
         stt = OpenAISTTService(
@@ -734,12 +777,18 @@ async def entrypoint(ctx) -> None:
                 language=stt_lang or None,
             )
         )
+        stt_needs_language_switch = bool(stt_lang)
+        stt_language_translator = lambda code: code.split("-")[0]
     else:
         log.info("Instantiating Sarvam STT...")
         stt = SarvamSTTService(
             api_key=settings.sarvam_api_key,
             settings=stt_settings,
         )
+        # saaras:v2.5 was built with no language at all (it auto-detects); the
+        # pinned models (saarika, saaras:v3) need to be told.
+        stt_needs_language_switch = stt_model != "saaras:v2.5"
+        stt_language_translator = _safe_lang
 
     # LLM — resilient provider selection (audit FIX 2). Probe the configured
     # provider first, fall back through healthy alternatives. This is what makes
@@ -763,6 +812,39 @@ async def entrypoint(ctx) -> None:
         ]
     )
     context_aggregator = LLMContextAggregatorPair(context)
+
+    # ── VAD — barge-in / interruption (pipecat 1.5.0 wiring) ────────────────
+    # This is the piece that was silently missing. In 1.5.0 VAD is neither a
+    # transport param nor implicit: it is a PROCESSOR. Placed FIRST, right after
+    # transport.input(), it broadcasts VADUserStartedSpeakingFrame /
+    # VADUserStoppedSpeakingFrame, which two different consumers need:
+    #
+    #   1. The user aggregator's default turn-start strategies are
+    #      [VADUserTurnStartStrategy, TranscriptionUserTurnStartStrategy]. The VAD
+    #      one fires the interruption on speech ONSET (~start_secs); without it
+    #      only the transcription strategy ran, so barge-in waited for Deepgram's
+    #      first interim transcript to make the network round-trip. Interruptions
+    #      themselves are ON by default in 1.5.0
+    #      (BaseUserTurnStartStrategy.enable_interruptions) — the analyzer was the
+    #      only missing half.
+    #   2. SegmentedSTTService subclasses (OpenAI Whisper) slice utterances off
+    #      these exact frames. That is why VAD must sit UPSTREAM of `stt` and not
+    #      on the aggregator: an aggregator-hosted analyzer is downstream of STT,
+    #      so whisper would never see a boundary and never transcribe. Deepgram
+    #      and Sarvam are streaming services and segment server-side.
+    vad = VADProcessor(
+        vad_analyzer=SileroVADAnalyzer(
+            params=VADParams(
+                # Tuned for low-latency barge-in:
+                # start_secs 0.2  → speech onset (and interruption) at ~200ms
+                # stop_secs  0.6  → end-of-speech 250ms sooner than the 0.85 default
+                # confidence 0.55 → slightly more sensitive, fewer missed starts
+                stop_secs=0.6,
+                start_secs=0.2,
+                confidence=0.55,
+            )
+        )
+    )
 
     # TTS — Sarvam AI or ElevenLabs
     tts_provider = agent_config.get("tts_provider", "sarvam")
@@ -856,6 +938,23 @@ async def entrypoint(ctx) -> None:
     # construction below.
     resilience = ResilienceProcessor(language=tts_language)
 
+    # Mid-call language switching: watches the caller's final transcripts and
+    # retunes TTS (and STT, when the model is language-pinned) the moment they
+    # change language. Sits between `stt` and the user aggregator for the same
+    # reason user_transcript_publisher does — the aggregator eats
+    # TranscriptionFrames without forwarding them.
+    language_switcher = LanguageSwitchProcessor(
+        tts=tts,
+        stt=stt,
+        initial_language=tts_language,
+        stt_language_map=stt_language_translator,
+        switch_stt=stt_needs_language_switch,
+        # One clear turn is enough — a caller who switches expects to be answered
+        # in the new language on the very next reply, not two turns later.
+        confirm_turns=1,
+        on_switch=resilience.set_language,
+    )
+
     # ── Build the Pipeline ─────────────────────────────────────────────────
     # Data flows left to right through each processor:
     #
@@ -889,7 +988,9 @@ async def entrypoint(ctx) -> None:
 
     pipeline = Pipeline([
         transport.input(),                       # Audio in from LiveKit room
+        vad,                                     # Silero VAD → speech start/stop (barge-in + segmentation)
         stt,                                     # Speech → Transcription/InterimTranscriptionFrame
+        language_switcher,                       # Caller changed language? retune STT/TTS (transparent)
         user_transcript_publisher,               # Mirror USER text → room data channel (transparent)
         context_aggregator.user(),               # Accumulates user turns into LLMContext
         booking_processor,                       # Booking state machine (transparent)
@@ -925,7 +1026,11 @@ async def entrypoint(ctx) -> None:
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=True,     # Barge-in: patient can interrupt agent speech
+            # NOTE: allow_interruptions used to be passed here. PipelineParams has
+            # no such field in pipecat 1.5.0 and pydantic drops unknown kwargs, so
+            # it was a no-op. Interruptions are ON by default in 1.5.0 — the knob
+            # that actually matters is the VAD analyzer on the user aggregator
+            # above (BaseUserTurnStartStrategy.enable_interruptions defaults True).
             enable_metrics=True,          # Enables MetricsFrame for latency tracking
             enable_usage_metrics=True,    # Enables token usage tracking
         ),

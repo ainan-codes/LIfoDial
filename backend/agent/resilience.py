@@ -216,6 +216,14 @@ class ResilienceProcessor(FrameProcessor):
     def bind_task(self, task) -> None:
         self._task = task
 
+    def set_language(self, language: str) -> None:
+        """Re-target the fallback phrase after a mid-call language switch.
+
+        Called by LanguageSwitchProcessor: if the caller moved to Hindi, an
+        error must not be apologised for in English.
+        """
+        self._phrase = fallback_phrase(language)
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         # REQUIRED first (pipecat 1.5): handle system frames + mark started.
         await super().process_frame(frame, direction)

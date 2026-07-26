@@ -1658,7 +1658,7 @@ async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint
     if stt_provider == "sarvam":
         api_key = settings.sarvam_api_key or os.getenv("SARVAM_API_KEY")
     elif stt_provider == "deepgram":
-        api_key = os.getenv("DEEPGRAM_API_KEY")
+        api_key = settings.deepgram_api_key or os.getenv("DEEPGRAM_API_KEY")
     elif stt_provider == "openai_whisper":
         api_key = os.getenv("OPENAI_API_KEY")
     
@@ -1689,9 +1689,12 @@ async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint
         return await sarvam_transcribe(api_key, audio_bytes, stt_model, lang)
     
     elif stt_provider == "deepgram":
-        transcript = await deepgram_transcribe(api_key, audio_bytes,
-                                          agent.stt_model or "nova-2")
-        return transcript, detect_text_language(transcript)
+        # Empty language ⇒ Deepgram auto-detect (nova-2) / multi (nova-3), same
+        # policy as the Sarvam branch above. A retry pins the language.
+        dg_lang = lang if (force_language or not getattr(agent, "auto_detect_language", True)) else ""
+        return await deepgram_transcribe(
+            api_key, audio_bytes, agent.stt_model or "nova-2", language=dg_lang
+        )
     
     elif stt_provider == "openai_whisper":
         return await openai_transcribe(api_key, audio_bytes)
@@ -1959,9 +1962,132 @@ def _convert_to_wav_pcm(audio_bytes: bytes) -> bytes:
                     pass
 
 
-async def deepgram_transcribe(api_key: str, audio_bytes: bytes, model: str) -> str:
-    # Placeholder — returns empty
-    return ""
+DEEPGRAM_LISTEN_URL = "https://api.deepgram.com/v1/listen"
+
+# BCP-47 (our internal codes) → Deepgram language codes for the pre-recorded API.
+# Anything not listed falls back to auto-detect rather than risking a 400.
+_DEEPGRAM_LANGS = {
+    "en-IN": "en-IN", "en-US": "en-US", "en-GB": "en-GB", "en": "en",
+    "hi-IN": "hi", "hi": "hi",
+    "ta-IN": "ta", "ta": "ta",
+    "te-IN": "te", "te": "te",
+    "ml-IN": "ml", "ml": "ml",
+    "mr-IN": "mr", "mr": "mr",
+    "bn-IN": "bn", "bn": "bn",
+    "gu-IN": "gu", "gu": "gu",
+    "pa-IN": "pa", "pa": "pa",
+    "kn-IN": "kn", "kn": "kn",
+}
+
+
+def _deepgram_language_param(model: str, language: str) -> dict:
+    """Query params controlling Deepgram language selection.
+
+    nova-3 only accepts ``en`` or ``multi``; nova-2 and earlier accept per-language
+    codes plus ``detect_language=true``. An empty ``language`` means auto-detect.
+    """
+    if model.startswith("nova-3"):
+        if language.startswith("en"):
+            return {"language": "en"}
+        return {"language": "multi"}
+
+    dg = _DEEPGRAM_LANGS.get(language) or _DEEPGRAM_LANGS.get(language.split("-")[0], "")
+    if dg:
+        return {"language": dg}
+    return {"detect_language": "true"}
+
+
+async def deepgram_transcribe(
+    api_key: str,
+    audio_bytes: bytes | None,
+    model: str = "nova-2",
+    language: str = "",
+    audio_url: str | None = None,
+) -> tuple[str, str]:
+    """Deepgram pre-recorded STT via ``POST /v1/listen``.
+
+    This is the REST call from Deepgram's console example::
+
+        curl -X POST \
+          -H "Authorization: Token $DEEPGRAM_API_KEY" \
+          -H 'content-type: application/json' \
+          -d '{"url": "https://static.deepgram.com/examples/Bueller-Life-moves-pretty-fast.wav"}' \
+          "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true"
+
+    Same endpoint and auth header, two interchangeable bodies:
+
+    * ``audio_url``   → ``content-type: application/json``, body ``{"url": ...}``
+      (the curl above, for audio already hosted somewhere reachable)
+    * ``audio_bytes`` → ``content-type: <sniffed audio mime>``, body = raw audio
+      (what the test-agent WebSocket path has: a recorded browser chunk)
+
+    Returns ``(transcript, detected_language)`` — ``("", "")`` on any failure so
+    callers degrade the same way the other STT providers do.
+
+    Note this is the *batch* API. The live LiveKit pipeline uses Deepgram's
+    streaming WebSocket via pipecat (see ``backend/agent/pipeline.py``); this
+    function is only for whole-utterance audio.
+    """
+    import httpx
+
+    if not api_key:
+        logger.warning("Deepgram STT: no API key")
+        return "", ""
+    if not audio_url and not audio_bytes:
+        logger.warning("Deepgram STT: no audio supplied")
+        return "", ""
+
+    params = {"model": model or "nova-2", "smart_format": "true", "punctuate": "true"}
+    params.update(_deepgram_language_param(params["model"], language))
+
+    if audio_url:
+        headers = {"Authorization": f"Token {api_key}", "content-type": "application/json"}
+        body: dict = {"json": {"url": audio_url}}
+    else:
+        _, mime = _detect_audio_upload_format(audio_bytes)
+        headers = {"Authorization": f"Token {api_key}", "content-type": mime}
+        body = {"content": audio_bytes}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(DEEPGRAM_LISTEN_URL, params=params, headers=headers, **body)
+
+            # An unsupported language for this model is a 400 — retry on
+            # auto-detect instead of losing the whole utterance.
+            if resp.status_code == 400 and "language" in params:
+                logger.warning(
+                    "Deepgram STT rejected language=%s for %s (%s) — retrying with detect_language",
+                    params["language"], params["model"], resp.text[:200],
+                )
+                params.pop("language")
+                params["detect_language"] = "true"
+                resp = await client.post(DEEPGRAM_LISTEN_URL, params=params, headers=headers, **body)
+
+            if resp.status_code != 200:
+                logger.error("Deepgram STT error %s: %s", resp.status_code, resp.text[:300])
+                return "", ""
+
+            data = resp.json()
+    except Exception as exc:
+        logger.error("Deepgram STT exception: %s", exc)
+        return "", ""
+
+    try:
+        channel = data["results"]["channels"][0]
+        transcript = (channel["alternatives"][0].get("transcript") or "").strip()
+    except (KeyError, IndexError, TypeError):
+        logger.error("Deepgram STT: unexpected response shape: %s", str(data)[:300])
+        return "", ""
+
+    # Deepgram reports ISO 639-1 when detect_language was used; normalise to the
+    # BCP-47 codes the rest of the agent speaks, else fall back to script sniffing.
+    dg_lang = channel.get("detected_language") or ""
+    if dg_lang:
+        detected = dg_lang if "-" in dg_lang else f"{dg_lang}-IN"
+    else:
+        detected = detect_text_language(transcript)
+
+    return transcript, detected
 
 async def openai_transcribe(api_key: str, audio_bytes: bytes) -> tuple[str, str]:
     """OpenAI Whisper transcription via OpenAI API — returns (transcript, detected_language)."""

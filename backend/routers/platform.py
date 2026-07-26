@@ -247,12 +247,22 @@ SARVAM_STT_MODELS = ["saarika:v2.5", "saarika:v2", "saaras:v3", "saaras:v2"]
 # ElevenLabs STT (Scribe) — listed here as fallback; also fetched live via /v1/models
 ELEVENLABS_STT_MODELS = ["scribe_v2_realtime", "scribe_v2"]
 
-# Deepgram Nova models
+# Deepgram STT models. Streaming-capable only — Deepgram's whisper-* models are
+# batch-only and would leave a live call deaf, so they are deliberately absent.
 DEEPGRAM_STT_MODELS = [
+    # nova-3 — English + "multi" (best accuracy, lowest latency)
+    "nova-3", "nova-3-general", "nova-3-medical",
+    # nova-2 — the Indic-capable family, plus domain-tuned variants
     "nova-2", "nova-2-general", "nova-2-meeting", "nova-2-phonecall",
     "nova-2-finance", "nova-2-conversationalai", "nova-2-voicemail",
     "nova-2-video", "nova-2-medical", "nova-2-drivethru", "nova-2-automotive",
-    "nova-3", "base", "enhanced"
+    "nova-2-atc",
+    # nova-1 and the older tiers
+    "nova", "nova-general", "nova-phonecall", "nova-medical",
+    "enhanced", "enhanced-general", "enhanced-meeting", "enhanced-phonecall",
+    "enhanced-finance",
+    "base", "base-general", "base-meeting", "base-phonecall", "base-finance",
+    "base-conversationalai", "base-voicemail", "base-video",
 ]
 
 # AssemblyAI models
