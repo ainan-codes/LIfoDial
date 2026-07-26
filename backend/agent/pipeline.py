@@ -73,7 +73,10 @@ from livekit import api as livekit_api
 
 # ── Local processors ──────────────────────────────────────────────────────────
 from backend.agent.processors.booking_processor import BookingProcessor
-from backend.agent.processors.call_logger_processor import CallLoggerProcessor
+from backend.agent.processors.call_logger_processor import (
+    CallLoggerProcessor,
+    UserTranscriptTap,
+)
 from backend.agent.processors.language_switcher import LanguageSwitchProcessor
 from backend.agent.processors.transcript_publisher import LiveKitTranscriptPublisher
 
@@ -1020,6 +1023,11 @@ async def entrypoint(ctx) -> None:
         call_meta=call_meta,
         agent_config=agent_config,
     )
+    # Feeds user utterances to call_logger from a position where
+    # TranscriptionFrames still exist. Without it the logger counts zero turns
+    # and stores an empty transcript, because context_aggregator.user() swallows
+    # those frames before they can reach it (see UserTranscriptTap's docstring).
+    user_transcript_tap = UserTranscriptTap(call_logger)
 
     # Never-silence guard (audit FIX 2): sits at the tail of the pipeline and,
     # on any LLM/TTS ErrorFrame, speaks a short reassurance phrase in the agent's
@@ -1080,6 +1088,7 @@ async def entrypoint(ctx) -> None:
         vad,                                     # Silero VAD → speech start/stop (barge-in + segmentation)
         stt,                                     # Speech → Transcription/InterimTranscriptionFrame
         language_switcher,                       # Caller changed language? retune STT/TTS (transparent)
+        user_transcript_tap,                     # Feed user turns to call_logger (transparent)
         user_transcript_publisher,               # Mirror USER text → room data channel (transparent)
         context_aggregator.user(),               # Accumulates user turns into LLMContext
         booking_processor,                       # Booking state machine (transparent)
@@ -1236,7 +1245,10 @@ async def entrypoint(ctx) -> None:
     _silence_watchdog_task: list = []  # mutable container so the closure can populate it
 
     watchdog_tasks = [
-        asyncio.create_task(_enforce_max_duration(task, max_duration_seconds, end_call_message)),
+        asyncio.create_task(
+            _enforce_max_duration(task, max_duration_seconds, end_call_message, call_logger)
+        ),
+        asyncio.create_task(_monitor_event_loop_lag(room_name)),
     ]
 
     # ── Run ────────────────────────────────────────────────────────────────
@@ -1265,14 +1277,60 @@ async def entrypoint(ctx) -> None:
     log.info("Pipeline finished for room=%s", room_name)
 
 
-async def _enforce_max_duration(task: "PipelineTask", max_duration_seconds: int, end_call_message: str) -> None:
+async def _monitor_event_loop_lag(
+    room_name: str,
+    sample_interval: float = 0.5,
+    warn_threshold: float = 0.15,
+) -> None:
+    """Log whenever the event loop is starved, with the size of the stall.
+
+    Stuttering TTS on this stack has exactly one mechanism: LiveKit's AudioSource
+    is created with a 1000ms queue and its capture_frame() self-paces, so pipecat
+    keeps roughly a second of audio buffered ahead. The caller therefore only
+    hears a gap when the event loop is blocked long enough to drain that — i.e.
+    hundreds of milliseconds to a second, not the ~40ms of a chunk boundary.
+
+    That makes "is the loop stalling, and for how long" the one measurement worth
+    having, and it is not something a code read can answer. This sampler sleeps
+    for a known interval and reports the overshoot, so a real call leaves evidence
+    in the logs instead of an argument. Cost is two wakeups a second and a
+    subtraction; it only logs when it has something to report.
+    """
+    try:
+        worst = 0.0
+        while True:
+            before = time.monotonic()
+            await asyncio.sleep(sample_interval)
+            lag = time.monotonic() - before - sample_interval
+            if lag >= warn_threshold:
+                worst = max(worst, lag)
+                log.warning(
+                    "Event loop stalled %.0fms (worst %.0fms this call) — audio "
+                    "output can gap when this approaches 1000ms | room=%s",
+                    lag * 1000, worst * 1000, room_name,
+                )
+    except asyncio.CancelledError:
+        if worst:
+            log.info("Worst event-loop stall this call: %.0fms | room=%s", worst * 1000, room_name)
+
+
+async def _enforce_max_duration(
+    task: "PipelineTask",
+    max_duration_seconds: int,
+    end_call_message: str,
+    call_logger: "CallLoggerProcessor | None" = None,
+) -> None:
     """Ends the call once it has run longer than the agent's configured ceiling."""
     from backend.agent.processors.call_logger_processor import speak_and_end_call
 
     try:
         await asyncio.sleep(max_duration_seconds)
         log.info("Max call duration (%ss) reached — ending call.", max_duration_seconds)
-        await speak_and_end_call(task, end_call_message)
+        await speak_and_end_call(
+            task,
+            end_call_message,
+            wait_playback=call_logger.wait_playback_complete if call_logger else None,
+        )
     except asyncio.CancelledError:
         pass
 
@@ -1283,16 +1341,41 @@ async def _enforce_silence_timeout(
     silence_timeout_seconds: int,
     end_call_message: str,
 ) -> None:
-    """Ends the call if the patient goes silent for longer than configured."""
+    """Ends the call if the CALLER goes silent for longer than configured.
+
+    "Silent" means the caller is not speaking AND the agent is not speaking to
+    them. The timer previously ran continuously and was only reset when TTS
+    STARTED, so the whole playback of an answer counted as caller silence: a
+    multi-sentence reply (doctor names, dates, slots) could exceed the timeout and
+    hang up on a caller who was simply listening, mid-sentence.
+
+    Two things fix that, both keyed on real playback rather than an estimate:
+      * while call_logger.bot_speaking is True the timer does not advance at all;
+      * BotStoppedSpeakingFrame — pushed from the output transport's audio task
+        after the audio has drained — resets last_activity_ts, so the countdown
+        starts from the moment the caller could actually begin replying.
+    """
     from backend.agent.processors.call_logger_processor import speak_and_end_call
 
     try:
         while True:
             await asyncio.sleep(2.0)
+
+            # The agent is talking: the caller is listening, not silent. Keep the
+            # clock pinned to now so no silence accrues during playback.
+            if call_logger.bot_speaking:
+                call_logger.last_activity_ts = time.time()
+                continue
+
             idle_seconds = time.time() - call_logger.last_activity_ts
             if idle_seconds >= silence_timeout_seconds:
-                log.info("Silence timeout (%ss) reached — ending call.", silence_timeout_seconds)
-                await speak_and_end_call(task, end_call_message)
+                log.info(
+                    "Silence timeout (%ss) reached with no caller speech — ending call.",
+                    silence_timeout_seconds,
+                )
+                await speak_and_end_call(
+                    task, end_call_message, wait_playback=call_logger.wait_playback_complete
+                )
                 return
     except asyncio.CancelledError:
         pass

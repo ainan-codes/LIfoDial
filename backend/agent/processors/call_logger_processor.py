@@ -21,6 +21,8 @@ import uuid
 from typing import Optional
 
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     CancelFrame,
     EndFrame,
     Frame,
@@ -28,6 +30,7 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     TTSSpeakFrame,
     TTSStartedFrame,
+    TTSTextFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -38,23 +41,134 @@ _CONSENT_DECLINE_WORDS: frozenset[str] = frozenset({
     "nahi", "mat karo",
 })
 
+# ── Closing-intent detection ──────────────────────────────────────────────────
+# The agent's configured End Call Phrases stay the source of truth; this list
+# EXTENDS them with natural closing language a caller actually uses, because no
+# clinic admin will ever enumerate every way a person says goodbye.
+#
+# Deliberately EXCLUDED: bare "thank you" / "thanks" / "dhanyavaad" / "shukriya".
+# Callers thank the agent constantly mid-conversation ("thanks, and what time is
+# the doctor free?") — treating that as a hangup would cut live calls.
+#
+# English + Hindi/Hinglish/Urdu only, i.e. the languages actually seen on these
+# calls. Other languages should be added through the End Call Phrases setting
+# rather than guessed at here: a wrong phrase in a language nobody verified is a
+# call that hangs up on a patient mid-sentence.
+_BUILTIN_CLOSING_PHRASES: tuple[str, ...] = (
+    "bye", "bye bye", "goodbye", "good bye",
+    "alvida", "khuda hafiz", "phir milenge",
+    "that's all", "thats all", "that's it", "thats it",
+    "nothing else", "no more questions",
+    "i'm done", "im done", "we're done", "were done",
+    "talk to you later", "call you later",
+    "bas itna hi", "bas yahi",
+)
 
-async def speak_and_end_call(task, message: str) -> None:
-    """Queue a final TTS message, give it time to play out, then end the call.
+# Words that turn a "bye" into something that is NOT a farewell. "by the way" is
+# the one that matters: STT routinely transcribes it as "bye the way".
+_CLOSING_TRAP_FOLLOWERS: frozenset[str] = frozenset({"the", "then"})
 
-    Shared by CallLoggerProcessor (end_call_phrases match) and pipeline.py's
-    max-duration / silence-timeout watchdogs — all three are "graceful hangup"
+# How close to the end of the utterance a phrase must sit to count as closing
+# intent, and how short an utterance may be to count anywhere in it.
+_CLOSING_TAIL_WORDS = 3
+_CLOSING_SHORT_UTTERANCE_WORDS = 5
+
+
+def _normalise_for_matching(text: str) -> list[str]:
+    """Lowercase, strip punctuation, split into words."""
+    cleaned = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in text.lower())
+    return cleaned.split()
+
+
+def is_closing_utterance(text: str, configured_phrases: list[str] | None = None) -> bool:
+    """True when ``text`` reads as an actual goodbye, not a passing mention.
+
+    Positional rule — a phrase counts only when it is either:
+
+      * inside the last ``_CLOSING_TAIL_WORDS`` words of the utterance (people
+        say goodbye at the END of what they are saying), or
+      * anywhere inside a short utterance (<= ``_CLOSING_SHORT_UTTERANCE_WORDS``
+        words), which is what a bare "ok bye" or "theek hai bye" looks like.
+
+    This is what stops "I don't want to say goodbye before I book the slot" or a
+    mid-sentence "bye the way" from hanging up on a live caller, while still
+    catching "haan theek hai, bye". Questions are also rejected outright: an
+    utterance ending in "?" is asking for something, not leaving.
+    """
+    if not text or not text.strip():
+        return False
+
+    if text.strip().endswith("?"):
+        return False
+
+    words = _normalise_for_matching(text)
+    if not words:
+        return False
+
+    phrases = [p.strip().lower() for p in (configured_phrases or []) if p and p.strip()]
+    phrases.extend(_BUILTIN_CLOSING_PHRASES)
+
+    total = len(words)
+    tail_start = max(0, total - _CLOSING_TAIL_WORDS)
+    short_utterance = total <= _CLOSING_SHORT_UTTERANCE_WORDS
+
+    for phrase in phrases:
+        p_words = _normalise_for_matching(phrase)
+        if not p_words:
+            continue
+        span = len(p_words)
+        for i in range(total - span + 1):
+            if words[i:i + span] != p_words:
+                continue
+            # "bye the way" / "bye then ..." → not a farewell.
+            following = words[i + span] if i + span < total else ""
+            if span == 1 and following in _CLOSING_TRAP_FOLLOWERS:
+                continue
+            if short_utterance or (i + span - 1) >= tail_start:
+                return True
+    return False
+
+
+async def speak_and_end_call(task, message: str, wait_playback=None, max_wait: float = 25.0) -> None:
+    """Queue a final TTS message, wait for it to actually finish, end the call.
+
+    Shared by CallLoggerProcessor (closing-intent match) and pipeline.py's
+    max-duration / silence-timeout watchdogs — all of them are "graceful hangup"
     triggers that should behave identically.
+
+    Args:
+        task: The PipelineTask to cancel once the goodbye has been heard.
+        message: What to say before hanging up. May be empty (hang up silently).
+        wait_playback: Optional zero-arg coroutine function that resolves when the
+            bot's audio has genuinely finished playing —
+            ``CallLoggerProcessor.wait_playback_complete``. When omitted, falls
+            back to a character-count estimate.
+        max_wait: Upper bound on the wait, so a TTS failure can never leave the
+            call open forever.
+
+    The old implementation slept on a ~14-chars/second ESTIMATE, which cuts long
+    goodbyes off mid-word and lingers pointlessly after short ones. The real
+    signal is BotStoppedSpeakingFrame, which pipecat emits from the output
+    transport's audio task in queue order — i.e. after the audio has actually
+    drained, not when synthesis was requested.
     """
     try:
         if message:
             # TTSSpeakFrame, not TextFrame — only TTSSpeakFrame is synthesized as a
             # standalone utterance outside an LLM response turn.
             await task.queue_frames([TTSSpeakFrame(message, append_to_context=False)])
-            # Rough speaking-time estimate (~14 chars/sec) so we don't hang up
-            # mid-sentence, clamped to a sane range for very short/long messages.
-            estimated_seconds = min(max(len(message) / 14.0, 1.5), 12.0)
-            await asyncio.sleep(estimated_seconds)
+
+            if wait_playback is not None:
+                finished = await wait_playback(timeout=max_wait)
+                if not finished:
+                    logger.warning(
+                        "Goodbye playback did not report completion within %.0fs — "
+                        "ending the call anyway.", max_wait,
+                    )
+            else:
+                # No playback signal available (e.g. a caller-side unit test):
+                # fall back to the old rough estimate.
+                await asyncio.sleep(min(max(len(message) / 14.0, 1.5), 12.0))
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -93,9 +207,30 @@ class CallLoggerProcessor(FrameProcessor):
         self._turn_count: int = 0
         self._transcript: list[dict] = []
 
-        # Wall-clock timestamp of the last user utterance — read by pipeline.py's
-        # silence-timeout watchdog (Call Behavior "Silence Timeout" setting).
+        # Wall-clock timestamp from which caller silence is measured — read by
+        # pipeline.py's silence-timeout watchdog (Call Behavior "Silence Timeout").
         self.last_activity_ts: float = time.time()
+
+        # ── Agent playback state (FIX 1 + agent-initiated hangup) ─────────────
+        # True between BotStartedSpeakingFrame and BotStoppedSpeakingFrame, which
+        # the output transport pushes BOTH downstream and upstream — this
+        # processor sits upstream of transport.output() and receives the upstream
+        # copy. BotStoppedSpeakingFrame is emitted from the transport's audio task
+        # in queue order, so it means "the audio actually drained", not "synthesis
+        # was requested".
+        #
+        # The silence watchdog must not count while this is True: the caller is
+        # not silent, they are listening. A 20s answer with a 20s timeout used to
+        # hang up on a caller who had done nothing wrong.
+        self.bot_speaking: bool = False
+        self._playback_complete = asyncio.Event()
+        self._playback_complete.set()  # nothing is playing at construction
+
+        # Text of the agent utterance currently being spoken, accumulated from
+        # TTSTextFrames so a closing phrase can be recognised in the agent's OWN
+        # words (the LLM says "Thank you for calling. Goodbye!" of its own accord —
+        # that is what left the reported call open).
+        self._agent_utterance: list[str] = []
 
         # Set by pipeline.py right after PipelineTask construction — lets this
         # processor end the call directly on an end_call_phrases match.
@@ -105,6 +240,9 @@ class CallLoggerProcessor(FrameProcessor):
         ]
         self._end_call_message = self._agent_config.get("end_call_message") or "Thank you for calling. Goodbye!"
         self._ending_call = False
+        # The configured message is itself a closing phrase for agent-side
+        # matching — if the LLM speaks it, the call is over.
+        self._agent_closing_phrases = self._end_call_phrases + [self._end_call_message.strip().lower()]
 
         # Recording Consent Plan ("require" mode) — set via begin_consent_gate()
         # from pipeline.py once the consent question has been asked.
@@ -152,16 +290,39 @@ class CallLoggerProcessor(FrameProcessor):
         # REQUIRED first (pipecat 1.5): handle system frames + mark started.
         await super().process_frame(frame, direction)
         try:
-            if isinstance(frame, TranscriptionFrame) and frame.text:
-                await self._on_user_speech(frame.text)
-
-            elif isinstance(frame, TTSStartedFrame):
+            # NOTE: user transcriptions do NOT arrive here. This processor sits
+            # after `tts` (it needs TTSStartedFrame / MetricsFrame, which only
+            # exist downstream of the TTS service), and context_aggregator.user()
+            # — which is upstream of it — CONSUMES TranscriptionFrame without
+            # pushing it downstream (pipecat 1.5.0 llm_response_universal.py
+            # :794-799). So this processor never saw a single user utterance:
+            # turn_count stayed 0 and the transcript stayed empty on every call.
+            # User speech now arrives via note_user_utterance(), called by the
+            # tap that pipeline.py places between `stt` and the aggregator — the
+            # same placement fix the transcript publisher needed.
+            if isinstance(frame, TTSStartedFrame):
                 self._last_tts_start = time.time()
-                # FIX: reset idle clock when the AGENT speaks too, not just when the
-                # user speaks. Previously the 10s clock ran through the 4-5s greeting
-                # and fired ~5s after the greeting ended, killing every call on the
-                # first turn before the caller had a chance to respond.
+                self._agent_utterance = []
+
+            elif isinstance(frame, TTSTextFrame):
+                # Accumulate what the agent is about to say. Sarvam pushes one
+                # TTSTextFrame per aggregated sentence, so a multi-sentence answer
+                # arrives as a few frames.
+                text = (getattr(frame, "text", "") or "").strip()
+                if text:
+                    self._agent_utterance.append(text)
+
+            elif isinstance(frame, BotStartedSpeakingFrame):
+                self.bot_speaking = True
+                self._playback_complete.clear()
+
+            elif isinstance(frame, BotStoppedSpeakingFrame):
+                # Real end of playback. Caller silence is measured from HERE — not
+                # from when the agent started talking.
+                self.bot_speaking = False
                 self.last_activity_ts = time.time()
+                self._playback_complete.set()
+                await self._maybe_end_after_agent_goodbye()
 
             elif isinstance(frame, MetricsFrame):
                 self._on_metrics(frame)
@@ -194,6 +355,51 @@ class CallLoggerProcessor(FrameProcessor):
         except asyncio.TimeoutError:
             logger.warning("Finalization did not complete within %.0fs.", timeout)
             return False
+
+    async def wait_playback_complete(self, timeout: float = 25.0) -> bool:
+        """Await the end of the agent's current audio playback.
+
+        Returns True if playback finished (or nothing was playing), False on
+        timeout. Used by speak_and_end_call so a goodbye is never cut off
+        mid-word and the call never lingers after it.
+        """
+        try:
+            await asyncio.wait_for(self._playback_complete.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def note_user_utterance(self, text: str) -> None:
+        """Record a finalised user utterance. Called by the pipeline's transcript
+        tap, which sits where TranscriptionFrames actually exist (between `stt`
+        and the user aggregator) — see the note in process_frame()."""
+        await self._on_user_speech(text)
+
+    async def _maybe_end_after_agent_goodbye(self) -> None:
+        """Hang up when the AGENT just finished saying goodbye.
+
+        This is the reported bug: the LLM produced "Thank you for calling.
+        Goodbye!" on its own and the call stayed open, so the caller carried on
+        talking to an agent that had already signed off. Playback has genuinely
+        finished by the time this runs (BotStoppedSpeakingFrame), so the call can
+        end immediately without waiting for any further caller input.
+
+        Skipped when _ending_call is already set: in that case speak_and_end_call
+        owns the hangup and is about to cancel the task itself — reacting here as
+        well would cancel twice.
+        """
+        if self._ending_call or self.task is None:
+            return
+
+        spoken = " ".join(self._agent_utterance).strip()
+        self._agent_utterance = []
+        if not spoken or not is_closing_utterance(spoken, self._agent_closing_phrases):
+            return
+
+        self._ending_call = True
+        logger.info("Agent said goodbye ('%s') — ending call now.", spoken[:80])
+        # Playback already drained, so no closing message to speak: just end.
+        asyncio.create_task(self.task.cancel())
 
     # ── Internal handlers ─────────────────────────────────────────────────────
 
@@ -233,7 +439,13 @@ class CallLoggerProcessor(FrameProcessor):
                 self._ending_call = True
                 logger.info("Recording consent declined — ending call politely.")
                 if self.task is not None:
-                    asyncio.create_task(speak_and_end_call(self.task, self._consent_decline_message))
+                    asyncio.create_task(
+                        speak_and_end_call(
+                            self.task,
+                            self._consent_decline_message,
+                            wait_playback=self.wait_playback_complete,
+                        )
+                    )
             else:
                 # Anything else is treated as consent granted — an ambiguous
                 # reply shouldn't trap the caller in a re-prompt loop.
@@ -244,16 +456,26 @@ class CallLoggerProcessor(FrameProcessor):
                     ]))
             return
 
-        # End-call phrase detection — was previously stored (Call Behavior tab)
-        # but never matched against anything the patient actually said.
+        # Caller-initiated hangup. The configured End Call Phrases remain the
+        # source of truth; is_closing_utterance() extends them with natural
+        # closing language ("ok bye", "theek hai bye", "that's all") and applies
+        # the positional guard that keeps a mid-sentence "bye" from ending a live
+        # call. The previous check was a bare substring test over the configured
+        # phrases only, so "bye the way" would have hung up and "ok bye" would not.
         if (
             not self._ending_call
             and self.task is not None
-            and any(phrase in text_lower for phrase in self._end_call_phrases)
+            and is_closing_utterance(text, self._end_call_phrases)
         ):
             self._ending_call = True
-            logger.info("End-call phrase matched in utterance: '%s'", text[:80])
-            asyncio.create_task(speak_and_end_call(self.task, self._end_call_message))
+            logger.info("Caller said goodbye ('%s') — ending call.", text[:80])
+            asyncio.create_task(
+                speak_and_end_call(
+                    self.task,
+                    self._end_call_message,
+                    wait_playback=self.wait_playback_complete,
+                )
+            )
 
     def _on_metrics(self, frame: MetricsFrame) -> None:
         """Capture TTFB (time-to-first-byte) latency from Pipecat's MetricsFrame."""
@@ -323,6 +545,41 @@ class CallLoggerProcessor(FrameProcessor):
             asyncio.create_task(
                 _run_post_call_evaluation(self._call_record_id, summary_on, eval_on)
             )
+
+
+class UserTranscriptTap(FrameProcessor):
+    """Feeds finalised user utterances to a CallLoggerProcessor.
+
+    Exists purely because of frame placement. The logger must sit AFTER `tts` to
+    see TTSStartedFrame / TTSTextFrame / MetricsFrame / Bot*SpeakingFrame, but
+    TranscriptionFrames never get that far: context_aggregator.user() consumes
+    them without pushing downstream. So the logger's turn count and transcript
+    were always empty (`turns=0` on every call, including calls with a dozen
+    turns).
+
+    This tap sits between `stt` and the aggregator, where the frames exist, and
+    hands the text sideways to the logger. Fully transparent — every frame is
+    pushed on unchanged, and a logger error can never break the pipeline.
+    """
+
+    def __init__(self, call_logger: "CallLoggerProcessor") -> None:
+        super().__init__()
+        self._call_logger = call_logger
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        # REQUIRED first (pipecat 1.5): handle system frames + mark started.
+        await super().process_frame(frame, direction)
+
+        # Finalised transcriptions only. InterimTranscriptionFrame is a running
+        # hypothesis that gets revised, so counting it would inflate turn_count
+        # and fill the transcript with half-words.
+        if isinstance(frame, TranscriptionFrame) and (frame.text or "").strip():
+            try:
+                await self._call_logger.note_user_utterance(frame.text)
+            except Exception as exc:
+                logger.error("UserTranscriptTap: logging utterance failed: %s", exc)
+
+        await self.push_frame(frame, direction)
 
 
 # ── Background DB helpers ──────────────────────────────────────────────────────
