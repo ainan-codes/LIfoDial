@@ -6,12 +6,18 @@
 import { getToken, clearSession } from './auth';
 
 const getDynamicApiUrl = () => {
-  if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
   if (typeof window !== 'undefined') {
     const origin = window.location.origin;
-    if (origin.includes('ngrok')) return `${origin}/api`;
-    if (origin.includes('localhost') || origin.includes('127.0.0.1')) return 'http://localhost:8000';
+    // Tunneled access (phone, remote testing): route through the same origin's
+    // /api prefix so the Vite dev-server proxy forwards to the local backend —
+    // a raw VITE_API_URL=http://localhost:8001 would resolve to the PHONE's
+    // own localhost, not the laptop running the backend.
+    if (origin.includes('ngrok') || origin.includes('trycloudflare.com')) return `${origin}/api`;
+    if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+      return import.meta.env.VITE_API_URL || 'http://localhost:8001';
+    }
   }
+  if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
   return 'https://lifodial.onrender.com';
 };
 
