@@ -102,6 +102,23 @@ async def _probe(provider: str, key: str) -> bool:
         return False
 
 
+# Setup-time probe results, cached per configured model for the life of the
+# worker process (jobs run as threads in one process, so this survives calls).
+#
+# The probe is a real HTTP GET against the winning provider, and it used to run on
+# EVERY call setup — the caller waits through it before hearing the greeting. A
+# short TTL keeps the resilience property that made the probe worth having (a key
+# revoked mid-day is still noticed within TTL, and an in-call failure is caught by
+# ResilienceProcessor regardless) while making the common case free.
+_SELECTION_TTL_SECS = 300.0
+_selection_cache: dict[str, tuple[float, tuple[str, str, str]]] = {}
+
+
+def reset_llm_selection_cache() -> None:
+    """Drop cached probe results (tests, or to force a re-probe)."""
+    _selection_cache.clear()
+
+
 async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
     """
     Return (provider, api_key, model) for the first reachable provider.
@@ -110,8 +127,20 @@ async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
     is honored), then the remaining providers in PROVIDER_ORDER. The configured
     model is kept only when its own provider wins; otherwise the fallback
     provider's default model is used.
+
+    The result is cached for _SELECTION_TTL_SECS so repeat calls skip the network
+    probe entirely.
     """
     configured_model = agent_config.get("llm_model") or ""
+
+    cached = _selection_cache.get(configured_model)
+    if cached and (time.monotonic() - cached[0]) < _SELECTION_TTL_SECS:
+        provider, _key, model = cached[1]
+        log.info(
+            "[RESILIENCE] using cached LLM selection provider=%s model=%s (no probe)",
+            provider, model,
+        )
+        return cached[1]
     # Auto-sanitize decommissioned models
     if configured_model in {"mixtral-8x7b-32768", "llama3-8b-8192", "llama3-70b-8192", "gemma-7b-it"}:
         configured_model = "llama-3.3-70b-versatile"
@@ -130,6 +159,7 @@ async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
                 )
             else:
                 log.info("[RESILIENCE] LLM provider '%s' healthy (model=%s)", provider, model)
+            _selection_cache[configured_model] = (time.monotonic(), (provider, key, model))
             return provider, key, model
 
     raise RuntimeError(
