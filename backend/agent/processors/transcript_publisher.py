@@ -21,6 +21,7 @@ SAFETY:
 import asyncio
 import json
 import logging
+import time
 
 from pipecat.frames.frames import (
     Frame,
@@ -40,10 +41,20 @@ class LiveKitTranscriptPublisher(FrameProcessor):
     """Publishes both TTSTextFrame (agent) and TranscriptionFrame (user) to the
     LiveKit room so the frontend can display a live dual-sided transcript."""
 
+    # Minimum gap between INTERIM user-transcript publishes. Deepgram emits
+    # interims several times a second and each one used to spawn a task that
+    # JSON-encodes and pushes a WebRTC data message. On the free-tier worker
+    # (0.1 CPU) that is measurable event-loop work competing with audio, and the
+    # caller cannot read 10 updates/second anyway. Finals are NEVER throttled.
+    _INTERIM_MIN_GAP_SECS = 0.25
+
     def __init__(self, transport):
         super().__init__()
         self._transport = transport
         self._counter = 0
+        self._last_interim_ts = 0.0
+        self.interims_published = 0
+        self.interims_skipped = 0
         # Monotonic sequence for user-transcript messages. Publishes are fired as
         # background tasks (so the pipeline is never blocked on the network), which
         # means a slow interim publish could otherwise land AFTER the final one and
@@ -75,13 +86,28 @@ class LiveKitTranscriptPublisher(FrameProcessor):
             text = (getattr(frame, "text", "") or "").strip()
             if text:
                 is_final = isinstance(frame, TranscriptionFrame)
-                self._user_seq += 1
-                asyncio.create_task(
-                    self._safe_publish_user(text, is_final, self._user_seq)
-                )
+                if is_final or self._interim_due():
+                    self._user_seq += 1
+                    asyncio.create_task(
+                        self._safe_publish_user(text, is_final, self._user_seq)
+                    )
+                    if not is_final:
+                        self.interims_published += 1
+                else:
+                    # Dropped, not queued: the next interim carries the same text
+                    # plus whatever was said since, so nothing is lost.
+                    self.interims_skipped += 1
 
         # Always forward the frame unchanged, without waiting on the publish.
         await self.push_frame(frame, direction)
+
+    def _interim_due(self) -> bool:
+        """True when enough time has passed to publish another interim."""
+        now = time.monotonic()
+        if now - self._last_interim_ts < self._INTERIM_MIN_GAP_SECS:
+            return False
+        self._last_interim_ts = now
+        return True
 
     async def _safe_publish_agent(self, text: str) -> None:
         try:

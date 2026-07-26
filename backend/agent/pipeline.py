@@ -833,11 +833,23 @@ async def entrypoint(ctx) -> None:
     # the LLM is now chosen at runtime (Gemini/Groq/OpenAI — audit FIX 2), use
     # the universal LLMContextAggregatorPair, which drives any provider off the
     # same LLMContext.
-    context = LLMContext(
-        messages=[
-            {"role": "system", "content": system_prompt},
-        ]
-    )
+    # NO system message here — build_llm() already passes `system_prompt` to the
+    # service as `system_instruction`, and pipecat's OpenAI-family adapter runs
+    # with discard_context_system=False, i.e. it KEEPS BOTH. Every request was
+    # therefore carrying two full copies of the system prompt (KB + booking rules
+    # + language rule); measured with a stand-in prompt: 7602 chars vs 3802 for a
+    # two-message exchange. The worker logged the warning on every turn:
+    #
+    #   "Both system_instruction and an initial system message in context are
+    #    set, which may be unintended. Keeping both..."
+    #
+    # Doubling the prompt doubles input tokens, LLM time-to-first-byte and the
+    # JSON the free-tier worker has to serialise per turn. Nothing reads
+    # messages[0] — BookingProcessor and the greeting only ever append — so the
+    # instruction alone is the single source of truth. Gemini's adapter
+    # (discard_context_system=True) prefers system_instruction as well, so this is
+    # correct for every provider build_llm() can return.
+    context = LLMContext(messages=[])
     # ── Turn-stop strategy — cheap timer, not a local transformer ───────────
     # pipecat 1.5 defaults the STOP strategy to TurnAnalyzerUserTurnStopStrategy,
     # which runs the Local Smart Turn v3 ONNX transformer over the utterance audio
