@@ -1,6 +1,18 @@
 # Lifodial - AI Voice Receptionist for Clinics
 
-Lifodial is a production-grade AI voice receptionist platform designed for healthcare, clinics, and hospitals. It features ultra-low latency voice-to-voice capabilities, a robust Master Agent architecture with barge-in interruption handling, AI-driven post-call evaluations, and a beautiful React frontend.
+Lifodial is a production-grade, multi-tenant AI voice receptionist platform built specifically for healthcare — clinics, hospitals, and multi-location practices. It answers patient calls (and web/embed calls) in real time, understands intent, books and manages appointments directly against the clinic's own scheduling system, and hands off gracefully whenever a human is genuinely needed.
+
+## 💡 Why Lifodial
+
+Most voice-AI agent platforms are generic — a chatbot with a phone number bolted on, built for any industry and none in particular. Lifodial is purpose-built for healthcare from the ground up:
+
+- **Native multilingual care, not translated English** — first-class support for Hindi and 20+ Indian languages (plus English/Arabic for Middle East clinics), with automatic language detection and seamless mid-call switching — not a bolt-on translation layer.
+- **Real scheduling, not a demo booking flow** — appointments are created directly against the clinic's actual doctor/slot data and show up instantly in the clinic's own dashboard, so front-desk staff see exactly what the AI booked, in real time.
+- **Bring your own AI stack** — Lifodial isn't locked into one speech or language model vendor. Clinics (or their technical team) can plug in their own API keys for the speech-to-text, text-to-speech, or LLM provider of their choice, with automatic fallback if a provider has an outage — no rebuild, no redeploy, no vendor lock-in.
+- **Sub-second, natural conversation** — a real-time WebRTC voice pipeline (not turn-based request/response) with barge-in support, so patients can interrupt the AI naturally mid-sentence the way they would a human receptionist.
+- **Deploy anywhere the clinic already is** — phone number forwarding, or a single embeddable widget snippet for the clinic's own website — live in minutes, not weeks.
+- **Built for operators, not just developers** — a full super-admin + per-clinic dashboard for call logs, transcripts, appointment history, credit/usage billing, and live health monitoring — the operational tooling a real healthcare business needs, included by default.
+- **Production-hardened from day one** — structured error monitoring, automatic provider failover, encrypted credential storage, and tenant-isolated data by design (never demo-quality software wearing a production label).
 
 ## 🚀 Tech Stack
 
@@ -70,7 +82,7 @@ The frontend provides the Administration dashboards (Clinic view and SuperAdmin 
    npm run dev
    ```
    The UI will now be running on `http://localhost:5173`. 
-   * Local API requests are proxied directly to the backend on `localhost:8000`.
+   * Local API requests are proxied directly to the backend on `localhost:8001`.
 
 ---
 

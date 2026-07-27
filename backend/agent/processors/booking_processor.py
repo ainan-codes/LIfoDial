@@ -255,22 +255,41 @@ class BookingProcessor(FrameProcessor):
                 break
 
     def _try_match_doctor(self, text_lower: str) -> None:
-        """Scan utterance for doctor name or specialization keywords."""
+        """Scan utterance for doctor name or specialization keywords.
+
+        An on-leave doctor is never armed for booking here: the system prompt
+        (backend/agent/pipeline.py::_doctor_availability_block) already tells
+        the LLM who's unavailable, so the spoken "sorry, on leave" response
+        comes from there — this just has to not silently start booking a
+        doctor who isn't seeing patients. A specialization match still tries
+        to fall through to another available doctor with the same
+        specialization before giving up, matching the prompt's own
+        instruction to offer an alternative.
+        """
         doctors: list[dict] = self._tenant.get("doctors", [])
+        spec_match_unavailable = False
         for doc in doctors:
             spec = (doc.get("specialization") or "").lower()
             name = (doc.get("name") or "").lower()
+            available = doc.get("is_available", True)
 
             # Match by specialization words or doctor name words
             spec_words = [w for w in spec.split() if len(w) > 2]
             name_words = [w for w in name.split() if len(w) > 2]
 
             if spec and (spec in text_lower or any(w in text_lower for w in spec_words)):
-                self._set_pending_doctor(doc)
-                break
+                if available:
+                    self._set_pending_doctor(doc)
+                    return
+                spec_match_unavailable = True
+                continue
             if name and any(w in text_lower for w in name_words):
-                self._set_pending_doctor(doc)
-                break
+                if available:
+                    self._set_pending_doctor(doc)
+                return  # matched by name (available or not) — stop scanning either way
+
+        if spec_match_unavailable:
+            logger.info("Booking: specialization matched only on-leave doctor(s) — not arming a pending doctor.")
 
     def _set_pending_doctor(self, doc: dict) -> None:
         """Record a matched doctor. Confirmation is NOT armed here — it requires

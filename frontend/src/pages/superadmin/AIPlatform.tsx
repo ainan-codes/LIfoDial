@@ -221,6 +221,154 @@ function ProviderCard({
   );
 }
 
+// ── Custom LLM provider card — a saved key whose provider id isn't in the
+// static catalog (added via AddCustomProviderCard below). Genuinely generic
+// only for LLM: any OpenAI-compatible endpoint works via base_url + key. STT/TTS
+// providers need a real pipecat adapter to function at all, so this is not
+// offered for those categories (see backend/agent/providers.py's own doc
+// comment on the same constraint).
+function CustomProviderCard({
+  saved, catColor, onDelete, onActivate,
+}: {
+  saved: SavedKey; catColor: string;
+  onDelete: (id: string) => Promise<void>;
+  onActivate: (id: string) => Promise<void>;
+}) {
+  let baseUrl = '';
+  try { baseUrl = JSON.parse(saved.extra_config || '{}').base_url || ''; } catch {}
+
+  return (
+    <div style={{
+      background: '#131313', border: `1px solid ${saved.is_active ? catColor + '40' : '#2E2E2E'}`,
+      borderRadius: '14px', overflow: 'hidden', boxShadow: saved.is_active ? `0 0 20px ${catColor}15` : 'none',
+    }}>
+      <div style={{ padding: '16px 20px', display: 'flex', alignItems: 'center', gap: '14px' }}>
+        <div style={{ width: '40px', height: '40px', borderRadius: '10px', background: `${catColor}15`, border: `1px solid ${catColor}30`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '16px', fontWeight: 700, color: catColor, flexShrink: 0 }}>
+          C
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ fontWeight: 700, color: '#fff', fontSize: '14px' }}>{saved.display_name}</span>
+            <span style={{ background: '#a78bfa20', color: '#a78bfa', fontSize: '10px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', letterSpacing: '0.04em' }}>CUSTOM</span>
+            {saved.is_active && (
+              <span style={{ background: `${catColor}20`, color: catColor, fontSize: '10px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', letterSpacing: '0.04em' }}>ACTIVE</span>
+            )}
+          </div>
+          <div style={{ fontSize: '12px', color: '#555', marginTop: '2px', display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
+            <span style={{ background: '#3ECF8E15', border: '1px solid #3ECF8E40', color: '#3ECF8E', fontSize: '10px', fontWeight: 700, padding: '1px 8px', borderRadius: '20px', letterSpacing: '0.04em', flexShrink: 0 }}>CONFIGURED</span>
+            <span style={{ color: '#555', fontFamily: 'monospace', fontSize: '11px' }}>{saved.key_masked}</span>
+            {baseUrl && <span style={{ color: '#444', fontSize: '11px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>· {baseUrl}</span>}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexShrink: 0 }}>
+          {!saved.is_active && (
+            <button
+              onClick={() => onActivate(saved.id)}
+              style={{ padding: '5px 12px', borderRadius: '7px', border: `1px solid ${catColor}40`, background: `${catColor}10`, color: catColor, fontSize: '11px', fontWeight: 700, cursor: 'pointer' }}
+              title="Set as active provider"
+            >
+              <Star size={11} style={{ display: 'inline', marginRight: '4px' }} />
+              Set Active
+            </button>
+          )}
+          <button onClick={() => onDelete(saved.id)} style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer', padding: '5px', display: 'flex' }} title="Remove">
+            <Trash2 size={13} />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Add Custom Provider — LLM only. Any OpenAI-compatible chat endpoint
+// (base_url + key) works through the same OpenAILLMService DeepSeek already
+// uses, so this is genuinely functional, not just a saved-but-unusable entry.
+function AddCustomProviderCard({
+  catColor, existingIds, onAdd,
+}: {
+  catColor: string; existingIds: Set<string>;
+  onAdd: (provider: string, displayName: string, apiKey: string, baseUrl: string) => Promise<void>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [name, setName] = useState('');
+  const [baseUrl, setBaseUrl] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+
+  const handleSave = async () => {
+    setError('');
+    if (!name.trim() || !baseUrl.trim() || !apiKey.trim()) {
+      setError('Name, base URL, and API key are all required.'); return;
+    }
+    if (!slug) { setError('Name must contain at least one letter or number.'); return; }
+    if (existingIds.has(slug)) { setError('A provider with that name already exists.'); return; }
+    setSaving(true);
+    try {
+      await onAdd(slug, name.trim(), apiKey.trim(), baseUrl.trim());
+      setName(''); setBaseUrl(''); setApiKey(''); setExpanded(false);
+    } catch (e: any) {
+      setError(e?.message || 'Failed to save custom provider');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!expanded) {
+    return (
+      <button
+        onClick={() => setExpanded(true)}
+        style={{
+          background: 'none', border: '1px dashed #2E2E2E', borderRadius: '14px', padding: '16px 20px',
+          color: '#777', cursor: 'pointer', fontSize: '13px', fontWeight: 600, display: 'flex',
+          alignItems: 'center', gap: '8px', textAlign: 'left', width: '100%',
+        }}
+      >
+        <Zap size={14} /> Add Custom Provider (any OpenAI-compatible endpoint)
+      </button>
+    );
+  }
+
+  return (
+    <div style={{ background: '#131313', border: '1px solid #2E2E2E', borderRadius: '14px', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      <div style={{ fontWeight: 700, color: '#fff', fontSize: '14px' }}>Add Custom Provider</div>
+      <p style={{ fontSize: '12px', color: '#666', margin: 0 }}>
+        Any endpoint that speaks the OpenAI chat-completions API — self-hosted, a proxy, or a provider not in the list above.
+      </p>
+      {(['name', 'baseUrl', 'apiKey'] as const).map(field => (
+        <div key={field}>
+          <label style={{ fontSize: '11px', fontWeight: 700, color: '#888', textTransform: 'uppercase', letterSpacing: '0.06em', display: 'block', marginBottom: '6px' }}>
+            {field === 'name' ? 'Display Name' : field === 'baseUrl' ? 'Base URL' : 'API Key'}
+          </label>
+          <input
+            type={field === 'apiKey' ? 'password' : 'text'}
+            value={field === 'name' ? name : field === 'baseUrl' ? baseUrl : apiKey}
+            onChange={e => (field === 'name' ? setName : field === 'baseUrl' ? setBaseUrl : setApiKey)(e.target.value)}
+            placeholder={field === 'name' ? 'e.g. My Local Llama' : field === 'baseUrl' ? 'https://api.example.com/v1' : 'sk-...'}
+            style={{ width: '100%', padding: '10px 12px', background: '#111', border: '1px solid #2E2E2E', borderRadius: '8px', color: '#fff', fontSize: '13px', outline: 'none', boxSizing: 'border-box', fontFamily: field === 'apiKey' ? 'monospace' : undefined }}
+          />
+        </div>
+      ))}
+      {slug && <p style={{ fontSize: '11px', color: '#555', margin: 0 }}>Provider id: <span style={{ fontFamily: 'monospace' }}>{slug}</span></p>}
+      {error && <p style={{ fontSize: '12px', color: '#ef4444', margin: 0 }}>{error}</p>}
+      <div style={{ display: 'flex', gap: '10px' }}>
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          style={{ padding: '9px 20px', background: catColor, border: 'none', borderRadius: '8px', color: '#000', fontWeight: 700, fontSize: '13px', cursor: 'pointer', opacity: saving ? 0.5 : 1 }}
+        >
+          {saving ? 'Saving…' : 'Add Provider'}
+        </button>
+        <button onClick={() => { setExpanded(false); setError(''); }} style={{ padding: '9px 16px', background: 'none', border: '1px solid #2E2E2E', borderRadius: '8px', color: '#888', cursor: 'pointer', fontSize: '13px' }}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── LiveKit card (3 fields: URL + API key + write-only secret) ────────────────
 function LiveKitCard({ catColor, showToast }: { catColor: string; showToast: (m: string, t?: 'ok' | 'err') => void }) {
   const [data, setData] = useState<{ url: string; api_key_masked: string; secret_set: boolean } | null>(null);
@@ -360,6 +508,18 @@ export default function AIPlatform() {
     }
   };
 
+  const handleAddCustomProvider = async (provider: string, displayName: string, apiKey: string, baseUrl: string) => {
+    await fetchWithAuth(`/platform/keys`, {
+      method: 'POST',
+      body: JSON.stringify({
+        provider, category: 'llm', api_key: apiKey, display_name: displayName,
+        extra_config: JSON.stringify({ base_url: baseUrl }),
+      }),
+    });
+    showToast(`✓ Custom provider "${displayName}" added`);
+    await loadAll();
+  };
+
   const handleDelete = async (id: string) => {
     try {
       await fetchWithAuth(`/platform/keys/${id}`, { method: 'DELETE' });
@@ -416,6 +576,10 @@ export default function AIPlatform() {
   const catKeys = savedKeys.filter(k => k.category === activeCategory);
   const activeKey = catKeys.find(k => k.is_active);
   const configuredCount = catKeys.filter(k => k.has_key).length;
+  const catProviderIds = new Set(catProviders.map(p => p.id));
+  // Saved keys whose provider isn't in the static catalog — i.e. added via
+  // "Add Custom Provider" below (LLM only; see that component's comment).
+  const customKeys = catKeys.filter(k => !catProviderIds.has(k.provider));
 
   return (
     <div style={{ display: 'flex', height: '100%', background: '#0A0A0A' }}>
@@ -561,6 +725,22 @@ export default function AIPlatform() {
                 />
               )
             ))}
+            {customKeys.map(k => (
+              <CustomProviderCard
+                key={k.id}
+                saved={k}
+                catColor={cat.color}
+                onDelete={handleDelete}
+                onActivate={handleActivate}
+              />
+            ))}
+            {activeCategory === 'llm' && (
+              <AddCustomProviderCard
+                catColor={cat.color}
+                existingIds={new Set([...catProviderIds, ...customKeys.map(k => k.provider)])}
+                onAdd={handleAddCustomProvider}
+              />
+            )}
           </div>
         )}
 

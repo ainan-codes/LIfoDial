@@ -1,6 +1,32 @@
 import { Edit2, Plus, Trash2, UserCheck, X } from 'lucide-react';
-import React, { useState } from 'react';
-import { FIXTURE_DOCTORS, SPECIALIZATIONS, type Doctor } from '../fixtures/data';
+import React, { useEffect, useState } from 'react';
+import { SPECIALIZATIONS, type Doctor as BaseDoctor } from '../fixtures/data';
+import fetchWithAuth from '../api/client';
+import { getTenantId } from '../api/auth';
+
+// Widened locally with leave_reason — the shared fixture Doctor type doesn't
+// have it (nothing else that imports it needs it).
+type Doctor = BaseDoctor & { leave_reason?: string | null };
+
+interface BackendDoctor {
+  id: string;
+  name: string;
+  specialization: string;
+  his_doctor_id: string | null;
+  is_available: boolean;
+  leave_reason: string | null;
+}
+
+function fromBackend(d: BackendDoctor): Doctor {
+  return {
+    id: d.id,
+    name: d.name,
+    specialization: d.specialization,
+    his_doctor_id: d.his_doctor_id ?? '',
+    available: d.is_available,
+    leave_reason: d.leave_reason,
+  };
+}
 
 // ── Initials helper ───────────────────────────────────────────────────────────
 function initials(name: string) {
@@ -25,11 +51,15 @@ function DoctorModal({ doctor, onSave, onClose }: ModalProps) {
   const [spec, setSpec]           = useState(doctor?.specialization ?? 'General Physician');
   const [hisId, setHisId]         = useState(doctor?.his_doctor_id ?? '');
   const [available, setAvailable] = useState(doctor?.available ?? true);
+  const [leaveReason, setLeaveReason] = useState(doctor?.leave_reason ?? '');
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
-    onSave({ name: name.trim(), specialization: spec, his_doctor_id: hisId.trim(), available });
+    onSave({
+      name: name.trim(), specialization: spec, his_doctor_id: hisId.trim(), available,
+      leave_reason: available ? null : (leaveReason.trim() || null),
+    });
   };
 
   return (
@@ -178,6 +208,34 @@ function DoctorModal({ doctor, onSave, onClose }: ModalProps) {
               />
             </button>
           </div>
+
+          {/* Leave reason — only shown while marking the doctor unavailable */}
+          {!available && (
+            <div>
+              <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, color: 'var(--text-secondary)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                Reason <span style={{ color: 'var(--text-muted)', textTransform: 'none', fontWeight: 400 }}>(optional — shown to callers by the AI)</span>
+              </label>
+              <input
+                type="text"
+                value={leaveReason}
+                onChange={e => setLeaveReason(e.target.value)}
+                placeholder="e.g. On leave until Monday"
+                style={{
+                  width: '100%',
+                  padding: '10px 12px',
+                  fontSize: '14px',
+                  borderRadius: '8px',
+                  outline: 'none',
+                  backgroundColor: 'var(--bg-surface-2)',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text-primary)',
+                  transition: 'border-color 0.15s, box-shadow 0.15s',
+                }}
+                onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-dim)'; }}
+                onBlur={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.boxShadow = 'none'; }}
+              />
+            </div>
+          )}
 
           {/* Actions */}
           <div className="flex gap-3 pt-2">
@@ -337,7 +395,7 @@ function DoctorCard({ doctor, onEdit, onDelete, onToggle }: DoctorCardProps) {
             style={{ backgroundColor: doctor.available ? 'var(--accent)' : 'var(--text-muted)' }}
           />
           <span style={{ fontSize: '13px', fontWeight: 500, color: doctor.available ? 'var(--accent)' : 'var(--text-muted)' }}>
-            {doctor.available ? 'Online' : 'Offline'}
+            {doctor.available ? 'Online' : (doctor.leave_reason ? `On leave — ${doctor.leave_reason}` : 'Offline')}
           </span>
         </div>
         <button
@@ -373,29 +431,93 @@ function DoctorCard({ doctor, onEdit, onDelete, onToggle }: DoctorCardProps) {
 
 // ── Doctors Page ──────────────────────────────────────────────────────────────
 export default function Doctors() {
-  const [doctors, setDoctors] = useState<Doctor[]>(FIXTURE_DOCTORS);
+  const tenantId = getTenantId();
+  const [doctors, setDoctors] = useState<Doctor[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<Doctor | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
 
-  const handleAdd = (data: Omit<Doctor, 'id'>) => {
-    const newDoc: Doctor = { ...data, id: `d-${Date.now()}` };
-    setDoctors(prev => [...prev, newDoc]);
-    setModalOpen(false);
+  useEffect(() => {
+    if (!tenantId) return;
+    let cancelled = false;
+    setLoading(true);
+    fetchWithAuth(`/tenants/${tenantId}/doctors`)
+      .then((data: BackendDoctor[]) => {
+        if (cancelled) return;
+        setDoctors((data || []).map(fromBackend));
+        setError(null);
+      })
+      .catch((e: Error) => { if (!cancelled) setError(e.message || 'Failed to load doctors'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [tenantId]);
+
+  const handleAdd = async (data: Omit<Doctor, 'id'>) => {
+    if (!tenantId) return;
+    try {
+      const created: BackendDoctor = await fetchWithAuth(`/tenants/${tenantId}/doctors`, {
+        method: 'POST',
+        body: JSON.stringify({
+          name: data.name, specialization: data.specialization,
+          his_doctor_id: data.his_doctor_id || null, is_available: data.available,
+        }),
+      });
+      setDoctors(prev => [...prev, fromBackend(created)]);
+      setModalOpen(false);
+    } catch (e) {
+      setError((e as Error).message || 'Failed to add doctor');
+    }
   };
 
-  const handleEdit = (data: Omit<Doctor, 'id'>) => {
-    setDoctors(prev => prev.map(d => d.id === editTarget?.id ? { ...data, id: d.id } : d));
-    setEditTarget(null);
+  const handleEdit = async (data: Omit<Doctor, 'id'>) => {
+    if (!tenantId || !editTarget) return;
+    try {
+      const updated: BackendDoctor = await fetchWithAuth(`/tenants/${tenantId}/doctors/${editTarget.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          name: data.name, specialization: data.specialization,
+          his_doctor_id: data.his_doctor_id || null,
+          is_available: data.available, leave_reason: data.leave_reason ?? null,
+        }),
+      });
+      setDoctors(prev => prev.map(d => d.id === editTarget.id ? fromBackend(updated) : d));
+      setEditTarget(null);
+    } catch (e) {
+      setError((e as Error).message || 'Failed to update doctor');
+    }
   };
 
-  const handleDelete = (id: string) => {
-    setDoctors(prev => prev.filter(d => d.id !== id));
-    setDeleteConfirm(null);
+  const handleDelete = async (id: string) => {
+    if (!tenantId) return;
+    try {
+      await fetchWithAuth(`/tenants/${tenantId}/doctors/${id}`, { method: 'DELETE' });
+      setDoctors(prev => prev.filter(d => d.id !== id));
+    } catch (e) {
+      setError((e as Error).message || 'Failed to remove doctor');
+    } finally {
+      setDeleteConfirm(null);
+    }
   };
 
-  const handleToggle = (id: string) => {
-    setDoctors(prev => prev.map(d => d.id === id ? { ...d, available: !d.available } : d));
+  const handleToggle = async (id: string) => {
+    if (!tenantId) return;
+    const target = doctors.find(d => d.id === id);
+    if (!target) return;
+    const nextAvailable = !target.available;
+    // Optimistic update — revert if the request fails.
+    setDoctors(prev => prev.map(d => d.id === id ? { ...d, available: nextAvailable } : d));
+    try {
+      const updated: BackendDoctor = await fetchWithAuth(`/tenants/${tenantId}/doctors/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ is_available: nextAvailable, leave_reason: target.leave_reason ?? null }),
+      });
+      setDoctors(prev => prev.map(d => d.id === id ? fromBackend(updated) : d));
+    } catch (e) {
+      setDoctors(prev => prev.map(d => d.id === id ? { ...d, available: !nextAvailable } : d));
+      setError((e as Error).message || 'Failed to update availability');
+    }
   };
 
   const onlineCount = doctors.filter(d => d.available).length;
@@ -439,7 +561,14 @@ export default function Doctors() {
 
       {/* Content */}
       <div className="flex-1 p-8 overflow-y-auto" style={{ backgroundColor: 'var(--bg-page)' }}>
-        {doctors.length === 0 ? (
+        {error && (
+          <p style={{ fontSize: '13px', color: 'var(--destructive)', marginBottom: '16px' }}>{error}</p>
+        )}
+        {loading ? (
+          <div className="flex flex-col items-center justify-center gap-3 py-24 text-center">
+            <p style={{ fontSize: '14px', color: 'var(--text-muted)' }}>Loading doctors…</p>
+          </div>
+        ) : doctors.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-4 py-24 text-center">
             <div
               className="w-16 h-16 rounded-full flex items-center justify-center"
@@ -514,7 +643,7 @@ export default function Doctors() {
             </h3>
             <p style={{ fontSize: '14px', color: 'var(--text-secondary)', marginBottom: '20px' }}>
               {doctors.find(d => d.id === deleteConfirm)?.name} will be removed from the AI's knowledge.
-              Existing appointments are not affected.
+              This also removes their existing appointments — consider marking them on leave instead if you just want to pause bookings.
             </p>
             <div className="flex gap-3">
               <button

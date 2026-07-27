@@ -460,7 +460,7 @@ async def superadmin_login(payload: SuperAdminLoginPayload) -> dict:
 # ── GET /agents/templates ─────────────────────────────────────────────────────
 
 @router.get("/agents/templates")
-async def list_templates() -> list[dict]:
+async def list_templates(user: CurrentUser = None) -> list[dict]:
     return [
         {
             "key": key,
@@ -1404,31 +1404,16 @@ async def test_agent_text(agent_id: str, body: dict = Body(...), user: CurrentUs
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── POST /agents/{agent_id}/test-call — create LiveKit room ─────────────────
-
-@router.post("/agents/{agent_id}/test-call")
-async def test_call(agent_id: str, user: CurrentUser = None) -> dict:
-    async with async_session() as session:
-        result = await session.execute(select(AgentConfig).where(AgentConfig.id == agent_id))
-        agent = result.scalar_one_or_none()
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
-        user.require_owns(str(agent.tenant_id))
-    room_name = f"call-test-{agent_id[:8]}-{uuid.uuid4().hex[:6]}"
-    return {
-        "room_name": room_name,
-        "livekit_url": settings.livekit_url,
-        "message": "Join this room in LiveKit dashboard to test your agent.",
-    }
-
-
-# NOTE: the /agents/{agent_id}/web-call-token route lived here previously but was
-# a stripped-down duplicate — it never created the LiveKit room WITH metadata and
-# never dispatched the Pipecat worker, so the agent couldn't identify the
-# tenant/agent or even join. The authoritative implementation is in
-# backend/routers/web_calls.py (creates the room + metadata, dispatches the
-# worker via RoomAgentDispatch, supports test_mode). This duplicate was removed
-# so that complete version is the one served.
+# NOTE: this file previously had both a /agents/{agent_id}/test-call AND a
+# /agents/{agent_id}/web-call-token route — both stripped-down duplicates that
+# never created the LiveKit room WITH metadata and never dispatched the
+# Pipecat worker, so the agent couldn't identify the tenant/agent or even
+# join (test-call's response even said "Join this room in LiveKit dashboard"
+# for a room that was never created). Confirmed unused by the frontend
+# (nothing calls either path) and removed. The authoritative implementation
+# is in backend/routers/web_calls.py (creates the room + metadata, dispatches
+# the worker via RoomAgentDispatch, supports test_mode) — that's the one the
+# frontend actually calls.
 
 
 # ── GET /agents/{agent_id}/call-logs (real CallRecord) ───────────────────────

@@ -326,6 +326,10 @@ class KeyUpsert(BaseModel):
     api_key: str
     extra_config: Optional[str] = None
     is_active: Optional[bool] = None
+    # Only used for a provider id that isn't in the PROVIDERS catalog (a
+    # custom OpenAI-compatible LLM entry) — the catalog lookup below has
+    # nothing to name it, so the frontend sends the name the user typed.
+    display_name: Optional[str] = None
 
 # ── Helper: get raw key for a provider ────────────────────────────────────────
 async def _get_raw_key(provider: str, db: AsyncSession) -> str | None:
@@ -474,7 +478,7 @@ async def upsert_key(data: KeyUpsert, user: SuperAdmin = None, db: AsyncSession 
         if err:
             raise HTTPException(status_code=422, detail=err)
 
-    dname = data.provider
+    dname = (data.display_name or "").strip() or data.provider
     for cat_providers in PROVIDERS.values():
         for p in cat_providers:
             if p["id"] == data.provider:
@@ -838,6 +842,7 @@ async def test_livekit(user: SuperAdmin = None, db: AsyncSession = Depends(get_d
         return {"ok": False, "detail": "LiveKit URL, API key, and secret must all be set."}
     try:
         import asyncio as _aio
+        from livekit import api as _lk
         async with _lk.LiveKitAPI(url, api_key, secret) as client:
             res = await _aio.wait_for(client.room.list_rooms(_lk.ListRoomsRequest()), timeout=8)
             return {"ok": True, "detail": f"Connected ✓ ({len(res.rooms)} active room(s))"}
@@ -1177,7 +1182,7 @@ async def list_voices(
 @router.get("/platform/tts/preview")
 async def tts_preview(
     provider: str = "sarvam",
-    voice_id: str = "meera",
+    voice_id: str = "shreya",
     language: str = "hi-IN",
     text: str = "Hello! I am your AI receptionist. How can I help you today?",
     pitch: float = 0.0,
@@ -1423,7 +1428,10 @@ async def transcribe_audio(
         from backend.db import AsyncSessionLocal
         async with AsyncSessionLocal() as s:
             api_key = await _get_raw_key("sarvam", s)
-            
+
+    if not api_key:
+        raise HTTPException(status_code=400, detail="No Sarvam API key configured. Add one under AI Platform → Speech-to-Text.")
+
     audio_bytes = await audio_file.read()
     
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1530,17 +1538,17 @@ async def sarvam_languages(user: CurrentUser = None):
     """
     return {
         "languages": [
-            {"code": "hi-IN", "name": "Hindi",            "script": "\u0939\u093f\u0928\u094d\u0926\u0940",       "default_speaker": "meera"},
-            {"code": "en-IN", "name": "English (India)",  "script": "English",        "default_speaker": "vian"},
-            {"code": "ta-IN", "name": "Tamil",            "script": "\u0ba4\u0bae\u0bbf\u0bb4\u0bcd",       "default_speaker": "pavithra"},
-            {"code": "te-IN", "name": "Telugu",           "script": "\u0c24\u0c46\u0c32\u0c41\u0c17\u0c41",       "default_speaker": "arvind"},
-            {"code": "kn-IN", "name": "Kannada",          "script": "\u0c95\u0ca8\u0ccd\u0ca8\u0ca1",       "default_speaker": "karun"},
-            {"code": "ml-IN", "name": "Malayalam",        "script": "\u0d2e\u0d32\u0d2f\u0d3e\u0d33\u0d02",     "default_speaker": "maya"},
-            {"code": "mr-IN", "name": "Marathi",          "script": "\u092e\u0930\u093e\u0920\u0940",       "default_speaker": "amol"},
-            {"code": "bn-IN", "name": "Bengali",          "script": "\u09ac\u09be\u0982\u09b2\u09be",       "default_speaker": "amartya"},
-            {"code": "gu-IN", "name": "Gujarati",         "script": "\u0a97\u0ac1\u0a9c\u0ab0\u0abe\u0aa4\u0ac0",     "default_speaker": "neel"},
-            {"code": "pa-IN", "name": "Punjabi",          "script": "\u0a2a\u0a70\u0a1c\u0a3e\u0a2c\u0a40",       "default_speaker": "arjun"},
-            {"code": "or-IN", "name": "Odia",             "script": "\u0b13\u0b21\u0b3c\u0b3f\u0b06",       "default_speaker": "diya"},
-            {"code": "unknown","name": "Auto-detect",     "script": "Auto",           "default_speaker": "meera"},
+            {"code": "hi-IN", "name": "Hindi",            "script": "\u0939\u093f\u0928\u094d\u0926\u0940",       "default_speaker": "shreya"},
+            {"code": "en-IN", "name": "English (India)",  "script": "English",        "default_speaker": "shubh"},
+            {"code": "ta-IN", "name": "Tamil",            "script": "\u0ba4\u0bae\u0bbf\u0bb4\u0bcd",       "default_speaker": "kavitha"},
+            {"code": "te-IN", "name": "Telugu",           "script": "\u0c24\u0c46\u0c32\u0c41\u0c17\u0c41",       "default_speaker": "rahul"},
+            {"code": "kn-IN", "name": "Kannada",          "script": "\u0c95\u0ca8\u0ccd\u0ca8\u0ca1",       "default_speaker": "kavya"},
+            {"code": "ml-IN", "name": "Malayalam",        "script": "\u0d2e\u0d32\u0d2f\u0d3e\u0d33\u0d02",     "default_speaker": "priya"},
+            {"code": "mr-IN", "name": "Marathi",          "script": "\u092e\u0930\u093e\u0920\u0940",       "default_speaker": "aditya"},
+            {"code": "bn-IN", "name": "Bengali",          "script": "\u09ac\u09be\u0982\u09b2\u09be",       "default_speaker": "rohan"},
+            {"code": "gu-IN", "name": "Gujarati",         "script": "\u0a97\u0ac1\u0a9c\u0ab0\u0abe\u0aa4\u0ac0",     "default_speaker": "amit"},
+            {"code": "pa-IN", "name": "Punjabi",          "script": "\u0a2a\u0a70\u0a1c\u0a3e\u0a2c\u0a40",       "default_speaker": "simran"},
+            {"code": "or-IN", "name": "Odia",             "script": "\u0b13\u0b21\u0b3c\u0b3f\u0b06",       "default_speaker": "ritu"},
+            {"code": "unknown","name": "Auto-detect",     "script": "Auto",           "default_speaker": "shreya"},
         ]
     }

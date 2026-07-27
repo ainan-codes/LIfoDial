@@ -14,10 +14,17 @@ import {
 import React from 'react';
 import { Link } from 'react-router-dom';
 import fetchWithAuth from '../api/client';
-import {
-    FIXTURE_APPOINTMENTS,
-    FIXTURE_TENANT
-} from '../fixtures/data';
+import { getTenantId } from '../api/auth';
+
+const APPOINTMENT_STATUS_FROM_BACKEND: Record<string, string> = {
+  confirmed: 'CONFIRMED', cancelled: 'CANCELLED', pending: 'PENDING',
+};
+
+function formatSlotTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
 
 // ── Status badge ──────────────────────────────────────────────────────────────
 const STATUS_STYLES: Record<string, { color: string; bg: string; border?: string }> = {
@@ -82,14 +89,13 @@ const KPI_DEFS = [
 ];
 
 // ── Quick Setup card ──────────────────────────────────────────────────────────
-function QuickSetupCard() {
-  const tenant = FIXTURE_TENANT;
-  const hasDoctors = true; // fixture: has doctors
-
+function QuickSetupCard({ aiNumber, forwardingSet, hasDoctors }: {
+  aiNumber: string | null; forwardingSet: boolean; hasDoctors: boolean;
+}) {
   const steps = [
     { label: 'Clinic registered',                  done: true  },
-    { label: `Phone number assigned: ${tenant.ai_number}`, done: true  },
-    { label: 'Call forwarding verified',           done: tenant.forwarding_verified },
+    { label: `Phone number assigned: ${aiNumber ?? 'pending'}`, done: !!aiNumber },
+    { label: 'Call forwarding number set',          done: forwardingSet },
     { label: 'Add your first doctor',              done: hasDoctors },
   ];
 
@@ -159,6 +165,8 @@ function QuickSetupCard() {
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 export default function Dashboard() {
+  const tenantId = getTenantId();
+
   const { data: statsData, isLoading: statsLoading } = useQuery({
     queryKey: ['dashboard-stats'],
     queryFn: () => fetchWithAuth('/api/dashboard/stats'),
@@ -171,13 +179,44 @@ export default function Dashboard() {
     retry: false,
   });
 
+  // Real clinic identity (name, AI number, forwarding number) — replaces the
+  // fixture tenant that used to be shown regardless of which clinic logged in.
+  const { data: tenantData } = useQuery({
+    queryKey: ['tenant', tenantId],
+    queryFn: () => fetchWithAuth(`/tenants/${tenantId}`),
+    enabled: !!tenantId,
+    retry: false,
+  });
+
+  const { data: doctorsData } = useQuery({
+    queryKey: ['doctors', tenantId],
+    queryFn: () => fetchWithAuth(`/tenants/${tenantId}/doctors`),
+    enabled: !!tenantId,
+    retry: false,
+  });
+
+  // Real appointments (already ordered most-recent-first server-side) for the
+  // "Recent Appointments" preview — same endpoint the full Appointments page uses.
+  const { data: aptsData } = useQuery({
+    queryKey: ['recent-appointments', tenantId],
+    queryFn: () => fetchWithAuth(`/tenants/${tenantId}/appointments`),
+    enabled: !!tenantId,
+    retry: false,
+  });
+
   // Real data only — /api/call_logs returns {items: [...]}. No fixture fallback:
   // when there are no calls (or the fetch fails) the table renders its empty state.
   const recentCalls = callsData?.items ?? [];
   const liveCount   = statsData?.live_calls ?? 0;
-  const isAgentOnline = true; // fixture: always online
+  const isAgentOnline = true; // TODO: no single "is this clinic's agent live" signal exists yet
 
-  const recentApts = FIXTURE_APPOINTMENTS.slice(0, 3);
+  const recentApts = (aptsData ?? []).slice(0, 3).map((a: any) => ({
+    id: a.id,
+    patient_phone: a.patient_phone,
+    doctor: a.doctor_name,
+    slot_time: formatSlotTime(a.slot_time),
+    status: APPOINTMENT_STATUS_FROM_BACKEND[a.status] ?? 'PENDING',
+  }));
 
   return (
     <div data-testid="dashboard-page" className="h-full flex flex-col">
@@ -201,7 +240,7 @@ export default function Dashboard() {
           color: isAgentOnline ? 'var(--accent)' : 'var(--destructive)',
         }}>
           {isAgentOnline
-            ? `Agent Online — Ready to receive calls on ${FIXTURE_TENANT.ai_number}`
+            ? `Agent Online — Ready to receive calls on ${tenantData?.ai_number ?? '—'}`
             : 'Agent Offline — Calls will not be answered'}
         </span>
       </div>
@@ -232,7 +271,11 @@ export default function Dashboard() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', maxWidth: '1400px', margin: '0 auto' }}>
 
         {/* ── Quick setup card (hides when complete) ── */}
-        <QuickSetupCard />
+        <QuickSetupCard
+          aiNumber={tenantData?.ai_number ?? null}
+          forwardingSet={!!tenantData?.forwarding_number}
+          hasDoctors={(doctorsData?.length ?? 0) > 0}
+        />
 
         {/* ── KPI row ── */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '12px' }}>

@@ -4,7 +4,6 @@ from collections.abc import AsyncGenerator
 
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from fastapi.responses import Response, FileResponse
 import os as _os

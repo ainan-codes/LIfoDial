@@ -253,7 +253,7 @@ async def test_tts(user: SuperAdmin = None) -> dict:
                 json={
                     "inputs": ["Namaste, test successful"],
                     "target_language_code": "hi-IN",
-                    "speaker": "meera",
+                    "speaker": "shreya",
                     "model": "bulbul:v3",
                     "speech_sample_rate": 16000,
                     "enable_preprocessing": True,

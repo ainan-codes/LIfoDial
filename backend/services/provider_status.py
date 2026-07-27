@@ -26,10 +26,21 @@ from backend.config import settings
 from backend.models.api_key_config import ApiKeyConfig
 
 # Providers whose settings attribute / env var don't follow the <provider>_api_key
-# convention.
+# convention — mostly STT/TTS catalog ids (backend/routers/platform.py PROVIDERS)
+# that share a key with a differently-named provider ("whisper" and "openai_tts"
+# both use the OpenAI key; "azure_stt"/"azure_tts" share Azure Speech; "deepgram_aura"
+# shares the Deepgram key). Without these, resolve_provider_key("whisper") would look
+# for a nonexistent WHISPER_API_KEY env var / settings.whisper_api_key attribute and
+# silently report "not configured" even when the real key is set.
 _SPECIAL_ATTR = {
     "vobiz": ("vobiz_account_sid", "VOBIZ_ACCOUNT_SID"),
     "oxzygen": ("oxzygen_api_key", "OXZYGEN_API_KEY"),
+    "whisper": ("openai_api_key", "OPENAI_API_KEY"),
+    "openai_tts": ("openai_api_key", "OPENAI_API_KEY"),
+    "azure_stt": ("azure_speech_key", "AZURE_SPEECH_KEY"),
+    "azure_tts": ("azure_speech_key", "AZURE_SPEECH_KEY"),
+    "deepgram_aura": ("deepgram_api_key", "DEEPGRAM_API_KEY"),
+    "google_stt": ("google_speech_api_key", "GOOGLE_SPEECH_API_KEY"),
 }
 
 

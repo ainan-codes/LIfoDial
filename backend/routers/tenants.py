@@ -39,6 +39,21 @@ class AssignNumberResponse(BaseModel):
     ai_number: str
     forwarding_instructions: str
 
+class TenantDetailResponse(BaseModel):
+    id: str
+    clinic_name: str
+    language: str
+    ai_number: str | None
+    forwarding_number: str | None
+    phone: str | None
+    location: str | None
+    plan: str
+    is_active: bool
+    google_sheets_webhook_url: str | None
+    created_at: Any
+
+    model_config = ConfigDict(from_attributes=True)
+
 # ── Endpoints ────────────────────────────────────────────────────────
 
 @router.get("")
@@ -132,8 +147,11 @@ async def create_tenant(payload: TenantCreate, user: SuperAdmin = None, db: Asyn
             detail=f"A clinic named '{payload.clinic_name}' already exists.",
         )
 
-@router.get("/{id}")
+@router.get("/{id}", response_model=TenantDetailResponse)
 async def get_tenant(id: str, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    """Note: explicit response_model — the Tenant row also holds admin_password
+    (stored plaintext, see backend/models/tenant.py) and must never be
+    serialized back to the browser."""
     user.require_owns(id)
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
@@ -186,16 +204,42 @@ async def get_forwarding_instructions(id: str, user: CurrentUser = None, db: Asy
 
 @router.delete("/{id}", status_code=204)
 async def delete_tenant(id: str, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
-    """Delete a clinic and all associated agents."""
+    """Delete a clinic and every row that references it.
+
+    Same explicit, ordered cascade as backend/routers/admin.py::delete_clinic
+    (see that function's docstring for why: Alembic migrations never actually
+    run at deploy time, so the live schema's real FK constraints can't be
+    trusted to match the model files — Appointment.doctor_id in particular is
+    NOT NULL with an impossible ON DELETE SET NULL, so deleting a doctor's
+    appointments explicitly, rather than relying on the DB to cascade them,
+    is required for this to ever succeed for a clinic with real activity.
+    """
+    from backend.models.agent_config import AgentConfig
+    from backend.models.appointment import Appointment
+    from backend.models.bulk_call import BulkCallCampaign
+    from backend.models.phone_number import PhoneNumber
+    from backend.models.call_record import CallRecord
+    from backend.models.call_log import CallLog
+    from backend.models.knowledge_base import KnowledgeBase
+    from backend.models.clinic_credits import ClinicCredits, CreditTransaction
+    from backend.models.doctor import Doctor
+    from sqlalchemy import delete as sa_delete
+
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    # Delete associated agents first (FK constraint)
-    from backend.models.agent_config import AgentConfig
-    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(Appointment).where(Appointment.tenant_id == id))
+    await db.execute(sa_delete(BulkCallCampaign).where(BulkCallCampaign.tenant_id == id))
+    await db.execute(sa_delete(PhoneNumber).where(PhoneNumber.tenant_id == id))
+    await db.execute(sa_delete(CallRecord).where(CallRecord.tenant_id == id))
+    await db.execute(sa_delete(CallLog).where(CallLog.tenant_id == id))
+    await db.execute(sa_delete(KnowledgeBase).where(KnowledgeBase.tenant_id == id))
+    await db.execute(sa_delete(CreditTransaction).where(CreditTransaction.tenant_id == id))
+    await db.execute(sa_delete(ClinicCredits).where(ClinicCredits.tenant_id == id))
     await db.execute(sa_delete(AgentConfig).where(AgentConfig.tenant_id == id))
+    await db.execute(sa_delete(Doctor).where(Doctor.tenant_id == id))
 
     await db.delete(tenant)
     await db.commit()

@@ -1,6 +1,49 @@
 import { ChevronDown, ChevronUp, Download, PhoneMissed } from 'lucide-react';
-import React, { useState } from 'react';
-import { FIXTURE_CALL_LOGS, type CallLog } from '../fixtures/data';
+import React, { useEffect, useState } from 'react';
+import type { CallLog } from '../fixtures/data';
+import fetchWithAuth from '../api/client';
+import { getTenantId } from '../api/auth';
+
+// GET /api/call_logs returns real, tenant-scoped call records
+// (backend/main.py::recent_call_logs / _call_record_to_row). Intent/status are
+// free-form strings from the LLM/booking flow, not the narrow fixture union,
+// so this page's own type is intentionally looser than the shared CallLog type.
+type UICallLog = Omit<CallLog, 'intent' | 'status'> & { intent: string; status: string };
+
+interface BackendCallLog {
+  id: string;
+  phone: string;
+  date: string;
+  duration: string;
+  intent: string;
+  status: string;
+  language: string;
+  transcript: { role: 'ai' | 'patient' | string; text: string; time?: string }[];
+}
+
+const LANGUAGE_FLAGS: Record<string, string> = {
+  'hi-IN': '🇮🇳', 'en-IN': '🇮🇳', 'en-US': '🇺🇸', 'en-GB': '🇬🇧', 'ta-IN': '🇮🇳',
+  'te-IN': '🇮🇳', 'kn-IN': '🇮🇳', 'ml-IN': '🇮🇳', 'mr-IN': '🇮🇳', 'bn-IN': '🇮🇳',
+  'pa-IN': '🇮🇳', 'gu-IN': '🇮🇳', 'ar-AE': '🇦🇪', 'ar-SA': '🇸🇦',
+};
+
+function fromBackend(c: BackendCallLog): UICallLog {
+  return {
+    id: c.id,
+    phone: c.phone,
+    date: c.date,
+    duration: c.duration,
+    intent: c.intent,
+    status: c.status,
+    language: c.language,
+    flag: LANGUAGE_FLAGS[c.language] ?? '🌐',
+    transcript: (c.transcript || []).map(t => ({
+      role: t.role === 'ai' ? 'ai' : 'patient',
+      text: t.text,
+      time: t.time ?? '',
+    })),
+  };
+}
 
 // ── Status badge ──────────────────────────────────────────────────────────────
 const STATUS_STYLES: Record<string, { color: string; bg: string; border?: string }> = {
@@ -33,7 +76,7 @@ const INTENT_STYLES: Record<string, { color: string; bg: string }> = {
   Cancellation:   { color: 'var(--warning)',  bg: 'var(--warning-dim)' },
 };
 
-function IntentBadge({ intent }: { intent: CallLog['intent'] }) {
+function IntentBadge({ intent }: { intent: string }) {
   const s = INTENT_STYLES[intent] ?? { color: 'var(--text-muted)', bg: 'var(--bg-surface-2)' };
   return (
     <span style={{
@@ -46,7 +89,7 @@ function IntentBadge({ intent }: { intent: CallLog['intent'] }) {
 }
 
 // ── Transcript drawer ─────────────────────────────────────────────────────────
-function TranscriptDrawer({ transcript }: { transcript: CallLog['transcript'] }) {
+function TranscriptDrawer({ transcript }: { transcript: UICallLog['transcript'] }) {
   return (
     <tr>
       <td colSpan={8} style={{ padding: 0 }}>
@@ -104,10 +147,30 @@ function TranscriptDrawer({ transcript }: { transcript: CallLog['transcript'] })
 
 // ── CallLogs page ─────────────────────────────────────────────────────────────
 export default function CallLogs() {
-  const [logs] = useState<CallLog[]>(FIXTURE_CALL_LOGS);
+  const [logs, setLogs] = useState<UICallLog[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [filterStatus, setFilterStatus] = useState('ALL');
   const [filterIntent, setFilterIntent] = useState('ALL');
+
+  useEffect(() => {
+    if (!getTenantId()) return;
+    let cancelled = false;
+    setLoading(true);
+    fetchWithAuth('/api/call_logs?limit=50')
+      .then((data: { items: BackendCallLog[] }) => {
+        if (cancelled) return;
+        setLogs((data?.items || []).map(fromBackend));
+        setError(null);
+      })
+      .catch((e: Error) => {
+        if (cancelled) return;
+        setError(e.message || 'Failed to load call logs');
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
 
   const filtered = logs.filter(l =>
     (filterStatus === 'ALL' || l.status === filterStatus) &&
@@ -205,12 +268,22 @@ export default function CallLogs() {
           className="rounded-xl overflow-hidden"
           style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border)', boxShadow: 'var(--shadow-card)' }}
         >
-          {filtered.length === 0 ? (
+          {loading ? (
+            <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+              <p style={{ fontSize: '14px', color: 'var(--text-muted)' }}>Loading call logs…</p>
+            </div>
+          ) : error ? (
+            <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+              <p style={{ fontSize: '14px', fontWeight: 500, color: 'var(--destructive)' }}>{error}</p>
+            </div>
+          ) : filtered.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
               <div className="w-12 h-12 rounded-full flex items-center justify-center" style={{ backgroundColor: 'var(--bg-surface-2)' }}>
                 <PhoneMissed size={22} style={{ color: 'var(--text-muted)' }} />
               </div>
-              <p style={{ fontSize: '14px', fontWeight: 500, color: 'var(--text-secondary)' }}>No calls match filters</p>
+              <p style={{ fontSize: '14px', fontWeight: 500, color: 'var(--text-secondary)' }}>
+                {logs.length === 0 ? 'No calls yet' : 'No calls match filters'}
+              </p>
             </div>
           ) : (
             <table className="w-full" style={{ borderCollapse: 'collapse' }}>

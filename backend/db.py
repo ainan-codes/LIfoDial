@@ -173,6 +173,8 @@ async def _apply_lightweight_migrations():
     migrations = [
         ("agent_configs", "embed_display_mode", "VARCHAR(20) DEFAULT 'button'"),
         ("agent_configs", "embed_auto_invite_delay", "INTEGER DEFAULT 3"),
+        ("doctors", "is_available", "BOOLEAN DEFAULT true"),
+        ("doctors", "leave_reason", "VARCHAR(500)"),
     ]
     for table, column, coldef in migrations:
         try:

@@ -123,6 +123,33 @@ def _kb_context_block(tenant: dict) -> str:
     )
 
 
+def _doctor_availability_block(tenant: dict) -> str:
+    """Doctors currently on leave, as an appendable prompt block. Empty string
+    when everyone is available (turn proceeds normally). Appended alongside
+    the KB block so this reaches the LLM regardless of whether the clinic uses
+    a custom prompt, a template, or the hardcoded fallback — the template's own
+    doctors_list placeholder (below) is template-only and does NOT cover a
+    custom prompt, so this is the one place that reaches every prompt path."""
+    unavailable = [d for d in (tenant.get("doctors") or []) if not d.get("is_available", True)]
+    if not unavailable:
+        return ""
+    lines = [
+        f"- {d['name']} ({d.get('specialization', 'Specialist')}) is ON LEAVE"
+        + (f" — {d['leave_reason']}" if d.get("leave_reason") else "")
+        for d in unavailable
+    ]
+    return (
+        "\n\n--- DOCTOR AVAILABILITY ---\n"
+        + "\n".join(lines)
+        + "\n--- END DOCTOR AVAILABILITY ---\n"
+        "Any doctor listed above is NOT available right now. If the caller asks for one of "
+        "them by name or specialization, tell them clearly that the doctor is on leave "
+        "(mention the reason if one is given) — do not offer to book that doctor. Instead, "
+        "offer another available doctor with the same specialization if one exists, or ask "
+        "the caller if they'd like to be notified when the doctor is back."
+    )
+
+
 # Appended to EVERY system prompt (custom, template, or fallback). This is the
 # honesty contract that pairs with BookingProcessor._commit_and_inject_result:
 # the DB write is awaited and its outcome arrives as a [BOOKING_RESULT] system
@@ -155,7 +182,12 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
         "comment on which language is being spoken — just answer in it.\n"
     )
 
-    kb_block = _kb_context_block(tenant) + _BOOKING_RULES_BLOCK + _LANGUAGE_MIRROR_RULE
+    kb_block = (
+        _kb_context_block(tenant)
+        + _doctor_availability_block(tenant)
+        + _BOOKING_RULES_BLOCK
+        + _LANGUAGE_MIRROR_RULE
+    )
 
     custom_prompt = (agent_config.get("system_prompt") or "").strip()
     if custom_prompt:
@@ -172,6 +204,7 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
         doctors = tenant.get("doctors", [])
         doctors_list = "\n".join(
             f"- {d['name']} ({d.get('specialization', 'Specialist')})"
+            + ("" if d.get("is_available", True) else " — ON LEAVE, do not book")
             for d in doctors
         ) or "- General Physician available"
 
@@ -381,6 +414,8 @@ async def _load_tenant_and_config(
                         "id":             str(d.id),
                         "name":           d.name,
                         "specialization": d.specialization,
+                        "is_available":   d.is_available,
+                        "leave_reason":   d.leave_reason,
                     }
                     for d in d_result.scalars().all()
                 ]
@@ -667,7 +702,8 @@ async def entrypoint(ctx) -> None:
         ),
     )
 
-    # STT — Deepgram (real-time streaming), Sarvam AI, OpenAI Whisper, or ElevenLabs
+    # STT — Deepgram (real-time streaming), Sarvam AI, OpenAI Whisper, ElevenLabs,
+    # or AssemblyAI
     stt_provider = agent_config.get("stt_provider", "sarvam")
 
     # Set by the branches below and consumed by LanguageSwitchProcessor: whether a
@@ -677,6 +713,19 @@ async def entrypoint(ctx) -> None:
     # "multi") — reconnecting a healthy socket would only add deaf time.
     stt_needs_language_switch = False
     stt_language_translator = None
+
+    # ── Resolve STT provider keys — DB (AI Platform dashboard) first, env
+    # fallback, via backend/agent/providers.py::resolve_key. A key saved
+    # through the dashboard now takes effect on the very next call: no
+    # redeploy, no env var edit, no worker restart. See providers.py for how
+    # to register a new provider here.
+    from backend.db import AsyncSessionLocal
+    from backend.agent import providers as provider_registry
+    async with AsyncSessionLocal() as _key_db:
+        _stt_keys = {
+            p: await provider_registry.resolve_key(_key_db, p)
+            for p in ("deepgram", "openai", "whisper", "elevenlabs", "sarvam", "assemblyai")
+        }
 
     # ── Deaf-agent guard ────────────────────────────────────────────────────
     # NONE of the STT services raise when handed an empty api_key — they build
@@ -691,15 +740,8 @@ async def entrypoint(ctx) -> None:
     # (render.yaml's lifodial-agent service). So: verify the selected provider's
     # key up front, shout if it's missing, and degrade to a provider that can
     # actually hear rather than running the whole call deaf.
-    _stt_keys = {
-        "deepgram":   settings.deepgram_api_key,
-        "openai":     settings.openai_api_key,
-        "whisper":    settings.openai_api_key,
-        "elevenlabs": settings.elevenlabs_api_key,
-        "sarvam":     settings.sarvam_api_key,
-    }
     if not (_stt_keys.get(stt_provider) or "").strip():
-        _fallback = "sarvam" if (settings.sarvam_api_key or "").strip() else None
+        _fallback = "sarvam" if (_stt_keys.get("sarvam") or "").strip() else None
         log.critical(
             "STT provider '%s' is selected but its API key is MISSING/EMPTY. The STT "
             "socket will 401 and the agent would greet the caller and then never hear "
@@ -766,7 +808,7 @@ async def entrypoint(ctx) -> None:
                 dg_model = "nova-2"
         log.info("Deepgram STT: model=%s language=%s", dg_model, dg_lang)
         stt = DeepgramSTTService(
-            api_key=settings.deepgram_api_key,
+            api_key=_stt_keys["deepgram"],
             settings=DeepgramSTTService.Settings(
                 model=dg_model,
                 language=dg_lang,
@@ -789,30 +831,36 @@ async def entrypoint(ctx) -> None:
     elif stt_provider in ("openai", "whisper"):
         log.info("Instantiating OpenAI Whisper STT...")
         stt = OpenAISTTService(
-            api_key=settings.openai_api_key,
+            api_key=_stt_keys.get(stt_provider) or _stt_keys["openai"],
             model="whisper-1"
         )
     elif stt_provider == "elevenlabs":
         log.info("Instantiating ElevenLabs Realtime STT...")
         from pipecat.services.elevenlabs.stt import ElevenLabsRealtimeSTTService
-        
+
         # ElevenLabs Scribe uses ISO 2-letter or 3-letter language code
         stt_lang = agent_config.get("stt_language") or tts_language
         if stt_lang and "-" in stt_lang:
             stt_lang = stt_lang.split("-")[0]
-            
+
         stt = ElevenLabsRealtimeSTTService(
-            api_key=settings.elevenlabs_api_key,
+            api_key=_stt_keys["elevenlabs"],
             settings=ElevenLabsRealtimeSTTService.Settings(
                 language=stt_lang or None,
             )
         )
         stt_needs_language_switch = bool(stt_lang)
         stt_language_translator = lambda code: code.split("-")[0]
+    elif stt_provider == "assemblyai":
+        log.info("Instantiating AssemblyAI streaming STT...")
+        stt = provider_registry.build_assemblyai_stt(api_key=_stt_keys["assemblyai"])
+        # AssemblyAI's streaming v3 API auto-detects language — no per-language
+        # reconnect needed mid-call.
+        stt_needs_language_switch = False
     else:
         log.info("Instantiating Sarvam STT...")
         stt = SarvamSTTService(
-            api_key=settings.sarvam_api_key,
+            api_key=_stt_keys["sarvam"],
             settings=stt_settings,
         )
         # saaras:v2.5 was built with no language at all (it auto-detects); the
@@ -829,7 +877,7 @@ async def entrypoint(ctx) -> None:
 
     llm_provider, llm_key, llm_model = await select_llm_provider(agent_config)
     log.info("Using LLM provider=%s model=%s for room=%s", llm_provider, llm_model, room_name)
-    llm = build_llm(llm_provider, llm_key, llm_model, system_prompt, agent_config)
+    llm = await build_llm(llm_provider, llm_key, llm_model, system_prompt, agent_config)
 
     # Build LLM context (conversation history) + a PROVIDER-AGNOSTIC aggregator.
     # llm.create_context_aggregator(...) only exists on GoogleLLMService; since
@@ -938,8 +986,17 @@ async def entrypoint(ctx) -> None:
         )
     )
 
-    # TTS — Sarvam AI or ElevenLabs
+    # TTS — Sarvam AI, ElevenLabs, OpenAI, or Cartesia
     tts_provider = agent_config.get("tts_provider", "sarvam")
+
+    # Same DB-first (AI Platform dashboard), env-fallback key resolution as STT
+    # above — see backend/agent/providers.py.
+    async with AsyncSessionLocal() as _key_db:
+        _tts_keys = {
+            p: await provider_registry.resolve_key(_key_db, p)
+            for p in ("elevenlabs", "openai_tts", "openai", "sarvam", "cartesia")
+        }
+
     if tts_provider == "elevenlabs":
         # Safe fallback: if tts_voice is empty or is a Sarvam voice name, default to ElevenLabs' Rachel ID
         selected_voice = tts_voice
@@ -966,7 +1023,7 @@ async def entrypoint(ctx) -> None:
 
         log.info("Instantiating ElevenLabs TTS for voice: %s, model: %s", selected_voice, tts_model_configured)
         tts = ElevenLabsTTSService(
-            api_key=settings.elevenlabs_api_key,
+            api_key=_tts_keys["elevenlabs"],
             voice_id=selected_voice,
             settings=ElevenLabsTTSService.Settings(
                 model=tts_model_configured,
@@ -982,12 +1039,24 @@ async def entrypoint(ctx) -> None:
         openai_speed = agent_config.get("tts_speed")
         openai_speed = min(max(float(openai_speed), 0.25), 4.0) if openai_speed is not None else None
         tts = OpenAITTSService(
-            api_key=settings.openai_api_key,
+            api_key=_tts_keys.get("openai_tts") or _tts_keys["openai"],
             settings=OpenAITTSService.Settings(
                 voice=tts_voice or "alloy",
                 model=tts_model_str if tts_model_str.startswith("gpt-") or tts_model_str.startswith("tts-") else "gpt-4o-mini-tts",
                 speed=openai_speed,
             ),
+        )
+    elif tts_provider == "cartesia":
+        # tts_model_str was validated against Sarvam's own model enum above
+        # (line ~607) and forced to a Sarvam value if it didn't match — read
+        # the raw configured model directly here instead, same as the
+        # ElevenLabs branch already does for its own model list.
+        cartesia_model = agent_config.get("tts_model") or "sonic-2"
+        log.info("Instantiating Cartesia TTS for voice: %s, model: %s", tts_voice, cartesia_model)
+        tts = provider_registry.build_cartesia_tts(
+            api_key=_tts_keys["cartesia"],
+            voice_id=tts_voice or None,
+            model=cartesia_model,
         )
     else:
         log.info("Instantiating Sarvam TTS...")
@@ -999,7 +1068,7 @@ async def entrypoint(ctx) -> None:
         # requirements.agent.txt pins no upper bound so this is what a fresh
         # deploy installs).
         tts = SarvamTTSService(
-            api_key=settings.sarvam_api_key,
+            api_key=_tts_keys["sarvam"],
             settings=SarvamTTSService.Settings(
                 voice=tts_voice,
                 model=tts_model_str,

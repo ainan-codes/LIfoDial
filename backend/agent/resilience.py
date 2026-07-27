@@ -74,6 +74,56 @@ def _key_for(provider: str) -> str:
     }.get(provider, "") or ""
 
 
+async def _resolve_key(provider: str) -> str:
+    """DB-first key for an LLM provider (a key saved via the AI Platform
+    dashboard reaches the very next call, no redeploy/restart needed) —
+    falling back to the static env-based _key_for() if the DB has nothing
+    configured, or is unreachable."""
+    from backend.db import AsyncSessionLocal
+    from backend.services.provider_status import resolve_provider_key
+
+    try:
+        async with AsyncSessionLocal() as db:
+            key = await resolve_provider_key(db, provider)
+    except Exception as e:
+        log.warning("[RESILIENCE] DB key lookup failed for %s (using env fallback): %s", provider, e)
+        key = None
+    return key or _key_for(provider)
+
+
+async def _resolve_custom_provider(provider: str) -> tuple[str, str] | None:
+    """(api_key, base_url) for a custom OpenAI-compatible LLM provider — one
+    not in PROVIDER_ORDER, registered via the AI Platform dashboard's
+    "Add Custom Provider" (category="llm", provider=<whatever id was chosen>,
+    extra_config={"base_url": "..."}). Returns None if that provider has no
+    key or no base_url configured — callers treat that as "not set up",
+    not as a transient failure."""
+    import json
+    from backend.db import AsyncSessionLocal
+    from backend.models.api_key_config import ApiKeyConfig
+    from sqlalchemy import select
+
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(ApiKeyConfig).where(
+                    ApiKeyConfig.provider == provider, ApiKeyConfig.category == "llm",
+                )
+            )
+            row = result.scalars().first()
+            if not row:
+                return None
+            key = row.get_key_raw()
+            extra = json.loads(row.extra_config) if row.extra_config else {}
+            base_url = (extra.get("base_url") or "").strip()
+            if not key or not base_url:
+                return None
+            return key, base_url
+    except Exception as e:
+        log.warning("[RESILIENCE] custom LLM provider lookup failed for %s: %s", provider, e)
+        return None
+
+
 async def _probe(provider: str, key: str) -> bool:
     """Cheap reachability probe (list-models). True iff the key is live."""
     if not key.strip():
@@ -132,6 +182,27 @@ async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
     probe entirely.
     """
     configured_model = agent_config.get("llm_model") or ""
+    configured_provider = (agent_config.get("llm_provider") or "").strip()
+
+    # Explicit custom provider (not one of the 4 known ones) — a deliberately
+    # chosen endpoint, not a pool to fail over across, and a cheap local DB
+    # read rather than a network probe, so it deliberately bypasses
+    # _selection_cache entirely (that cache is keyed by model string alone,
+    # which would collide across different clinics' different custom
+    # providers if reused here — simplest correct fix is to not share it).
+    if configured_provider and configured_provider not in PROVIDER_ORDER:
+        custom = await _resolve_custom_provider(configured_provider)
+        if custom is not None:
+            key, _base_url = custom
+            model = configured_model or "gpt-3.5-turbo"
+            log.info("[RESILIENCE] using custom LLM provider '%s' (model=%s)", configured_provider, model)
+            return configured_provider, key, model
+        log.warning(
+            "[RESILIENCE] custom LLM provider '%s' has no key/base_url configured — "
+            "falling back to the standard provider pool.", configured_provider,
+        )
+        # Fall through to the standard pool below, exactly as if no provider
+        # preference had been set at all.
 
     cached = _selection_cache.get(configured_model)
     if cached and (time.monotonic() - cached[0]) < _SELECTION_TTL_SECS:
@@ -145,11 +216,14 @@ async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
     if configured_model in {"mixtral-8x7b-32768", "llama3-8b-8192", "llama3-70b-8192", "gemma-7b-it"}:
         configured_model = "llama-3.3-70b-versatile"
 
-    preferred = _provider_from_model(configured_model) or "gemini"
+    preferred = (
+        configured_provider if configured_provider in PROVIDER_ORDER
+        else _provider_from_model(configured_model) or "gemini"
+    )
 
     order: list[str] = [preferred] + [p for p in PROVIDER_ORDER if p != preferred]
     for provider in order:
-        key = _key_for(provider)
+        key = await _resolve_key(provider)
         if await _probe(provider, key):
             model = configured_model if provider == preferred and configured_model else PROVIDER_DEFAULT_MODEL[provider]
             if provider != preferred:
@@ -168,12 +242,15 @@ async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
     )
 
 
-def build_llm(provider: str, api_key: str, model: str, system_prompt: str, agent_config: dict):
+async def build_llm(provider: str, api_key: str, model: str, system_prompt: str, agent_config: dict):
     """Instantiate the Pipecat LLM service for the selected provider.
 
-    All three services share Settings(system_instruction/temperature/max_tokens),
+    All services share Settings(system_instruction/temperature/max_tokens),
     so configuration is uniform. DeepSeek uses the OpenAI service against
-    DeepSeek's OpenAI-compatible base URL.
+    DeepSeek's OpenAI-compatible base URL — any other provider not in the 4
+    known ones is treated the same way: a custom OpenAI-compatible endpoint,
+    with its base_url read from that provider's ApiKeyConfig.extra_config
+    (set via the AI Platform dashboard's "Add Custom Provider").
     """
     temperature = float(agent_config.get("llm_temperature", 0.3))
     max_tokens = int(agent_config.get("max_response_tokens", 120))
@@ -203,6 +280,20 @@ def build_llm(provider: str, api_key: str, model: str, system_prompt: str, agent
         if provider == "deepseek":
             kwargs["base_url"] = "https://api.deepseek.com/v1"
         return OpenAILLMService(**kwargs)
+
+    # Custom provider — resolved again here (cheap local DB read) rather than
+    # threaded through select_llm_provider's return value, so that function's
+    # (provider, key, model) signature — and the tests that destructure it —
+    # stay unchanged.
+    custom = await _resolve_custom_provider(provider)
+    if custom is not None:
+        _custom_key, base_url = custom
+        from pipecat.services.openai.llm import OpenAILLMService
+        return OpenAILLMService(
+            api_key=api_key, base_url=base_url,
+            settings=OpenAILLMService.Settings(
+                model=model, system_instruction=system_prompt, temperature=temperature, max_tokens=max_tokens),
+        )
 
     raise ValueError(f"Unbuildable LLM provider: {provider}")
 

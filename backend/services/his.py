@@ -92,6 +92,15 @@ async def _set_cached_doctors(tenant_id: str, doctors: List[Dict[str, Any]]) -> 
     key = f"{tenant_id}:doctors:list"
     _doctor_cache[key] = (time.time(), doctors)
 
+
+def invalidate_doctor_cache(tenant_id: str) -> None:
+    """Drop the cached doctor list for a tenant. Call this on any doctor
+    add/delete/availability change — without it, a clinic marking a doctor on
+    leave (or adding/removing one) would silently keep showing the stale list
+    to callers and the booking flow for up to _CACHE_TTL (1 hour)."""
+    _doctor_cache.pop(f"{tenant_id}:doctors:list", None)
+
+
 async def get_doctors(tenant_id: str, specialization: str = None) -> List[dict]:
     # Check cache first (ignore specialization exactly in cache key, filter in memory)
     cached = await _get_cached_doctors(tenant_id)
@@ -113,7 +122,9 @@ async def get_doctors(tenant_id: str, specialization: str = None) -> List[dict]:
                     "id": str(d.id),
                     "name": d.name,
                     "specialization": d.specialization,
-                    "his_doctor_id": d.his_doctor_id
+                    "his_doctor_id": d.his_doctor_id,
+                    "is_available": d.is_available,
+                    "leave_reason": d.leave_reason,
                 }
                 for d in db_docs
             ]

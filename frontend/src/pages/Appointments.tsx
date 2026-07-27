@@ -1,6 +1,51 @@
 import { CalendarCheck, Clock, Download, Filter, Headphones, XCircle } from 'lucide-react';
-import React, { useState } from 'react';
-import { FIXTURE_APPOINTMENTS, type Appointment } from '../fixtures/data';
+import React, { useEffect, useState } from 'react';
+import type { Appointment } from '../fixtures/data';
+import fetchWithAuth from '../api/client';
+import { getTenantId } from '../api/auth';
+
+// ── Backend <-> UI shape mapping ───────────────────────────────────────────
+// GET /tenants/{tenant_id}/appointments returns lowercase status
+// (pending/confirmed/cancelled) and doctor_name/specialization already
+// joined server-side (backend/routers/appointments.py).
+interface BackendAppointment {
+  id: string;
+  doctor_id: string;
+  doctor_name: string;
+  specialization: string;
+  slot_time: string;
+  patient_phone: string;
+  status: 'pending' | 'confirmed' | 'cancelled';
+}
+
+const STATUS_FROM_BACKEND: Record<BackendAppointment['status'], Appointment['status']> = {
+  confirmed: 'CONFIRMED',
+  cancelled: 'CANCELLED',
+  pending: 'PENDING',
+};
+
+function formatSlotTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, {
+    day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+function fromBackend(a: BackendAppointment): Appointment {
+  return {
+    id: a.id,
+    patient_phone: a.patient_phone,
+    doctor: a.doctor_name,
+    specialization: a.specialization,
+    slot_time: formatSlotTime(a.slot_time),
+    // Every appointment today is created by the voice booking pipeline —
+    // there is no manual/staff-created booking path yet.
+    booked_via: 'AI Voice',
+    call_id: '',
+    status: STATUS_FROM_BACKEND[a.status] ?? 'PENDING',
+  };
+}
 
 // ── Status badge ──────────────────────────────────────────────────────────────
 function StatusBadge({ status }: { status: Appointment['status'] }) {
@@ -72,11 +117,32 @@ function StatCard({ label, value, icon: Icon, color }: {
 
 // ── Appointments Page ─────────────────────────────────────────────────────────
 export default function Appointments() {
-  const [appointments, setAppointments] = useState<Appointment[]>(FIXTURE_APPOINTMENTS);
+  const [appointments, setAppointments] = useState<Appointment[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [filterStatus, setFilterStatus] = useState<string>('ALL');
   const [filterSpec, setFilterSpec]     = useState<string>('ALL');
 
-  const specs = Array.from(new Set(FIXTURE_APPOINTMENTS.map(a => a.specialization)));
+  useEffect(() => {
+    const tenantId = getTenantId();
+    if (!tenantId) return;
+    let cancelled = false;
+    setLoading(true);
+    fetchWithAuth(`/tenants/${tenantId}/appointments`)
+      .then((data: BackendAppointment[]) => {
+        if (cancelled) return;
+        setAppointments((data || []).map(fromBackend));
+        setError(null);
+      })
+      .catch((e: Error) => {
+        if (cancelled) return;
+        setError(e.message || 'Failed to load appointments');
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const specs = Array.from(new Set(appointments.map(a => a.specialization)));
 
   const filtered = appointments.filter(a =>
     (filterStatus === 'ALL' || a.status === filterStatus) &&
@@ -107,10 +173,23 @@ export default function Appointments() {
   };
 
   // Cancel an appointment
-  const handleCancel = (id: string) => {
+  const handleCancel = async (id: string) => {
+    const tenantId = getTenantId();
+    if (!tenantId) return;
+    // Optimistic update — revert if the request fails.
+    const prevAppointments = appointments;
     setAppointments(prev =>
       prev.map(a => a.id === id ? { ...a, status: 'CANCELLED' as const } : a)
     );
+    try {
+      await fetchWithAuth(`/tenants/${tenantId}/appointments/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status: 'cancelled' }),
+      });
+    } catch (e) {
+      setAppointments(prevAppointments);
+      setError((e as Error).message || 'Failed to cancel appointment');
+    }
   };
 
   const selectStyle: React.CSSProperties = {
@@ -210,7 +289,16 @@ export default function Appointments() {
             className="rounded-xl overflow-hidden"
             style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border)', boxShadow: 'var(--shadow-card)' }}
           >
-            {filtered.length === 0 ? (
+            {loading ? (
+              <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+                <p style={{ fontSize: '14px', color: 'var(--text-muted)' }}>Loading appointments…</p>
+              </div>
+            ) : error ? (
+              <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+                <XCircle size={22} style={{ color: 'var(--destructive)' }} />
+                <p style={{ fontSize: '14px', fontWeight: 500, color: 'var(--destructive)' }}>{error}</p>
+              </div>
+            ) : filtered.length === 0 ? (
               <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
                 <div
                   className="w-12 h-12 rounded-full flex items-center justify-center"
@@ -218,8 +306,12 @@ export default function Appointments() {
                 >
                   <CalendarCheck size={22} style={{ color: 'var(--text-muted)' }} />
                 </div>
-                <p style={{ fontSize: '14px', fontWeight: 500, color: 'var(--text-secondary)' }}>No appointments match your filters</p>
-                <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>Try clearing the filters above.</p>
+                <p style={{ fontSize: '14px', fontWeight: 500, color: 'var(--text-secondary)' }}>
+                  {appointments.length === 0 ? 'No appointments yet' : 'No appointments match your filters'}
+                </p>
+                <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
+                  {appointments.length === 0 ? 'Bookings made by the voice receptionist will show up here.' : 'Try clearing the filters above.'}
+                </p>
               </div>
             ) : (
               <table className="w-full" style={{ borderCollapse: 'collapse' }}>

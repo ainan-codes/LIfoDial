@@ -29,6 +29,14 @@ interface ClinicAgentSummary {
   status: string;
 }
 
+interface ClinicDoctorSummary {
+  id: string;
+  name: string;
+  specialization: string;
+  is_available: boolean;
+  leave_reason: string | null;
+}
+
 const PLANS: PlanTier[] = ['Free', 'Pro', 'Enterprise'];
 
 // ── Add Clinic Form ──────────────────────────────────────────────────────────
@@ -198,6 +206,13 @@ function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose:
   const [agentsLoading, setAgentsLoading] = useState(true);
   const [showAgentPicker, setShowAgentPicker] = useState(false);
 
+  // ── Doctors for this clinic — superadmin can toggle on-leave status here
+  // without needing to log in as the clinic (same PATCH endpoint the clinic's
+  // own Doctors page uses).
+  const [doctors, setDoctors] = useState<ClinicDoctorSummary[]>([]);
+  const [doctorsLoading, setDoctorsLoading] = useState(true);
+  const [togglingDoctorId, setTogglingDoctorId] = useState<string | null>(null);
+
   useEffect(() => {
     let cancelled = false;
     setAgentsLoading(true);
@@ -211,6 +226,32 @@ function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose:
       .finally(() => { if (!cancelled) setAgentsLoading(false); });
     return () => { cancelled = true; };
   }, [clinic.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setDoctorsLoading(true);
+    fetchWithAuth(`/tenants/${clinic.id}/doctors`)
+      .then((data: ClinicDoctorSummary[]) => { if (!cancelled) setDoctors(data || []); })
+      .catch(() => { if (!cancelled) setDoctors([]); })
+      .finally(() => { if (!cancelled) setDoctorsLoading(false); });
+    return () => { cancelled = true; };
+  }, [clinic.id]);
+
+  const toggleDoctorAvailability = async (doctor: ClinicDoctorSummary) => {
+    setTogglingDoctorId(doctor.id);
+    const nextAvailable = !doctor.is_available;
+    try {
+      const updated: ClinicDoctorSummary = await fetchWithAuth(`/tenants/${clinic.id}/doctors/${doctor.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ is_available: nextAvailable }),
+      });
+      setDoctors(prev => prev.map(d => d.id === doctor.id ? updated : d));
+    } catch {
+      alert('Failed to update doctor availability');
+    } finally {
+      setTogglingDoctorId(null);
+    }
+  };
 
   const goToAgent = (agentId: string) => {
     window.location.href = `/superadmin/agents/${agentId}`;
@@ -303,6 +344,52 @@ function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose:
                   <ChevronR size={13} color="#555" />
                 </div>
               </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div style={{ padding: '20px 24px', borderBottom: '1px solid #2E2E2E' }}>
+        <p style={{ color: '#888', fontSize: '11px', fontWeight: 700, textTransform: 'uppercase', marginBottom: '8px' }}>Doctors</p>
+        {doctorsLoading ? (
+          <p style={{ color: '#666', fontSize: '12px', margin: 0 }}>Loading…</p>
+        ) : doctors.length === 0 ? (
+          <div style={{ backgroundColor: '#0F0F0F', border: '1px solid #2E2E2E', borderRadius: '8px', padding: '14px', textAlign: 'center' }}>
+            <p style={{ color: '#666', fontSize: '12px', margin: 0 }}>No doctors added yet</p>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            {doctors.map(d => (
+              <div
+                key={d.id}
+                style={{
+                  backgroundColor: '#0F0F0F', border: '1px solid #2E2E2E', borderRadius: '8px',
+                  padding: '10px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px',
+                }}
+              >
+                <div style={{ overflow: 'hidden' }}>
+                  <p style={{ color: '#fff', fontSize: '13px', fontWeight: 600, margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {d.name}
+                  </p>
+                  <p style={{ color: '#666', fontSize: '11px', margin: '2px 0 0' }}>
+                    {d.specialization}{!d.is_available && d.leave_reason ? ` · ${d.leave_reason}` : ''}
+                  </p>
+                </div>
+                <button
+                  disabled={togglingDoctorId === d.id}
+                  onClick={() => toggleDoctorAvailability(d)}
+                  title={d.is_available ? 'Mark on leave' : 'Mark available'}
+                  style={{
+                    flexShrink: 0, fontSize: '11px', fontWeight: 700, padding: '4px 10px', borderRadius: '9999px',
+                    border: 'none', cursor: togglingDoctorId === d.id ? 'not-allowed' : 'pointer',
+                    color: d.is_available ? '#3ECF8E' : '#f59e0b',
+                    backgroundColor: d.is_available ? 'rgba(62,207,142,0.12)' : 'rgba(245,158,11,0.12)',
+                    opacity: togglingDoctorId === d.id ? 0.6 : 1,
+                  }}
+                >
+                  {d.is_available ? 'Available' : 'On Leave'}
+                </button>
+              </div>
             ))}
           </div>
         )}
