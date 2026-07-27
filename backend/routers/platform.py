@@ -751,12 +751,10 @@ async def _get_livekit_row(db: AsyncSession):
 
 
 def _livekit_extra(row) -> dict:
-    if not row or not row.extra_config:
+    if not row:
         return {}
-    try:
-        return json.loads(row.extra_config)
-    except Exception:
-        return {}
+    from backend.services.provider_status import parse_extra_config
+    return parse_extra_config(row.extra_config)
 
 
 @router.get("/platform/livekit")

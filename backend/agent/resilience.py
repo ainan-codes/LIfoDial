@@ -65,30 +65,23 @@ def _provider_from_model(model: str) -> Optional[str]:
     return None
 
 
-def _key_for(provider: str) -> str:
-    return {
-        "gemini": settings.gemini_api_key,
-        "groq": settings.groq_api_key,
-        "openai": settings.openai_api_key,
-        "deepseek": settings.deepseek_api_key,
-    }.get(provider, "") or ""
-
-
 async def _resolve_key(provider: str) -> str:
     """DB-first key for an LLM provider (a key saved via the AI Platform
     dashboard reaches the very next call, no redeploy/restart needed) —
-    falling back to the static env-based _key_for() if the DB has nothing
-    configured, or is unreachable."""
+    falling back to the static env/settings value if the DB has nothing
+    configured, or is unreachable. Delegates to backend/agent/providers.py's
+    resolve_key(), the same DB-first/env-fallback resolver the STT/TTS side of
+    the pipeline uses, so there's one implementation of that precedence."""
     from backend.db import AsyncSessionLocal
-    from backend.services.provider_status import resolve_provider_key
+    from backend.agent.providers import resolve_key as _shared_resolve_key
 
     try:
         async with AsyncSessionLocal() as db:
-            key = await resolve_provider_key(db, provider)
+            return await _shared_resolve_key(db, provider, category="llm")
     except Exception as e:
         log.warning("[RESILIENCE] DB key lookup failed for %s (using env fallback): %s", provider, e)
-        key = None
-    return key or _key_for(provider)
+        from backend.services.provider_status import _env_key
+        return _env_key(provider) or ""
 
 
 async def _resolve_custom_provider(provider: str) -> tuple[str, str] | None:
@@ -98,24 +91,25 @@ async def _resolve_custom_provider(provider: str) -> tuple[str, str] | None:
     extra_config={"base_url": "..."}). Returns None if that provider has no
     key or no base_url configured — callers treat that as "not set up",
     not as a transient failure."""
-    import json
     from backend.db import AsyncSessionLocal
     from backend.models.api_key_config import ApiKeyConfig
+    from backend.services.provider_status import parse_extra_config
     from sqlalchemy import select
 
     try:
         async with AsyncSessionLocal() as db:
             result = await db.execute(
                 select(ApiKeyConfig).where(
-                    ApiKeyConfig.provider == provider, ApiKeyConfig.category == "llm",
+                    ApiKeyConfig.provider == provider,
+                    ApiKeyConfig.category == "llm",
+                    ApiKeyConfig.is_active == True,  # noqa: E712
                 )
             )
             row = result.scalars().first()
             if not row:
                 return None
             key = row.get_key_raw()
-            extra = json.loads(row.extra_config) if row.extra_config else {}
-            base_url = (extra.get("base_url") or "").strip()
+            base_url = (parse_extra_config(row.extra_config).get("base_url") or "").strip()
             if not key or not base_url:
                 return None
             return key, base_url
@@ -124,8 +118,11 @@ async def _resolve_custom_provider(provider: str) -> tuple[str, str] | None:
         return None
 
 
-async def _probe(provider: str, key: str) -> bool:
-    """Cheap reachability probe (list-models). True iff the key is live."""
+async def _probe(provider: str, key: str, base_url: str | None = None) -> bool:
+    """Cheap reachability probe (list-models). True iff the key is live.
+
+    `base_url` is used for a custom OpenAI-compatible provider (not one of the
+    4 known ones) — same list-models convention, against its own endpoint."""
     if not key.strip():
         return False
     try:
@@ -140,6 +137,9 @@ async def _probe(provider: str, key: str) -> bool:
                                 headers={"Authorization": f"Bearer {key}"})
             elif provider == "deepseek":
                 r = await c.get("https://api.deepseek.com/models",
+                                headers={"Authorization": f"Bearer {key}"})
+            elif base_url:
+                r = await c.get(f"{base_url.rstrip('/')}/models",
                                 headers={"Authorization": f"Bearer {key}"})
             else:
                 return False
@@ -185,26 +185,32 @@ async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
     configured_provider = (agent_config.get("llm_provider") or "").strip()
 
     # Explicit custom provider (not one of the 4 known ones) — a deliberately
-    # chosen endpoint, not a pool to fail over across, and a cheap local DB
-    # read rather than a network probe, so it deliberately bypasses
-    # _selection_cache entirely (that cache is keyed by model string alone,
-    # which would collide across different clinics' different custom
-    # providers if reused here — simplest correct fix is to not share it).
+    # chosen endpoint, so it deliberately bypasses _selection_cache entirely
+    # (that cache is keyed by provider+model, but a custom endpoint's health
+    # can change between calls just like the standard pool's, and probing it
+    # is one cheap local DB read plus one HTTP GET, not worth caching).
     if configured_provider and configured_provider not in PROVIDER_ORDER:
         custom = await _resolve_custom_provider(configured_provider)
         if custom is not None:
-            key, _base_url = custom
+            key, base_url = custom
             model = configured_model or "gpt-3.5-turbo"
-            log.info("[RESILIENCE] using custom LLM provider '%s' (model=%s)", configured_provider, model)
-            return configured_provider, key, model
-        log.warning(
-            "[RESILIENCE] custom LLM provider '%s' has no key/base_url configured — "
-            "falling back to the standard provider pool.", configured_provider,
-        )
+            if await _probe(configured_provider, key, base_url=base_url):
+                log.info("[RESILIENCE] using custom LLM provider '%s' (model=%s)", configured_provider, model)
+                return configured_provider, key, model
+            log.warning(
+                "[RESILIENCE] custom LLM provider '%s' is configured but unreachable — "
+                "falling back to the standard provider pool.", configured_provider,
+            )
+        else:
+            log.warning(
+                "[RESILIENCE] custom LLM provider '%s' has no key/base_url configured — "
+                "falling back to the standard provider pool.", configured_provider,
+            )
         # Fall through to the standard pool below, exactly as if no provider
         # preference had been set at all.
 
-    cached = _selection_cache.get(configured_model)
+    cache_key = f"{configured_provider}::{configured_model}"
+    cached = _selection_cache.get(cache_key)
     if cached and (time.monotonic() - cached[0]) < _SELECTION_TTL_SECS:
         provider, _key, model = cached[1]
         log.info(
@@ -233,7 +239,7 @@ async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
                 )
             else:
                 log.info("[RESILIENCE] LLM provider '%s' healthy (model=%s)", provider, model)
-            _selection_cache[configured_model] = (time.monotonic(), (provider, key, model))
+            _selection_cache[cache_key] = (time.monotonic(), (provider, key, model))
             return provider, key, model
 
     raise RuntimeError(
@@ -284,13 +290,15 @@ async def build_llm(provider: str, api_key: str, model: str, system_prompt: str,
     # Custom provider — resolved again here (cheap local DB read) rather than
     # threaded through select_llm_provider's return value, so that function's
     # (provider, key, model) signature — and the tests that destructure it —
-    # stay unchanged.
+    # stay unchanged. The freshly-resolved key (not the possibly-stale `api_key`
+    # argument select_llm_provider returned earlier) is what's actually used,
+    # so a key rotated between selection and build takes effect immediately.
     custom = await _resolve_custom_provider(provider)
     if custom is not None:
-        _custom_key, base_url = custom
+        custom_key, base_url = custom
         from pipecat.services.openai.llm import OpenAILLMService
         return OpenAILLMService(
-            api_key=api_key, base_url=base_url,
+            api_key=custom_key or api_key, base_url=base_url,
             settings=OpenAILLMService.Settings(
                 model=model, system_instruction=system_prompt, temperature=temperature, max_tokens=max_tokens),
         )

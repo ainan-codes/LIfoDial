@@ -17,6 +17,7 @@ delegates here), so "configured" here means "usable" — not merely "present in 
 of two stores". The live-reachability probe in /admin/health-status stays as a
 separate signal layered on top of the key this resolves.
 """
+import json
 import os
 
 from sqlalchemy import select
@@ -54,20 +55,28 @@ def _env_key(provider: str) -> str | None:
     return val or None
 
 
-async def resolve_provider_key(session: AsyncSession, provider: str) -> str | None:
+async def resolve_provider_key(session: AsyncSession, provider: str, category: str | None = None) -> str | None:
     """Effective key for a provider: active DB ApiKeyConfig row first, then env.
+
+    `category` ("llm" | "stt" | "tts" | ...) disambiguates a provider id that can
+    be independently configured under more than one category (e.g. a custom
+    provider named "elevenlabs" registered as an LLM endpoint vs. the real
+    ElevenLabs TTS key) — pass it whenever the caller cares about ONE specific
+    category. Left optional (unfiltered) for callers that intentionally want
+    "is this provider id configured anywhere" (e.g. the System Health probe).
 
     Returns the raw key string or None. Never raises — if the DB is unreachable it
     falls back to the env value so the health check can still run.
     """
     try:
+        conditions = [
+            ApiKeyConfig.provider == provider,
+            ApiKeyConfig.is_active == True,  # noqa: E712
+        ]
+        if category is not None:
+            conditions.append(ApiKeyConfig.category == category)
         result = await session.execute(
-            select(ApiKeyConfig)
-            .where(
-                ApiKeyConfig.provider == provider,
-                ApiKeyConfig.is_active == True,  # noqa: E712
-            )
-            .limit(1)
+            select(ApiKeyConfig).where(*conditions).limit(1)
         )
         cfg = result.scalars().first()
         if cfg and cfg.api_key_enc:
@@ -79,6 +88,17 @@ async def resolve_provider_key(session: AsyncSession, provider: str) -> str | No
     return _env_key(provider)
 
 
-async def is_provider_configured(session: AsyncSession, provider: str) -> bool:
+async def is_provider_configured(session: AsyncSession, provider: str, category: str | None = None) -> bool:
     """True if a usable key exists in either store (DB-first, then env)."""
-    return bool(await resolve_provider_key(session, provider))
+    return bool(await resolve_provider_key(session, provider, category=category))
+
+
+def parse_extra_config(raw: str | None) -> dict:
+    """Safely parse an ApiKeyConfig.extra_config JSON blob (base_url, model,
+    etc.) — malformed or missing JSON never raises, just yields {}."""
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}

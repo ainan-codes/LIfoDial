@@ -101,6 +101,8 @@ async def update_doctor(
     if payload.is_available is not None:
         doctor.is_available = payload.is_available
         doctor.leave_reason = payload.leave_reason if not payload.is_available else None
+    elif payload.leave_reason is not None:
+        doctor.leave_reason = payload.leave_reason if not doctor.is_available else None
 
     await db.commit()
     await db.refresh(doctor)
@@ -128,7 +130,11 @@ async def delete_doctor(tenant_id: str, doctor_id: str, user: CurrentUser = None
     # would otherwise raise an IntegrityError for any doctor with a booking.
     from backend.models.appointment import Appointment
     from sqlalchemy import delete as sa_delete
-    await db.execute(sa_delete(Appointment).where(Appointment.doctor_id == doctor_id))
+    await db.execute(
+        sa_delete(Appointment).where(
+            Appointment.doctor_id == doctor_id, Appointment.tenant_id == tenant_id,
+        )
+    )
 
     await db.delete(doctor)
     await db.commit()

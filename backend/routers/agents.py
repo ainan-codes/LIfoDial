@@ -460,7 +460,7 @@ async def superadmin_login(payload: SuperAdminLoginPayload) -> dict:
 # ── GET /agents/templates ─────────────────────────────────────────────────────
 
 @router.get("/agents/templates")
-async def list_templates(user: CurrentUser = None) -> list[dict]:
+async def list_templates() -> list[dict]:
     return [
         {
             "key": key,

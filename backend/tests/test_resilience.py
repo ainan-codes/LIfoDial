@@ -23,13 +23,28 @@ from backend.agent import resilience as R
 from backend.agent.resilience import ResilienceProcessor, select_llm_provider, fallback_phrase
 
 
+@pytest.fixture(autouse=True)
+def _reset_llm_selection_cache():
+    """select_llm_provider caches its result in a module-level dict keyed by
+    provider+model (see resilience._selection_cache) — without a reset, a test
+    reusing the same model string as an earlier test would silently get that
+    earlier test's cached provider instead of exercising its own mocked probe."""
+    R.reset_llm_selection_cache()
+    yield
+    R.reset_llm_selection_cache()
+
+
+async def _fake_resolve_key(provider):
+    return "k" * 40
+
+
 @pytest.mark.asyncio
 async def test_dead_primary_falls_back_to_next_healthy():
     """Gemini dead, Groq healthy → pick Groq with its default model."""
     async def fake_probe(provider, key):
         return provider == "groq"
     with patch.object(R, "_probe", fake_probe), \
-         patch.object(R, "_key_for", lambda p: "k" * 40):
+         patch.object(R, "_resolve_key", _fake_resolve_key):
         prov, key, model = await select_llm_provider({"llm_model": "gemini-2.5-flash"})
     assert prov == "groq"
     assert model == "llama-3.3-70b-versatile"
@@ -41,7 +56,7 @@ async def test_configured_provider_kept_when_healthy():
     async def fake_probe(provider, key):
         return True  # everything healthy; preferred should win
     with patch.object(R, "_probe", fake_probe), \
-         patch.object(R, "_key_for", lambda p: "k" * 40):
+         patch.object(R, "_resolve_key", _fake_resolve_key):
         prov, key, model = await select_llm_provider({"llm_model": "llama-3.1-8b-instant"})
     assert prov == "groq"
     assert model == "llama-3.1-8b-instant"  # configured model preserved
@@ -52,7 +67,7 @@ async def test_no_provider_reachable_raises():
     async def fake_probe(provider, key):
         return False
     with patch.object(R, "_probe", fake_probe), \
-         patch.object(R, "_key_for", lambda p: "k" * 40):
+         patch.object(R, "_resolve_key", _fake_resolve_key):
         with pytest.raises(RuntimeError):
             await select_llm_provider({"llm_model": "gemini-2.5-flash"})
 

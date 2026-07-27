@@ -719,12 +719,20 @@ async def entrypoint(ctx) -> None:
     # through the dashboard now takes effect on the very next call: no
     # redeploy, no env var edit, no worker restart. See providers.py for how
     # to register a new provider here.
+    #
+    # Only the selected provider (plus "sarvam", the deaf-agent-guard fallback,
+    # and "openai" when stt_provider aliases to it) is ever read below, so only
+    # those are resolved — each is a DB round-trip, and this runs on every call
+    # setup on a latency-sensitive path.
     from backend.db import AsyncSessionLocal
     from backend.agent import providers as provider_registry
+    _stt_needed = {stt_provider, "sarvam"}
+    if stt_provider in ("openai", "whisper"):
+        _stt_needed.add("openai")
     async with AsyncSessionLocal() as _key_db:
         _stt_keys = {
-            p: await provider_registry.resolve_key(_key_db, p)
-            for p in ("deepgram", "openai", "whisper", "elevenlabs", "sarvam", "assemblyai")
+            p: await provider_registry.resolve_key(_key_db, p, category="stt")
+            for p in _stt_needed
         }
 
     # ── Deaf-agent guard ────────────────────────────────────────────────────
@@ -990,11 +998,15 @@ async def entrypoint(ctx) -> None:
     tts_provider = agent_config.get("tts_provider", "sarvam")
 
     # Same DB-first (AI Platform dashboard), env-fallback key resolution as STT
-    # above — see backend/agent/providers.py.
+    # above — see backend/agent/providers.py. Only the selected provider (plus
+    # "openai", the openai_tts fallback) is ever read below.
+    _tts_needed = {tts_provider}
+    if tts_provider == "openai_tts":
+        _tts_needed.add("openai")
     async with AsyncSessionLocal() as _key_db:
         _tts_keys = {
-            p: await provider_registry.resolve_key(_key_db, p)
-            for p in ("elevenlabs", "openai_tts", "openai", "sarvam", "cartesia")
+            p: await provider_registry.resolve_key(_key_db, p, category="tts")
+            for p in _tts_needed
         }
 
     if tts_provider == "elevenlabs":

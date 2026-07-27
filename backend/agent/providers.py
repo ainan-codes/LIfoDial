@@ -35,14 +35,18 @@ class ProviderNotAvailable(Exception):
     """Raised when a selected provider's pipecat-ai adapter isn't installed."""
 
 
-async def resolve_key(db: AsyncSession, provider: str) -> str:
-    """Effective API key for `provider`: an active DB row saved via the AI
-    Platform dashboard wins, otherwise the server's env/settings value.
+async def resolve_key(db: AsyncSession, provider: str, category: str) -> str:
+    """Effective API key for `provider` under `category` ("stt" | "tts"): an
+    active DB row saved via the AI Platform dashboard wins, otherwise the
+    server's env/settings value. `category` is required here — a provider id
+    can be independently configured under more than one category (e.g. a
+    custom LLM endpoint named the same as a real STT/TTS provider), and the
+    live call pipeline must never resolve the wrong one.
     Never raises — returns "" if nothing is configured anywhere."""
-    return (await resolve_provider_key(db, provider)) or ""
+    return (await resolve_provider_key(db, provider, category=category)) or ""
 
 
-def _require_import(provider: str, pip_extra: str, import_error: Exception):
+def _require_import(provider: str, pip_extra: str, import_error: Exception) -> None:
     raise ProviderNotAvailable(
         f"Provider '{provider}' is selected but its pipecat-ai adapter isn't "
         f'installed. Run: pip install "pipecat-ai[{pip_extra}]". '
@@ -51,7 +55,7 @@ def _require_import(provider: str, pip_extra: str, import_error: Exception):
 
 
 # ── AssemblyAI STT ────────────────────────────────────────────────────────────
-def build_assemblyai_stt(api_key: str):
+def build_assemblyai_stt(api_key: str) -> "AssemblyAISTTService":
     """AssemblyAI's streaming v3 API (used by this pipecat service) auto-detects
     language — it takes no language hint at connect time, unlike Sarvam/Deepgram."""
     try:
@@ -62,7 +66,7 @@ def build_assemblyai_stt(api_key: str):
 
 
 # ── Cartesia TTS ───────────────────────────────────────────────────────────────
-def build_cartesia_tts(api_key: str, voice_id: str | None, model: str | None = None):
+def build_cartesia_tts(api_key: str, voice_id: str | None, model: str | None = None) -> "CartesiaTTSService":
     """voice_id must be a real Cartesia voice id (from https://play.cartesia.ai) —
     there is no universal safe default the way Sarvam/ElevenLabs have one, so
     this passes through whatever the agent is configured with."""
