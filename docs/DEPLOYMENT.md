@@ -21,7 +21,7 @@ cp .env.example .env
 # Edit .env — set GEMINI_API_KEY, SARVAM_API_KEY at minimum
 
 # Run
-uvicorn backend.main:app --reload --port 8000
+uvicorn backend.main:app --reload --port 8001
 ```
 
 ### Frontend
@@ -34,7 +34,7 @@ Open http://localhost:5173
 
 ### Health Check
 ```
-GET http://localhost:8000/health
+GET http://localhost:8001/health
 ```
 Returns database type, connection status, and environment.
 
@@ -66,7 +66,7 @@ docker compose up -d --build
 Services started:
 - **postgres** — PostgreSQL 16
 - **redis** — Redis 7 with AOF persistence
-- **backend** — FastAPI on :8000 (with healthcheck)
+- **backend** — FastAPI on :8001 (with healthcheck)
 - **livekit-agent** — Voice pipeline worker
 - **frontend** — React app served by nginx
 - **nginx** — Reverse proxy on :80/:443

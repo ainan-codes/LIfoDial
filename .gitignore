@@ -82,6 +82,10 @@ logs/
 # Quarantine area for cleanup candidates awaiting confirmed deletion
 _quarantine/
 
+# Local file storage scratch dirs — real uploads live in Supabase Storage
+output/
+uploads/
+
 # Temporary developer scripts
 scratch/
 test_db_conn.py

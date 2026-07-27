@@ -47,9 +47,9 @@ The backend handles the API, database connectivity, and the core AI agent logic.
 
 5. **Start the FastAPI server:**
    ```bash
-   uvicorn main:app --reload --port 8000
+   uvicorn main:app --reload --port 8001
    ```
-   The API will now be running on `http://localhost:8000`.
+   The API will now be running on `http://localhost:8001`.
 
 ### 2. Frontend Setup
 
@@ -79,5 +79,35 @@ The frontend provides the Administration dashboards (Clinic view and SuperAdmin 
 - **Clinic Dashboard:** `http://localhost:5173/login` (Use any credentials in demo mode)
 - **SuperAdmin Dashboard:** `http://localhost:5173/superadmin/login` (credentials come from the `SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD` env vars — see `.env.example`)
 
-## 🚢 Deployment Updates
-*(Note: A comprehensive VPS container deployment guide is available in `scripts/setup_vps.sh` for when the application moves to production).*
+## 🧪 Full Local Test Flow
+
+1. **Super Admin Access**:
+   - URL: `http://localhost:5173/superadmin/login`
+   - Log in with your `SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD` from `.env`
+2. **Create Test Clinic**:
+   - Go to **"All Clinics"**.
+   - Click **"Add Clinic"** → Fill form → Submit.
+   - **COPY THE GENERATED PASSWORD** (only shown once).
+3. **Login as Clinic**:
+   - Logout from Super Admin.
+   - Login at `http://localhost:5173/login` using the generated email and password.
+4. **Voice Test (Needs LiveKit Keys)**:
+   - Add `LIVEKIT_*` keys to `.env`.
+   - Run: `python backend/tests/create_test_room.py`
+
+## 🚢 Deployment
+
+- A comprehensive VPS container deployment guide is available in `scripts/setup_vps.sh` and `docs/DEPLOYMENT.md`.
+- **Vercel (frontend only):**
+  ```bash
+  cd frontend
+  npm run build
+  vercel --prod
+  ```
+
+## 📚 More Docs
+
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — full deployment guide (local, Docker Compose, VPS)
+- [`docs/PRODUCTION_READINESS_AUDIT.md`](docs/PRODUCTION_READINESS_AUDIT.md) — production readiness audit findings
+- [`docs/STREAMING_STT_README.md`](docs/STREAMING_STT_README.md) — streaming STT architecture
+- [`docs/STREAMING_STT_TEST.md`](docs/STREAMING_STT_TEST.md) — streaming STT manual test guide
