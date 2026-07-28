@@ -174,11 +174,13 @@ function callLogsToStats(logs: CallLogRow[]) {
 
 type Tab = 'assistant' | 'configure' | 'logs' | 'tools' | 'analysis' | 'advanced';
 
-const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
+// My Agent is VIEW-ONLY for clinic admins. They can see what their receptionist
+// does and how it is performing, but the agent itself is configured by the
+// Lifodial team — so `Configure` is superadminOnly, exactly like the raw model
+// IDs and the Latency/Security sections in the Advanced tab.
+const TABS: { id: Tab; label: string; icon: React.ElementType; superadminOnly?: boolean }[] = [
   { id: 'assistant', label: 'Assistant',  icon: Mic },
-  // Configure is where a clinic admin actually edits their receptionist. Before
-  // this existed, My Agent was entirely read-only ("managed by Lifodial team").
-  { id: 'configure', label: 'Configure',  icon: Sliders },
+  { id: 'configure', label: 'Configure',  icon: Sliders, superadminOnly: true },
   { id: 'logs',      label: 'Logs',       icon: FileText },
   { id: 'tools',     label: 'Tools',      icon: Wrench },
   { id: 'analysis',  label: 'Analysis',   icon: BarChart2 },
@@ -362,7 +364,7 @@ export default function MyAgent() {
 
         {/* ── Tab bar ─────────────────────────────────────────────────── */}
         <div style={{ display: 'flex', gap: 4 }}>
-          {TABS.map(tab => {
+          {TABS.filter(t => !t.superadminOnly || showInternals).map(tab => {
             const isActive = activeTab === tab.id;
             const Icon = tab.icon;
             return (
@@ -427,7 +429,7 @@ export default function MyAgent() {
                 <p style={styles.cardSubtitle}>
                   {showInternals
                     ? 'Platform configuration'
-                    : 'How your receptionist sounds — change it in Configure'}
+                    : 'How your receptionist sounds — managed by the Lifodial team'}
                 </p>
                 <div style={styles.configGrid}>
                   {showInternals ? (
@@ -539,9 +541,14 @@ export default function MyAgent() {
           </div>
         )}
 
-        {/* ══ LOGS TAB ════════════════════════════════════════════════════ */}
-        {activeTab === 'configure' && <ConfigureTab agent={agent} onSaved={loadData} />}
+        {/* ══ CONFIGURE TAB (superadmin only) ═════════════════════════════ */}
+        {/* Guarded as well as hidden from the tab bar: My Agent is read-only for
+            clinic admins, and stale `activeTab` state must not reach an editor. */}
+        {activeTab === 'configure' && showInternals && (
+          <ConfigureTab agent={agent} onSaved={loadData} />
+        )}
 
+        {/* ══ LOGS TAB ════════════════════════════════════════════════════ */}
         {activeTab === 'logs' && <LogsTab logs={callLogs} />}
 
         {/* ══ TOOLS TAB ═══════════════════════════════════════════════════ */}
