@@ -2,8 +2,7 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { useSAStore, Clinic, PlanTier } from '../../store/saStore';
 import { PlanBadge, StatusBadge, Modal, SpinBtn, EmptyState } from '../../components/superadmin/SAShared';
 import { Search, Power, Zap, X, ChevronRight, Building2, Plus, Copy, Check, Mail, Trash2, ChevronRight as ChevronR } from 'lucide-react';
-import fetchWithAuth, { API_URL } from '../../api/client';
-import { getToken } from '../../api/auth';
+import fetchWithAuth from '../../api/client';
 
 // ── Agent status pill — mirrors the vocabulary AgentConfig.status actually uses
 // (ACTIVE/CONFIGURED/ERROR/INACTIVE), which differs from StatusBadge's clinic vocabulary.
@@ -413,21 +412,24 @@ function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose:
               if (!window.confirm(`Permanently delete "${clinic.name}" and all its agents? This cannot be undone.`)) return;
               setDeleting(true);
               try {
-                // Backend returns 204 No Content on success — fetchWithAuth always
-                // parses the body as JSON, which throws on an empty 204 response,
-                // so this stays a raw fetch with the bearer token attached manually.
-                const token = getToken();
-                const res = await fetch(`${API_URL}/admin/clinics/${clinic.id}`, {
-                  method: 'DELETE',
-                  headers: token ? { Authorization: `Bearer ${token}` } : {},
-                });
-                if (res.ok || res.status === 204) {
-                  onDeleted(clinic.id);
-                  onClose();
-                } else {
-                  alert('Failed to delete clinic');
-                }
-              } catch { alert('Network error'); }
+                // MUST go through fetchWithAuth. This was a raw fetch() whose comment
+                // claimed fetchWithAuth "throws on an empty 204" — it does not, it
+                // returns null for 204 (api/client.ts). What the raw fetch actually
+                // lost was the 'ngrok-skip-browser-warning' header that fetchWithAuth
+                // sends, and this app is routinely driven over an ngrok tunnel. Without
+                // that header ngrok answers with its browser-warning interstitial —
+                // HTTP 200 carrying HTML — so the DELETE never reached FastAPI at all.
+                // Combined with the old `if (res.ok || res.status === 204)` check, that
+                // interstitial read as SUCCESS: the clinic vanished from the in-memory
+                // list and came back on the next reload, still fully live in the DB
+                // with a working admin login. fetchWithAuth throws on a real failure,
+                // so onDeleted() below now only runs when the row is genuinely gone.
+                await fetchWithAuth(`/admin/clinics/${clinic.id}`, { method: 'DELETE' });
+                onDeleted(clinic.id);
+                onClose();
+              } catch (e) {
+                alert(`Failed to delete clinic: ${(e as Error).message}`);
+              }
               finally { setDeleting(false); }
             }}
             style={{

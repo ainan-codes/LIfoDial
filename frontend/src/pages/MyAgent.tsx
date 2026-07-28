@@ -7,7 +7,7 @@ import {
   PhoneMissed, PlayCircle, Globe, Lock, Bell,
 } from 'lucide-react';
 import fetchWithAuth from '../api/client';
-import { FIXTURE_CALL_LOGS, FIXTURE_APPOINTMENTS } from '../fixtures/data';
+import { isSuperAdmin } from '../api/auth';
 
 /**
  * MyAgent — Vapi-style tabbed agent dashboard.
@@ -58,11 +58,105 @@ interface CallRecord {
   sentiment: string;
 }
 
+/** A row from GET /api/call_logs (backend/main.py::_call_record_to_row). */
+interface CallLogRow {
+  id: string;
+  phone: string;
+  date: string;
+  duration: string;
+  intent: string;
+  status: string;
+  language: string;
+  transcript: { role: string; text: string; time?: string }[];
+}
+
 const LANG_MAP: Record<string, string> = {
   'hi-IN': '🇮🇳 Hindi', 'en-IN': '🇮🇳 English', 'ta-IN': '🇮🇳 Tamil',
   'ml-IN': '🇮🇳 Malayalam', 'te-IN': '🇮🇳 Telugu', 'kn-IN': '🇮🇳 Kannada',
   'bn-IN': '🇮🇳 Bengali', 'ar-SA': '🇦🇪 Arabic', 'mr-IN': '🇮🇳 Marathi',
 };
+
+/** "meera" → "Meera" — voice ids are lowercase internally. */
+const titleCase = (s?: string | null) =>
+  s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
+
+/** Flag for a BCP-47 code. The real /api/call_logs rows carry no `flag` field
+ *  (only the deleted fixtures did), so derive it — mirrors CallLogs.tsx. */
+const LANGUAGE_FLAGS: Record<string, string> = {
+  'hi-IN': '🇮🇳', 'en-IN': '🇮🇳', 'en-US': '🇺🇸', 'en-GB': '🇬🇧', 'ta-IN': '🇮🇳',
+  'te-IN': '🇮🇳', 'kn-IN': '🇮🇳', 'ml-IN': '🇮🇳', 'mr-IN': '🇮🇳', 'bn-IN': '🇮🇳',
+  'pa-IN': '🇮🇳', 'gu-IN': '🇮🇳', 'ar-AE': '🇦🇪', 'ar-SA': '🇸🇦',
+};
+const languageFlag = (code: string) => LANGUAGE_FLAGS[code] ?? '🌐';
+
+/** "2:18" → 138 seconds. Backend sends "M:SS", or "—" when unknown. */
+function parseDurationSeconds(d: string): number | null {
+  const m = /^(\d+):(\d{2})$/.exec((d || '').trim());
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+/** 138 → "2:18" */
+function formatDurationSeconds(secs: number): string {
+  const m = Math.floor(secs / 60);
+  const s = Math.round(secs % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+/**
+ * Real analytics from real call rows. Everything degrades to a clean zero-state
+ * rather than a fabricated one: no calls means 0 / "—" / an empty 7-day chart.
+ *
+ * `date` arrives pre-formatted as "%d %b %Y, %H:%M" (backend/main.py
+ * ::_call_record_to_row), so it is parsed back rather than assumed to be ISO.
+ */
+function callLogsToStats(logs: CallLogRow[]) {
+  const totalCalls = logs.length;
+  const booked = logs.filter(l => l.status === 'Booked').length;
+  const resolved = logs.filter(l => l.status === 'Booked' || l.status === 'Resolved').length;
+
+  const durations = logs
+    .map(l => parseDurationSeconds(l.duration))
+    .filter((n): n is number => n !== null);
+  const avgHandleTime = durations.length
+    ? formatDurationSeconds(durations.reduce((a, b) => a + b, 0) / durations.length)
+    : '—';
+
+  const tally = (key: keyof CallLogRow) =>
+    logs.reduce((acc, l) => {
+      const v = String(l[key] ?? '').trim();
+      if (v && v !== '—') acc[v] = (acc[v] ?? 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+
+  // Trailing 7 days, oldest → newest, counted from each call's real timestamp.
+  const dayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const buckets: { day: string; value: number }[] = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    buckets.push({ day: dayLabels[d.getDay()], value: 0 });
+  }
+  for (const l of logs) {
+    const parsed = new Date((l.date || '').replace(',', ''));
+    if (Number.isNaN(parsed.getTime())) continue;
+    parsed.setHours(0, 0, 0, 0);
+    const daysAgo = Math.round((today.getTime() - parsed.getTime()) / 86_400_000);
+    if (daysAgo >= 0 && daysAgo <= 6) buckets[6 - daysAgo].value += 1;
+  }
+
+  return {
+    totalCalls,
+    booked,
+    resolutionPct: totalCalls ? `${Math.round((resolved / totalCalls) * 100)}%` : '—',
+    avgHandleTime,
+    intentCounts: tally('intent'),
+    langCounts: tally('language'),
+    days: buckets,
+  };
+}
 
 type Tab = 'assistant' | 'logs' | 'tools' | 'analysis' | 'advanced';
 
@@ -81,8 +175,17 @@ export default function MyAgent() {
   const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [credits, setCredits] = useState<CreditInfo | null>(null);
   const [calls, setCalls] = useState<CallRecord[]>([]);
+  const [callLogs, setCallLogs] = useState<CallLogRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+
+  // Gate for platform internals: raw provider/model IDs, latency-tuning values,
+  // and the security/infrastructure breakdown. A clinic admin sees what their
+  // receptionist does; only superadmins see which vendors and settings deliver it.
+  // (The backend also strips the actual LiveKit/SIP credentials from the API
+  // response for non-superadmins — see agents.py::redact_agent_for_clinic — so
+  // this flag controls presentation, not secrecy of the keys themselves.)
+  const showInternals = isSuperAdmin();
 
   useEffect(() => { loadData(); }, []);
 
@@ -123,6 +226,18 @@ export default function MyAgent() {
         try {
           setCalls(await fetchWithAuth(`/agents/${myAgent.id}/call-logs?limit=10`));
         } catch {}
+        // Richer, tenant-scoped rows (phone / date / duration / intent /
+        // language / transcript) for the Logs and Analysis tabs. Those tabs used
+        // to render FIXTURE_CALL_LOGS — five invented calls with fake Hindi and
+        // Tamil transcripts — shown identically to every clinic, which is why a
+        // clinic that had never taken a call still saw call history and
+        // analytics. Same endpoint the Call Logs page uses.
+        try {
+          const logsResp = await fetchWithAuth('/api/call_logs?limit=50');
+          setCallLogs(logsResp?.items ?? []);
+        } catch {
+          setCallLogs([]);
+        }
       } else {
         setError(email ? `No agent configured for ${email}` : 'No agent found for your clinic.');
       }
@@ -283,15 +398,40 @@ export default function MyAgent() {
 
             {/* Two Columns: Voice Config + Recent Calls */}
             <div style={styles.columns}>
-              {/* Voice Config */}
+              {/* Voice Config.
+                  Clinic admins see WHAT their receptionist does, not which vendor
+                  stack runs it. The raw model IDs shown here (saaras:v3, bulbul:v3,
+                  gemini-2.5-flash) name our providers by implication — that's
+                  platform information, so it's superadmin-only. The clinic-facing
+                  view shows the spoken language and voice name instead, which is
+                  what a clinic actually needs to recognise. */}
               <div style={styles.card}>
                 <h3 style={styles.cardTitle}>Voice Configuration</h3>
-                <p style={styles.cardSubtitle}>Read-only — managed by Lifodial team</p>
+                <p style={styles.cardSubtitle}>
+                  {showInternals ? 'Read-only — managed by Lifodial team' : 'How your receptionist sounds'}
+                </p>
                 <div style={styles.configGrid}>
-                  <ConfigRow icon={<Mic size={16} />} label="STT Model" value={agent.stt_model || 'saaras:v3'} />
-                  <ConfigRow icon={<Volume2 size={16} />} label="TTS Voice" value={agent.tts_voice || 'meera'} />
-                  <ConfigRow icon={<Volume2 size={16} />} label="TTS Model" value={agent.tts_model || 'bulbul:v3'} />
-                  <ConfigRow icon={<Brain size={16} />} label="LLM" value={agent.llm_model || 'gemini-2.5-flash'} />
+                  {showInternals ? (
+                    <>
+                      <ConfigRow icon={<Mic size={16} />} label="STT Model" value={agent.stt_model || 'saaras:v3'} />
+                      <ConfigRow icon={<Volume2 size={16} />} label="TTS Voice" value={agent.tts_voice || 'meera'} />
+                      <ConfigRow icon={<Volume2 size={16} />} label="TTS Model" value={agent.tts_model || 'bulbul:v3'} />
+                      <ConfigRow icon={<Brain size={16} />} label="LLM" value={agent.llm_model || 'gemini-2.5-flash'} />
+                    </>
+                  ) : (
+                    <>
+                      <ConfigRow
+                        icon={<Volume2 size={16} />}
+                        label="Voice"
+                        value={titleCase(agent.tts_voice) || '—'}
+                      />
+                      <ConfigRow
+                        icon={<Mic size={16} />}
+                        label="Language"
+                        value={LANG_MAP[agent.tts_language] || agent.tts_language || '—'}
+                      />
+                    </>
+                  )}
                 </div>
                 {agent.first_message && (
                   <div style={styles.firstMsgBox}>
@@ -381,16 +521,16 @@ export default function MyAgent() {
         )}
 
         {/* ══ LOGS TAB ════════════════════════════════════════════════════ */}
-        {activeTab === 'logs' && <LogsTab calls={calls} />}
+        {activeTab === 'logs' && <LogsTab logs={callLogs} />}
 
         {/* ══ TOOLS TAB ═══════════════════════════════════════════════════ */}
         {activeTab === 'tools' && <ToolsTab agent={agent} />}
 
         {/* ══ ANALYSIS TAB ════════════════════════════════════════════════ */}
-        {activeTab === 'analysis' && <AnalysisTab calls={calls} />}
+        {activeTab === 'analysis' && <AnalysisTab logs={callLogs} />}
 
         {/* ══ ADVANCED TAB ════════════════════════════════════════════════ */}
-        {activeTab === 'advanced' && <AdvancedTab agent={agent} credits={credits} />}
+        {activeTab === 'advanced' && <AdvancedTab agent={agent} credits={credits} showInternals={showInternals} />}
 
       </div>
     </div>
@@ -400,11 +540,10 @@ export default function MyAgent() {
 
 // ── LOGS TAB ──────────────────────────────────────────────────────────────────
 
-function LogsTab({ calls }: { calls: CallRecord[] }) {
+function LogsTab({ logs }: { logs: CallLogRow[] }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [filterStatus, setFilterStatus] = useState('ALL');
 
-  const logs = FIXTURE_CALL_LOGS;
   const filtered = logs.filter(l => filterStatus === 'ALL' || l.status === filterStatus);
   const toggle = (id: string) => setExpandedId(prev => prev === id ? null : id);
 
@@ -489,7 +628,7 @@ function LogsTab({ calls }: { calls: CallRecord[] }) {
                       <td style={{ padding: '12px 16px' }}>
                         <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 9999, color: '#3ECF8E', backgroundColor: 'rgba(62,207,142,0.1)' }}>{call.intent}</span>
                       </td>
-                      <td style={{ padding: '12px 16px', fontSize: 12, color: '#888' }}>{call.flag} {call.language}</td>
+                      <td style={{ padding: '12px 16px', fontSize: 12, color: '#888' }}>{languageFlag(call.language)} {call.language}</td>
                       <td style={{ padding: '12px 16px' }}>
                         <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 9999, color: sc.color, backgroundColor: sc.bg }}>{call.status}</span>
                       </td>
@@ -639,31 +778,20 @@ function ToolsTab({ agent }: { agent: AgentInfo }) {
 
 // ── ANALYSIS TAB ──────────────────────────────────────────────────────────────
 
-function AnalysisTab({ calls }: { calls: CallRecord[] }) {
-  const totalCalls    = FIXTURE_CALL_LOGS.length;
-  const booked        = FIXTURE_APPOINTMENTS.filter(a => a.status === 'CONFIRMED').length;
-  const resolved      = FIXTURE_CALL_LOGS.filter(l => l.status === 'Booked' || l.status === 'Resolved').length;
-  const resolutionPct = `${Math.round((resolved / totalCalls) * 100)}%`;
-
-  const intentCounts = FIXTURE_CALL_LOGS.reduce((acc, l) => {
-    acc[l.intent] = (acc[l.intent] ?? 0) + 1; return acc;
-  }, {} as Record<string, number>);
-
-  const langCounts = FIXTURE_CALL_LOGS.reduce((acc, l) => {
-    acc[l.language] = (acc[l.language] ?? 0) + 1; return acc;
-  }, {} as Record<string, number>);
-
-  const days = [
-    { day: 'Mon', value: 2 }, { day: 'Tue', value: 4 }, { day: 'Wed', value: 3 },
-    { day: 'Thu', value: 6 }, { day: 'Fri', value: 5 }, { day: 'Sat', value: totalCalls }, { day: 'Sun', value: 0 },
-  ];
-  const maxDay = Math.max(...days.map(d => d.value));
+// Every number here is derived from the clinic's REAL calls. This tab used to
+// compute all of it from FIXTURE_CALL_LOGS / FIXTURE_APPOINTMENTS — including a
+// hardcoded "2:18" average handle time and a literal Mon–Sun bar array — so a
+// clinic with zero calls still saw a populated dashboard. See callLogsToStats().
+function AnalysisTab({ logs }: { logs: CallLogRow[] }) {
+  const stats = callLogsToStats(logs);
+  const { totalCalls, booked, resolutionPct, avgHandleTime, intentCounts, langCounts, days } = stats;
+  const maxDay = Math.max(1, ...days.map(d => d.value));
 
   const kpiCards = [
-    { label: 'Total Calls',      value: totalCalls,    icon: Phone,       accent: '#3B82F6' },
-    { label: 'Apts Booked',      value: booked,        icon: CheckCircle2, accent: '#3ECF8E' },
-    { label: 'Resolution Rate',  value: resolutionPct, icon: Activity,    accent: '#8B5CF6' },
-    { label: 'Avg Handle Time',  value: '2:18',        icon: Clock,       accent: '#F59E0B' },
+    { label: 'Total Calls',      value: totalCalls,     icon: Phone,       accent: '#3B82F6' },
+    { label: 'Apts Booked',      value: booked,         icon: CheckCircle2, accent: '#3ECF8E' },
+    { label: 'Resolution Rate',  value: resolutionPct,  icon: Activity,    accent: '#8B5CF6' },
+    { label: 'Avg Handle Time',  value: avgHandleTime,  icon: Clock,       accent: '#F59E0B' },
   ];
 
   const INTENT_COLORS: Record<string, string> = {
@@ -782,8 +910,13 @@ function AnalysisTab({ calls }: { calls: CallRecord[] }) {
 
 // ── ADVANCED TAB ──────────────────────────────────────────────────────────────
 
-function AdvancedTab({ agent, credits }: { agent: AgentInfo; credits: CreditInfo | null }) {
-  const sections = [
+function AdvancedTab({
+  agent, credits, showInternals,
+}: { agent: AgentInfo; credits: CreditInfo | null; showInternals: boolean }) {
+  // Platform-internal sections. These name our vendors (Sarvam bulbul/saaras,
+  // Gemini, LiveKit), expose latency-tuning values that are our own engineering
+  // work, and describe the auth/encryption architecture. Superadmin only.
+  const internalSections = [
     {
       title: 'Model Configuration',
       icon: Brain,
@@ -818,6 +951,11 @@ function AdvancedTab({ agent, credits }: { agent: AgentInfo; credits: CreditInfo
         { label: 'Call Encryption', value: 'LiveKit DTLS/SRTP' },
       ],
     },
+  ];
+
+  // Sections every clinic admin legitimately needs: their own money, their own
+  // alerts, their own languages.
+  const clinicSections = [
     {
       title: 'Billing & Credits',
       icon: IndianRupee,
@@ -848,6 +986,8 @@ function AdvancedTab({ agent, credits }: { agent: AgentInfo; credits: CreditInfo
       ],
     },
   ];
+
+  const sections = showInternals ? [...internalSections, ...clinicSections] : clinicSections;
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>

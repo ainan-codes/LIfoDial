@@ -15,10 +15,13 @@ import {
     XCircle,
     Zap
 } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import fetchWithAuth from '../api/client';
+import { getTenantId, isSuperAdmin } from '../api/auth';
 import { useThemeContext } from '../context/ThemeContext';
-import { FIXTURE_DOCTORS, FIXTURE_TENANT } from '../fixtures/data';
+import { FIXTURE_TENANT } from '../fixtures/data';
 import AIConfig from './settings/AIConfig';
 import Integrations from './settings/Integrations';
 
@@ -347,9 +350,31 @@ function AiNumberTab() {
 }
 
 // ── Tab 3 — Doctors ───────────────────────────────────────────────────────────
+// Real, tenant-scoped doctors. This used to render FIXTURE_DOCTORS — six invented
+// names ("Dr. Suresh Menon", "Dr. Priya Nair", …) shown to every clinic, which is
+// why a brand-new clinic saw "6 doctors registered" here while its actual
+// /doctors page was empty. Same endpoint and react-query key the Doctors page and
+// Dashboard already use, so the cache is shared.
+interface SettingsDoctor {
+  id: string;
+  name: string;
+  specialization?: string | null;
+  is_available?: boolean;
+}
+
 function DoctorsTab() {
   const navigate = useNavigate();
-  const activeCount = FIXTURE_DOCTORS.filter(d => d.available).length;
+  const tenantId = getTenantId();
+
+  const { data, isLoading, error } = useQuery<SettingsDoctor[]>({
+    queryKey: ['doctors', tenantId],
+    queryFn: () => fetchWithAuth(`/tenants/${tenantId}/doctors`),
+    enabled: !!tenantId,
+    retry: false,
+  });
+
+  const doctors = data ?? [];
+  const activeCount = doctors.filter(d => d.is_available).length;
 
   return (
     <div className="space-y-5">
@@ -362,10 +387,12 @@ function DoctorsTab() {
         <div className="flex items-center justify-between mb-4">
           <div>
             <p style={{ fontSize: '14px', fontWeight: 600, color: 'var(--text-primary)', margin: 0 }}>
-              {FIXTURE_DOCTORS.length} doctors registered
+              {isLoading
+                ? 'Loading doctors…'
+                : `${doctors.length} ${doctors.length === 1 ? 'doctor' : 'doctors'} registered`}
             </p>
             <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '2px' }}>
-              {activeCount} currently online and available
+              {isLoading ? ' ' : `${activeCount} currently available`}
             </p>
           </div>
           <button
@@ -382,8 +409,22 @@ function DoctorsTab() {
           </button>
         </div>
 
+        {error && (
+          <p style={{ fontSize: '13px', color: 'var(--warning)', margin: 0 }}>
+            Couldn't load doctors. Please try again shortly.
+          </p>
+        )}
+
+        {!isLoading && !error && doctors.length === 0 && (
+          <div className="py-6 text-center">
+            <p style={{ fontSize: '13px', color: 'var(--text-muted)', margin: 0 }}>
+              No doctors yet. Add your first doctor so the AI can book appointments.
+            </p>
+          </div>
+        )}
+
         <div className="space-y-2">
-          {FIXTURE_DOCTORS.map(doc => (
+          {doctors.map(doc => (
             <div
               key={doc.id}
               className="flex items-center justify-between py-2.5 px-3 rounded-lg"
@@ -394,23 +435,23 @@ function DoctorsTab() {
                   className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold"
                   style={{ backgroundColor: 'var(--accent-dim)', color: 'var(--accent)' }}
                 >
-                  {doc.name.replace(/^Dr\.\s*/, '').split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase()}
+                  {(doc.name || '?').replace(/^Dr\.\s*/, '').split(' ').filter(Boolean).map(w => w[0]).join('').slice(0, 2).toUpperCase()}
                 </div>
                 <div>
                   <p style={{ fontSize: '13px', fontWeight: 500, color: 'var(--text-primary)', margin: 0 }}>{doc.name}</p>
-                  <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{doc.specialization}</p>
+                  <p style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{doc.specialization || '—'}</p>
                 </div>
               </div>
               <div
                 className="flex items-center gap-1.5"
                 style={{
                   padding: '2px 8px', borderRadius: '9999px', fontSize: '11px', fontWeight: 600,
-                  color: doc.available ? 'var(--accent)' : 'var(--text-muted)',
-                  backgroundColor: doc.available ? 'var(--accent-dim)' : 'var(--bg-surface-2)',
+                  color: doc.is_available ? 'var(--accent)' : 'var(--text-muted)',
+                  backgroundColor: doc.is_available ? 'var(--accent-dim)' : 'var(--bg-surface-2)',
                 }}
               >
                 <div className="w-1 h-1 rounded-full" style={{ backgroundColor: 'currentColor' }} />
-                {doc.available ? 'Online' : 'Offline'}
+                {doc.is_available ? 'Available' : 'On leave'}
               </div>
             </div>
           ))}
@@ -577,7 +618,82 @@ function NotificationsTab() {
   );
 }
 
-// ── Tab 6 — System Status (MVP Acceptance Criteria) ───────────────────────────
+// ── Tab 6 — System Status ─────────────────────────────────────────────────────
+// For a CLINIC ADMIN this answers exactly one question: is my clinic active?
+//
+// It used to show the platform's internal stack to every clinic — an MVP
+// checklist naming LiveKit and "HIS mock", plus a "Backend Services" card listing
+// FastAPI :8001 / PostgreSQL :5432 / Redis :6379 / LiveKit :7880 all hardcoded to
+// "Offline", and a footer telling the reader to run `make dev`. That is developer
+// infrastructure detail, it was permanently wrong (the hardcoded flags never
+// reflected reality), and it made a healthy clinic look broken. Superadmins keep
+// the detailed view via the dedicated /superadmin/system page.
+function ClinicStatusTab() {
+  const tenantId = getTenantId();
+
+  const { data, isLoading, error } = useQuery<{ clinic_name?: string; is_active?: boolean }>({
+    queryKey: ['tenant', tenantId],
+    queryFn: () => fetchWithAuth(`/tenants/${tenantId}`),
+    enabled: !!tenantId,
+    retry: false,
+  });
+
+  const isActive = data?.is_active !== false;
+
+  return (
+    <div className="space-y-5">
+      <SectionHeader
+        title="System Status"
+        description="Whether your clinic's AI receptionist is currently active."
+      />
+
+      <div
+        className="rounded-xl p-6"
+        style={{
+          backgroundColor: 'var(--bg-surface)',
+          border: `1px solid ${isLoading || error ? 'var(--border)' : isActive ? 'var(--accent-border)' : 'var(--border)'}`,
+        }}
+      >
+        {isLoading ? (
+          <p style={{ fontSize: '14px', color: 'var(--text-muted)', margin: 0 }}>Checking status…</p>
+        ) : error ? (
+          <div className="flex items-center gap-3">
+            <AlertCircle size={18} style={{ color: 'var(--warning)', flexShrink: 0 }} />
+            <div>
+              <p style={{ fontSize: '15px', fontWeight: 600, color: 'var(--text-primary)', margin: 0 }}>
+                Status unavailable
+              </p>
+              <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '2px' }}>
+                We couldn't reach the service just now. Please try again shortly.
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div className="flex items-center gap-3">
+            {isActive
+              ? <CheckCircle2 size={20} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+              : <XCircle size={20} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />}
+            <div>
+              <p style={{
+                fontSize: '15px', fontWeight: 600, margin: 0,
+                color: isActive ? 'var(--accent)' : 'var(--text-primary)',
+              }}>
+                {isActive ? 'Clinic active' : 'Clinic inactive'}
+              </p>
+              <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '2px' }}>
+                {isActive
+                  ? 'Your AI receptionist is live and able to take calls.'
+                  : 'Your AI receptionist is not taking calls. Contact Lifodial support to reactivate.'}
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Full platform-internals view — superadmin only (see ClinicStatusTab above).
 function SystemStatusTab() {
   const criteria = [
     { label: 'Clinic onboarding configured',         done: true  },
@@ -689,10 +805,19 @@ function SystemStatusTab() {
   );
 }
 
+// `superadminOnly` tabs are hidden from clinic admins.
+//
+// "AI Config" is superadmin-only because that panel is the platform's provider
+// console: it renders raw API-key entry fields for 11 providers (including
+// LiveKit), every provider's env-var name (GEMINI_API_KEY, SARVAM_API_KEY, …),
+// links to each provider's billing console, and the live model IDs making up the
+// voice pipeline. None of that belongs to a clinic. The behavioural settings a
+// clinic legitimately controls (greeting, prompt, languages, voice choice) live
+// on the agent itself, not here.
 const TABS = [
   { id: 'clinic',        label: 'Clinic Profile', icon: Building2  },
   { id: 'ai-number',     label: 'AI Number',      icon: Phone      },
-  { id: 'ai-config',     label: 'AI Config',      icon: Zap        },
+  { id: 'ai-config',     label: 'AI Config',      icon: Zap,       superadminOnly: true },
   { id: 'integrations',  label: 'Integrations',   icon: Webhook    },
   { id: 'doctors',       label: 'Doctors',        icon: Users      },
   { id: 'appearance',   label: 'Appearance',     icon: Sun        },
@@ -705,6 +830,10 @@ type TabId = typeof TABS[number]['id'];
 // ── Settings Page ─────────────────────────────────────────────────────────────
 export default function Settings() {
   const [activeTab, setActiveTab] = useState<TabId>('clinic');
+  const showSuperadminOnly = isSuperAdmin();
+  const visibleTabs = TABS.filter(
+    t => !('superadminOnly' in t && t.superadminOnly) || showSuperadminOnly
+  );
 
   return (
     <div data-testid="settings-page" className="h-full flex flex-col">
@@ -726,7 +855,7 @@ export default function Settings() {
         className="flex items-center gap-1 px-8 flex-shrink-0 overflow-x-auto"
         style={{ borderBottom: '1px solid var(--border)', backgroundColor: 'var(--bg-surface)' }}
       >
-        {TABS.map(tab => {
+        {visibleTabs.map(tab => {
           const Icon = tab.icon;
           const isActive = activeTab === tab.id;
           return (
@@ -761,12 +890,14 @@ export default function Settings() {
         <div style={{ maxWidth: '680px', margin: '0 auto', padding: '32px 24px' }}>
           {activeTab === 'clinic'        && <ClinicProfileTab />}
           {activeTab === 'ai-number'     && <AiNumberTab />}
-          {activeTab === 'ai-config'     && <AIConfig />}
+          {/* Guarded as well as hidden — the tab id could otherwise still be
+              reached through stale state. */}
+          {activeTab === 'ai-config'     && showSuperadminOnly && <AIConfig />}
           {activeTab === 'integrations'  && <Integrations />}
           {activeTab === 'doctors'       && <DoctorsTab />}
           {activeTab === 'appearance'    && <AppearanceTab />}
           {activeTab === 'notifications' && <NotificationsTab />}
-          {activeTab === 'system'        && <SystemStatusTab />}
+          {activeTab === 'system'        && (showSuperadminOnly ? <SystemStatusTab /> : <ClinicStatusTab />)}
         </div>
       </div>
     </div>

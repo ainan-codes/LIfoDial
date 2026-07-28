@@ -14,12 +14,18 @@ import {
 } from 'lucide-react';
 import React, { useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
-import { clearSession } from '../api/auth';
+import { clearSession, isSuperAdmin } from '../api/auth';
 
 // Agent setup pending — will be enabled later
 // To show the Agents nav item, set CLINIC_AGENT_NAV_ENABLED = true
 const CLINIC_AGENT_NAV_ENABLED = false;
 
+// `superadminOnly` entries are platform-team tooling, not clinic features:
+// Voice Clone trains a custom TTS voice and Voice Library manages the shared
+// voice catalogue (and shows which providers have keys) — a clinic admin should
+// not be able to reach or change either. They stay fully available under
+// /superadmin/*. Routes are guarded too (see App.tsx) so typing the URL by hand
+// doesn't get around the hidden nav entry.
 const nav = [
   { label: 'Dashboard',    icon: LayoutDashboard, to: '/dashboard',    hidden: false },
   { label: 'My Agent',     icon: Bot,             to: '/my-agent',     hidden: false },
@@ -28,8 +34,8 @@ const nav = [
   { label: 'Appointments', icon: CalendarCheck,    to: '/appointments', hidden: false },
   { label: 'Doctors',      icon: Users,            to: '/doctors',      hidden: false },
   { label: 'Analytics',    icon: BarChart2,        to: '/analytics',    hidden: false },
-  { label: 'Voice Clone',  icon: Mic,              to: '/recorder',     hidden: false },
-  { label: 'Voice Library',icon: Music,            to: '/voice-library',hidden: false },
+  { label: 'Voice Clone',  icon: Mic,              to: '/recorder',     hidden: false, superadminOnly: true },
+  { label: 'Voice Library',icon: Music,            to: '/voice-library',hidden: false, superadminOnly: true },
   { label: 'Settings',     icon: Settings,         to: '/settings',     hidden: false },
 ];
 
@@ -45,6 +51,17 @@ const bottomNav = [
 export default function Layout() {
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // Drop hidden/superadmin-only entries outright rather than rendering them with
+  // display:none — a CSS-hidden NavLink is still in the DOM and still a live link.
+  const showSuperadminOnly = isSuperAdmin();
+  const visibleNav = nav.filter(
+    item => !item.hidden && (!item.superadminOnly || showSuperadminOnly)
+  );
+  // The "Community" divider labels the Voice Clone/Voice Library group, so it
+  // must not render when that whole group is hidden (it would orphan itself
+  // above Settings).
+  const communityHeadingBefore = visibleNav.find(i => i.superadminOnly)?.to;
 
   const closeSidebar = () => setSidebarOpen(false);
 
@@ -128,9 +145,9 @@ export default function Layout() {
 
         {/* Nav links */}
         <nav className="flex-1 py-4 overflow-y-auto">
-          {nav.map(({ label, icon: Icon, to, hidden }) => (
+          {visibleNav.map(({ label, icon: Icon, to }) => (
             <React.Fragment key={to}>
-              {label === 'Voice Library' && (
+              {to === communityHeadingBefore && (
                 <div style={{ fontSize: '10px', fontWeight: 700, color: 'var(--text-muted)', padding: '12px 14px 4px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
                    Community
                 </div>
@@ -140,7 +157,7 @@ export default function Layout() {
                 onClick={closeSidebar}
                 className="flex items-center gap-3 mx-2 my-0.5 px-3 py-2 rounded-lg transition-all"
                 style={({ isActive }) => ({
-                  display: hidden ? 'none' : 'flex',
+                  display: 'flex',
                   backgroundColor: isActive ? 'var(--accent-dim)' : 'transparent',
                   color: isActive ? 'var(--accent)' : 'var(--text-secondary)',
                   borderLeft: isActive ? '2px solid var(--accent)' : '2px solid transparent',

@@ -21,6 +21,7 @@ import VoiceRecorder from './pages/VoiceRecorder';
 import { AgentRouteGuard } from './components/AgentRouteGuard';
 import Layout from './components/Layout';
 import { RequireAuth } from './components/RequireAuth';
+import { SuperadminOnlyRoute } from './components/SuperadminOnlyRoute';
 
 // Super Admin Imports
 import { RequireSuperAdmin } from './components/superadmin/RequireSuperAdmin';
@@ -94,11 +95,13 @@ function App() {
               <Route index element={<Analytics />} />
             </Route>
 
+            {/* Voice Clone — platform tooling, superadmin only (clinic admins
+                must not be able to retrain the clinic's TTS voice). */}
             <Route
               path="/recorder"
               element={<RequireAuth><Layout /></RequireAuth>}
             >
-              <Route index element={<VoiceRecorder />} />
+              <Route index element={<SuperadminOnlyRoute><VoiceRecorder /></SuperadminOnlyRoute>} />
             </Route>
 
             <Route
@@ -107,12 +110,15 @@ function App() {
             >
               <Route index element={<Settings />} />
             </Route>
-            
+
+            {/* Voice Library — superadmin only. It exposes which TTS providers
+                have API keys configured ("Connected" / "Add API key to unlock"),
+                which is platform information, not clinic information. */}
             <Route
               path="/voice-library"
               element={<RequireAuth><Layout /></RequireAuth>}
             >
-              <Route index element={<VoiceLibrary readOnly={true} />} />
+              <Route index element={<SuperadminOnlyRoute><VoiceLibrary readOnly={true} /></SuperadminOnlyRoute>} />
             </Route>
 
             {/* Clinic admin — Agents view (hidden, redirects to dashboard) */}

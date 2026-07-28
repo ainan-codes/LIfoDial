@@ -114,12 +114,12 @@ async def create_clinic(data: ClinicCreate, user: SuperAdmin = None, db: AsyncSe
         db.add(new_tenant)
         await db.flush()
 
-        default_doctors = [
-            Doctor(tenant_id=new_tenant.id, name="Dr. Sharma", specialization="General Physician"),
-            Doctor(tenant_id=new_tenant.id, name="Dr. Reddy", specialization="Pediatrician"),
-            Doctor(tenant_id=new_tenant.id, name="Dr. Kapoor", specialization="Dermatologist")
-        ]
-        db.add_all(default_doctors)
+        # A new clinic starts with ZERO doctors. This used to seed three fake
+        # ones ("Dr. Sharma"/"Dr. Reddy"/"Dr. Kapoor"), which were real rows in
+        # the doctors table — so a clinic admin logging in for the first time saw
+        # staff they never added, and Dashboard's "Add your first doctor" setup
+        # step was already silently ticked off. The clinic's own doctors are
+        # added through POST /tenants/{id}/doctors.
         await db.commit()
 
         return {
@@ -429,21 +429,13 @@ async def update_clinic_status(tenant_id: str, data: StatusUpdate, user: SuperAd
 async def delete_clinic(tenant_id: str, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
     """Permanently delete a clinic and every row that references it.
 
-    Explicit, ordered child deletes rather than relying on DB-level ON DELETE
-    behavior: this project's Alembic migrations are never actually applied at
-    deploy time (init_db() only does additive ADD COLUMN changes), so the
-    live schema's real FK constraints can't be trusted to match the model
-    files. Doing the cascade here means this works regardless of that drift.
-    Order matters — children before the parents they reference.
+    The ordered cascade lives in one place —
+    backend/services/tenant_service.py::delete_tenant_cascade — because this
+    endpoint and DELETE /tenants/{id} previously each carried their own
+    hand-maintained copy of a 12-statement ordered delete, which is exactly the
+    kind of duplication that drifts (and did: neither copy deleted embed_events).
     """
-    from backend.models.agent_config import AgentConfig
-    from backend.models.bulk_call import BulkCallCampaign
-    from backend.models.phone_number import PhoneNumber
-    from backend.models.call_record import CallRecord
-    from backend.models.call_log import CallLog
-    from backend.models.knowledge_base import KnowledgeBase
-    from backend.models.clinic_credits import ClinicCredits, CreditTransaction
-    from sqlalchemy import delete as sa_delete
+    from backend.services.tenant_service import delete_tenant_cascade
 
     try:
         result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
@@ -451,22 +443,7 @@ async def delete_clinic(tenant_id: str, user: SuperAdmin = None, db: AsyncSessio
         if not tenant:
             raise HTTPException(status_code=404, detail="Clinic not found")
 
-        # Leaf tables that reference tenant_id and/or agent_id — delete before
-        # the rows they point at.
-        await db.execute(sa_delete(Appointment).where(Appointment.tenant_id == tenant_id))
-        await db.execute(sa_delete(BulkCallCampaign).where(BulkCallCampaign.tenant_id == tenant_id))
-        await db.execute(sa_delete(PhoneNumber).where(PhoneNumber.tenant_id == tenant_id))
-        await db.execute(sa_delete(CallRecord).where(CallRecord.tenant_id == tenant_id))
-        await db.execute(sa_delete(CallLog).where(CallLog.tenant_id == tenant_id))
-        await db.execute(sa_delete(KnowledgeBase).where(KnowledgeBase.tenant_id == tenant_id))
-        await db.execute(sa_delete(CreditTransaction).where(CreditTransaction.tenant_id == tenant_id))
-        await db.execute(sa_delete(ClinicCredits).where(ClinicCredits.tenant_id == tenant_id))
-
-        # Agents and doctors next (now nothing references them for this tenant).
-        await db.execute(sa_delete(AgentConfig).where(AgentConfig.tenant_id == tenant_id))
-        await db.execute(sa_delete(Doctor).where(Doctor.tenant_id == tenant.id))
-
-        await db.delete(tenant)
+        await delete_tenant_cascade(db, tenant)
         await db.commit()
     except HTTPException:
         raise
@@ -559,11 +536,8 @@ async def approve_onboarding_request(req_id: str, user: SuperAdmin = None, db: A
         db.add(new_tenant)
         await db.flush()
 
-        # Default doctors
-        db.add_all([
-            Doctor(tenant_id=new_tenant.id, name="Dr. Sharma", specialization="General Physician"),
-            Doctor(tenant_id=new_tenant.id, name="Dr. Reddy", specialization="Pediatrician"),
-        ])
+        # No default doctors — see the note in create_clinic(). An approved clinic
+        # starts empty and adds its own staff.
 
         # Mark request approved
         req.status = "Approved"

@@ -206,42 +206,18 @@ async def get_forwarding_instructions(id: str, user: CurrentUser = None, db: Asy
 async def delete_tenant(id: str, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)):
     """Delete a clinic and every row that references it.
 
-    Same explicit, ordered cascade as backend/routers/admin.py::delete_clinic
-    (see that function's docstring for why: Alembic migrations never actually
-    run at deploy time, so the live schema's real FK constraints can't be
-    trusted to match the model files — Appointment.doctor_id in particular is
-    NOT NULL with an impossible ON DELETE SET NULL, so deleting a doctor's
-    appointments explicitly, rather than relying on the DB to cascade them,
-    is required for this to ever succeed for a clinic with real activity.
+    Delegates to the one shared cascade —
+    backend/services/tenant_service.py::delete_tenant_cascade — which this
+    endpoint and admin.py::delete_clinic both used to duplicate by hand.
     """
-    from backend.models.agent_config import AgentConfig
-    from backend.models.appointment import Appointment
-    from backend.models.bulk_call import BulkCallCampaign
-    from backend.models.phone_number import PhoneNumber
-    from backend.models.call_record import CallRecord
-    from backend.models.call_log import CallLog
-    from backend.models.knowledge_base import KnowledgeBase
-    from backend.models.clinic_credits import ClinicCredits, CreditTransaction
-    from backend.models.doctor import Doctor
-    from sqlalchemy import delete as sa_delete
+    from backend.services.tenant_service import delete_tenant_cascade
 
     result = await db.execute(select(Tenant).where(Tenant.id == id))
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    await db.execute(sa_delete(Appointment).where(Appointment.tenant_id == id))
-    await db.execute(sa_delete(BulkCallCampaign).where(BulkCallCampaign.tenant_id == id))
-    await db.execute(sa_delete(PhoneNumber).where(PhoneNumber.tenant_id == id))
-    await db.execute(sa_delete(CallRecord).where(CallRecord.tenant_id == id))
-    await db.execute(sa_delete(CallLog).where(CallLog.tenant_id == id))
-    await db.execute(sa_delete(KnowledgeBase).where(KnowledgeBase.tenant_id == id))
-    await db.execute(sa_delete(CreditTransaction).where(CreditTransaction.tenant_id == id))
-    await db.execute(sa_delete(ClinicCredits).where(ClinicCredits.tenant_id == id))
-    await db.execute(sa_delete(AgentConfig).where(AgentConfig.tenant_id == id))
-    await db.execute(sa_delete(Doctor).where(Doctor.tenant_id == id))
-
-    await db.delete(tenant)
+    await delete_tenant_cascade(db, tenant)
     await db.commit()
 
 

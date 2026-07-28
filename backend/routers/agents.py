@@ -262,6 +262,43 @@ class PreviewPromptPayload(BaseModel):
 
 # ── Helper ───────────────────────────────────────────────────────────────────
 
+# Columns a clinic admin must NEVER receive. _agent_to_dict() serialises every
+# AgentConfig column, so without this deny-list a clinic-admin token reading
+# GET /agents/mine or GET /agents/{id} gets the platform's LiveKit and SIP
+# credentials back in plain text — visible in the browser's network tab. Hiding
+# them in the UI is not enough; they must not leave the server.
+#
+# Scope is deliberately narrow: PLATFORM infrastructure credentials only (one
+# LiveKit project and one SIP trunk shared by every clinic). Deliberately NOT
+# included, because they are the CLINIC's own property and it must be able to
+# read and set them: google_sheets_webhook_url and webhook_url (the clinic's own
+# integrations), and sip_provider / telephony_option (names, not secrets, and the
+# telephony UI needs them). Superadmin always gets the full row.
+_CONFIDENTIAL_AGENT_FIELDS = frozenset({
+    "sip_account_sid",
+    "sip_auth_token",
+    "sip_domain",
+    "livekit_url",
+    "livekit_api_key",
+    "livekit_api_secret",
+})
+
+
+def redact_agent_for_clinic(data: dict) -> dict:
+    """Strip platform credentials from an agent payload bound for a clinic admin.
+
+    Returns a new dict; each removed key is replaced by a `<key>_configured`
+    boolean so the UI can still say "telephony is set up" without being handed
+    the secret that makes it work.
+    """
+    out = dict(data)
+    for field in _CONFIDENTIAL_AGENT_FIELDS:
+        if field in out:
+            out[f"{field}_configured"] = bool(out[field])
+            del out[field]
+    return out
+
+
 def _agent_to_dict(agent: AgentConfig, clinic_name: str = "") -> dict:
     data = {c.name: getattr(agent, c.name) for c in agent.__table__.columns if hasattr(agent, c.name)}
     data["clinic_name"] = clinic_name
@@ -365,6 +402,9 @@ async def get_my_agent(email: str, user: CurrentUser = None) -> dict:
             data = _agent_to_dict(agent, clinic_name)
             data["system_prompt"] = agent.system_prompt
             data["first_message"] = agent.first_message
+            # Clinic admins never receive the platform's LiveKit/SIP credentials.
+            if not user.is_superadmin:
+                data = redact_agent_for_clinic(data)
             return data
     except HTTPException:
         raise
@@ -985,6 +1025,10 @@ async def get_agent(agent_id: str, user: CurrentUser = None) -> dict:
             data["tts_loudness"] = agent.tts_loudness
             data["llm_temperature"] = agent.llm_temperature
             data["max_response_tokens"] = agent.max_response_tokens
+            # Clinic admins never receive the platform's LiveKit/SIP credentials.
+            # (Applied last so the explicit assignments above can't reintroduce one.)
+            if not user.is_superadmin:
+                data = redact_agent_for_clinic(data)
             return data
     except HTTPException:
         raise
@@ -1149,6 +1193,26 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
             if not agent:
                 raise HTTPException(status_code=404, detail="Agent not found")
             user.require_owns(str(agent.tenant_id))
+
+            # A clinic admin may configure everything about how their agent
+            # BEHAVES, but not the platform credentials it runs on. Writing
+            # livekit_api_secret / sip_auth_token from a clinic token would let
+            # one clinic repoint (or break) the shared voice infrastructure, so
+            # those fields are rejected rather than silently ignored — a silent
+            # drop would make the UI show a save that never happened.
+            if not user.is_superadmin:
+                _attempted = {
+                    f for f in _CONFIDENTIAL_AGENT_FIELDS
+                    if getattr(payload, f, None) is not None
+                }
+                if _attempted:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=(
+                            "These fields are managed by the Lifodial platform team and "
+                            f"cannot be changed from the clinic dashboard: {', '.join(sorted(_attempted))}."
+                        ),
+                    )
 
             # If google_sheets_webhook_url is provided, update the Tenant's record
             if payload.google_sheets_webhook_url is not None:

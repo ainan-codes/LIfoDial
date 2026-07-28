@@ -301,6 +301,14 @@ async def _load_tenant_and_config(
         "stt_model":       metadata.get("stt_model", "saaras:v2"),
         "stt_language":    metadata.get("stt_language", "hi-IN"),
         "llm_model":       metadata.get("llm_model", "gemini-2.0-flash"),
+        # The agent's EXPLICIT LLM provider choice. Without this key,
+        # resilience.select_llm_provider() only ever saw "" and had to guess the
+        # provider from the model-name prefix (_provider_from_model), so choosing
+        # Anthropic/Mistral/Ollama or a custom OpenAI-compatible endpoint silently
+        # ran Gemini instead, and a Cerebras "llama-*" model got routed to Groq.
+        # The dashboard's text-test path already read agent.llm_provider, so the
+        # test chat and the real voice call disagreed about which model was running.
+        "llm_provider":    (metadata.get("llm_provider") or "").strip(),
         "llm_temperature": float(metadata.get("llm_temperature", 0.3)),
         "max_response_tokens": int(metadata.get("max_response_tokens", 120)),
         # ── Tool toggles (Tools tab) ──────────────────────────────────────
@@ -375,6 +383,11 @@ async def _load_tenant_and_config(
                         "stt_model":           cfg.stt_model or "saaras:v2",
                         "stt_language":        cfg.stt_language or "hi-IN",
                         "llm_model":           cfg.llm_model or "gemini-2.0-flash",
+                        # See the note on "llm_provider" in the metadata-only branch
+                        # above — the AgentConfig row has always had this column, the
+                        # pipeline just never read it, so the provider was inferred
+                        # from the model name and any non-inferable choice ran Gemini.
+                        "llm_provider":        (getattr(cfg, "llm_provider", "") or "").strip(),
                         "llm_temperature":     float(cfg.llm_temperature or 0.3),
                         "max_response_tokens": int(cfg.max_response_tokens or 120),
                         "can_book_appointments":   bool(cfg.can_book_appointments if cfg.can_book_appointments is not None else True),
@@ -761,6 +774,29 @@ async def entrypoint(ctx) -> None:
         if _fallback:
             stt_provider = _fallback
 
+    # Unbuildable-provider guard. The guard above only proves the SELECTED provider
+    # has a key — it can't see that the provider has no `elif` branch below and will
+    # therefore fall through to the Sarvam `else:`. google_stt and azure_stt are both
+    # in the AI Platform catalog and both resolve a key successfully (via
+    # provider_status._SPECIAL_ATTR), so they passed the key check and then silently
+    # transcribed through Sarvam instead — or, with no Sarvam key, ran the call
+    # completely deaf, which is exactly what the guard above exists to prevent.
+    _BUILDABLE_STT = {"sarvam", "deepgram", "openai", "whisper", "elevenlabs", "assemblyai"}
+    if stt_provider not in _BUILDABLE_STT:
+        log.critical(
+            "STT provider '%s' is selected but this pipeline has no build branch for it "
+            "(buildable: %s). Falling back to Sarvam STT for room=%s — transcription will "
+            "NOT use the provider shown in the dashboard. Add a branch in pipeline.py + a "
+            "builder in backend/agent/providers.py to support it.",
+            stt_provider, sorted(_BUILDABLE_STT), room_name,
+        )
+        stt_provider = "sarvam"
+        if not (_stt_keys.get("sarvam") or "").strip():
+            log.critical(
+                "…and there is no Sarvam key either — room=%s WILL have no speech input.",
+                room_name,
+            )
+
     if stt_provider == "deepgram":
         # Deepgram Nova-3: real-time streaming with ~200ms TTFB (vs ~800ms Sarvam batch).
         # Best for English; supports Hindi/Tamil/Telugu with nova-2.
@@ -997,10 +1033,23 @@ async def entrypoint(ctx) -> None:
     # TTS — Sarvam AI, ElevenLabs, OpenAI, or Cartesia
     tts_provider = agent_config.get("tts_provider", "sarvam")
 
+    # Providers this function can actually BUILD, i.e. those with an `elif` branch
+    # below. The AI Platform catalog is deliberately wider than this (it also
+    # lists playht / azure_tts / deepgram_aura / resemble), and any saved key makes
+    # a provider selectable in the agent's TTS dropdown — so an id that reaches
+    # here without a branch is entirely expected and must degrade cleanly.
+    _BUILDABLE_TTS = {"sarvam", "elevenlabs", "openai_tts", "cartesia"}
+
     # Same DB-first (AI Platform dashboard), env-fallback key resolution as STT
-    # above — see backend/agent/providers.py. Only the selected provider (plus
-    # "openai", the openai_tts fallback) is ever read below.
-    _tts_needed = {tts_provider}
+    # above — see backend/agent/providers.py. Only the keys actually read below are
+    # resolved (each is a DB round-trip on a latency-critical path).
+    #
+    # "sarvam" is ALWAYS resolved because the final `else:` is the Sarvam branch —
+    # it is the fallback every unrecognised provider lands on, and it reads
+    # _tts_keys["sarvam"]. Omitting it here raised KeyError: 'sarvam' inside
+    # entrypoint(), which kills the job before the agent joins the room: the
+    # caller hears dead air and the logs show no reason why.
+    _tts_needed = {tts_provider, "sarvam"}
     if tts_provider == "openai_tts":
         _tts_needed.add("openai")
     async with AsyncSessionLocal() as _key_db:
@@ -1008,6 +1057,24 @@ async def entrypoint(ctx) -> None:
             p: await provider_registry.resolve_key(_key_db, p, category="tts")
             for p in _tts_needed
         }
+
+    # Mute-agent guard — the TTS mirror of the deaf-agent guard above. Say so
+    # loudly when the configured provider cannot be built, instead of quietly
+    # speaking in a different voice than the dashboard shows.
+    if tts_provider not in _BUILDABLE_TTS:
+        log.critical(
+            "TTS provider '%s' is selected but this pipeline has no build branch for it "
+            "(buildable: %s). Falling back to Sarvam TTS for room=%s — the caller will "
+            "hear a DIFFERENT voice than the dashboard shows. Add a branch in "
+            "pipeline.py + a builder in backend/agent/providers.py to support it.",
+            tts_provider, sorted(_BUILDABLE_TTS), room_name,
+        )
+        tts_provider = "sarvam"
+    if not (_tts_keys.get(tts_provider) or "").strip():
+        log.critical(
+            "TTS provider '%s' has no API key (DB or env). Synthesis will 401 and the "
+            "caller will hear NOTHING at all for room=%s.", tts_provider, room_name,
+        )
 
     if tts_provider == "elevenlabs":
         # Safe fallback: if tts_voice is empty or is a Sarvam voice name, default to ElevenLabs' Rachel ID
@@ -1089,6 +1156,23 @@ async def entrypoint(ctx) -> None:
                 pitch=tts_pitch,
                 loudness=tts_loudness,
                 enable_preprocessing=tts_input_preprocessing,
+                # ── Time-to-first-audio ────────────────────────────────────
+                # These are sent to Sarvam in the websocket config frame and
+                # decide when it STARTS synthesizing. pipecat's defaults are
+                # min_buffer_size=50 / max_chunk_length=150 characters, which are
+                # tuned for long-form narration and are wrong for a phone call:
+                # this agent is instructed to answer in at most 2 sentences and
+                # runs with max_response_tokens=120, so a typical reply is well
+                # under 50 characters. Sarvam therefore buffered the ENTIRE reply
+                # without emitting a sample, and audio only began after pipecat
+                # flushed on LLMFullResponseEndFrame — i.e. the caller waited for
+                # the whole LLM turn to finish before hearing the first word.
+                #
+                # 15/60 lets a short reply start synthesizing almost immediately
+                # while still batching enough text for natural prosody. Costs
+                # nothing but marginally more chunking on long replies.
+                min_buffer_size=15,
+                max_chunk_length=60,
             ),
         )
 

@@ -1,6 +1,75 @@
+import { useQuery } from '@tanstack/react-query';
 import { BarChart2, CalendarCheck, PhoneIncoming, TrendingUp } from 'lucide-react';
 import React from 'react';
-import { FIXTURE_APPOINTMENTS, FIXTURE_CALL_LOGS } from '../fixtures/data';
+import { getTenantId } from '../api/auth';
+import fetchWithAuth from '../api/client';
+
+/**
+ * Analytics — real, tenant-scoped call performance.
+ *
+ * This page used to import FIXTURE_APPOINTMENTS / FIXTURE_CALL_LOGS and make ZERO
+ * API calls: every KPI, both breakdowns and the 7-day chart were computed from
+ * five invented calls, the average handle time was the literal string '2:18', the
+ * chart was a hardcoded Mon–Sun array, and the subtitle said "Apollo Demo Clinic"
+ * no matter who logged in. A brand-new clinic therefore opened Analytics and saw
+ * a full week of traffic it had never received.
+ */
+
+/** A row from GET /api/call_logs (backend/main.py::_call_record_to_row). */
+interface CallLogRow {
+  id: string;
+  date: string;      // "%d %b %Y, %H:%M"
+  duration: string;  // "M:SS", or "—" when unknown
+  intent: string;
+  status: string;
+  language: string;
+}
+
+const LANGUAGE_LABELS: Record<string, string> = {
+  'hi-IN': 'Hindi', 'en-IN': 'English', 'en-US': 'English (US)', 'en-GB': 'English (UK)',
+  'ta-IN': 'Tamil', 'te-IN': 'Telugu', 'kn-IN': 'Kannada', 'ml-IN': 'Malayalam',
+  'mr-IN': 'Marathi', 'bn-IN': 'Bengali', 'pa-IN': 'Punjabi', 'gu-IN': 'Gujarati',
+  'ar-AE': 'Arabic', 'ar-SA': 'Arabic',
+};
+
+function parseDurationSeconds(d: string): number | null {
+  const m = /^(\d+):(\d{2})$/.exec((d || '').trim());
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+}
+
+function formatDurationSeconds(secs: number): string {
+  return `${Math.floor(secs / 60)}:${String(Math.round(secs % 60)).padStart(2, '0')}`;
+}
+
+function tally(logs: CallLogRow[], key: 'intent' | 'language'): Record<string, number> {
+  return logs.reduce((acc, l) => {
+    let v = String(l[key] ?? '').trim();
+    if (key === 'language') v = LANGUAGE_LABELS[v] ?? v;
+    if (v && v !== '—') acc[v] = (acc[v] ?? 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
+}
+
+/** Trailing 7 real days, oldest → newest, bucketed from each call's timestamp. */
+function last7Days(logs: CallLogRow[]): { day: string; value: number }[] {
+  const labels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const buckets: { day: string; value: number }[] = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    buckets.push({ day: labels[d.getDay()], value: 0 });
+  }
+  for (const l of logs) {
+    const parsed = new Date((l.date || '').replace(',', ''));
+    if (Number.isNaN(parsed.getTime())) continue;
+    parsed.setHours(0, 0, 0, 0);
+    const ago = Math.round((today.getTime() - parsed.getTime()) / 86_400_000);
+    if (ago >= 0 && ago <= 6) buckets[6 - ago].value += 1;
+  }
+  return buckets;
+}
 
 function StatCard({ label, value, icon: Icon, color }: {
   label: string; value: string | number; icon: React.ElementType; color?: string;
@@ -53,36 +122,53 @@ function BarGroup({ day, value, max }: { day: string; value: number; max: number
 }
 
 export default function Analytics() {
-  // Derive stats from fixture data
-  const totalCalls    = FIXTURE_CALL_LOGS.length;
-  const booked        = FIXTURE_APPOINTMENTS.filter(a => a.status === 'CONFIRMED').length;
-  const resolved      = FIXTURE_CALL_LOGS.filter(l => l.status === 'Booked' || l.status === 'Resolved').length;
-  const resolutionPct = `${Math.round((resolved / totalCalls) * 100)}%`;
-  const avgDuration   = '2:18';
+  const tenantId = getTenantId();
 
-  // Intent breakdown
-  const intentCounts = FIXTURE_CALL_LOGS.reduce((acc, l) => {
-    acc[l.intent] = (acc[l.intent] ?? 0) + 1;
-    return acc;
-  }, {} as Record<string, number>);
+  const { data: logsData, isLoading } = useQuery<{ items: CallLogRow[] }>({
+    queryKey: ['analytics-call-logs'],
+    queryFn: () => fetchWithAuth('/api/call_logs?limit=200'),
+    retry: false,
+  });
 
-  // Language breakdown
-  const langCounts = FIXTURE_CALL_LOGS.reduce((acc, l) => {
-    acc[l.language] = (acc[l.language] ?? 0) + 1;
-    return acc;
-  }, {} as Record<string, number>);
+  const { data: tenantData } = useQuery<{ clinic_name?: string }>({
+    queryKey: ['tenant', tenantId],
+    queryFn: () => fetchWithAuth(`/tenants/${tenantId}`),
+    enabled: !!tenantId,
+    retry: false,
+  });
 
-  // Mock 7-day call volume
-  const days = [
-    { day: 'Mon', value: 2 },
-    { day: 'Tue', value: 4 },
-    { day: 'Wed', value: 3 },
-    { day: 'Thu', value: 6 },
-    { day: 'Fri', value: 5 },
-    { day: 'Sat', value: totalCalls },
-    { day: 'Sun', value: 0 },
-  ];
-  const maxDay = Math.max(...days.map(d => d.value));
+  const { data: aptsData } = useQuery<{ status?: string }[]>({
+    queryKey: ['analytics-appointments', tenantId],
+    queryFn: () => fetchWithAuth(`/tenants/${tenantId}/appointments`),
+    enabled: !!tenantId,
+    retry: false,
+  });
+
+  const logs = logsData?.items ?? [];
+  const totalCalls = logs.length;
+
+  const booked = (aptsData ?? []).filter(
+    a => String(a.status ?? '').toUpperCase() === 'CONFIRMED'
+  ).length;
+
+  const resolved = logs.filter(l => l.status === 'Booked' || l.status === 'Resolved').length;
+  const resolutionPct = totalCalls ? `${Math.round((resolved / totalCalls) * 100)}%` : '—';
+
+  const durations = logs
+    .map(l => parseDurationSeconds(l.duration))
+    .filter((n): n is number => n !== null);
+  const avgDuration = durations.length
+    ? formatDurationSeconds(durations.reduce((a, b) => a + b, 0) / durations.length)
+    : '—';
+
+  const intentCounts = tally(logs, 'intent');
+  const langCounts   = tally(logs, 'language');
+  const days         = last7Days(logs);
+  // Floor of 1 so an all-zero week renders flat bars instead of dividing by zero.
+  const maxDay       = Math.max(1, ...days.map(d => d.value));
+
+  const clinicName = tenantData?.clinic_name;
+  const hasNoData  = !isLoading && totalCalls === 0;
 
   const cardStyle: React.CSSProperties = {
     backgroundColor: 'var(--bg-surface)',
@@ -102,11 +188,27 @@ export default function Analytics() {
           Analytics
         </h1>
         <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '2px' }}>
-          Call performance and outcome trends for Apollo Demo Clinic
+          {clinicName
+            ? `Call performance and outcome trends for ${clinicName}`
+            : 'Call performance and outcome trends'}
         </p>
       </div>
 
       <div className="flex-1 p-8 space-y-5 overflow-y-auto" style={{ backgroundColor: 'var(--bg-page)' }}>
+        {hasNoData && (
+          <div
+            className="rounded-xl p-5"
+            style={{ backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border)' }}
+          >
+            <p style={{ fontSize: '14px', fontWeight: 600, color: 'var(--text-primary)', margin: 0 }}>
+              No calls yet
+            </p>
+            <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '4px' }}>
+              Once your AI receptionist starts taking calls, performance trends will appear here.
+            </p>
+          </div>
+        )}
+
         {/* KPI row */}
         <div className="grid grid-cols-4 gap-4">
           <StatCard label="Total Calls"       value={totalCalls}    icon={PhoneIncoming} />
@@ -203,7 +305,9 @@ export default function Analytics() {
                 { label: 'Calls fully resolved by AI',    value: `${resolutionPct}` },
                 { label: 'Languages handled',              value: `${Object.keys(langCounts).length}` },
                 { label: 'Appointments booked (no staff)', value: `${booked}` },
-                { label: 'Avg response time',              value: '< 3 sec' },
+                // "Avg response time: < 3 sec" was a hardcoded marketing claim.
+                // Average call length is a number we can actually measure.
+                { label: 'Avg call length',                value: avgDuration },
               ].map(item => (
                 <div key={item.label} className="flex justify-between">
                   <span style={{ fontSize: '13px', color: 'var(--accent)', opacity: 0.8 }}>{item.label}</span>
