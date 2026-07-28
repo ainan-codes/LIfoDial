@@ -123,6 +123,62 @@ def _kb_context_block(tenant: dict) -> str:
     )
 
 
+_DEFAULT_WORKING_HOURS = "9 AM – 7 PM, Mon–Sat"
+
+
+def _clinic_facts_block(tenant: dict) -> str:
+    """Clinic hours + the full doctor roster, as a block appended to EVERY prompt.
+
+    Why this is separate from the template's own {working_hours} / {doctors_list}
+    placeholders: those are interpolated ONLY when the prompt comes from
+    prompt_templates. A clinic with a custom system_prompt — which is precedence
+    #1 in _build_system_prompt — got neither. So the two things a clinic admin can
+    actually edit about their clinic (its timings, and its doctors) were invisible
+    to the agent for exactly the clinics that had customised anything.
+
+    Same reasoning as _doctor_availability_block below, which already had to solve
+    this for on-leave doctors. This block carries the positive roster and the
+    hours; that one carries the emphatic do-not-book warning for absences.
+    """
+    hours = (tenant.get("working_hours") or "").strip() or _DEFAULT_WORKING_HOURS
+    doctors = tenant.get("doctors") or []
+
+    lines = [f"Working hours: {hours}"]
+    if tenant.get("address"):
+        lines.append(f"Address: {tenant['address']}")
+
+    available = [d for d in doctors if d.get("is_available", True)]
+    if available:
+        lines.append("Doctors available to book:")
+        lines += [
+            f"  - {d['name']} ({d.get('specialization') or 'Specialist'})"
+            for d in available
+        ]
+    elif doctors:
+        lines.append(
+            "No doctor is available right now — every doctor on staff is on leave."
+        )
+    else:
+        # An empty roster is a real state for a new clinic. Say so explicitly, or
+        # the model invents a doctor to be helpful.
+        lines.append(
+            "No doctors have been added to this clinic yet. You therefore CANNOT "
+            "book an appointment with a named doctor — offer to take the caller's "
+            "details so the clinic can call them back instead, and never invent a "
+            "doctor's name."
+        )
+
+    return (
+        "\n\n--- CLINIC DETAILS ---\n"
+        + "\n".join(lines)
+        + "\n--- END CLINIC DETAILS ---\n"
+        "Only ever offer or confirm appointment times that fall INSIDE the working "
+        "hours above. If the caller asks for a time outside them, say the clinic is "
+        "closed then and offer the nearest time that is open. Never invent a doctor, "
+        "a specialization, or an opening time that is not listed above.\n"
+    )
+
+
 def _doctor_availability_block(tenant: dict) -> str:
     """Doctors currently on leave, as an appendable prompt block. Empty string
     when everyone is available (turn proceeds normally). Appended alongside
@@ -184,6 +240,9 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
 
     kb_block = (
         _kb_context_block(tenant)
+        # Hours + roster BEFORE the availability warning, so the model reads "who
+        # exists and when we're open" and then "who of those is away".
+        + _clinic_facts_block(tenant)
         + _doctor_availability_block(tenant)
         + _BOOKING_RULES_BLOCK
         + _LANGUAGE_MIRROR_RULE
@@ -214,7 +273,7 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
                 "clinic_name": tenant.get("clinic_name", "the clinic"),
                 "agent_name": agent_config.get("agent_name", "Receptionist"),
                 "clinic_location": tenant.get("location", "India"),
-                "working_hours": tenant.get("working_hours", "9 AM – 7 PM, Mon–Sat"),
+                "working_hours": tenant.get("working_hours") or _DEFAULT_WORKING_HOURS,
                 "emergency_number": tenant.get("emergency_number", "108"),
                 "doctors_list": doctors_list,
             },
@@ -403,6 +462,12 @@ async def _load_tenant_and_config(
                         "end_call_phrases":        cfg.end_call_phrases or [],
                         "end_call_message":        cfg.end_call_message or "Thank you for calling. Goodbye!",
                         "recording_consent_plan":  getattr(cfg, "recording_consent_plan", None) or "none",
+                        # Clinic-owned facts the receptionist must know: working
+                        # hours, address, emergency number, services, FAQs. This is
+                        # what Settings -> Clinic Profile writes its calling hours
+                        # into, and it is the ONLY place those hours are stored —
+                        # Tenant has no working_hours column (see below).
+                        "clinic_info":         cfg.clinic_info if isinstance(cfg.clinic_info, dict) else {},
                         "status":              cfg.status,
                     })
                     log.info("AgentConfig loaded from DB: agent_id=%s", agent_id)
@@ -417,7 +482,25 @@ async def _load_tenant_and_config(
                     tenant["id"]            = str(t.id)
                     tenant["clinic_name"]   = t.clinic_name
                     tenant["location"]      = getattr(t, "location", "India")
-                    tenant["working_hours"] = getattr(t, "working_hours", "9 AM – 7 PM, Mon–Sat")
+
+                    # Working hours come from AgentConfig.clinic_info, which is where
+                    # Settings -> Clinic Profile saves them.
+                    #
+                    # This used to read getattr(t, "working_hours", "9 AM – 7 PM, Mon–Sat")
+                    # — but Tenant has NO working_hours column, so getattr always fell
+                    # through to that default. Every clinic's agent therefore believed it
+                    # opened 9-7 Mon-Sat no matter what the clinic had configured, and a
+                    # clinic that set 10:00-18:00 had an agent happily offering 9 AM.
+                    _ci = agent_config.get("clinic_info") or {}
+                    tenant["working_hours"] = (
+                        (_ci.get("working_hours") or "").strip()
+                        or _DEFAULT_WORKING_HOURS
+                    )
+                    # Same source for the other clinic facts the prompt interpolates.
+                    if (_ci.get("emergency_number") or "").strip():
+                        tenant["emergency_number"] = _ci["emergency_number"].strip()
+                    if (_ci.get("address") or "").strip():
+                        tenant["address"] = _ci["address"].strip()
 
                 d_result = await db.execute(
                     select(Doctor).where(Doctor.tenant_id == tenant_id)
