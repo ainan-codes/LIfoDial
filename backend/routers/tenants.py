@@ -22,6 +22,13 @@ class TenantCreate(BaseModel):
 class TenantUpdate(BaseModel):
     clinic_name: str | None = None
     google_sheets_webhook_url: str | None = None
+    # Editable from the clinic dashboard's Settings → Clinic Profile tab. That tab
+    # used to hold these purely in local component state with a Save button that
+    # only flipped a "✓ Saved" flag — no request was ever sent, so every edit was
+    # silently lost on reload.
+    language: str | None = None
+    location: str | None = None
+    phone: str | None = None
 
 # NOTE: ids are str, not uuid.UUID — the DB columns are varchar(36) and
 # comparing a Python UUID against them makes Postgres raise
@@ -231,10 +238,19 @@ async def update_tenant(id: str, payload: TenantUpdate, user: CurrentUser = None
         raise HTTPException(status_code=404, detail="Tenant not found")
         
     if payload.clinic_name is not None:
-        tenant.clinic_name = payload.clinic_name
+        name = payload.clinic_name.strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="Clinic name cannot be empty")
+        tenant.clinic_name = name
     if payload.google_sheets_webhook_url is not None:
         tenant.google_sheets_webhook_url = payload.google_sheets_webhook_url
-        
+    if payload.language is not None:
+        tenant.language = payload.language
+    if payload.location is not None:
+        tenant.location = payload.location
+    if payload.phone is not None:
+        tenant.phone = payload.phone
+
     await db.commit()
     await db.refresh(tenant)
     return {
@@ -242,5 +258,7 @@ async def update_tenant(id: str, payload: TenantUpdate, user: CurrentUser = None
         "clinic_name": tenant.clinic_name,
         "google_sheets_webhook_url": tenant.google_sheets_webhook_url,
         "language": tenant.language,
+        "location": tenant.location,
+        "phone": tenant.phone,
         "ai_number": tenant.ai_number,
     }

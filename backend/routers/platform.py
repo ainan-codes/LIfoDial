@@ -597,6 +597,9 @@ async def configured_providers(user: CurrentUser = None, db: AsyncSession = Depe
         select(ApiKeyConfig).where(ApiKeyConfig.api_key_enc.isnot(None))
     )).scalars().all()
 
+    from backend.services.provider_registry import is_buildable, unsupported_reason
+    from backend.services.provider_status import parse_extra_config
+
     out: dict = {}
     for r in rows:
         if not r.api_key_enc:
@@ -606,11 +609,22 @@ async def configured_providers(user: CurrentUser = None, db: AsyncSession = Depe
             if p["id"] == r.provider:
                 models = p.get("models", [])
                 break
+
+        # "Has a key" is NOT the same as "works on a live call". A saved key used
+        # to be enough to make a provider selectable in the agent builder, which is
+        # how playht/azure_tts/deepgram_aura became choosable and then killed the
+        # call, and how google_stt/azure_stt silently became Sarvam. Surface the
+        # difference so the UI can show these as unavailable, with the reason.
+        _has_base_url = bool(parse_extra_config(r.extra_config).get("base_url"))
+        buildable = is_buildable(r.category, r.provider, has_base_url=_has_base_url)
+
         out.setdefault(r.category, []).append({
             "id": r.provider,
             "display_name": r.display_name,
             "is_active": r.is_active,
             "models": models,
+            "buildable": buildable,
+            "unavailable_reason": None if buildable else unsupported_reason(r.category, r.provider),
         })
 
     _CONFIGURED_CACHE["data"] = out

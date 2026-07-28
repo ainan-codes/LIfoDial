@@ -781,7 +781,12 @@ async def entrypoint(ctx) -> None:
     # provider_status._SPECIAL_ATTR), so they passed the key check and then silently
     # transcribed through Sarvam instead — or, with no Sarvam key, ran the call
     # completely deaf, which is exactly what the guard above exists to prevent.
-    _BUILDABLE_STT = {"sarvam", "deepgram", "openai", "whisper", "elevenlabs", "assemblyai"}
+    #
+    # The buildable set is imported, not redeclared: backend/services/provider_registry.py
+    # is the one place that knows what this file can construct, and the API now
+    # refuses to SAVE anything outside it — so reaching this branch means either an
+    # older row or a registry/pipeline mismatch. Both are worth shouting about.
+    from backend.services.provider_registry import BUILDABLE_STT as _BUILDABLE_STT
     if stt_provider not in _BUILDABLE_STT:
         log.critical(
             "STT provider '%s' is selected but this pipeline has no build branch for it "
@@ -1034,11 +1039,9 @@ async def entrypoint(ctx) -> None:
     tts_provider = agent_config.get("tts_provider", "sarvam")
 
     # Providers this function can actually BUILD, i.e. those with an `elif` branch
-    # below. The AI Platform catalog is deliberately wider than this (it also
-    # lists playht / azure_tts / deepgram_aura / resemble), and any saved key makes
-    # a provider selectable in the agent's TTS dropdown — so an id that reaches
-    # here without a branch is entirely expected and must degrade cleanly.
-    _BUILDABLE_TTS = {"sarvam", "elevenlabs", "openai_tts", "cartesia"}
+    # below — imported from the shared registry rather than redeclared here, so the
+    # API's write-time validation and this run-time guard can never disagree.
+    from backend.services.provider_registry import BUILDABLE_TTS as _BUILDABLE_TTS
 
     # Same DB-first (AI Platform dashboard), env-fallback key resolution as STT
     # above — see backend/agent/providers.py. Only the keys actually read below are

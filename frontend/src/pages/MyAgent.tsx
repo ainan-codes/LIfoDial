@@ -4,10 +4,11 @@ import {
   Phone, Clock, IndianRupee, Activity, Mic, Volume2, Brain,
   AlertCircle, CheckCircle2, FileText, Wrench, BarChart2, Settings,
   ChevronDown, ChevronUp, Download, Zap, Shield, RefreshCw,
-  PhoneMissed, PlayCircle, Globe, Lock, Bell,
+  PhoneMissed, PlayCircle, Globe, Lock, Bell, Sliders,
 } from 'lucide-react';
 import fetchWithAuth from '../api/client';
 import { isSuperAdmin } from '../api/auth';
+import ConfigureTab from './myagent/ConfigureTab';
 
 /**
  * MyAgent — Vapi-style tabbed agent dashboard.
@@ -30,6 +31,19 @@ interface AgentInfo {
   first_message: string;
   system_prompt?: string;
   llm_temperature?: number;
+  // Behaviour fields the Configure tab edits. Optional because /agents/mine fills
+  // defaults for some of them and a clinic payload has platform credentials
+  // stripped (backend/routers/agents.py::redact_agent_for_clinic).
+  tts_provider?: string;
+  max_response_tokens?: number;
+  silence_timeout_seconds?: number;
+  max_duration_seconds?: number;
+  end_call_message?: string;
+  can_book_appointments?: boolean;
+  can_cancel_appointments?: boolean;
+  can_check_availability?: boolean;
+  can_transfer_emergency?: boolean;
+  emergency_transfer_number?: string;
 }
 
 interface CreditInfo {
@@ -158,10 +172,13 @@ function callLogsToStats(logs: CallLogRow[]) {
   };
 }
 
-type Tab = 'assistant' | 'logs' | 'tools' | 'analysis' | 'advanced';
+type Tab = 'assistant' | 'configure' | 'logs' | 'tools' | 'analysis' | 'advanced';
 
 const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
   { id: 'assistant', label: 'Assistant',  icon: Mic },
+  // Configure is where a clinic admin actually edits their receptionist. Before
+  // this existed, My Agent was entirely read-only ("managed by Lifodial team").
+  { id: 'configure', label: 'Configure',  icon: Sliders },
   { id: 'logs',      label: 'Logs',       icon: FileText },
   { id: 'tools',     label: 'Tools',      icon: Wrench },
   { id: 'analysis',  label: 'Analysis',   icon: BarChart2 },
@@ -408,7 +425,9 @@ export default function MyAgent() {
               <div style={styles.card}>
                 <h3 style={styles.cardTitle}>Voice Configuration</h3>
                 <p style={styles.cardSubtitle}>
-                  {showInternals ? 'Read-only — managed by Lifodial team' : 'How your receptionist sounds'}
+                  {showInternals
+                    ? 'Platform configuration'
+                    : 'How your receptionist sounds — change it in Configure'}
                 </p>
                 <div style={styles.configGrid}>
                   {showInternals ? (
@@ -521,6 +540,8 @@ export default function MyAgent() {
         )}
 
         {/* ══ LOGS TAB ════════════════════════════════════════════════════ */}
+        {activeTab === 'configure' && <ConfigureTab agent={agent} onSaved={loadData} />}
+
         {activeTab === 'logs' && <LogsTab logs={callLogs} />}
 
         {/* ══ TOOLS TAB ═══════════════════════════════════════════════════ */}

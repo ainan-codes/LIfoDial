@@ -167,9 +167,13 @@ function QuickSetupCard({ aiNumber, forwardingSet, hasDoctors }: {
 export default function Dashboard() {
   const tenantId = getTenantId();
 
+  // /api/clinic/stats, NOT /api/dashboard/stats — the latter never existed AND
+  // the whole /api/dashboard prefix is hard-404'd by block_foreign_requests() in
+  // backend/main.py as noise from another project, so every KPI tile below
+  // rendered "—" forever with no visible error.
   const { data: statsData, isLoading: statsLoading } = useQuery({
-    queryKey: ['dashboard-stats'],
-    queryFn: () => fetchWithAuth('/api/dashboard/stats'),
+    queryKey: ['clinic-stats'],
+    queryFn: () => fetchWithAuth('/api/clinic/stats'),
     retry: false,
   });
 

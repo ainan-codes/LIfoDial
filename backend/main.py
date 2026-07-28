@@ -433,6 +433,75 @@ async def recent_call_logs(limit: int = 5, user=Depends(get_current_user)) -> di
 
     return {"items": [_call_record_to_row(r, name_by_tid.get(r.tenant_id)) for r in rows]}
 
+
+@app.get("/api/clinic/stats", tags=["calls"])
+async def clinic_stats(user=Depends(get_current_user)) -> dict:
+    """Today's KPI tiles for the clinic dashboard, computed from real call_records.
+
+    Replaces `/api/dashboard/stats`, which the frontend called but which NEVER
+    EXISTED — and worse, `/api/dashboard` is listed in _FOREIGN_PATHS above and is
+    hard-404'd by block_foreign_requests() as noise from another project. So all
+    four KPI tiles rendered "—" permanently and no error ever surfaced. The path
+    is deliberately `/api/clinic/...` to stay clear of that prefix.
+
+    Tenant-scoped from the verified token, never from the request. Returns real
+    zeros for a clinic with no calls rather than placeholder numbers.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import select
+
+    from backend.db import AsyncSessionLocal
+    from backend.models.appointment import Appointment
+    from backend.models.call_record import CallRecord
+
+    # "Today" in UTC — the same clock created_at is stored in.
+    start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    async with AsyncSessionLocal() as db:
+        calls_stmt = select(CallRecord).where(CallRecord.created_at >= start_of_day)
+        appts_stmt = select(Appointment).where(Appointment.created_at >= start_of_day)
+        if not user.is_superadmin:
+            calls_stmt = calls_stmt.where(CallRecord.tenant_id == user.tenant_id)
+            appts_stmt = appts_stmt.where(Appointment.tenant_id == user.tenant_id)
+
+        todays_calls = (await db.execute(calls_stmt)).scalars().all()
+        todays_appts = (await db.execute(appts_stmt)).scalars().all()
+
+        # A call still in progress right now.
+        live_stmt = select(CallRecord).where(CallRecord.status == "in_progress")
+        if not user.is_superadmin:
+            live_stmt = live_stmt.where(CallRecord.tenant_id == user.tenant_id)
+        live_calls = len((await db.execute(live_stmt)).scalars().all())
+
+    calls_today = len(todays_calls)
+    outcomes = [(c.outcome or "").lower() for c in todays_calls]
+    statuses = [(c.status or "").lower() for c in todays_calls]
+
+    resolved = sum(1 for o in outcomes if o in ("booked", "resolved", "transferred"))
+    missed = sum(
+        1 for s, o in zip(statuses, outcomes)
+        if s in ("failed", "voicemail") or o == "unresolved"
+    )
+
+    durations = [c.duration_seconds for c in todays_calls if c.duration_seconds]
+    avg_duration = _fmt_call_duration(sum(durations) / len(durations)) if durations else "—"
+
+    return {
+        "calls_today": calls_today,
+        "booked_today": sum(
+            1 for a in todays_appts
+            if (a.status or "").lower() in ("confirmed", "booked")
+        ),
+        "avg_duration": avg_duration,
+        # "—" rather than "0%" when there are no calls: 0% reads as a failure,
+        # "no data yet" is the truth.
+        "resolution_rate": f"{round(resolved / calls_today * 100)}%" if calls_today else "—",
+        "missed_calls": missed,
+        "live_calls": live_calls,
+    }
+
+
 @app.post("/admin/reset-db", tags=["superadmin"])
 async def reset_db(_user=Depends(require_superadmin)):
     """

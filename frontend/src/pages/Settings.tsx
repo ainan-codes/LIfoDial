@@ -15,13 +15,12 @@ import {
     XCircle,
     Zap
 } from 'lucide-react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import fetchWithAuth from '../api/client';
 import { getTenantId, isSuperAdmin } from '../api/auth';
 import { useThemeContext } from '../context/ThemeContext';
-import { FIXTURE_TENANT } from '../fixtures/data';
 import AIConfig from './settings/AIConfig';
 import Integrations from './settings/Integrations';
 
@@ -114,35 +113,136 @@ function InputField({
   );
 }
 
-function SaveButton({ onClick, saved }: { onClick: () => void; saved?: boolean }) {
+function SaveButton({ onClick, saved, disabled, label }: {
+  onClick: () => void; saved?: boolean; disabled?: boolean; label?: string;
+}) {
   return (
     <button
       onClick={onClick}
+      disabled={disabled}
       style={{
         marginTop: '24px', padding: '10px 24px', borderRadius: '8px',
         fontSize: '14px', fontWeight: 600, color: '#000',
         backgroundColor: saved ? 'var(--accent-hover)' : 'var(--accent)',
-        border: 'none', cursor: 'pointer', transition: 'background-color 0.15s',
+        border: 'none', cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.6 : 1, transition: 'background-color 0.15s',
       }}
-      onMouseEnter={e => { (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--accent-hover)'; }}
-      onMouseLeave={e => { (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--accent)'; }}
+      onMouseEnter={e => { if (!disabled) (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--accent-hover)'; }}
+      onMouseLeave={e => { if (!disabled) (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--accent)'; }}
     >
-      {saved ? '✓ Saved' : 'Save Changes'}
+      {label ?? (saved ? '✓ Saved' : 'Save Changes')}
     </button>
   );
 }
 
 // ── Tab 1 — Clinic Profile ────────────────────────────────────────────────────
-function ClinicProfileTab() {
-  const [name, setName]     = useState(FIXTURE_TENANT.clinic_name);
-  const [lang, setLang]     = useState('hi-IN');
-  const [from, setFrom]     = useState('09:00');
-  const [to, setTo]         = useState('19:00');
-  const [saved, setSaved]   = useState(false);
+// Reads and WRITES the real tenant row. Previously this tab seeded its fields
+// from FIXTURE_TENANT ("Apollo Demo Clinic") and its Save button only set a local
+// `saved` flag — no API call at all — so it showed "✓ Saved" while discarding
+// every edit. Calling hours are stored on the agent (AgentConfig.clinic_info
+// .working_hours), which is where the voice pipeline actually reads them from.
+interface TenantProfile {
+  id: string;
+  clinic_name: string;
+  language: string;
+  ai_number: string | null;
+  is_active?: boolean;
+}
 
-  const handleSave = () => {
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2500);
+function ClinicProfileTab() {
+  const tenantId = getTenantId();
+  const queryClient = useQueryClient();
+
+  const { data: tenant, isLoading } = useQuery<TenantProfile>({
+    queryKey: ['tenant', tenantId],
+    queryFn: () => fetchWithAuth(`/tenants/${tenantId}`),
+    enabled: !!tenantId,
+    retry: false,
+  });
+
+  // The agent carries working hours; resolved by the clinic admin's own email.
+  const email = localStorage.getItem('lifodial-email') || '';
+  const { data: agent } = useQuery<any>({
+    queryKey: ['my-agent', email],
+    queryFn: () => fetchWithAuth(`/agents/mine?email=${encodeURIComponent(email)}`),
+    enabled: !!email,
+    retry: false,
+  });
+
+  const [name, setName]   = useState('');
+  const [lang, setLang]   = useState('');
+  const [from, setFrom]   = useState('09:00');
+  const [to, setTo]       = useState('19:00');
+  const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
+  const [dirty, setDirty] = useState(false);
+
+  // Seed the form from the server once loaded, but never stomp on edits the user
+  // has already started making.
+  React.useEffect(() => {
+    if (!tenant || dirty) return;
+    setName(tenant.clinic_name ?? '');
+    setLang(tenant.language ?? 'en-IN');
+  }, [tenant, dirty]);
+
+  React.useEffect(() => {
+    if (!agent || dirty) return;
+    // "9:00 AM - 7:00 PM, Mon-Sat" → best-effort 24h values for the time inputs.
+    const hours: string = agent?.clinic_info?.working_hours ?? '';
+    const m = /(\d{1,2}):(\d{2})\s*(AM|PM)?\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i.exec(hours);
+    if (m) {
+      const to24 = (h: string, mm: string, ap?: string) => {
+        let hr = Number(h);
+        if (ap?.toUpperCase() === 'PM' && hr < 12) hr += 12;
+        if (ap?.toUpperCase() === 'AM' && hr === 12) hr = 0;
+        return `${String(hr).padStart(2, '0')}:${mm}`;
+      };
+      setFrom(to24(m[1], m[2], m[3]));
+      setTo(to24(m[4], m[5], m[6]));
+    }
+  }, [agent, dirty]);
+
+  const edit = <T,>(setter: (v: T) => void) => (v: T) => { setter(v); setDirty(true); };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setSaveError('');
+    try {
+      await fetchWithAuth(`/tenants/${tenantId}`, {
+        method: 'PUT',
+        body: JSON.stringify({ clinic_name: name.trim(), language: lang }),
+      });
+
+      // Working hours belong to the agent, not the tenant.
+      if (agent?.id) {
+        const to12 = (t: string) => {
+          const [h, mm] = t.split(':').map(Number);
+          const ap = h >= 12 ? 'PM' : 'AM';
+          const hr = h % 12 === 0 ? 12 : h % 12;
+          return `${hr}:${String(mm).padStart(2, '0')} ${ap}`;
+        };
+        await fetchWithAuth(`/agents/${agent.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            clinic_info: {
+              ...(agent.clinic_info ?? {}),
+              working_hours: `${to12(from)} - ${to12(to)}`,
+            },
+          }),
+        });
+      }
+
+      setDirty(false);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2500);
+      queryClient.invalidateQueries({ queryKey: ['tenant', tenantId] });
+      queryClient.invalidateQueries({ queryKey: ['my-agent', email] });
+    } catch (e) {
+      setSaveError((e as Error).message || 'Could not save changes');
+    } finally {
+      setSaving(false);
+    }
   };
 
   const selectStyle: React.CSSProperties = {
@@ -156,17 +256,32 @@ function ClinicProfileTab() {
     <div className="space-y-5">
       <SectionHeader title="Clinic Profile" description="Basic information about your clinic used by the AI." />
 
-      <InputField label="Clinic Name" value={name} onChange={setName} placeholder="e.g. Apollo Demo Clinic" />
+      <InputField
+        label="Clinic Name"
+        value={isLoading ? 'Loading…' : name}
+        onChange={edit(setName)}
+        placeholder="Your clinic's name"
+        disabled={isLoading}
+      />
 
       <div>
         <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, color: 'var(--text-secondary)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
           Primary Language
         </label>
-        <select value={lang} onChange={e => setLang(e.target.value)} style={selectStyle}>
+        <select value={lang} onChange={e => edit(setLang)(e.target.value)} style={selectStyle} disabled={isLoading}>
+          {/* Matches the languages the voice pipeline actually supports
+              (backend/agent/resilience.py fallback phrases + Sarvam codes) —
+              the old list offered en-US/ar-SA, which Sarvam TTS cannot speak. */}
+          <option value="en-IN">🇮🇳 English</option>
           <option value="hi-IN">🇮🇳 Hindi</option>
-          <option value="en-US">🇬🇧 English (US)</option>
           <option value="ta-IN">🇮🇳 Tamil</option>
-          <option value="ar-SA">🇸🇦 Arabic</option>
+          <option value="te-IN">🇮🇳 Telugu</option>
+          <option value="kn-IN">🇮🇳 Kannada</option>
+          <option value="ml-IN">🇮🇳 Malayalam</option>
+          <option value="mr-IN">🇮🇳 Marathi</option>
+          <option value="bn-IN">🇮🇳 Bengali</option>
+          <option value="gu-IN">🇮🇳 Gujarati</option>
+          <option value="pa-IN">🇮🇳 Punjabi</option>
         </select>
       </div>
 
@@ -176,12 +291,12 @@ function ClinicProfileTab() {
         </label>
         <div className="flex items-center gap-3">
           <input
-            type="time" value={from} onChange={e => setFrom(e.target.value)}
+            type="time" value={from} onChange={e => edit(setFrom)(e.target.value)}
             style={{ ...selectStyle, width: 'auto' }}
           />
           <span style={{ color: 'var(--text-muted)', fontSize: '13px' }}>to</span>
           <input
-            type="time" value={to} onChange={e => setTo(e.target.value)}
+            type="time" value={to} onChange={e => edit(setTo)(e.target.value)}
             style={{ ...selectStyle, width: 'auto' }}
           />
         </div>
@@ -190,17 +305,33 @@ function ClinicProfileTab() {
         </p>
       </div>
 
-      <SaveButton onClick={handleSave} saved={saved} />
+      {saveError && (
+        <p style={{ fontSize: '13px', color: 'var(--destructive)', margin: 0 }}>{saveError}</p>
+      )}
+
+      <SaveButton onClick={handleSave} saved={saved} disabled={saving || isLoading} label={saving ? 'Saving…' : undefined} />
     </div>
   );
 }
 
 // ── Tab 2 — AI Number ─────────────────────────────────────────────────────────
+// Real per-clinic number. This used to render FIXTURE_TENANT.ai_number
+// ("+91 90001 23456") to EVERY clinic with `isActive = true` hardcoded, so no
+// clinic ever saw its own number and one that had none assigned still looked live.
 function AiNumberTab() {
   const [copied, setCopied]   = useState(false);
   const [showModal, setModal] = useState(false);
-  const aiNumber = FIXTURE_TENANT.ai_number;
-  const isActive = true; // fixture: always active
+  const tenantId = getTenantId();
+
+  const { data: tenant } = useQuery<TenantProfile>({
+    queryKey: ['tenant', tenantId],
+    queryFn: () => fetchWithAuth(`/tenants/${tenantId}`),
+    enabled: !!tenantId,
+    retry: false,
+  });
+
+  const aiNumber = tenant?.ai_number ?? '';
+  const isActive = !!tenant?.ai_number && tenant?.is_active !== false;
 
   const handleCopy = () => {
     navigator.clipboard.writeText(aiNumber).catch(() => {});

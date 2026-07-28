@@ -155,8 +155,14 @@ class AgentPatchPayload(BaseModel):
     first_message: str | None = None
     first_message_mode: str | None = None
     system_prompt: str | None = None
-    clinic_info: str | None = None
-    
+    # AgentConfig.clinic_info is a JSON column (working_hours / address /
+    # emergency_number / services / faqs), so accept the object form as well as a
+    # JSON string. It was declared `str | None` only, which meant a caller sending
+    # the natural `{"working_hours": ...}` object got a 422 and clinic_info was in
+    # practice unpatchable.
+    clinic_info: dict | str | None = None
+
+
     stt_provider: str | None = None
     stt_model: str | None = None
     stt_language: str | None = None
@@ -1193,6 +1199,22 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
             if not agent:
                 raise HTTPException(status_code=404, detail="Agent not found")
             user.require_owns(str(agent.tenant_id))
+
+            # Refuse a provider the live pipeline cannot build. Saving one used to
+            # be accepted happily and then failed at CALL time — a hard KeyError
+            # crash for TTS, or a silent substitution for STT/LLM that nobody
+            # noticed. Failing here puts the error in front of whoever is choosing.
+            from backend.services.provider_registry import validate_or_raise
+
+            validate_or_raise("stt", payload.stt_provider)
+            validate_or_raise("tts", payload.tts_provider)
+            if payload.llm_provider is not None:
+                # An unknown LLM id is legitimate IF it's a registered custom
+                # OpenAI-compatible endpoint with a base_url.
+                from backend.agent.resilience import _resolve_custom_provider
+
+                _custom = await _resolve_custom_provider(payload.llm_provider)
+                validate_or_raise("llm", payload.llm_provider, has_base_url=_custom is not None)
 
             # A clinic admin may configure everything about how their agent
             # BEHAVES, but not the platform credentials it runs on. Writing
