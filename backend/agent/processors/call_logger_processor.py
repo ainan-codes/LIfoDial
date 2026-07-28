@@ -389,7 +389,36 @@ class CallLoggerProcessor(FrameProcessor):
         self.bot_speaking = False
         self.last_activity_ts = time.time()
         self._playback_complete.set()
+        # Record what the agent just SAID before the goodbye check consumes and
+        # clears _agent_utterance. Without this the stored transcript is one-sided:
+        # only user turns were ever appended, so a saved conversation read as a list
+        # of questions with no answers — useless for review, and useless to the
+        # post-call evaluator that has to judge how the call went.
+        self._record_agent_turn(" ".join(self._agent_utterance).strip())
         await self._maybe_end_after_agent_goodbye()
+
+    def _record_agent_turn(self, spoken: str) -> None:
+        """Append one agent utterance to the transcript and persist it.
+
+        Strips before the emptiness check: a whitespace-only TTSTextFrame would
+        otherwise inflate turn_count with a phantom turn carrying no words.
+        """
+        spoken = (spoken or "").strip()
+        if not spoken:
+            return
+        self._turn_count += 1
+        self._transcript.append({
+            "turn": self._turn_count,
+            "role": "assistant",
+            "text": spoken,
+            "timestamp": time.time(),
+        })
+        if self._call_record_id:
+            asyncio.create_task(
+                _update_call_record_turns(
+                    self._call_record_id, self._turn_count, list(self._transcript)
+                )
+            )
 
     async def wait_playback_complete(self, timeout: float = 25.0) -> bool:
         """Await the end of the agent's current audio playback.
@@ -459,10 +488,22 @@ class CallLoggerProcessor(FrameProcessor):
             text[:80] + ("..." if len(text) > 80 else ""),
         )
 
-        # Persist turn count incrementally so partial data survives crashes
+        # Persist the turn count AND the transcript-so-far, so partial data really
+        # does survive a crash. This used to save only the count, which is why
+        # production had 95/95 call_records with transcript=[] while showing
+        # turn_count=12 — the incremental write landed, the words never did,
+        # because the only transcript write was at finalize and 88% of calls never
+        # reached it. Losing the whole conversation also silently disabled
+        # post-call analysis: call_evaluator bails out with "no transcript", which
+        # is why summary/sentiment/intent/detected_language were 100% NULL too.
+        #
+        # A shallow copy is passed because the list keeps mutating while the
+        # background task runs.
         if self._call_record_id:
             asyncio.create_task(
-                _update_call_record_turns(self._call_record_id, self._turn_count)
+                _update_call_record_turns(
+                    self._call_record_id, self._turn_count, list(self._transcript)
+                )
             )
 
         text_lower = text.lower().strip()
@@ -622,12 +663,25 @@ class UserTranscriptTap(FrameProcessor):
 # ── Background DB helpers ──────────────────────────────────────────────────────
 # All functions below run as asyncio.create_task() — they never block the voice call.
 
-async def _update_call_record_turns(call_record_id: str, turn_count: int) -> None:
-    """Incrementally update turn count on the CallRecord row."""
+async def _update_call_record_turns(
+    call_record_id: str,
+    turn_count: int,
+    transcript: Optional[list[dict]] = None,
+) -> None:
+    """Incrementally persist turn count AND the transcript captured so far.
+
+    The transcript is written on every turn, not just at finalize, so a job that
+    dies mid-call still leaves the conversation behind. Before this, the only
+    transcript write was in _finalize_call_record — and since ~88% of production
+    calls never finalized, the stored transcript was an empty list for every
+    single call ever made, which in turn starved the post-call evaluator
+    (summary / sentiment / intent / language were all NULL as a result).
+    """
     try:
+        from sqlalchemy import select
+
         from backend.db import AsyncSessionLocal
         from backend.models.call_record import CallRecord
-        from sqlalchemy import select
 
         async with AsyncSessionLocal() as db:
             result = await db.execute(
@@ -636,6 +690,12 @@ async def _update_call_record_turns(call_record_id: str, turn_count: int) -> Non
             record = result.scalar_one_or_none()
             if record:
                 record.turn_count = turn_count
+                if transcript is not None:
+                    # Never overwrite a longer stored transcript with a shorter one:
+                    # these updates run as detached tasks and can land out of order.
+                    existing = record.transcript if isinstance(record.transcript, list) else []
+                    if len(transcript) >= len(existing):
+                        record.transcript = transcript
                 await db.commit()
     except Exception as exc:
         logger.debug("_update_call_record_turns error (non-critical): %s", exc)
