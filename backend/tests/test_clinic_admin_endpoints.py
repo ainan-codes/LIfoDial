@@ -111,6 +111,59 @@ async def test_clinic_stats_endpoint_exists_and_returns_all_kpi_keys(app_client)
 
 
 @pytest.mark.asyncio
+async def test_live_calls_ignores_stranded_records(app_client):
+    """A job that dies never writes a terminal status, so its row stays
+    'in_progress' forever. Production had 68 such rows going back weeks and the
+    dashboard reported "68 live calls" for an idle clinic."""
+    from datetime import datetime, timedelta, timezone
+
+    from backend.models.call_record import CallRecord
+
+    tenant_id, agent_id = await _make_clinic(email="live@clinic.com")
+    now = datetime.now(timezone.utc)
+
+    async with db_module.AsyncSessionLocal() as s:
+        s.add_all([
+            # Stranded weeks ago — must NOT count.
+            CallRecord(tenant_id=tenant_id, agent_id=agent_id, status="in_progress",
+                       created_at=now - timedelta(days=14)),
+            CallRecord(tenant_id=tenant_id, agent_id=agent_id, status="active",
+                       created_at=now - timedelta(hours=5)),
+            # Genuinely in flight right now — must count.
+            CallRecord(tenant_id=tenant_id, agent_id=agent_id, status="in_progress",
+                       created_at=now - timedelta(seconds=20)),
+        ])
+        await s.commit()
+
+    r = await app_client.get("/api/clinic/stats", headers=_clinic_token(tenant_id))
+    assert r.status_code == 200, r.text
+    assert r.json()["live_calls"] == 1, "stranded records must not be reported as live"
+
+
+@pytest.mark.asyncio
+async def test_stats_are_tenant_scoped(app_client):
+    """One clinic's calls must never appear in another clinic's KPIs."""
+    from datetime import datetime, timezone
+
+    from backend.models.call_record import CallRecord
+
+    mine, mine_agent = await _make_clinic("Mine", "s-mine@c.com")
+    theirs, theirs_agent = await _make_clinic("Theirs", "s-theirs@c.com")
+
+    async with db_module.AsyncSessionLocal() as s:
+        s.add(CallRecord(tenant_id=theirs, agent_id=theirs_agent, status="completed",
+                         outcome="booked", duration_seconds=60,
+                         created_at=datetime.now(timezone.utc)))
+        await s.commit()
+
+    r = await app_client.get("/api/clinic/stats", headers=_clinic_token(mine))
+    assert r.json()["calls_today"] == 0, "leaked another clinic's calls"
+
+    r = await app_client.get("/api/clinic/stats", headers=_clinic_token(theirs))
+    assert r.json()["calls_today"] == 1
+
+
+@pytest.mark.asyncio
 async def test_old_dashboard_path_is_still_blocked(app_client):
     """Documents WHY the new path is /api/clinic/... and not /api/dashboard/..."""
     tenant_id, _ = await _make_clinic()

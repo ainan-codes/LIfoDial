@@ -55,6 +55,75 @@ def _configure_pipecat_logging() -> None:
         print(f"warning: could not configure pipecat log level: {exc}", file=sys.stderr)
 
 
+def _worker_tuning() -> dict:
+    """Worker concurrency/isolation settings, and why they are what they are.
+
+    These three defaults exist because this worker runs on Render's FREE plan
+    (0.1 CPU, see render.yaml). They are NOT arbitrary, and two of them are
+    actively dangerous to "improve" without also upgrading the plan:
+
+    job_executor_type = THREAD
+        Runs each job as a thread in the worker process instead of livekit-agents'
+        default process isolation. A thread shares the GIL with the worker's own
+        event loop, which IS a contributor to the audio gaps this worker logs
+        (`Event loop stalled …ms` from _monitor_event_loop_lag in pipeline.py —
+        stalls above ~1000ms drain LiveKit's audio queue and the caller hears
+        silence; stalls of 4s+ have been observed on this plan). PROCESS isolation
+        removes that contention and is the better setting on a real CPU, but
+        spawning a Python process that imports pipecat + onnxruntime on 0.1 CPU
+        risks exceeding initialize_process_timeout and failing the job outright.
+        So: THREAD while on the free plan, PROCESS after upgrading.
+
+    load_threshold = inf
+        Accept every dispatch regardless of reported load. This looks reckless but
+        is deliberate: on 0.1 CPU the load metric sits permanently near saturation,
+        so ANY finite threshold makes the worker refuse every job and the product
+        goes completely dark. Set a real value (e.g. 0.75) only once the plan has
+        headroom for the metric to mean something.
+
+    num_idle_processes = 0
+        No pre-warmed processes — they would each hold memory this plan doesn't
+        have. Costs a little cold-start latency on the first call.
+
+    All three are env-overridable so they can be tuned on the paid plan without a
+    code change:
+        AGENT_JOB_EXECUTOR=process|thread
+        AGENT_LOAD_THRESHOLD=0.75
+        AGENT_IDLE_PROCESSES=1
+    """
+    executor = (os.environ.get("AGENT_JOB_EXECUTOR") or "thread").strip().lower()
+    job_executor_type = (
+        JobExecutorType.PROCESS if executor == "process" else JobExecutorType.THREAD
+    )
+
+    raw_threshold = (os.environ.get("AGENT_LOAD_THRESHOLD") or "").strip()
+    try:
+        load_threshold = float(raw_threshold) if raw_threshold else float("inf")
+    except ValueError:
+        print(
+            f"warning: AGENT_LOAD_THRESHOLD={raw_threshold!r} is not a number — "
+            "falling back to unlimited (accept every dispatch).",
+            file=sys.stderr,
+        )
+        load_threshold = float("inf")
+
+    try:
+        idle = int(os.environ.get("AGENT_IDLE_PROCESSES") or 0)
+    except ValueError:
+        idle = 0
+
+    print(
+        f"[worker] executor={job_executor_type.name} "
+        f"load_threshold={load_threshold} idle_processes={idle}",
+        file=sys.stderr,
+    )
+    return {
+        "job_executor_type": job_executor_type,
+        "load_threshold": load_threshold,
+        "num_idle_processes": idle,
+    }
+
+
 if __name__ == "__main__":
     _configure_pipecat_logging()
     _preflight_or_die()
@@ -69,9 +138,7 @@ if __name__ == "__main__":
             api_secret=settings.livekit_api_secret or None,
             host="0.0.0.0",
             port=port,
-            job_executor_type=JobExecutorType.THREAD,
             initialize_process_timeout=60.0,
-            num_idle_processes=0,
-            load_threshold=float("inf"),
+            **_worker_tuning(),
         )
     )

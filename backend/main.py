@@ -468,8 +468,19 @@ async def clinic_stats(user=Depends(get_current_user)) -> dict:
         todays_calls = (await db.execute(calls_stmt)).scalars().all()
         todays_appts = (await db.execute(appts_stmt)).scalars().all()
 
-        # A call still in progress right now.
-        live_stmt = select(CallRecord).where(CallRecord.status == "in_progress")
+        # A call still in progress RIGHT NOW.
+        #
+        # Must be bounded by recency. A worker whose job dies (crash, OOM, deploy
+        # mid-call) never writes a terminal status, so its row stays "in_progress"
+        # forever — production had 68 such rows going back weeks, which made a naive
+        # count report "68 live calls" on a dashboard for a clinic that was idle.
+        # No real call can outlive max_duration_seconds (default 300s), so anything
+        # older than this window is a dead record, not a live call.
+        live_cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+        live_stmt = select(CallRecord).where(
+            CallRecord.status.in_(("in_progress", "active")),
+            CallRecord.created_at >= live_cutoff,
+        )
         if not user.is_superadmin:
             live_stmt = live_stmt.where(CallRecord.tenant_id == user.tenant_id)
         live_calls = len((await db.execute(live_stmt)).scalars().all())
