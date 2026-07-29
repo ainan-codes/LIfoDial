@@ -1,13 +1,9 @@
 import {
-    Activity,
     BookOpen,
     Building2,
     CalendarCheck,
     ChevronLeft,
-    ClipboardList,
-    CreditCard,
     Headphones,
-    IndianRupee,
     Key,
     LayoutDashboard,
     LogOut,
@@ -27,16 +23,11 @@ const SA_NAV = [
   { path: '/superadmin/agents',       label: 'Agents',           icon: Headphones,      section: 'ORG SETTINGS' },
   { path: '/superadmin/clinics',      label: 'All Clinics',      icon: Building2,       section: 'ORG SETTINGS' },
   { path: '/superadmin/calls',        label: 'All Calls',        icon: Phone,           section: 'ORG SETTINGS' },
-  { path: '/superadmin/phone-numbers',label: 'Phone Numbers',    icon: Phone,           section: 'ORG SETTINGS' },
-  { path: '/superadmin/billing',      label: 'Billing',          icon: CreditCard,      section: 'ORG SETTINGS' },
-  { path: '/superadmin/credits',      label: 'Credits',          icon: IndianRupee,     section: 'ORG SETTINGS' },
   // ─── COMMUNITY ───
   { path: '/superadmin/voice-library',label: 'Voice Library',    icon: Music,           section: 'COMMUNITY' },
   { path: '/superadmin/appointments', label: 'All Appointments', icon: CalendarCheck,   section: 'COMMUNITY' },
-  { path: '/superadmin/requests',     label: 'Onboarding Reqs',  icon: ClipboardList,   section: 'COMMUNITY' },
   { path: '/superadmin/knowledge',    label: 'Knowledge Base',   icon: BookOpen,        section: 'COMMUNITY' },
   // ─── ACCOUNT ───
-  { path: '/superadmin/system',       label: 'System Health',    icon: Activity,        section: 'ACCOUNT' },
   { path: '/superadmin/ai-platform',  label: 'Platform',         icon: Key,             section: 'ACCOUNT' },
 ];
 

@@ -1,23 +1,35 @@
 """
-backend/services/credit_service.py — Credit balance management.
+backend/services/credit_service.py — Credit balance read-out.
 
-Handles:
-  • Balance checks before call start
-  • Per-minute deduction after call ends
-  • Top-up / adjustment by super admin
-  • Transaction logging (immutable ledger)
+CREDIT ENFORCEMENT IS OFF FOR THIS MVP PHASE.
+
+No call is gated, refused, throttled, or ended because of a clinic's credit
+balance — for any clinic, regardless of a zero, negative, or suspended balance.
+Concretely:
+  • check_call_allowed() / has_sufficient_balance() always allow. They are kept
+    (rather than deleted) so that any caller — now or added later — cannot
+    reintroduce a gate by accident; there is no code path that returns "denied".
+  • deduct_call_credits() no longer exists. Calls do not write to the ledger, so
+    nothing can drive a balance negative or auto-suspend a clinic.
+  • The `clinic_credits` / `credit_transactions` tables are untouched and still
+    readable (the clinic dashboard's balance card reads them), just never
+    enforced or debited.
+
+To re-enable billing later, restore the balance comparison in
+check_call_allowed() and the post-call deduction in
+backend/agent/processors/call_logger_processor.py — those are the only two
+places that ever enforced credits.
 """
 import logging
-import math
-from datetime import datetime, timezone
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.clinic_credits import ClinicCredits, CreditTransaction
 
 logger = logging.getLogger(__name__)
 
-# Default rate: ₹1.50 per minute of voice call
+# Default rate: ₹1.50 per minute of voice call. Informational only while
+# enforcement is off — shown in the dashboard, never charged.
 DEFAULT_RATE_PER_MINUTE = 1.50
 
 
@@ -53,10 +65,12 @@ class CreditService:
         tenant_id: str,
         min_minutes: float = 1.0,
     ) -> bool:
-        """Check if clinic has enough credits for at least `min_minutes`."""
-        credits = await CreditService.get_or_create_balance(db, tenant_id)
-        required = credits.rate_per_minute * min_minutes
-        return credits.balance >= required
+        """Always True — credit enforcement is off (see module docstring).
+
+        Deliberately does not read the balance: there must be no balance-derived
+        way for this to return False.
+        """
+        return True
 
     @staticmethod
     async def check_call_allowed(
@@ -64,123 +78,24 @@ class CreditService:
         tenant_id: str,
         max_duration_seconds: int = 300,
     ) -> dict:
-        """Pre-call credit gate (audit P4).
+        """Always allows the call — credit enforcement is off for this MVP phase.
 
-        A real call may start ONLY when the clinic's prepaid balance covers the
-        *worst-case* cost of a full-length call (rate × ceil(max_duration/60)).
-        Gating on the worst case — not just one minute — is what guarantees a
-        call can never drive the balance negative: billing is post-call and
-        atomic, so a 1-minute gate would still let a 5-minute call overdraw.
+        Every clinic is allowed regardless of balance (zero, negative, or
+        suspended). No DB read happens here at all, so there is no value in
+        `clinic_credits` — including is_active=False — that can block a call, and
+        a DB hiccup can't turn into a refused call either.
 
-        Also honours the ClinicCredits.is_active suspension flag.
-
-        Returns a dict (never raises) so callers can log the exact reason:
+        Kept as an always-allow stub rather than deleted so an existing or future
+        caller can't silently resurrect a gate. Shape is unchanged for callers:
           {allowed, reason, balance, required, rate_per_minute, is_active}
-        reason ∈ {"ok", "insufficient_balance", "credit_suspended"}.
         """
-        credits = await CreditService.get_or_create_balance(db, tenant_id)
-        minutes = math.ceil(max_duration_seconds / 60) if max_duration_seconds > 0 else 1
-        required = round(credits.rate_per_minute * minutes, 2)
-        base = {
-            "balance": round(credits.balance, 2),
-            "required": required,
-            "rate_per_minute": credits.rate_per_minute,
-            "is_active": credits.is_active,
-        }
-        if not credits.is_active:
-            return {"allowed": False, "reason": "credit_suspended", **base}
-        if credits.balance < required:
-            return {"allowed": False, "reason": "insufficient_balance", **base}
-        return {"allowed": True, "reason": "ok", **base}
-
-    @staticmethod
-    async def deduct_call_credits(
-        db: AsyncSession,
-        tenant_id: str,
-        duration_seconds: int,
-        call_id: str | None = None,
-    ) -> dict:
-        """
-        Deduct credits after a call ends.
-        Rounds UP to nearest second, then bills per minute.
-        Returns dict with deduction details.
-        """
-        credits = await CreditService.get_or_create_balance(db, tenant_id)
-        rate = credits.rate_per_minute
-
-        # Calculate cost: ceil to nearest minute for billing
-        minutes = math.ceil(duration_seconds / 60) if duration_seconds > 0 else 0
-        cost = round(rate * minutes, 2)
-
-        if cost <= 0:
-            return {
-                "deducted": 0,
-                "balance_after": credits.balance,
-                "duration_seconds": duration_seconds,
-                "minutes_billed": 0,
-            }
-
-        # Atomic decrement — avoids the read-modify-write lost-update race under
-        # concurrent calls. The single UPDATE is evaluated by the DB, not Python.
-        await db.execute(
-            update(ClinicCredits)
-            .where(ClinicCredits.tenant_id == tenant_id)
-            .values(
-                balance=ClinicCredits.balance - cost,
-                total_deducted=ClinicCredits.total_deducted + cost,
-            )
-        )
-        # Re-read the authoritative post-update balance for the ledger entry.
-        refreshed = await db.execute(
-            select(ClinicCredits.balance).where(ClinicCredits.tenant_id == tenant_id)
-        )
-        balance_after = round(refreshed.scalar_one(), 2)
-
-        # Defence-in-depth behind the pre-call gate (check_call_allowed): the
-        # gate should make this impossible, but if a deduction ever drives the
-        # balance negative we record the real usage HONESTLY (never silently
-        # clamp to 0 — that would hide that it happened, audit P4) and suspend
-        # the clinic so the overdraw is visible and no further calls run until
-        # a top-up. Ledger amount/balance_after stay truthful.
-        overdrawn = balance_after < 0
-        description = f"Call {minutes}m ({duration_seconds}s) @ ₹{rate:.2f}/min"
-        if overdrawn:
-            description += " — OVERDRAWN, clinic auto-suspended (insufficient credit)"
-            await db.execute(
-                update(ClinicCredits)
-                .where(ClinicCredits.tenant_id == tenant_id)
-                .values(is_active=False)
-            )
-
-        txn = CreditTransaction(
-            tenant_id=tenant_id,
-            transaction_type="call_deduction",
-            amount=-cost,
-            balance_after=balance_after,
-            description=description,
-            call_id=call_id,
-            performed_by="system",
-        )
-        db.add(txn)
-        await db.commit()
-
-        if overdrawn:
-            logger.warning(
-                "Credit OVERDRAWN: tenant=%s cost=₹%.2f balance=₹%.2f call=%s — clinic suspended",
-                tenant_id, cost, balance_after, call_id,
-            )
-        else:
-            logger.info(
-                "Credit deduction: tenant=%s cost=₹%.2f balance=₹%.2f call=%s",
-                tenant_id, cost, balance_after, call_id,
-            )
-
         return {
-            "deducted": cost,
-            "balance_after": balance_after,
-            "duration_seconds": duration_seconds,
-            "minutes_billed": minutes,
-            "rate_per_minute": rate,
+            "allowed": True,
+            "reason": "credit_enforcement_disabled",
+            "balance": 0.0,
+            "required": 0.0,
+            "rate_per_minute": 0.0,
+            "is_active": True,
         }
 
     @staticmethod

@@ -177,26 +177,9 @@ async def create_web_call_token(
     )
     tenant = tenant_result.scalar_one_or_none()
 
-    # ── Pre-call credit gate (audit P4) ─────────────────────────────────────
-    # Reject up front with a clear error so the browser shows "insufficient
-    # credit" immediately, instead of issuing a token for a call the worker
-    # will then silently decline (the pipeline enforces the same gate as the
-    # authoritative choke point). test_mode bypasses it, same as the pipeline.
-    if not test_mode:
-        from backend.services.credit_service import CreditService
-
-        max_dur = int(getattr(agent, "max_duration_seconds", None) or 300)
-        gate = await CreditService.check_call_allowed(db, str(agent.tenant_id), max_dur)
-        if not gate["allowed"]:
-            detail = (
-                "Clinic account suspended (insufficient credit) — top up to resume calls."
-                if gate["reason"] == "credit_suspended"
-                else (
-                    f"Insufficient credit to start a call. Balance ₹{gate['balance']:.2f}, "
-                    f"need ₹{gate['required']:.2f} to cover a full-length call."
-                )
-            )
-            raise HTTPException(status_code=402, detail=detail)
+    # No credit gate here. Credits are not enforced in this MVP phase — a call is
+    # never refused for balance/suspension reasons, for any clinic. See
+    # backend/services/credit_service.py for the single place that decision lives.
 
     # Create unique room name for this call
     prefix = "testcall" if test_mode else "webcall"

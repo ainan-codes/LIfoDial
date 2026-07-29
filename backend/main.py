@@ -628,7 +628,7 @@ async def sync_tenants_from_agents(_user=Depends(require_superadmin)):
     }
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-from backend.routers import admin, tenants, doctors, voice, appointments, ws, voice_upload, agents, agent_test, platform, knowledge_base, voices, web_calls, phone_numbers, embed, models, simulation, latency, providers, bulk_calls, credits
+from backend.routers import admin, tenants, doctors, voice, appointments, ws, voice_upload, agents, agent_test, platform, knowledge_base, voices, web_calls, embed, models, simulation, latency, providers, bulk_calls, credits
 
 app.include_router(admin.router,          prefix="/admin",    tags=["superadmin"])
 app.include_router(voice.router,          prefix="/voice",    tags=["voice"])
@@ -643,7 +643,6 @@ app.include_router(agent_test.router,     prefix="",          tags=["agent-test"
 app.include_router(platform.router,       prefix="",          tags=["platform"])
 app.include_router(knowledge_base.router, prefix="",          tags=["knowledge-base"])
 app.include_router(web_calls.router,      prefix="",          tags=["web-calls"])
-app.include_router(phone_numbers.router,  prefix="",          tags=["phone-numbers"])
 app.include_router(embed.router,          prefix="",          tags=["embed"])
 app.include_router(models.router,         prefix="",          tags=["models"])
 app.include_router(simulation.router,     prefix="",          tags=["simulation"])

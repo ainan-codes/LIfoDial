@@ -31,18 +31,13 @@ const AgentDetail = lazy(() => import('./pages/superadmin/AgentDetail'));
 const SAAgents = lazy(() => import('./pages/superadmin/Agents'));
 const AIPlatform = lazy(() => import('./pages/superadmin/AIPlatform'));
 const SAAppointments = lazy(() => import('./pages/superadmin/Appointments'));
-const SABilling = lazy(() => import('./pages/superadmin/Billing'));
 const SACalls = lazy(() => import('./pages/superadmin/Calls'));
 const SAClinics = lazy(() => import('./pages/superadmin/Clinics'));
 const CreateAgent = lazy(() => import('./pages/superadmin/CreateAgent'));
 const SADashboard = lazy(() => import('./pages/superadmin/Dashboard'));
 const KnowledgeBase = lazy(() => import('./pages/superadmin/KnowledgeBase'));
-const SAOnboardingReqs = lazy(() => import('./pages/superadmin/OnboardingReqs'));
-const PhoneNumbers = lazy(() => import('./pages/superadmin/PhoneNumbers'));
 const SuperAdminLogin = lazy(() => import('./pages/superadmin/SuperAdminLogin'));
-const SASystemHealth = lazy(() => import('./pages/superadmin/SystemHealth'));
 const VoiceLibrary = lazy(() => import('./pages/superadmin/VoiceLibrary'));
-const SACredits = lazy(() => import('./pages/superadmin/Credits'));
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: false } },
@@ -164,13 +159,8 @@ function App() {
                 <Route path="/superadmin/calls" element={<SACalls />} />
                 <Route path="/superadmin/appointments" element={<SAAppointments />} />
                 <Route path="/superadmin/knowledge" element={<KnowledgeBase />} />
-                <Route path="/superadmin/system" element={<SASystemHealth />} />
                 <Route path="/superadmin/ai-platform" element={<AIPlatform />} />
-                <Route path="/superadmin/requests" element={<SAOnboardingReqs />} />
-                <Route path="/superadmin/billing" element={<SABilling />} />
                 <Route path="/superadmin/voice-library" element={<VoiceLibrary />} />
-                <Route path="/superadmin/phone-numbers" element={<PhoneNumbers />} />
-                <Route path="/superadmin/credits" element={<SACredits />} />
               </Route>
             </Route>
 

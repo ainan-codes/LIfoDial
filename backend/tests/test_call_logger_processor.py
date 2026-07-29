@@ -80,7 +80,6 @@ async def test_finalize_completes_without_consent_gate():
         return None
 
     with patch.object(clp_mod, "_finalize_call_record", fake_finalize_record), \
-         patch.object(clp_mod, "_deduct_call_credits", _noop), \
          patch.object(clp_mod, "_run_post_call_evaluation", _noop):
         await proc._finalize_call()
         # _finalize_call fires the record write via create_task — let it run.
@@ -113,7 +112,6 @@ async def test_finalize_completes_with_consent_gate():
         return None
 
     with patch.object(clp_mod, "_finalize_call_record", fake_finalize_record), \
-         patch.object(clp_mod, "_deduct_call_credits", _noop), \
          patch.object(clp_mod, "_run_post_call_evaluation", _noop):
         await proc._finalize_call()
         await asyncio.sleep(0.05)
@@ -143,7 +141,6 @@ async def test_finalize_runs_on_cancelframe_hangup():
         return None
 
     with patch.object(clp_mod, "_finalize_call_record", fake_finalize_record), \
-         patch.object(clp_mod, "_deduct_call_credits", _noop), \
          patch.object(clp_mod, "_run_post_call_evaluation", _noop), \
          patch.object(proc, "push_frame", new=_noop):
         await proc.process_frame(CancelFrame(), FrameDirection.DOWNSTREAM)
@@ -171,7 +168,6 @@ async def test_finalize_runs_only_once():
         return None
 
     with patch.object(clp_mod, "_finalize_call_record", fake_finalize_record), \
-         patch.object(clp_mod, "_deduct_call_credits", _noop), \
          patch.object(clp_mod, "_run_post_call_evaluation", _noop), \
          patch.object(proc, "push_frame", new=_noop):
         await proc.process_frame(CancelFrame(), FrameDirection.DOWNSTREAM)

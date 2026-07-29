@@ -1,22 +1,20 @@
 """
-backend/routers/credits.py — Credit management + debug STT endpoints.
+backend/routers/credits.py — Credit balance read-out + debug STT/TTS endpoints.
 
-Super admin endpoints:
-  • GET  /credits           — all clinic balances
-  • POST /credits/topup     — add credits to a clinic
-  • POST /credits/set-rate  — change per-minute rate
-  • GET  /credits/{tid}/transactions — transaction history
+Credits are NOT enforced anywhere in this MVP phase: no call is ever gated,
+refused, or ended because of a balance (see backend/services/credit_service.py).
+The ledger tables remain in place, so this read-only endpoint stays for the
+clinic dashboard's balance card.
 
 Clinic admin endpoints:
   • GET  /credits/my-balance?tenant_id=xxx — own balance + recent txns
 
 Debug endpoints:
   • POST /debug/test-stt    — test Sarvam STT connectivity
+  • POST /debug/test-tts    — test Sarvam TTS connectivity
 """
 import logging
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from sqlalchemy import select
 
 from backend.auth import CurrentUser, SuperAdmin
 from backend.db import async_session
@@ -25,92 +23,6 @@ from backend.services.credit_service import CreditService
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-
-# ── Schemas ───────────────────────────────────────────────────────────────────
-
-class TopUpPayload(BaseModel):
-    tenant_id: str
-    amount: float
-    description: str = "Admin top-up"
-
-
-class SetRatePayload(BaseModel):
-    tenant_id: str
-    rate_per_minute: float
-
-
-# ── Super Admin: All Balances ─────────────────────────────────────────────────
-
-@router.get("/credits")
-async def list_all_credits(user: SuperAdmin = None) -> dict:
-    """Get all clinic credit balances (super admin)."""
-    try:
-        async with async_session() as db:
-            balances = await CreditService.get_all_balances(db)
-            return {"credits": balances, "total": len(balances)}
-    except Exception as e:
-        logger.exception("Error listing credits: %s", e)
-        raise HTTPException(500, str(e))
-
-
-# ── Super Admin: Top Up ──────────────────────────────────────────────────────
-
-@router.post("/credits/topup")
-async def topup_credits(payload: TopUpPayload, user: SuperAdmin = None) -> dict:
-    """Add credits to a clinic's balance."""
-    try:
-        async with async_session() as db:
-            result = await CreditService.add_credits(
-                db,
-                tenant_id=payload.tenant_id,
-                amount=payload.amount,
-                description=payload.description,
-                performed_by="super_admin",
-            )
-            await db.commit()
-            return result
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        logger.exception("Error topping up credits: %s", e)
-        raise HTTPException(500, str(e))
-
-
-# ── Super Admin: Set Rate ────────────────────────────────────────────────────
-
-@router.post("/credits/set-rate")
-async def set_credit_rate(payload: SetRatePayload, user: SuperAdmin = None) -> dict:
-    """Update per-minute billing rate for a clinic."""
-    try:
-        async with async_session() as db:
-            result = await CreditService.set_rate(
-                db,
-                tenant_id=payload.tenant_id,
-                rate_per_minute=payload.rate_per_minute,
-            )
-            await db.commit()
-            return result
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        logger.exception("Error setting rate: %s", e)
-        raise HTTPException(500, str(e))
-
-
-# ── Super Admin: Transaction History ─────────────────────────────────────────
-
-@router.get("/credits/{tenant_id}/transactions")
-async def get_transactions(tenant_id: str, limit: int = 50, user: CurrentUser = None) -> dict:
-    """Get transaction history for a specific clinic."""
-    user.require_owns(tenant_id)
-    try:
-        async with async_session() as db:
-            txns = await CreditService.get_transactions(db, tenant_id, limit)
-            return {"transactions": txns, "total": len(txns)}
-    except Exception as e:
-        logger.exception("Error fetching transactions: %s", e)
-        raise HTTPException(500, str(e))
 
 
 # ── Clinic Admin: My Balance ─────────────────────────────────────────────────
@@ -137,36 +49,6 @@ async def my_balance(tenant_id: str, user: CurrentUser = None) -> dict:
             }
     except Exception as e:
         logger.exception("Error fetching my balance: %s", e)
-        raise HTTPException(500, str(e))
-
-
-# ── Super Admin: Initialize Credits for All Clinics ──────────────────────────
-
-@router.post("/credits/init-all")
-async def init_all_credits(user: SuperAdmin = None) -> dict:
-    """Create credit records for all clinics that don't have one."""
-    try:
-        from backend.models.tenant import Tenant
-
-        async with async_session() as db:
-            result = await db.execute(select(Tenant))
-            tenants = result.scalars().all()
-
-            created = 0
-            for tenant in tenants:
-                credits = await CreditService.get_or_create_balance(
-                    db, str(tenant.id)
-                )
-                if credits.balance == 0.0 and credits.total_added == 0.0:
-                    created += 1
-
-            await db.commit()
-            return {
-                "total_clinics": len(tenants),
-                "records_created": created,
-            }
-    except Exception as e:
-        logger.exception("Error initializing credits: %s", e)
         raise HTTPException(500, str(e))
 
 

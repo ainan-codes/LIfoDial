@@ -757,8 +757,8 @@ function NotificationsTab() {
 // FastAPI :8001 / PostgreSQL :5432 / Redis :6379 / LiveKit :7880 all hardcoded to
 // "Offline", and a footer telling the reader to run `make dev`. That is developer
 // infrastructure detail, it was permanently wrong (the hardcoded flags never
-// reflected reality), and it made a healthy clinic look broken. Superadmins keep
-// the detailed view via the dedicated /superadmin/system page.
+// reflected reality), and it made a healthy clinic look broken. (The superadmin
+// System Health page that used to carry the detailed view was removed too.)
 function ClinicStatusTab() {
   const tenantId = getTenantId();
 

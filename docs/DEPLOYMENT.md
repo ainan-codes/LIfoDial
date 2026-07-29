@@ -175,5 +175,4 @@ the same). Then the keep-warm ping for the worker becomes unnecessary.
 | `POST /agents/{id}/web-call-token` | Get LiveKit token for browser call |
 | `POST /agents/{id}/outbound-call` | Initiate SIP outbound call |
 | `GET /agents/{id}/call-records` | Call history for agent |
-| `GET /phone-numbers` | List virtual numbers |
 | `WS /ws/calls/{tenant_id}` | Realtime call events |

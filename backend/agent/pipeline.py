@@ -874,26 +874,10 @@ async def entrypoint(ctx) -> None:
         if test_mode:
             log.info("TEST MODE call — publish gate bypassed for agent_id=%s", agent_id)
 
-        # ── Pre-call credit gate (audit P4) ─────────────────────────────────
-        # A real (non-test) call must not start unless the clinic's prepaid balance
-        # covers the worst-case cost of a full-length call. Declining here — before
-        # _create_call_record() / ctx.connect() — guarantees a call can never drive
-        # the balance negative (the bug that left a clinic at ₹-1.50: deduction ran
-        # post-call with no floor and nothing checked the balance up front). Same
-        # decline-before-connect shape as the publish gate above; test_mode bypasses
-        # it just like the publish gate.
-        if tenant_id and not test_mode:
-            from backend.services.credit_service import CreditService
-
-            max_dur = int(agent_config.get("max_duration_seconds") or 300)
-            gate = await CreditService.check_call_allowed(setup_db, tenant_id, max_dur)
-            if not gate["allowed"]:
-                log.warning(
-                    "Declining call: tenant=%s failed credit gate (reason=%s balance=₹%.2f "
-                    "required=₹%.2f) — not joining room %s",
-                    tenant_id, gate["reason"], gate["balance"], gate["required"], room_name,
-                )
-                return
+        # No credit gate here. Credits are not enforced in this MVP phase — a call
+        # is never declined for balance/suspension reasons, for any clinic. The
+        # publish gate above is the only reason this worker declines a room. See
+        # backend/services/credit_service.py.
 
         # ── Create call record ──────────────────────────────────────────────
         # The row is only READ at finalisation (CallLoggerProcessor writes
@@ -923,8 +907,8 @@ async def entrypoint(ctx) -> None:
         # Deliberately LAST inside this session: resolve_provider_key swallows its
         # own DB errors and falls back to the env key, so a failure here leaves the
         # transaction needing a rollback without ever telling us. Nothing else uses
-        # the session afterwards, so that can't poison the CallRecord insert or the
-        # credit gate the way it would if these ran first.
+        # the session afterwards, so that can't poison anything that reads it
+        # earlier in setup the way it would if these ran first.
         _stt_provider_cfg = agent_config.get("stt_provider", "sarvam") or "sarvam"
         _tts_provider_cfg = agent_config.get("tts_provider", "sarvam") or "sarvam"
         _stt_keys, _tts_keys = await _resolve_provider_keys(

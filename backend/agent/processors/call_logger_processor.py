@@ -606,13 +606,9 @@ class CallLoggerProcessor(FrameProcessor):
             transcript=self._transcript,
         )
 
-        # Credit deduction — AWAITED (billing correctness).
-        if self._tenant_id:
-            await _deduct_call_credits(
-                tenant_id=self._tenant_id,
-                duration_seconds=duration_seconds,
-                call_record_id=self._call_record_id,
-            )
+        # No credit deduction. Credits are not enforced in this MVP phase, so no
+        # call writes to the credit ledger and nothing can drive a balance
+        # negative or auto-suspend a clinic. See backend/services/credit_service.py.
 
         # Post-call Gemini evaluation — slow + external, keep in the background
         # (gated on the Analysis tab toggles). May not finish on abrupt teardown;
@@ -738,36 +734,6 @@ async def _finalize_call_record(
 
     except Exception as exc:
         logger.error("_finalize_call_record error: %s", exc, exc_info=True)
-
-
-async def _deduct_call_credits(
-    tenant_id: str,
-    duration_seconds: int,
-    call_record_id: Optional[str],
-) -> None:
-    """Deduct per-minute credits from clinic balance after call ends."""
-    try:
-        from backend.db import AsyncSessionLocal
-        from backend.services.credit_service import CreditService
-
-        async with AsyncSessionLocal() as db:
-            result = await CreditService.deduct_call_credits(
-                db,
-                tenant_id=tenant_id,
-                duration_seconds=duration_seconds,
-                call_id=call_record_id,
-            )
-            await db.commit()
-
-        logger.info(
-            "Credit deduction: tenant=%s deducted=₹%.2f balance=₹%.2f duration=%ds",
-            tenant_id,
-            result.get("deducted", 0),
-            result.get("balance_after", 0),
-            duration_seconds,
-        )
-    except Exception as exc:
-        logger.error("_deduct_call_credits error: %s", exc, exc_info=True)
 
 
 async def _run_post_call_evaluation(call_record_id: str, summary_enabled: bool = True, eval_enabled: bool = True) -> None:

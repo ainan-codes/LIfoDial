@@ -1,40 +1,29 @@
 import {
   Activity,
   AlertTriangle,
-  BookOpen,
   Brain,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  Code2,
-  Globe,
   Headphones,
   History,
-  LineChart,
   Loader2,
   Mic,
   Pause,
   Phone,
   Play,
-  Send,
   Settings,
-  Sliders,
-  Upload,
-  Voicemail,
-  Wrench,
   X
 } from 'lucide-react';
 import React, { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import fetchWithAuth, { API_URL } from '../../api/client';
 import { getToken } from '../../api/auth';
 // Lazy: pulls in the LiveKit/WebRTC client stack (~526kB alone, the single
-// largest chunk in the app) — only needed when Simulation Testing is opened.
+// largest chunk in the app) — only needed when Test Agent is opened.
 const TestAgentModal = lazy(() => import('../../components/TestAgentModal'));
 import VoiceLibrary from './VoiceLibrary';
-import SimulationTab from './agent_detail/SimulationTab';
-import AgentHealthTab from './agent_detail/AgentHealthTab';
 import { useSAStore } from '../../store/saStore';
 
 const ACCENT = '#00D4AA';
@@ -345,548 +334,6 @@ const CollapsibleSection = ({ icon: Icon, title, summary, children }: any) => {
   );
 };
 
-// ── Embed Section Component ──────────────────────────────────────────────────
-
-function EmbedSection({ agent, agentId, updateField }: { agent: any; agentId: string; updateField: (k: string, v: any) => void }) {
-  const [stats, setStats] = React.useState<any>(null);
-  const [copied, setCopied] = React.useState(false);
-  const [showGuide, setShowGuide] = React.useState(false);
-  const [guidePlatform, setGuidePlatform] = React.useState('wordpress');
-  const [avatarState, setAvatarState] = React.useState<'idle' | 'uploading' | 'error'>('idle');
-  const [avatarError, setAvatarError] = React.useState('');
-  const avatarInputRef = React.useRef<HTMLInputElement>(null);
-
-  const handleAvatarPick = async (fileList: FileList | null) => {
-    const f = fileList?.[0];
-    if (!f) return;
-    setAvatarError('');
-    // Client-side guard mirrors the server-side validation (PNG/JPG/WebP, ≤8MB).
-    if (!['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(f.type)) {
-      setAvatarState('error'); setAvatarError('Use a PNG, JPG, or WebP image.'); return;
-    }
-    if (f.size > 8 * 1024 * 1024) {
-      setAvatarState('error'); setAvatarError('Image must be 8MB or smaller.'); return;
-    }
-    setAvatarState('uploading');
-    try {
-      const fd = new FormData();
-      fd.append('file', f);
-      // Bare fetch (not fetchWithAuth) so we don't force a JSON Content-Type on multipart.
-      const token = localStorage.getItem('lifodial-token');
-      const res = await fetch(`${API_URL}/agents/${agentId}/avatar`, {
-        method: 'POST',
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-        body: fd,
-      });
-      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || `Upload failed (${res.status})`); }
-      const data = await res.json();
-      updateField('avatar_url', data.avatar_url); // sync local state + persist
-      setAvatarState('idle');
-    } catch (e: any) {
-      setAvatarState('error'); setAvatarError(e?.message || 'Upload failed');
-    }
-  };
-
-  const handleAvatarRemove = async () => {
-    setAvatarState('uploading');
-    try {
-      const token = localStorage.getItem('lifodial-token');
-      await fetch(`${API_URL}/agents/${agentId}/avatar`, { method: 'DELETE', headers: token ? { Authorization: `Bearer ${token}` } : {} });
-      updateField('avatar_url', null);
-      setAvatarState('idle');
-    } catch {
-      setAvatarState('idle');
-    }
-  };
-
-  // Derive API base from current browser origin for dynamic embed code generation.
-  // In production the admin dashboard is served from the same domain as the API.
-  // When developing locally (vite devserver on 5173 → backend on 8001), fall back.
-  const apiBase = API_URL;
-
-  const position   = agent.embed_position    || 'bottom-right';
-  const theme      = agent.embed_theme       || 'dark';
-  const color      = agent.embed_primary_color || '#3ECF8E';
-  const buttonText = agent.embed_button_text  || 'Talk to Receptionist';
-
-  const embedCode = `<script\n  src="${apiBase}/widget.js"\n  data-agent-id="${agentId}"\n  data-position="${position}"\n  data-theme="${theme}"\n></script>`;
-
-  React.useEffect(() => {
-    fetchWithAuth(`/embed/${agentId}/analytics`)
-      .then(setStats)
-      .catch(() => {});
-  }, [agentId]);
-
-  const copyCode = () => {
-    navigator.clipboard.writeText(embedCode).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2200);
-    });
-  };
-
-  const platforms: Record<string, { title: string; steps: React.ReactNode }> = {
-    react: {
-      title: 'React',
-      steps: (
-        <div style={{ fontSize: '13px', lineHeight: 1.8, color: 'rgba(255,255,255,0.7)' }}>
-          <b style={{ color: '#fff' }}>Create React App or Vite — same fix either way:</b><br />
-          1. Open <code style={{ color: color }}>public/index.html</code> (CRA) or <code style={{ color: color }}>index.html</code> (Vite) — the static HTML shell, <em>not</em> a <code style={{ color: color }}>.jsx</code>/<code style={{ color: color }}>.tsx</code> file.<br />
-          2. Paste the code just before <code style={{ color: color }}>&lt;/body&gt;</code>, as a sibling of <code style={{ color: color }}>&lt;div id="root"&gt;</code> (or <code style={{ color: color }}>#app</code> for Vite).<br /><br />
-          <b style={{ color: '#fff' }}>Why here and not inside a component:</b> React Router only re-renders what's inside your root div — it never touches the static shell around it, so a script tag placed here survives every client-side route change automatically. Put it inside a component instead (e.g. a shared <code style={{ color: color }}>Layout.tsx</code>) and it can re-execute every time that component remounts, which is exactly the double-load bug this widget guards against — but placing it in the HTML shell avoids the question entirely.
-        </div>
-      ),
-    },
-    nextjs: {
-      title: 'Next.js',
-      steps: (
-        <div style={{ fontSize: '13px', lineHeight: 1.8, color: 'rgba(255,255,255,0.7)' }}>
-          <b style={{ color: '#fff' }}>App Router — <code style={{ color: color }}>app/layout.tsx</code>:</b><br />
-          1. Import <code style={{ color: color }}>Script</code> from <code style={{ color: color }}>next/script</code> at the top of your root layout.<br />
-          2. Render it inside <code style={{ color: color }}>&lt;body&gt;</code>, alongside <code style={{ color: color }}>{'{children}'}</code>:
-          <pre style={{ background: '#0a0a0a', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '8px', padding: '12px', margin: '8px 0', fontSize: '12px', color: '#ccc', overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-{`import Script from 'next/script'
-
-<Script
-  src="${apiBase}/widget.js"
-  data-agent-id="${agentId}"
-  strategy="afterInteractive"
-/>`}
-          </pre>
-          <b style={{ color: '#fff' }}>Pages Router — <code style={{ color: color }}>pages/_app.tsx</code>:</b><br />
-          Same <code style={{ color: color }}>next/script</code> import, rendered once around <code style={{ color: color }}>&lt;Component {'{...pageProps}'} /&gt;</code>.<br /><br />
-          Either way, put it in the <em>root</em> layout/app file, not an individual page — that's what makes it persist across navigation. <code style={{ color: color }}>next/script</code> also dedupes by <code style={{ color: color }}>src</code> on its own, on top of the widget's own duplicate-load guard.
-        </div>
-      ),
-    },
-    wordpress: {
-      title: 'WordPress',
-      steps: (
-        <div style={{ fontSize: '13px', lineHeight: 1.8, color: 'rgba(255,255,255,0.7)' }}>
-          Most themes strip raw <code style={{ color: color }}>&lt;script&gt;</code> tags pasted directly into post/page content — use one of these instead:<br /><br />
-          <b style={{ color: '#fff' }}>Option A — Theme Editor:</b><br />
-          1. Go to <em>Appearance → Theme File Editor</em><br />
-          2. Choose <code style={{ color: color }}>footer.php</code><br />
-          3. Paste the code just before <code style={{ color: color }}>&lt;/body&gt;</code><br /><br />
-          <b style={{ color: '#fff' }}>Option B — Plugin (easier, survives theme updates):</b><br />
-          1. Install "WP Headers and Footers" (or "Insert Headers and Footers")<br />
-          2. Go to <em>Settings → WP Headers and Footers</em><br />
-          3. Paste the code in the Footer Scripts box
-        </div>
-      ),
-    },
-    shopify: {
-      title: 'Shopify',
-      steps: (
-        <div style={{ fontSize: '13px', lineHeight: 1.8, color: 'rgba(255,255,255,0.7)' }}>
-          Shopify blocks script injection through the storefront editor's content areas — <code style={{ color: color }}>theme.liquid</code> (or an app embed block) is the only reliable path:<br /><br />
-          1. <em>Online Store → Themes → Edit Code</em><br />
-          2. Open <code style={{ color: color }}>layout/theme.liquid</code><br />
-          3. Paste the code just before <code style={{ color: color }}>&lt;/body&gt;</code><br />
-          4. Click <b style={{ color: '#fff' }}>Save</b><br /><br />
-          If your theme is managed by an agency and direct code edits get overwritten on theme updates, ask them to add it as an <b style={{ color: '#fff' }}>app embed block</b> instead — same script tag, just delivered through the Theme App Extension so it survives theme changes.
-        </div>
-      ),
-    },
-    wix: {
-      title: 'Wix',
-      steps: (
-        <div style={{ fontSize: '13px', lineHeight: 1.8, color: 'rgba(255,255,255,0.7)' }}>
-          1. Open <b style={{ color: '#fff' }}>Wix Editor</b><br />
-          2. Click <em>Settings → Custom Code</em><br />
-          3. Click <b style={{ color: '#fff' }}>+ Add Custom Code</b><br />
-          4. Paste the Lifodial code<br />
-          5. Set "Place Code in" to <code style={{ color: color }}>Body - end</code><br />
-          6. Click <b style={{ color: '#fff' }}>Apply</b>
-        </div>
-      ),
-    },
-    squarespace: {
-      title: 'Squarespace',
-      steps: (
-        <div style={{ fontSize: '13px', lineHeight: 1.8, color: 'rgba(255,255,255,0.7)' }}>
-          1. Go to <em>Pages → Website Tools → Code Injection</em><br />
-          2. Paste the code in the <b style={{ color: '#fff' }}>Footer</b> section<br />
-          3. Click <b style={{ color: '#fff' }}>Save</b>
-        </div>
-      ),
-    },
-    html: {
-      title: 'Custom HTML',
-      steps: (
-        <div style={{ fontSize: '13px', lineHeight: 1.8, color: 'rgba(255,255,255,0.7)' }}>
-          Paste the code just before the closing <code style={{ color: color }}>&lt;/body&gt;</code> tag of your HTML file:
-          <pre style={{ background: '#0a0a0a', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '8px', padding: '12px', marginTop: '12px', fontSize: '12px', color: '#ccc', overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-{`<!DOCTYPE html>
-<html>
-  <head>...</head>
-  <body>
-    <!-- your content -->
-
-    ← Paste here ↓
-    ${embedCode}
-  </body>
-</html>`}
-          </pre>
-        </div>
-      ),
-    },
-  };
-
-  return (
-    <>
-      <div style={{ borderRadius: '16px', border: `1px solid rgba(255,255,255,0.06)`, overflow: 'hidden', marginBottom: '12px' }}>
-        {/* Header */}
-        <div style={{ padding: '20px 24px', background: 'rgba(255,255,255,0.02)', display: 'flex', alignItems: 'center', gap: '14px' }}>
-          <div style={{ width: '36px', height: '36px', borderRadius: '8px', background: 'rgba(0,212,170,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <Globe size={18} color={ACCENT} />
-          </div>
-          <div>
-            <div style={{ fontSize: '15px', fontWeight: 600, color: '#fff' }}>Website Embed</div>
-            <div style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', marginTop: '2px' }}>Add your AI receptionist to any clinic website in one line</div>
-          </div>
-        </div>
-
-        <div style={{ padding: '24px', display: 'flex', flexDirection: 'column', gap: '28px' }}>
-
-          {/* Enable toggle */}
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', background: 'rgba(255,255,255,0.02)', borderRadius: '12px', border: `1px solid rgba(255,255,255,0.06)` }}>
-            <div>
-              <div style={{ fontSize: '14px', fontWeight: 600, color: '#fff' }}>Widget Active</div>
-              <div style={{ fontSize: '12px', color: 'rgba(255,255,255,0.4)', marginTop: '3px' }}>Allow this agent to appear on external websites</div>
-            </div>
-            <Toggle checked={agent.embed_enabled !== false && agent.embed_enabled !== 0} onChange={(v: any) => updateField('embed_enabled', v ? 1 : 0)} label="" />
-          </div>
-
-          {/* Avatar — per-agent widget image */}
-          <div>
-            <div style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '16px', fontWeight: 600 }}>Widget Avatar</div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-              <div style={{ width: '56px', height: '56px', borderRadius: '50%', overflow: 'hidden', background: 'rgba(255,255,255,0.05)', border: `1px solid rgba(255,255,255,0.1)`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                {agent.avatar_url
-                  ? <img src={agent.avatar_url} alt="Agent avatar" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                  : <Headphones size={22} color={ACCENT} />}
-              </div>
-              <div style={{ flex: 1 }}>
-                <input ref={avatarInputRef} type="file" accept="image/png,image/jpeg,image/webp" style={{ display: 'none' }} onChange={e => handleAvatarPick(e.target.files)} />
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <button onClick={() => avatarInputRef.current?.click()} disabled={avatarState === 'uploading'}
-                    style={{ padding: '8px 14px', borderRadius: '8px', border: `1px solid rgba(255,255,255,0.15)`, background: 'rgba(255,255,255,0.06)', color: '#fff', fontSize: '13px', fontWeight: 500, cursor: 'pointer' }}>
-                    {avatarState === 'uploading' ? 'Uploading…' : agent.avatar_url ? 'Replace image' : 'Upload image'}
-                  </button>
-                  {agent.avatar_url && (
-                    <button onClick={handleAvatarRemove} disabled={avatarState === 'uploading'}
-                      style={{ padding: '8px 14px', borderRadius: '8px', border: `1px solid rgba(255,255,255,0.12)`, background: 'transparent', color: 'rgba(255,255,255,0.6)', fontSize: '13px', cursor: 'pointer' }}>
-                      Remove
-                    </button>
-                  )}
-                </div>
-                <div style={{ fontSize: '11px', color: avatarState === 'error' ? '#EF4444' : 'rgba(255,255,255,0.4)', marginTop: '8px' }}>
-                  {avatarState === 'error' ? avatarError : 'PNG, JPG, or WebP · max 8MB · automatically optimized to a fast 256×256 image · shown in the widget launcher & header. Falls back to the default icon if unset.'}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Appearance */}
-          <div>
-            <div style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '16px', fontWeight: 600 }}>Appearance</div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
-              <div>
-                <Label>Button Text</Label>
-                <Input value={agent.embed_button_text || 'Talk to Receptionist'} onChange={(v: any) => updateField('embed_button_text', v)} placeholder="Talk to Receptionist" />
-              </div>
-              <div>
-                <Label>Primary Color</Label>
-                <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
-                  <input type="color" value={agent.embed_primary_color || '#3ECF8E'} onChange={e => updateField('embed_primary_color', e.target.value)}
-                    style={{ width: '48px', height: '42px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)', cursor: 'pointer', background: 'none', padding: '2px' }} />
-                  <Input value={agent.embed_primary_color || '#3ECF8E'} onChange={(v: any) => updateField('embed_primary_color', v)} style={{ fontFamily: 'monospace' }} />
-                </div>
-              </div>
-              <div>
-                <Label>Button Position</Label>
-                <div style={{ display: 'flex', gap: '10px', marginTop: '6px' }}>
-                  {['bottom-right', 'bottom-left'].map(pos => (
-                    <label key={pos} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: '#fff', cursor: 'pointer' }}>
-                      <input type="radio" checked={(agent.embed_position || 'bottom-right') === pos}
-                        onChange={() => updateField('embed_position', pos)} style={{ accentColor: ACCENT }} />
-                      {pos === 'bottom-right' ? 'Bottom Right' : 'Bottom Left'}
-                    </label>
-                  ))}
-                </div>
-              </div>
-              <div>
-                <Label>Theme</Label>
-                <div style={{ display: 'flex', gap: '10px', marginTop: '6px' }}>
-                  {['dark', 'light'].map(t => (
-                    <label key={t} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: '#fff', cursor: 'pointer' }}>
-                      <input type="radio" checked={(agent.embed_theme || 'dark') === t}
-                        onChange={() => updateField('embed_theme', t)} style={{ accentColor: ACCENT }} />
-                      {t.charAt(0).toUpperCase() + t.slice(1)}
-                    </label>
-                  ))}
-                </div>
-              </div>
-              <div>
-                <Label>Display Mode</Label>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '6px' }}>
-                  {[
-                    { id: 'button', name: 'Button with label', desc: 'Icon + button text (default).' },
-                    { id: 'icon', name: 'Icon only', desc: 'Just the launcher icon — minimal footprint, no text.' },
-                    { id: 'auto-invite', name: 'Auto-invite', desc: 'Panel auto-opens after a delay to invite the visitor. Does NOT start audio or ask for the mic — the visitor still taps to talk.' },
-                  ].map(m => (
-                    <label key={m.id} style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', fontSize: '13px', color: '#fff', cursor: 'pointer' }}>
-                      <input type="radio" checked={(agent.embed_display_mode || 'button') === m.id}
-                        onChange={() => updateField('embed_display_mode', m.id)} style={{ accentColor: ACCENT, marginTop: '2px' }} />
-                      <span>
-                        <span style={{ fontWeight: 600 }}>{m.name}</span>
-                        <span style={{ display: 'block', fontSize: '11px', color: 'rgba(255,255,255,0.45)' }}>{m.desc}</span>
-                      </span>
-                    </label>
-                  ))}
-                </div>
-                {(agent.embed_display_mode === 'auto-invite') && (
-                  <div style={{ marginTop: '10px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <Label>Auto-invite delay (seconds)</Label>
-                    <input type="number" min={1} max={60}
-                      value={agent.embed_auto_invite_delay ?? 3}
-                      onChange={e => updateField('embed_auto_invite_delay', Math.max(1, Math.min(60, parseInt(e.target.value) || 3)))}
-                      style={{ width: '64px', background: 'rgba(255,255,255,0.04)', border: `1px solid ${BORDER}`, borderRadius: '8px', padding: '6px 8px', color: '#fff', fontSize: '13px' }} />
-                  </div>
-                )}
-              </div>
-              <div>
-                <Label>Show Lifosys Branding</Label>
-                <Toggle checked={agent.embed_show_branding !== false && agent.embed_show_branding !== 0} onChange={(v: any) => updateField('embed_show_branding', v ? 1 : 0)} label="Powered by Lifosys" />
-              </div>
-            </div>
-          </div>
-
-          {/* Security */}
-          <div>
-            <div style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '12px', fontWeight: 600 }}>Security — Allowed Domains</div>
-            <Textarea
-              value={Array.isArray(agent.embed_allowed_domains) ? agent.embed_allowed_domains.join('\n') : (agent.embed_allowed_domains || '')}
-              onChange={(v: any) => {
-                const domains = v.split('\n').map((d: string) => d.trim()).filter(Boolean);
-                updateField('embed_allowed_domains', domains);
-              }}
-              placeholder={'apolloclinic.com\napollo.in\nwww.apollohospital.com'}
-              rows={3}
-            />
-            <Helper>One domain per line. Leave empty to allow all domains (not recommended in production).</Helper>
-          </div>
-
-          {/* Live Preview — reflects UNSAVED appearance + display mode in real time.
-              The form values are forwarded to the preview page as query params,
-              which it maps to the widget's data-* attributes. `key` forces the
-              iframe to reload whenever any of these change. */}
-          {(() => {
-            const previewParams = new URLSearchParams({
-              style: agent.embed_display_mode || 'button',
-              theme: agent.embed_theme || 'dark',
-              position: agent.embed_position || 'bottom-right',
-              color: agent.embed_primary_color || '#3ECF8E',
-              label: agent.embed_button_text || 'Talk to Receptionist',
-              delay: String(agent.embed_auto_invite_delay ?? 3),
-            }).toString();
-            const previewSrc = `${apiBase}/embed/${agentId}/preview?${previewParams}`;
-            return (
-              <div>
-                <div style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '12px', fontWeight: 600 }}>Live Preview</div>
-                <iframe
-                  key={previewSrc}
-                  src={previewSrc}
-                  style={{ width: '100%', height: '280px', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '12px', background: '#0a0a0a' }}
-                  title="Widget Preview"
-                />
-              </div>
-            );
-          })()}
-
-          {/* Embed Code */}
-          <div>
-            <div style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '12px', fontWeight: 600 }}>Embed Code</div>
-            <div style={{ fontSize: '13px', color: 'rgba(255,255,255,0.5)', marginBottom: '12px' }}>
-              Copy this single line and give it to your web developer:
-            </div>
-            <div style={{ position: 'relative' }}>
-              <pre style={{
-                background: '#080808', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '12px',
-                padding: '16px 20px', fontSize: '13px', color: '#a5f3c0', fontFamily: 'monospace',
-                overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: 0,
-                paddingRight: '100px',
-              }}>{embedCode}</pre>
-              <button
-                onClick={copyCode}
-                style={{
-                  position: 'absolute', top: '12px', right: '12px',
-                  padding: '6px 14px', borderRadius: '8px', border: `1px solid rgba(255,255,255,0.15)`,
-                  background: copied ? ACCENT : 'rgba(255,255,255,0.08)',
-                  color: copied ? '#000' : '#fff', fontSize: '12px', fontWeight: 600,
-                  cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', transition: 'all 0.2s',
-                }}
-              >
-                <Code2 size={12} />{copied ? '✓ Copied!' : 'Copy'}
-              </button>
-            </div>
-          </div>
-
-          {/* View Install Guide */}
-          <div>
-            <button
-              onClick={() => setShowGuide(true)}
-              style={{ padding: '10px 20px', borderRadius: '8px', border: `1px solid rgba(255,255,255,0.12)`, background: 'transparent', color: '#fff', fontSize: '13px', fontWeight: 500, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' }}
-            >
-              📄 View Full Installation Instructions
-            </button>
-          </div>
-
-          {/* Analytics */}
-          {stats && (
-            <div>
-              <div style={{ fontSize: '12px', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'rgba(255,255,255,0.35)', marginBottom: '16px', fontWeight: 600 }}>This Month's Analytics</div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px' }}>
-                {[
-                  { label: 'Widget Views', val: stats.views },
-                  { label: 'Opens', val: `${stats.opens} (${stats.open_rate}%)` },
-                  { label: 'Conversations', val: `${stats.conversations} (${stats.chat_rate}%)` },
-                  { label: 'Bookings via Web', val: `${stats.bookings} (${stats.booking_rate}%)` },
-                ].map(s => (
-                  <div key={s.label} style={{ padding: '16px', background: 'rgba(255,255,255,0.02)', border: `1px solid rgba(255,255,255,0.06)`, borderRadius: '12px' }}>
-                    <div style={{ fontSize: '22px', fontWeight: 700, color: '#fff' }}>{s.val}</div>
-                    <div style={{ fontSize: '11px', color: 'rgba(255,255,255,0.4)', marginTop: '4px' }}>{s.label}</div>
-                  </div>
-                ))}
-              </div>
-              {/* Funnel */}
-              <div style={{ marginTop: '16px', padding: '14px 18px', background: 'rgba(255,255,255,0.02)', border: `1px solid rgba(255,255,255,0.06)`, borderRadius: '12px', fontSize: '12px', color: 'rgba(255,255,255,0.5)' }}>
-                Conversion funnel: &nbsp;
-                <span style={{ color: '#fff' }}>Views {stats.views}</span> →&nbsp;
-                <span style={{ color: '#fff' }}>Opens {stats.opens}</span> →&nbsp;
-                <span style={{ color: '#fff' }}>Conversations {stats.conversations}</span> →&nbsp;
-                <span style={{ color: ACCENT }}>Bookings {stats.bookings}</span>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* ── Installation Guide Modal ── */}
-      {showGuide && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 200, background: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px' }}
-          onClick={e => { if (e.target === e.currentTarget) setShowGuide(false); }}>
-          <div style={{ width: '100%', maxWidth: '680px', background: '#0f0f0f', border: `1px solid rgba(255,255,255,0.1)`, borderRadius: '20px', overflow: 'hidden', maxHeight: '85vh', display: 'flex', flexDirection: 'column' }}>
-            {/* Modal Header */}
-            <div style={{ padding: '20px 24px', borderBottom: `1px solid rgba(255,255,255,0.06)`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexShrink: 0 }}>
-              <div>
-                <div style={{ fontSize: '18px', fontWeight: 700, color: '#fff' }}>Add AI Receptionist to Your Website</div>
-                <div style={{ fontSize: '13px', color: 'rgba(255,255,255,0.4)', marginTop: '3px' }}>Step-by-step integration guide</div>
-              </div>
-              <button onClick={() => setShowGuide(false)} style={{ background: 'rgba(255,255,255,0.08)', border: 'none', color: '#fff', width: '32px', height: '32px', borderRadius: '50%', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <X size={16} />
-              </button>
-            </div>
-
-            <div style={{ flex: 1, overflowY: 'auto', padding: '24px', display: 'flex', flexDirection: 'column', gap: '28px' }}>
-              {/* Step 1 */}
-              <div>
-                <div style={{ fontSize: '12px', color: ACCENT, fontWeight: 700, marginBottom: '8px' }}>STEP 1 — Copy the embed code</div>
-                <div style={{ position: 'relative' }}>
-                  <pre style={{ background: '#080808', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '10px', padding: '14px 16px', fontSize: '12px', color: '#a5f3c0', fontFamily: 'monospace', overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: 0, paddingRight: '80px' }}>{embedCode}</pre>
-                  <button onClick={copyCode} style={{ position: 'absolute', top: '10px', right: '10px', padding: '5px 12px', borderRadius: '6px', border: `1px solid rgba(255,255,255,0.15)`, background: copied ? ACCENT : 'rgba(255,255,255,0.08)', color: copied ? '#000' : '#fff', fontSize: '11px', fontWeight: 600, cursor: 'pointer' }}>
-                    {copied ? '✓' : 'Copy'}
-                  </button>
-                </div>
-              </div>
-
-              {/* Step 2 — diagram */}
-              <div>
-                <div style={{ fontSize: '12px', color: ACCENT, fontWeight: 700, marginBottom: '8px' }}>STEP 2 — Where to paste it</div>
-                <p style={{ fontSize: '13px', color: 'rgba(255,255,255,0.6)', marginBottom: '12px' }}>
-                  Paste this code just before the closing <code style={{ color: ACCENT }}>&lt;/body&gt;</code> tag of your website's HTML.
-                </p>
-                <pre style={{ background: '#080808', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '10px', padding: '16px', fontSize: '12px', color: '#ccc', fontFamily: 'monospace', whiteSpace: 'pre', overflowX: 'auto', margin: 0 }}>
-{`<!DOCTYPE html>
-<html>
-  <head>...</head>
-  <body>
-    <!-- Your website content -->
-
-    <!-- ↓ Paste Lifodial script here -->
-    <script
-      src="${apiBase}/widget.js"
-      data-agent-id="${agentId}"
-    ></script>
-  </body>  ← just before this
-</html>`}
-                </pre>
-              </div>
-
-              {/* Step 3 — platforms */}
-              <div>
-                <div style={{ fontSize: '12px', color: ACCENT, fontWeight: 700, marginBottom: '12px' }}>STEP 3 — Platform-specific guide</div>
-                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '16px' }}>
-                  {Object.entries(platforms).map(([key, p]) => (
-                    <button key={key} onClick={() => setGuidePlatform(key)}
-                      style={{ padding: '6px 14px', borderRadius: '20px', border: `1px solid ${guidePlatform === key ? ACCENT : 'rgba(255,255,255,0.12)'}`, background: guidePlatform === key ? 'rgba(0,212,170,0.1)' : 'transparent', color: guidePlatform === key ? ACCENT : '#888', fontSize: '12px', fontWeight: 500, cursor: 'pointer' }}>
-                      {p.title}
-                    </button>
-                  ))}
-                </div>
-                <div style={{ padding: '16px', background: 'rgba(255,255,255,0.02)', border: `1px solid rgba(255,255,255,0.06)`, borderRadius: '10px' }}>
-                  {platforms[guidePlatform].steps}
-                </div>
-              </div>
-
-              {/* Step 4 */}
-              <div>
-                <div style={{ fontSize: '12px', color: ACCENT, fontWeight: 700, marginBottom: '8px' }}>STEP 4 — Test it</div>
-                <p style={{ fontSize: '13px', color: 'rgba(255,255,255,0.6)' }}>
-                  Visit your website after adding the code. You should see the <strong style={{ color: '#fff' }}>"Talk to Receptionist"</strong> button in the corner. Click it to start chatting with your AI receptionist!
-                </p>
-              </div>
-
-              {/* Step 5 — customization */}
-              <div>
-                <div style={{ fontSize: '12px', color: ACCENT, fontWeight: 700, marginBottom: '8px' }}>STEP 5 — Optional customization</div>
-                <pre style={{ background: '#080808', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '10px', padding: '14px 16px', fontSize: '12px', color: '#ccc', fontFamily: 'monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: 0 }}>
-{`data-position="bottom-left"  → Move widget to bottom-left
-data-theme="light"            → Use light background
-data-language="ta-IN"         → Force Tamil language`}
-                </pre>
-              </div>
-
-              {/* Step 6 — CSP */}
-              <div>
-                <div style={{ fontSize: '12px', color: ACCENT, fontWeight: 700, marginBottom: '8px' }}>STEP 6 — Nothing showing up? Check your CSP</div>
-                <p style={{ fontSize: '13px', color: 'rgba(255,255,255,0.6)', marginBottom: '12px' }}>
-                  Many WordPress security plugins and enterprise sites ship a strict <code style={{ color: ACCENT }}>Content-Security-Policy</code> that blocks third-party widgets with <em>no visible error</em> on the page — only a CSP violation in the browser console. If the button never appears, hand this to whoever manages the site's security headers:
-                </p>
-                <pre style={{ background: '#080808', border: `1px solid rgba(255,255,255,0.08)`, borderRadius: '10px', padding: '14px 16px', fontSize: '12px', color: '#ccc', fontFamily: 'monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: 0 }}>
-{(() => {
-  const origin = (() => { try { return new URL(apiBase).origin; } catch { return apiBase; } })();
-  const wsOrigin = origin.replace(/^http/, 'ws');
-  return `script-src ${origin};
-connect-src ${origin} ${wsOrigin};
-style-src 'unsafe-inline';`;
-})()}
-                </pre>
-                <p style={{ fontSize: '12px', color: 'rgba(255,255,255,0.45)', marginTop: '10px', lineHeight: 1.7 }}>
-                  <b style={{ color: 'rgba(255,255,255,0.7)' }}>script-src</b> — loads widget.js itself.<br />
-                  <b style={{ color: 'rgba(255,255,255,0.7)' }}>connect-src</b> — the widget's chat/config requests (<code style={{ color: ACCENT }}>https</code>) and its live voice call (<code style={{ color: ACCENT }}>wss</code>) both count as "connect," not "frame" — the widget never uses an iframe, so <code style={{ color: ACCENT }}>frame-src</code> isn't needed.<br />
-                  <b style={{ color: 'rgba(255,255,255,0.7)' }}>style-src 'unsafe-inline'</b> — the widget injects its own <code style={{ color: ACCENT }}>&lt;style&gt;</code> tag at runtime to theme itself; without this the button and panel will render completely unstyled.<br /><br />
-                  Voice calls also need microphone access — if the site sets a <code style={{ color: ACCENT }}>Permissions-Policy</code> header that blocks <code style={{ color: ACCENT }}>microphone</code> site-wide, voice will fail even with CSP correctly configured. Chat is unaffected either way.
-                </p>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-    </>
-  );
-}
-
 // ── Main Page ────────────────────────────────────────────────────────────────
 
 function getLlmFallbackModels(provider: string): string[] {
@@ -905,7 +352,6 @@ function getLlmFallbackModels(provider: string): string[] {
 export default function AgentDetail() {
   const { agentId } = useParams();
   const navigate = useNavigate();
-  const location = useLocation();
   const [agent, setAgent] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -959,21 +405,19 @@ export default function AgentDetail() {
     };
   }, []);
   
-  // Scroll-spy tab navigation
-  type AgentTab = 'assistant' | 'logs' | 'tools' | 'analysis' | 'advanced';
+  // Tab navigation. Assistant is the only tab in this MVP phase — the Logs /
+  // Tools / Analysis / Advanced tabs and their sections were removed, so there
+  // is nothing left to scroll-spy between.
+  type AgentTab = 'assistant';
   const [activeTab, setActiveTab] = useState<AgentTab>('assistant');
   const AGENT_TABS: { id: AgentTab; label: string; icon: any }[] = [
     { id: 'assistant', label: 'Assistant',  icon: Mic },
-    { id: 'logs',      label: 'Logs',       icon: LineChart },
-    { id: 'tools',     label: 'Tools',      icon: Wrench },
-    { id: 'analysis',  label: 'Analysis',   icon: Activity },
-    { id: 'advanced',  label: 'Advanced',   icon: Sliders },
   ];
 
-  // Refs for scroll-spy section anchors
+  // Refs for the scroll container + the Assistant section anchor
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const sectionRefs = useRef<Record<AgentTab, HTMLDivElement | null>>({
-    assistant: null, logs: null, tools: null, analysis: null, advanced: null,
+    assistant: null,
   });
 
   // Scroll to section when tab is clicked
@@ -988,30 +432,6 @@ export default function AgentDetail() {
     }
   };
 
-  // IntersectionObserver for scroll-spy
-  useEffect(() => {
-    const container = scrollContainerRef.current;
-    if (!container) return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        // Find the topmost section that is intersecting
-        const visible = entries
-          .filter(e => e.isIntersecting)
-          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
-        if (visible.length > 0) {
-          const id = visible[0].target.getAttribute('data-section') as AgentTab;
-          if (id) setActiveTab(id);
-        }
-      },
-      { root: container, rootMargin: '-20% 0px -60% 0px', threshold: 0 }
-    );
-    // Observe all section refs
-    Object.entries(sectionRefs.current).forEach(([, el]) => {
-      if (el) observer.observe(el);
-    });
-    return () => observer.disconnect();
-  }, [agent]); // re-run when agent loads
-  
   // Test lab state
   const [testTab, setTestTab] = useState<'voice'|'chat'>('voice');
   const [chatLog, setChatLog] = useState<{from: 'agent'|'user', text: string}[]>([]);
@@ -1087,19 +507,6 @@ export default function AgentDetail() {
       scrollContainerRef.current.scrollTop = 0;
     }
   }, [agentId]);
-
-  // Deep-link support: a caller can request a specific tab via ?tab=<id>
-  // (e.g. a future "View Logs" link) to opt out of the assistant/top default
-  // above. Runs after the agent has loaded so the target section actually
-  // exists in the DOM to scroll to.
-  useEffect(() => {
-    if (loading || !agent) return;
-    const requested = new URLSearchParams(location.search).get('tab');
-    const validTabs: AgentTab[] = ['assistant', 'logs', 'tools', 'analysis', 'advanced'];
-    if (requested && (validTabs as string[]).includes(requested) && requested !== 'assistant') {
-      handleTabClick(requested as AgentTab);
-    }
-  }, [agentId, location.search, loading, agent]);
 
   // Fetch models when provider changes.
   // The model catalogue is a SUGGESTION list, not an allow-list: whatever is
@@ -2132,158 +1539,6 @@ export default function AgentDetail() {
 
             </div>{/* end assistant section */}
 
-            {/* ══ TOOLS SECTION ═════════════════════════════════════════════════ */}
-            <div ref={el => { sectionRefs.current.tools = el; }} data-section="tools">
-            {/* 6. TOOLS */}
-            <CollapsibleSection icon={Wrench} title="Tools" summary={`${Array.isArray(agent.tools_enabled) ? agent.tools_enabled.length : (agent.tools_enabled && typeof agent.tools_enabled === 'string' ? JSON.parse(agent.tools_enabled).length : 0)} tools enabled`}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-                {[
-                  { id: 'appt_booking', name: '🗓️ Appointment Booking', desc: 'Connect to HIS to check availability & book.', dbField: 'can_book_appointments' },
-                  { id: 'transfer_call', name: '📞 Transfer Call', desc: 'Transfer to human agent. (Not yet available — no telephony transfer integration configured.)' },
-                  { id: 'sms', name: '📱 Send SMS', desc: 'Send appointment confirmation. (Not yet available — no SMS provider configured.)' },
-                  { id: 'status', name: '🔍 Check Appt Status', desc: 'Patients can check existing.', dbField: 'can_check_availability' },
-                  { id: 'cancel', name: '❌ Cancel Appointment', desc: 'Patients can cancel.', dbField: 'can_cancel_appointments' },
-                  { id: 'doctors', name: '🩺 Doctor Information', desc: 'Answer questions about doctors.' },
-                  { id: 'hours', name: '⏰ Clinic Hours', desc: 'Tell patients about hours.' },
-                  { id: 'emergency', name: '🚨 Emergency Redirect', desc: 'Detect emergencies & speak the emergency number. (Announcement only — no live call transfer yet.)', dbField: 'can_transfer_emergency' }
-                ].map(t => {
-                  const enabledTools = Array.isArray(agent.tools_enabled) ? agent.tools_enabled : (agent.tools_enabled && typeof agent.tools_enabled === 'string' ? JSON.parse(agent.tools_enabled) : []);
-                  // Tools backed by a real AgentConfig column (dbField) are gated by
-                  // that column at call time — read/write it directly instead of the
-                  // flat tools_enabled list, which nothing in the pipeline reads.
-                  const isEnabled = t.dbField ? (agent[t.dbField] ?? true) : enabledTools.includes(t.id);
-                  return (
-                    <div key={t.id} style={{ background: 'rgba(255,255,255,0.02)', border: `1px solid ${BORDER}`, borderRadius: '12px', padding: '16px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <span style={{ fontSize: '14px', fontWeight: 600, color: '#fff' }}>{t.name}</span>
-                        <Toggle checked={isEnabled} onChange={(on:any) => {
-                          if (t.dbField) {
-                            updateField(t.dbField, on);
-                            return;
-                          }
-                          const newer = on ? [...enabledTools, t.id] : enabledTools.filter((x:any) => x !== t.id);
-                          updateField('tools_enabled', JSON.stringify(newer));
-                        }} label="" />
-                      </div>
-                      <div style={{ fontSize: '12px', color: 'rgba(255,255,255,0.45)' }}>{t.desc}</div>
-                    </div>
-                  );
-                })}
-              </div>
-              <div style={{ marginTop: '20px', paddingTop: '20px', borderTop: `1px solid ${BORDER}` }}>
-                <Label>Custom Functions</Label>
-                <Helper>Define custom functions to extend agent capabilities via your own webhooks.</Helper>
-                <button style={{ marginTop: '12px', padding: '8px 16px', background: 'none', border: `1px solid ${BORDER}`, color: '#fff', borderRadius: '8px', fontSize: '13px', cursor: 'pointer' }}>+ Add Function</button>
-              </div>
-
-              <div style={{ marginTop: '20px', paddingTop: '20px', borderTop: `1px solid ${BORDER}` }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
-                  <Globe size={14} color={ACCENT} />
-                  <span style={{ fontSize: '12px', fontWeight: 600, color: '#fff', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Google Sheets Integration</span>
-                </div>
-                <Label>Google Sheets Webapp URL</Label>
-                <Input 
-                  value={agent.google_sheets_webhook_url} 
-                  onChange={(v:any) => updateField('google_sheets_webhook_url', v)} 
-                  placeholder="e.g. https://script.google.com/macros/s/.../exec"
-                />
-                <Helper>
-                  Paste the deployed Google Apps Script Web App URL here. Every time a patient books, reschedules, or cancels an appointment, the details will automatically sync with this Google Sheet.
-                </Helper>
-              </div>
-            </CollapsibleSection>
-
-            {/* 7. KNOWLEDGE BASE — still in Tools tab */}
-            {/* 7. KNOWLEDGE BASE */}
-            <CollapsibleSection icon={BookOpen} title="Knowledge Base" summary="0 documents · 0MB indexed">
-              <div style={{ padding: '40px', border: `1px dashed rgba(255,255,255,0.2)`, borderRadius: '12px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', background: 'rgba(255,255,255,0.01)', cursor: 'pointer' }}>
-                <Upload size={24} color="#888" />
-                <div style={{ color: '#fff', fontSize: '14px', fontWeight: 500 }}>Drop files here or click to browse</div>
-                <div style={{ color: 'rgba(255,255,255,0.45)', fontSize: '12px' }}>PDF · TXT · DOCX · CSV · MD (Max 60MB)</div>
-              </div>
-              <div style={{ marginTop: '20px' }}>
-                <Label>Search Test</Label>
-                <Input placeholder="Type a question to test retrieval..." onChange={()=>{}} />
-              </div>
-            </CollapsibleSection>
-
-            {/* 11. EMBED / WEBSITE WIDGET */}
-            <EmbedSection agent={agent} agentId={agentId} updateField={updateField} />
-
-            </div>{/* end tools section */}
-
-            {/* ══ ANALYSIS SECTION ══════════════════════════════════════════════ */}
-            <div ref={el => { sectionRefs.current.analysis = el; }} data-section="analysis">
-            {/* 9. ANALYSIS & OUTCOMES */}
-            <CollapsibleSection icon={LineChart} title="Analysis & Outcomes" summary={`Summary · Evaluation · Structured output ${agent.structured_output_enabled ? 'on' : 'off'}`}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-                <Toggle checked={agent.summary_enabled === 1} onChange={(v:any) => updateField('summary_enabled', v?1:0)} label="Call Summary" helper="Generate a summary of each call automatically" />
-                <div>
-                  <Toggle checked={agent.success_evaluation_enabled === 1} onChange={(v:any) => updateField('success_evaluation_enabled', v?1:0)} label="Success Evaluation" helper="Evaluate if the call achieved its goal" />
-                  {agent.success_evaluation_enabled === 1 && (
-                     <div style={{ marginTop: '12px', paddingLeft: '48px' }}>
-                       <Label>Success Criteria</Label>
-                       <Textarea value="The call was successful if the patient booked an appointment OR was given the information they needed." onChange={()=>{}} />
-                     </div>
-                  )}
-                </div>
-                <div>
-                  <Toggle checked={agent.structured_output_enabled === 1} onChange={(v:any) => updateField('structured_output_enabled', v?1:0)} label="Structured Output" helper="Extract JSON data from each call (appointment details, intent, etc)" />
-                </div>
-              </div>
-            </CollapsibleSection>
-
-            {/* Voicemail Detection — also in Analysis tab */}
-            <CollapsibleSection icon={Voicemail} title="Voicemail Detection" summary={agent.voicemail_detection_enabled ? "Enabled" : "Disabled"}>
-              <Toggle checked={agent.voicemail_detection_enabled === 1} onChange={(v:any) => updateField('voicemail_detection_enabled', v?1:0)} label="Enable Voicemail Detection" />
-              {agent.voicemail_detection_enabled === 1 && (
-                <div style={{ marginTop: '16px' }}>
-                  <Label>Voicemail Message</Label>
-                  <Textarea value={agent.voicemail_message ?? ''} onChange={(v:any) => updateField('voicemail_message', v)} placeholder="Hello! Please call back later..." />
-                  <Helper>If voicemail detected, leave this message.</Helper>
-                </div>
-              )}
-            </CollapsibleSection>
-
-            </div>{/* end analysis section */}
-
-            {/* ══ ADVANCED SECTION ══════════════════════════════════════════════ */}
-            <div ref={el => { sectionRefs.current.advanced = el; }} data-section="advanced">
-            {/* 10. ADVANCED */}
-            <CollapsibleSection icon={Sliders} title="Advanced" summary="Recording Consent, Privacy, Keypad">
-               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
-                 <div><Label>Recording Consent Plan</Label><Select value={agent.recording_consent_plan} onChange={(v:any) => updateField('recording_consent_plan', v)} options={['none', 'inform', 'require']} /></div>
-                 <div><Label>Keypad Input</Label><Toggle checked={agent.keypad_input_enabled === 1} onChange={(v:any) => updateField('keypad_input_enabled', v?1:0)} label="Allow DTMF keypad input" /></div>
-                 <div><Label>HIPAA Mode</Label><Toggle checked={agent.hipaa_enabled === 1} onChange={(v:any) => updateField('hipaa_enabled', v?1:0)} label="Redact PII from logs limits" /></div>
-                 <div><Label>PII Redaction</Label><Toggle checked={agent.pii_redaction_enabled === 1} onChange={(v:any) => updateField('pii_redaction_enabled', v?1:0)} label="Redact names, phone numbers" /></div>
-               </div>
-            </CollapsibleSection>
-
-            </div>{/* end advanced section */}
-
-            {/* ══ LOGS SECTION (Simulation + Health) ═════════════════════════════ */}
-            <div ref={el => { sectionRefs.current.logs = el; }} data-section="logs">
-            {/* 12. SIMULATION TESTING / TEST PANEL */}
-            <CollapsibleSection icon={Activity} title="Simulation Testing" summary="Run real-time voice and text patient scenarios">
-              <div style={{ height: '600px', display: 'flex', flexDirection: 'column' }}>
-                <Suspense fallback={null}>
-                  <TestAgentModal
-                    agent={{ ...agent, name: agent?.agent_name || agent?.name }}
-                    agentId={agentId}
-                    inline={true}
-                    onClose={() => {}}
-                  />
-                </Suspense>
-              </div>
-            </CollapsibleSection>
-
-            {/* 13. AGENT HEALTH DASHBOARD */}
-            <CollapsibleSection icon={LineChart} title="Agent Health" summary="Latency · Call stats · Eval scores">
-              <AgentHealthTab agentId={agentId!} />
-            </CollapsibleSection>
-
-            </div>{/* end logs section */}
-
           </div>
         </div>
 
@@ -2333,12 +1588,19 @@ export default function AgentDetail() {
         </div>
       )}
 
+        {/* Local Suspense boundary: TestAgentModal is a lazy chunk (the LiveKit
+            stack). The removed Simulation Testing section used to mount it on
+            page load, so the chunk was always warm by the time this button was
+            clicked. Without a boundary here, the first click would suspend up to
+            the route-level fallback and blank the whole page while it loads. */}
         {showTest && (
-          <TestAgentModal
-            agent={{ ...agent, name: agent?.agent_name || agent?.name }}
-            agentId={agentId}
-            onClose={() => setShowTest(false)}
-          />
+          <Suspense fallback={null}>
+            <TestAgentModal
+              agent={{ ...agent, name: agent?.agent_name || agent?.name }}
+              agentId={agentId}
+              onClose={() => setShowTest(false)}
+            />
+          </Suspense>
         )}
 
     </div>
