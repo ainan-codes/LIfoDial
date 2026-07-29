@@ -1319,7 +1319,56 @@ async def handle_text_command(
             await websocket.send_json({"type": "status", "status": "idle"})
         except RuntimeError:
             pass
-        
+
+
+# ── TTS pipelining ────────────────────────────────────────────────────────────
+# Splits an already-final, already-safety-checked reply into sentence-ish
+# chunks so handle_audio_turn can synthesize them CONCURRENTLY and send each
+# one to the client as soon as it's ready, instead of paying one large TTS
+# call's full latency before the caller hears anything. This must only ever
+# run on text that has already been through _handle_booking_action — an
+# [ACTION: ...] tag can appear anywhere in the model's raw output and triggers
+# a full replacement of the reply with a DB-verified outcome (never confirm a
+# booking before the row exists), so speaking any partial text before that
+# check has run would risk speaking words that get thrown away.
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?।])\s+')  # । = Hindi/Devanagari danda
+
+
+def _split_into_speakable_chunks(text: str, min_chunk_len: int = 12) -> list[str]:
+    """Split final reply text into TTS-sized chunks for pipelined synthesis.
+
+    Only affects chunk BOUNDARIES for pipelining — never correctness. A bad
+    split (e.g. on "Dr.") costs an awkward pause, not wrong spoken content, so
+    this is a pragmatic splitter, not a linguistic sentence tokenizer. Any
+    fragment shorter than min_chunk_len is merged into the previous chunk
+    (avoids a lone "Dr." or stray punctuation becoming its own TTS call).
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    raw_parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text) if p.strip()]
+    if len(raw_parts) <= 1:
+        return raw_parts
+
+    # Accumulate fragments into a running buffer until it reaches min_chunk_len,
+    # then emit it as one chunk and start a new buffer. This (rather than
+    # merging a short fragment into whatever chunk came before it) is what
+    # correctly folds a leading short fragment like "Dr." into the sentence
+    # that follows it, since there's no "previous chunk" to merge into yet.
+    chunks: list[str] = []
+    buf = ""
+    for part in raw_parts:
+        buf = f"{buf} {part}".strip() if buf else part
+        if len(buf) >= min_chunk_len:
+            chunks.append(buf)
+            buf = ""
+    if buf:
+        if chunks:
+            chunks[-1] = f"{chunks[-1]} {buf}"
+        else:
+            chunks.append(buf)
+    return chunks
+
 
 async def handle_audio_turn(
     websocket: WebSocket,
@@ -1542,54 +1591,145 @@ async def handle_audio_turn(
             return
 
         tts_ms = 0
+        ttfa_ms = 0  # time-to-first-audio — the metric the pipelining below improves
         tts_ok = False
         # Get the interrupt event for this session (barge-in support)
         _interrupt = _agent_speaking.get(session_id)
         if _interrupt:
             _interrupt.clear()  # reset before starting new TTS
+
+        def _make_tts_coro(text_chunk: str):
+            # Use retry-capable TTS wrapper for sarvam, else generic
+            return sarvam_synthesize_with_retry(
+                agent, text_chunk, language_override=tts_lang_for_turn
+            ) if (agent.tts_provider or "sarvam") == "sarvam" else synthesize_speech(
+                agent, text_chunk, language_override=tts_lang_for_turn
+            )
+
+        # response_text is already final and already past _handle_booking_action
+        # (see the note on _split_into_speakable_chunks) — safe to chunk here.
+        speakable_chunks = _split_into_speakable_chunks(response_text)
+
         try:
             tts_start = time.monotonic()
-            # BUG 3: Wrap TTS with timeout + cancellation check
-            try:
-                # Use retry-capable TTS wrapper for sarvam, else generic
-                tts_coro = sarvam_synthesize_with_retry(
-                    agent, response_text, language_override=tts_lang_for_turn
-                ) if (agent.tts_provider or "sarvam") == "sarvam" else synthesize_speech(
-                    agent, response_text, language_override=tts_lang_for_turn
-                )
-                audio_response = await asyncio.wait_for(tts_coro, timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning("TTS timeout — client may have disconnected")
-                if _cancel and _cancel.is_set():
-                    return
-                audio_response = b""
-            tts_ms = int((time.monotonic() - tts_start) * 1000)
-            logger.info(f"[TIMING] TTS: {tts_ms}ms ({len(audio_response) if audio_response else 0} bytes)")
 
-            if audio_response and len(audio_response) >= 512:  # sanity-check non-empty
-                # Check if user interrupted BEFORE we send
-                if _interrupt and _interrupt.is_set():
-                    logger.info("TTS send aborted — interrupt received for session %s", session_id)
-                    tts_ok = False
-                elif _cancel and _cancel.is_set():
-                    logger.info("Session cancelled before TTS send for %s", session_id)
-                    return
-                else:
-                    tts_ok = True
-                    try:
-                        await websocket.send_bytes(audio_response)
-                    except Exception:
-                        return
-                    # BUG 1: Set agent_speaking_until so incoming mic audio is discarded
-                    # Calculate audio duration: 16-bit PCM @ 24kHz (Sarvam default) ≈ 48000 bytes/sec
-                    audio_duration_s = len(audio_response) / 48000.0
-                    _agent_speaking_until[session_id] = time.time() + audio_duration_s + 0.8
-                    logger.info(
-                        "Agent speaking for %.1fs (audio=%d bytes, buffer=0.8s)",
-                        audio_duration_s + 0.8, len(audio_response),
+            if len(speakable_chunks) <= 1:
+                # ── Single-sentence replies: unchanged from before pipelining ──
+                # BUG 3: Wrap TTS with timeout + cancellation check
+                try:
+                    audio_response = await asyncio.wait_for(
+                        _make_tts_coro(response_text), timeout=10.0
                     )
+                except asyncio.TimeoutError:
+                    logger.warning("TTS timeout — client may have disconnected")
+                    if _cancel and _cancel.is_set():
+                        return
+                    audio_response = b""
+                tts_ms = int((time.monotonic() - tts_start) * 1000)
+                logger.info(f"[TIMING] TTS: {tts_ms}ms ({len(audio_response) if audio_response else 0} bytes)")
+
+                if audio_response and len(audio_response) >= 512:  # sanity-check non-empty
+                    # Check if user interrupted BEFORE we send
+                    if _interrupt and _interrupt.is_set():
+                        logger.info("TTS send aborted — interrupt received for session %s", session_id)
+                        tts_ok = False
+                    elif _cancel and _cancel.is_set():
+                        logger.info("Session cancelled before TTS send for %s", session_id)
+                        return
+                    else:
+                        tts_ok = True
+                        try:
+                            await websocket.send_bytes(audio_response)
+                        except Exception:
+                            return
+                        ttfa_ms = tts_ms
+                        # BUG 1: Set agent_speaking_until so incoming mic audio is discarded
+                        # Calculate audio duration: 16-bit PCM @ 24kHz (Sarvam default) ≈ 48000 bytes/sec
+                        audio_duration_s = len(audio_response) / 48000.0
+                        _agent_speaking_until[session_id] = time.time() + audio_duration_s + 0.8
+                        logger.info(
+                            "Agent speaking for %.1fs (audio=%d bytes, buffer=0.8s)",
+                            audio_duration_s + 0.8, len(audio_response),
+                        )
+                else:
+                    logger.warning(f"TTS returned empty/tiny response ({len(audio_response) if audio_response else 0}B) — sending tts_failed")
+
             else:
-                logger.warning(f"TTS returned empty/tiny response ({len(audio_response) if audio_response else 0}B) — sending tts_failed")
+                # ── Multi-sentence replies: pipelined synthesis ────────────────
+                # Kick off every chunk's synthesis CONCURRENTLY so chunk 2+'s
+                # TTS runs while chunk 1 is being awaited/sent — by the time
+                # chunk 1 is on the wire, chunk 2 is often already done or
+                # close to it. Sent to the client strictly IN ORDER; the
+                # frontend already queues and plays multiple sequential audio
+                # messages per turn (TestAgentModal.tsx's audioQueueRef), so
+                # this needs no protocol or frontend change.
+                synth_tasks = [asyncio.create_task(_make_tts_coro(c)) for c in speakable_chunks]
+                speaking_until = time.time()
+                any_sent = False
+                for i, task in enumerate(synth_tasks):
+                    if _cancel and _cancel.is_set():
+                        for t in synth_tasks[i:]:
+                            t.cancel()
+                        return
+                    if _interrupt and _interrupt.is_set():
+                        logger.info(
+                            "TTS send aborted mid-stream — interrupt received for session %s "
+                            "(chunk %d/%d)", session_id, i + 1, len(synth_tasks),
+                        )
+                        for t in synth_tasks[i:]:
+                            t.cancel()
+                        break
+
+                    try:
+                        chunk_audio = await asyncio.wait_for(task, timeout=10.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "TTS chunk %d/%d timed out — client may have disconnected",
+                            i + 1, len(synth_tasks),
+                        )
+                        if _cancel and _cancel.is_set():
+                            return
+                        chunk_audio = b""
+                    except Exception as chunk_err:
+                        logger.error(
+                            "TTS chunk %d/%d failed: %s", i + 1, len(synth_tasks), chunk_err
+                        )
+                        chunk_audio = b""
+
+                    if not (chunk_audio and len(chunk_audio) >= 512):
+                        logger.warning(
+                            "TTS chunk %d/%d empty/tiny (%dB) — stopping remaining chunks",
+                            i + 1, len(synth_tasks), len(chunk_audio) if chunk_audio else 0,
+                        )
+                        for t in synth_tasks[i + 1:]:
+                            t.cancel()
+                        break
+
+                    try:
+                        await websocket.send_bytes(chunk_audio)
+                    except Exception:
+                        for t in synth_tasks[i + 1:]:
+                            t.cancel()
+                        return
+                    any_sent = True
+                    if ttfa_ms == 0:
+                        ttfa_ms = int((time.monotonic() - tts_start) * 1000)
+                    # Echo suppression must cover the WHOLE multi-chunk
+                    # utterance — extend forward cumulatively, don't overwrite.
+                    chunk_duration_s = len(chunk_audio) / 48000.0
+                    speaking_until = max(speaking_until, time.time()) + chunk_duration_s
+
+                tts_ms = int((time.monotonic() - tts_start) * 1000)
+                tts_ok = any_sent
+                if any_sent:
+                    _agent_speaking_until[session_id] = speaking_until + 0.8
+                    logger.info(
+                        "[TIMING] TTS (pipelined, %d chunks): %dms total, first audio at %dms",
+                        len(speakable_chunks), tts_ms, ttfa_ms,
+                    )
+                else:
+                    logger.warning("TTS pipelined path produced no audio at all")
+
         except WebSocketDisconnect:
             # Client hung up mid-TTS — normal on mobile when user closes tab,
             # navigates away, or backgrounds Safari. Bubble up to outer except
@@ -1623,6 +1763,7 @@ async def handle_audio_turn(
                 "stt_ms": stt_ms,
                 "llm_ms": llm_ms,
                 "tts_ms": tts_ms,
+                "ttfa_ms": ttfa_ms,
                 "total_ms": total_ms,
             })
         except RuntimeError:
