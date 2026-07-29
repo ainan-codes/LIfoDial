@@ -781,8 +781,14 @@ async def manage_sarvam_streaming_tts(
                                 agent.tts_language or "en-IN"
                             ),
                             "pace": buffered_config.get("pace", agent.tts_pace or 1.0),
-                            "min_buffer_size": buffered_config.get("min_buffer_size", 50),
-                            "max_chunk_length": buffered_config.get("max_chunk_length", 200),
+                            # 30/60 — same tuning as pipeline.py's live-call path
+                            # (Sarvam's floor is 30; below it the server rejects
+                            # the whole config). 50/200 are pipecat's stock,
+                            # narration-tuned defaults and reproduce the
+                            # wait-for-the-whole-reply latency this agent can't
+                            # afford at a 2-sentence response length.
+                            "min_buffer_size": buffered_config.get("min_buffer_size", 30),
+                            "max_chunk_length": buffered_config.get("max_chunk_length", 60),
                             "output_audio_codec": buffered_config.get("output_audio_codec", "mp3"),
                             "output_audio_bitrate": buffered_config.get("output_audio_bitrate", "128k"),
                             "pitch": agent.tts_pitch or 0.0,
@@ -1666,7 +1672,7 @@ async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint
         logger.warning(f"No API key for STT provider: {stt_provider}")
         return "", ""
     
-    lang = language_hint or agent.tts_language or "en-IN"
+    lang = language_hint or agent.stt_language or agent.tts_language or "en-IN"
 
     if stt_provider == "sarvam":
         stt_model = agent.stt_model or "saaras:v3"
@@ -1693,7 +1699,7 @@ async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint
         # policy as the Sarvam branch above. A retry pins the language.
         dg_lang = lang if (force_language or not getattr(agent, "auto_detect_language", True)) else ""
         return await deepgram_transcribe(
-            api_key, audio_bytes, agent.stt_model or "nova-2", language=dg_lang
+            api_key, audio_bytes, agent.stt_model or "nova-3", language=dg_lang
         )
     
     elif stt_provider == "openai_whisper":
@@ -2017,7 +2023,7 @@ def _deepgram_language_param(model: str, language: str) -> dict:
 async def deepgram_transcribe(
     api_key: str,
     audio_bytes: bytes | None,
-    model: str = "nova-2",
+    model: str = "nova-3",
     language: str = "",
     audio_url: str | None = None,
 ) -> tuple[str, str]:
@@ -2054,7 +2060,7 @@ async def deepgram_transcribe(
         logger.warning("Deepgram STT: no audio supplied")
         return "", ""
 
-    params = {"model": model or "nova-2", "smart_format": "true", "punctuate": "true"}
+    params = {"model": model or "nova-3", "smart_format": "true", "punctuate": "true"}
     params.update(_deepgram_language_param(params["model"], language))
 
     if audio_url:
@@ -3030,10 +3036,14 @@ async def synthesize_speech(agent: AgentConfig, text: str, language_override: st
             )
         
         elif tts_provider == "openai_tts":
+            openai_model = agent.tts_model or "gpt-4o-mini-tts"
+            if not (openai_model.startswith("gpt-") or openai_model.startswith("tts-")):
+                openai_model = "gpt-4o-mini-tts"
             return await openai_synthesize(
                 api_key=api_key,
                 text=text,
-                voice=agent.tts_voice or "nova"
+                voice=agent.tts_voice or "nova",
+                model=openai_model,
             )
         
         else:
@@ -3247,7 +3257,15 @@ async def sarvam_synthesize(api_key: str, text: str, voice: str,
     # FIX: Validate language code — Sarvam only supports Indian languages.
     # Unsupported codes like 'ar-SA' would cause a 400 validation error.
     normalized_language = normalize_sarvam_language(language)
-    
+
+    # Clamp to Sarvam's accepted ranges — same bounds as pipeline.py's live-call
+    # path. Callers pass agent.tts_pace/pitch/loudness straight from the DB with
+    # no validation at write time, so a stray out-of-range stored value would
+    # otherwise reach Sarvam unclamped and 400.
+    clamped_pace = min(max(float(pace), 0.5), 2.0)
+    clamped_pitch = min(max(float(pitch), -0.75), 0.75)
+    clamped_loudness = min(max(float(loudness), 0.3), 3.0)
+
     # Build payload based on model capabilities.
     payload = {
         # Sarvam REST v3 expects `text` for synchronous synthesis.
@@ -3255,15 +3273,15 @@ async def sarvam_synthesize(api_key: str, text: str, voice: str,
         "target_language_code": normalized_language,
         "speaker": normalized_voice,
         "model": normalized_model,
-        "pace": pace,
+        "pace": clamped_pace,
         "enable_preprocessing": enable_preprocessing,
         "speech_sample_rate": 24000,
     }
 
     # Only bulbul:v2 supports pitch/loudness — v3 and v3-beta both reject them.
     if normalized_model == "bulbul:v2":
-        payload["pitch"] = pitch
-        payload["loudness"] = loudness
+        payload["pitch"] = clamped_pitch
+        payload["loudness"] = clamped_loudness
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.post(
@@ -3345,9 +3363,9 @@ async def elevenlabs_synthesize(api_key: str, text: str,
             raise Exception(f"ElevenLabs TTS: {response.status_code}")
 
 
-async def openai_synthesize(api_key: str, text: str, voice: str) -> bytes:
+async def openai_synthesize(api_key: str, text: str, voice: str, model: str = "tts-1") -> bytes:
     import httpx
-    
+
     async with httpx.AsyncClient(timeout=15.0) as client:
         response = await client.post(
             "https://api.openai.com/v1/audio/speech",
@@ -3356,7 +3374,7 @@ async def openai_synthesize(api_key: str, text: str, voice: str) -> bytes:
                 "Content-Type": "application/json"
             },
             json={
-                "model": "tts-1",
+                "model": model,
                 "input": text,
                 "voice": voice,
                 "response_format": "mp3"

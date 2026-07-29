@@ -1242,14 +1242,24 @@ async def entrypoint(ctx) -> None:
             )
         )
     elif tts_provider == "openai_tts":
-        log.info("Instantiating OpenAI TTS for voice: %s, model: %s", tts_voice, tts_model_str)
+        # tts_model_str was validated against Sarvam's own model enum above
+        # (line ~767) and forced to "bulbul:v3" if it didn't match — read the
+        # raw configured model directly here instead, same as the Cartesia and
+        # ElevenLabs branches already do for their own model lists. Without
+        # this, every OpenAI TTS call silently used gpt-4o-mini-tts regardless
+        # of the admin's actual choice (tts-1 / tts-1-hd), because
+        # "bulbul:v3" doesn't start with "gpt-"/"tts-" either.
+        openai_model = agent_config.get("tts_model") or "gpt-4o-mini-tts"
+        if not (openai_model.startswith("gpt-") or openai_model.startswith("tts-")):
+            openai_model = "gpt-4o-mini-tts"
+        log.info("Instantiating OpenAI TTS for voice: %s, model: %s", tts_voice, openai_model)
         openai_speed = agent_config.get("tts_speed")
         openai_speed = min(max(float(openai_speed), 0.25), 4.0) if openai_speed is not None else None
         tts = OpenAITTSService(
             api_key=_tts_keys.get("openai_tts") or _tts_keys["openai"],
             settings=OpenAITTSService.Settings(
                 voice=tts_voice or "alloy",
-                model=tts_model_str if tts_model_str.startswith("gpt-") or tts_model_str.startswith("tts-") else "gpt-4o-mini-tts",
+                model=openai_model,
                 speed=openai_speed,
             ),
         )
