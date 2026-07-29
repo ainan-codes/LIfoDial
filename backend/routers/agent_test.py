@@ -1983,16 +1983,33 @@ _DEEPGRAM_LANGS = {
 def _deepgram_language_param(model: str, language: str) -> dict:
     """Query params controlling Deepgram language selection.
 
-    nova-3 only accepts ``en`` or ``multi``; nova-2 and earlier accept per-language
-    codes plus ``detect_language=true``. An empty ``language`` means auto-detect.
-    """
-    if model.startswith("nova-3"):
-        if language.startswith("en"):
-            return {"language": "en"}
-        return {"language": "multi"}
+    Mirrors the live pipeline's rules — see the verified support matrix in
+    backend/agent/pipeline.py (_DG_NOVA3_MULTI_LANGS / _DG_UNSUPPORTED_LANGS).
+    nova-3 covers en/hi via "multi" and ta/te/kn/mr/bn/gu via their own codes;
+    nova-2 rejects every Indic language with HTTP 400. An empty ``language``
+    means auto-detect.
 
-    dg = _DEEPGRAM_LANGS.get(language) or _DEEPGRAM_LANGS.get(language.split("-")[0], "")
-    if dg:
+    This previously sent EVERY non-English language to nova-3 as "multi", which
+    nova-3 does not support for ta/te/kn/mr/bn/gu — the same 400 the live pipeline
+    was hitting from the opposite direction.
+    """
+    from backend.agent.pipeline import _DG_NOVA3_MULTI_LANGS, _DG_UNSUPPORTED_LANGS
+
+    base = (language or "").split("-")[0]
+
+    if model.startswith("nova-3"):
+        if not base:
+            return {"language": "multi"}
+        if base in _DG_UNSUPPORTED_LANGS:
+            # Deepgram cannot do these on any tier; let it auto-detect rather than
+            # sending a language it will reject outright.
+            return {"detect_language": "true"}
+        return {"language": "multi" if base in _DG_NOVA3_MULTI_LANGS else base}
+
+    # nova-2 and earlier: only English variants and Hindi are accepted. Every other
+    # Indic code returns HTTP 400, so auto-detect instead of guaranteeing a failure.
+    dg = _DEEPGRAM_LANGS.get(language) or _DEEPGRAM_LANGS.get(base, "")
+    if dg and (dg.startswith("en") or dg == "hi"):
         return {"language": dg}
     return {"detect_language": "true"}
 

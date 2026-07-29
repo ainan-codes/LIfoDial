@@ -125,6 +125,35 @@ def _kb_context_block(tenant: dict) -> str:
 
 _DEFAULT_WORKING_HOURS = "9 AM – 7 PM, Mon–Sat"
 
+# ── Deepgram language support ─────────────────────────────────────────────────
+# Verified by live probes against the Deepgram API on 2026-07-28. Deepgram's own
+# 400 body is explicit about the tier: "No such model/language/tier combination
+# found. You could try the 'general' model (language: ta, Nova-3 tier)."
+#
+#   nova-3 + en/hi/ta/te/kn/mr/bn/gu -> 200
+#   nova-3 + ml/pa                   -> 400 (unsupported by Deepgram entirely)
+#   nova-2 + ta/te/kn/ml/mr/bn/pa/gu -> 400
+#   nova-2 + hi/en-*                 -> 200
+#
+# Do NOT "fix" an Indic 400 by falling back to nova-2 — that is the combination
+# Deepgram rejects, and it is how this shipped broken: the 400 is swallowed by
+# pipecat's Deepgram _connection_handler (bare `except`, `while True`, no backoff),
+# so the agent greets the caller and then loops forever without transcribing.
+_DG_LANG_MAP = {
+    "en-IN": "en-IN", "en-US": "en-US", "en-GB": "en-GB",
+    "hi-IN": "hi",     "ta-IN": "ta",     "te-IN": "te",
+    "kn-IN": "kn",     "ml-IN": "ml",     "mr-IN": "mr",
+    "bn-IN": "bn",     "pa-IN": "pa",     "gu-IN": "gu",
+}
+
+#: Languages where nova-3's "multi" model is the right target (it code-switches
+#: inside one socket). Other nova-3-supported languages are pinned to their own
+#: code instead.
+_DG_NOVA3_MULTI_LANGS = {"en", "hi"}
+
+#: Languages Deepgram cannot do on any tier — use a different provider.
+_DG_UNSUPPORTED_LANGS = {"ml", "pa"}
+
 
 def _clinic_facts_block(tenant: dict) -> str:
     """Clinic hours + the full doctor roster, as a block appended to EVERY prompt.
@@ -885,59 +914,70 @@ async def entrypoint(ctx) -> None:
                 room_name,
             )
 
+    # Deepgram cannot transcribe Malayalam or Punjabi on ANY tier (verified against
+    # the live API — both nova-2 and nova-3 answer HTTP 400). Switching provider
+    # here, BEFORE the build chain, rather than inside the deepgram branch: doing it
+    # in there would leave `stt_provider == "deepgram"` for the rest of the chain,
+    # miss every `elif`, and land in the Sarvam `else:` — which is fine — but doing
+    # it the other way round (breaking the elif chain into separate `if`s) would let
+    # a SUCCESSFUL Deepgram build get silently overwritten by that same `else:`.
     if stt_provider == "deepgram":
-        # Deepgram Nova-3: real-time streaming with ~200ms TTFB (vs ~800ms Sarvam batch).
-        # Best for English; supports Hindi/Tamil/Telugu with nova-2.
+        _dg_base = (_DG_LANG_MAP.get(stt_language, "en-IN") or "").split("-")[0]
+        if _dg_base in _DG_UNSUPPORTED_LANGS:
+            log.warning(
+                "Deepgram has no model/tier for %s (%s) — using Sarvam STT for room=%s so "
+                "the agent can actually hear the caller. Deepgram would answer HTTP 400 and "
+                "pipecat would retry it in a hot loop without ever transcribing.",
+                stt_language, _dg_base, room_name,
+            )
+            stt_provider = "sarvam"
+
+    if stt_provider == "deepgram":
+        # Deepgram: real-time streaming, ~200ms TTFB (vs ~800ms Sarvam batch).
         log.info("Instantiating Deepgram streaming STT...")
         DeepgramSTTService = _import_deepgram_stt()
-        # Map our BCP-47 language code to Deepgram's language code
-        _dg_lang_map = {
-            "en-IN": "en-IN", "en-US": "en-US", "en-GB": "en-GB",
-            "hi-IN": "hi",     "ta-IN": "ta",     "te-IN": "te",
-            "kn-IN": "kn",     "ml-IN": "ml",     "mr-IN": "mr",
-            "bn-IN": "bn",     "pa-IN": "pa",     "gu-IN": "gu",
-        }
-        dg_lang = _dg_lang_map.get(stt_language, "en-IN")
-        # Honour the model picked in the UI (nova-2-phonecall, nova-2-medical, …).
-        # agent_config["stt_model"] is shared with Sarvam and defaults to a
-        # "saaras:*" value, so only accept strings that are actually Deepgram
-        # model names; anything else falls back to the language-based default:
-        # nova-3 for English, nova-2 for Indic (nova-3 is English-optimised).
-        _dg_default = "nova-3" if dg_lang.startswith("en") else "nova-2"
+        dg_lang = _DG_LANG_MAP.get(stt_language, "en-IN")
+
+        # ── Model/language selection ─────────────────────────────────────────
+        # This block used to have the tier logic BACKWARDS, and the failure was
+        # silent. Verified live against the Deepgram API (2026-07-28):
+        #
+        #   nova-2 + ta/te/kn/ml/mr/bn/pa/gu  -> HTTP 400
+        #       "No such model/language/tier combination found. You could try the
+        #        'general' model (language: ta, Nova-3 tier)."
+        #   nova-3 + en/hi/ta/te/kn/mr/bn/gu  -> 200 OK
+        #   nova-3 + ml, pa                   -> 400 (Deepgram supports neither)
+        #
+        # The old code did the opposite: it defaulted Indic languages to nova-2 and
+        # actively DOWNGRADED an explicit nova-3 choice to nova-2 for exactly the
+        # languages nova-2 rejects. Worse, the resulting 400 was invisible —
+        # pipecat's Deepgram _connection_handler catches it in a bare `except` and
+        # retries in a `while True` with no backoff, so the agent greeted the caller
+        # and then sat in a hot reconnect loop, never transcribing a word.
+        #
+        # nova-3 is now the default for every language.
         _dg_requested = (agent_config.get("stt_model") or "").strip()
         dg_model = (
             _dg_requested
-            if _dg_requested.startswith(("nova-", "nova", "base", "enhanced"))
-            else _dg_default
+            if _dg_requested.startswith(("nova-", "base", "enhanced"))
+            else "nova-3"
         )
         if _dg_requested and dg_model != _dg_requested:
             log.info(
                 "STT model %r is not a Deepgram model — using %s for room=%s",
                 _dg_requested, dg_model, room_name,
             )
-        # nova-3 takes only "en*" or "multi" as its language.
-        #
-        # Prefer "multi" even for English: nova-3 multilingual code-switches inside
-        # ONE socket, so a caller moving English → Hindi mid-call costs NOTHING.
-        # Pinning "en-IN" instead would force LanguageSwitchProcessor to send an
-        # STTUpdateSettingsFrame, and Deepgram's _update_settings reconnects the
-        # websocket — ~200-400ms deaf right at the moment the caller switched.
-        #
-        # nova-3 multilingual does NOT cover every language this product serves
-        # (Tamil/Telugu/Malayalam/Kannada/Bengali/Gujarati/Punjabi/Marathi/Odia are
-        # nova-2-only), so for those an explicit nova-3 choice is downgraded to
-        # nova-2 rather than silently transcribing nothing.
-        _NOVA3_MULTI_LANGS = {"en", "hi"}  # of ours; nova-3 multi also covers es/fr/de/it/nl/pt/ja/ru
+
+        _base = dg_lang.split("-")[0]
         if dg_model.startswith("nova-3"):
-            _base = dg_lang.split("-")[0]
-            if _base in _NOVA3_MULTI_LANGS:
-                dg_lang = "multi"
-            else:
-                log.warning(
-                    "nova-3 does not support %s — falling back to nova-2 for room=%s",
-                    dg_lang, room_name,
-                )
-                dg_model = "nova-2"
+            # Prefer "multi" where nova-3 offers it: multilingual code-switches
+            # inside ONE socket, so a caller moving English → Hindi mid-call costs
+            # nothing. Pinning a single code would make LanguageSwitchProcessor send
+            # an STTUpdateSettingsFrame, and Deepgram's _update_settings reconnects
+            # the websocket — ~200-400ms deaf at exactly the moment the caller
+            # switched.
+            dg_lang = "multi" if _base in _DG_NOVA3_MULTI_LANGS else _base
+
         log.info("Deepgram STT: model=%s language=%s", dg_model, dg_lang)
         stt = DeepgramSTTService(
             api_key=_stt_keys["deepgram"],
@@ -951,15 +991,17 @@ async def entrypoint(ctx) -> None:
                 utterance_end_ms=1000,
             ),
         )
-        # nova-3 on "multi" already code-switches inside one socket, so only the
+        # "multi" already code-switches inside one socket, so only the
         # language-pinned models need a mid-call STT retune.
         stt_needs_language_switch = dg_lang != "multi"
 
         def stt_language_translator(code: str, _model: str = dg_model) -> str:
-            # nova-3 accepts only "en*" or "multi"; older models take real codes.
+            base = (_DG_LANG_MAP.get(code, "") or "").split("-")[0]
+            if not base or base in _DG_UNSUPPORTED_LANGS:
+                return ""  # no valid Deepgram target — leave STT as it is
             if _model.startswith("nova-3"):
-                return "en" if code.startswith("en") else "multi"
-            return _dg_lang_map.get(code, "")
+                return "multi" if base in _DG_NOVA3_MULTI_LANGS else base
+            return _DG_LANG_MAP.get(code, "")
     elif stt_provider in ("openai", "whisper"):
         log.info("Instantiating OpenAI Whisper STT...")
         stt = OpenAISTTService(
