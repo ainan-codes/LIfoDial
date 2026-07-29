@@ -27,6 +27,7 @@ from backend.models.agent_config import AgentConfig
 from backend.models.api_key_config import ApiKeyConfig
 from backend.config import settings
 from backend.security import decode_access_token
+from backend import redis_client
 from backend.agent.booking_rules import (
     BOOKING_RULES_BLOCK,
     BOOKING_RESULT_TRUE,
@@ -247,6 +248,7 @@ async def clear_agent_session(agent_id: str, session_id: str, user: CurrentUser 
     session_key = session_id or agent_id
     if session_key in _conversation_history:
         del _conversation_history[session_key]
+    await redis_client.delete_chat_history(str(session_key))
     return {"status": "cleared"}
 
 
@@ -2415,11 +2417,21 @@ async def generate_llm_response(
     
     llm_provider = agent.llm_provider or "gemini"
     session_key = session_id or agent.id
-    
-    # Initialize conversation history for this session
+
+    # Initialize conversation history for this session.
+    # `_conversation_history` is an L1 in-process cache. The WS voice/text path
+    # (`websocket` is not None) is pinned to one worker for the connection's
+    # whole life, so the cache alone is correct there — skip Redis to leave
+    # that hot low-latency loop untouched. REST /agent-chat and public
+    # /embed chat (`websocket is None`) reuse the same session_key across
+    # independent requests that can land on any worker, so read-through from
+    # the shared store the first time *this* worker sees the session_key.
     if session_key not in _conversation_history:
-        _conversation_history[session_key] = []
-    
+        seeded = None
+        if websocket is None:
+            seeded = await redis_client.get_chat_history(str(session_key))
+        _conversation_history[session_key] = seeded or []
+
     history = _conversation_history[session_key]
     
     # Get API key — check DB first, then fall back to .env
@@ -2620,11 +2632,19 @@ async def generate_llm_response(
 
         # Add response to history
         history.append({"role": "assistant", "content": response})
-        
+
         # Keep history to last 10 turns to avoid token overflow
         if len(history) > 20:
-            _conversation_history[session_key] = history[-20:]
-        
+            history = history[-20:]
+            _conversation_history[session_key] = history
+
+        # Write-through so a follow-up turn on the same session_id, landing on
+        # a different uvicorn worker, still sees this turn (see the
+        # read-through comment above — WS voice turns are excluded).
+        # Not atomic — see redis_client.save_chat_history's race note.
+        if websocket is None:
+            await redis_client.save_chat_history(str(session_key), history)
+
         return response
         
     except Exception as e:
@@ -2714,7 +2734,10 @@ async def generate_llm_response(
 
                     history.append({"role": "assistant", "content": response})
                     if len(history) > 20:
-                        _conversation_history[session_key] = history[-20:]
+                        history = history[-20:]
+                        _conversation_history[session_key] = history
+                    if websocket is None:
+                        await redis_client.save_chat_history(str(session_key), history)
                     return response
                 except Exception as fb_e:
                     logger.error(

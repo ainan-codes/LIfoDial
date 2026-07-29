@@ -13,11 +13,14 @@ Behavior:
   byte-for-byte, so nothing breaks if Redis isn't provisioned. A Redis op that
   fails mid-run degrades to memory rather than dropping the call.
 
-IMPORTANT SCOPE NOTE: this store backs the LEGACY telephony path
-(routers/voice.py, routers/ws.py). The live web-call turn (routers/agent_test.py)
-still keeps its per-turn state in module-level dicts, so wiring Redis here does
-NOT by itself make that path multi-worker-safe — that requires moving the
-hot-path state here too (fast-follow). Until then, keep uvicorn at --workers 1.
+SCOPE NOTE: the call-session store (get/save/delete_session, append_history)
+backs the LEGACY telephony path (routers/voice.py, routers/ws.py). The
+chat-history store (get/save/delete_chat_history) backs the REST/embed chat
+callers in routers/agent_test.py — see the comment above that section for why
+the WS voice/text turn loop doesn't need it. Neither of these makes it safe to
+raise uvicorn's --workers today: REDIS_URL isn't configured in production, so
+every function here still resolves to the in-memory fallback. Raising workers
+requires actually provisioning Redis and setting REDIS_URL first.
 """
 from __future__ import annotations
 
@@ -173,3 +176,69 @@ async def append_history(tenant_id: str, call_id: str, role: str, text: str) -> 
         await save_session(tenant_id, call_id, sess)
     except Exception as e:
         log.warning("[SESSION] append_history failed (%s)", e)
+
+
+# ── Chat/text history store (agent_test.py REST + embed-widget chat turns) ────
+# Separate keyspace from the call-session store above: these are the LLM
+# `[{"role": ..., "content": ...}]` histories used by the dashboard "Test
+# Agent" chat, /embed/{id}/chat, and the agents.py chat-test endpoint — NOT the
+# telephony call-session dict. Kept distinct so a chat session_key can never
+# collide with a `{tenant_id}:{call_id}` call-session key.
+#
+# The WS voice/text turn loop in agent_test.py does NOT use this — a single WS
+# connection is always served by one worker for its whole life, so its local
+# dict is already correct. This backs the REST/embed callers, whose requests
+# can land on any worker and previously silently lost/duplicated context
+# depending on which one held the local dict entry.
+_CHAT_KEY_PREFIX = "lifodial:chat:"
+
+# In-memory fallback (mirrors `_sessions` above, same lifecycle/semantics).
+_chat_histories: dict = {}
+
+
+def _chat_key(session_key: str) -> str:
+    return f"{_CHAT_KEY_PREFIX}{session_key}"
+
+
+async def get_chat_history(session_key: str) -> list | None:
+    client = await _get_client()
+    if client is None:
+        return _chat_histories.get(session_key)
+    try:
+        raw = await client.get(_chat_key(session_key))
+        return json.loads(raw) if raw else None
+    except Exception as e:
+        log.warning("[CHAT] get_chat_history failed (%s) — falling back to memory", e)
+        return _chat_histories.get(session_key)
+
+
+async def save_chat_history(session_key: str, history: list) -> None:
+    # Race note: this is a plain get-then-set with no compare-and-swap, same as
+    # append_history above — two rapid requests for the same session_key on
+    # different workers can clobber each other's shared copy. Accepted
+    # best-effort limitation (see append_history precedent); real chat turns
+    # for one session are overwhelmingly sequential in practice.
+    client = await _get_client()
+    if client is None:
+        _chat_histories[session_key] = history
+        return
+    try:
+        await client.set(
+            _chat_key(session_key),
+            json.dumps(history, default=str),
+            ex=_SESSION_TTL_SECONDS,
+        )
+    except Exception as e:
+        log.warning("[CHAT] save_chat_history failed (%s) — kept in memory only", e)
+        _chat_histories[session_key] = history
+
+
+async def delete_chat_history(session_key: str) -> None:
+    _chat_histories.pop(session_key, None)
+    client = await _get_client()
+    if client is None:
+        return
+    try:
+        await client.delete(_chat_key(session_key))
+    except Exception as e:
+        log.warning("[CHAT] delete_chat_history failed (%s)", e)
