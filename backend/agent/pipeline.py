@@ -2031,28 +2031,15 @@ def prewarm(proc) -> None:
     except Exception as exc:
         log.warning("Prewarm: DB layer import failed (non-fatal): %s", exc)
 
-    # Open a real connection so the first CALLER doesn't pay for the Supabase
-    # TCP+TLS+auth handshake. With DB_POOL_SIZE set (see backend/db.py) this
-    # connection stays in the pool and every later call reuses it; without it the
-    # warm-up still primes asyncpg's own machinery. Runs on its own loop because
-    # prewarm_fnc is synchronous — the connection lands in the process-wide pool
-    # either way, which is what matters.
-    try:
-        t2 = time.monotonic()
-        import asyncio as _asyncio
-
-        from sqlalchemy import text as _text
-
-        from backend.db import AsyncSessionLocal as _Session
-
-        async def _touch() -> None:
-            async with _Session() as s:
-                await s.execute(_text("SELECT 1"))
-
-        _asyncio.run(_touch())
-        log.info("Prewarm: Supabase connection opened (%.2fs)", time.monotonic() - t2)
-    except Exception as exc:
-        log.warning("Prewarm: DB connection warm-up failed (non-fatal): %s", exc)
+    # NO DB connection warm-up here, deliberately. prewarm_fnc is synchronous, so
+    # opening one means asyncio.run() and a throwaway event loop — and asyncpg
+    # connections are BOUND to the loop that created them. With DB_POOL_SIZE set
+    # (backend/db.py) that connection would be parked in the pool and later handed
+    # to a job running on a different loop, which is a much worse failure than the
+    # handshake it saves. The live worker refused it outright:
+    #   "Prewarm: DB connection warm-up failed: Task <Task pending …_touch()…>"
+    # The pool already solves this properly — the first call pays the handshake
+    # once and every call after it reuses the connection.
 
     try:
         t1 = time.monotonic()
