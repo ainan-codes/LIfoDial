@@ -93,6 +93,42 @@ async def is_provider_configured(session: AsyncSession, provider: str, category:
     return bool(await resolve_provider_key(session, provider, category=category))
 
 
+async def resolve_custom_llm_endpoint(
+    session: AsyncSession, provider: str
+) -> tuple[str, str] | None:
+    """(api_key, base_url) for a custom OpenAI-compatible LLM provider, or None.
+
+    A provider id that isn't one of the built-in four is still legitimate if it
+    was registered through the AI Platform's "Add Custom Provider" with a
+    base_url in extra_config. Returns None when it has no key or no base_url —
+    callers read that as "not set up", not as a transient failure.
+
+    Lives HERE rather than in backend/agent/resilience.py because the API needs
+    it to validate an agent save, and resilience.py imports pipecat, which is only
+    installed on the agent worker. That import turned every PATCH /agents/{id}
+    carrying an llm_provider into `500: No module named 'pipecat'` — a save that
+    the dashboard could only report as "failed to save".
+    """
+    try:
+        result = await session.execute(
+            select(ApiKeyConfig).where(
+                ApiKeyConfig.provider == provider,
+                ApiKeyConfig.category == "llm",
+                ApiKeyConfig.is_active == True,  # noqa: E712
+            )
+        )
+        row = result.scalars().first()
+        if not row:
+            return None
+        key = row.get_key_raw()
+        base_url = (parse_extra_config(row.extra_config).get("base_url") or "").strip()
+        if not key or not base_url:
+            return None
+        return key, base_url
+    except Exception:
+        return None
+
+
 def parse_extra_config(raw: str | None) -> dict:
     """Safely parse an ApiKeyConfig.extra_config JSON blob (base_url, model,
     etc.) — malformed or missing JSON never raises, just yields {}."""

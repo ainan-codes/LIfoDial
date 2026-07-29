@@ -2142,7 +2142,13 @@ def _deepgram_language_param(model: str, language: str) -> dict:
     nova-3 does not support for ta/te/kn/mr/bn/gu — the same 400 the live pipeline
     was hitting from the opposite direction.
     """
-    from backend.agent.pipeline import _DG_NOVA3_MULTI_LANGS, _DG_UNSUPPORTED_LANGS
+    # From provider_registry (pipecat-free), NOT backend.agent.pipeline — this
+    # router runs in the API process, which has no pipecat installed, so importing
+    # the pipeline here raised `No module named 'pipecat'` mid-request.
+    from backend.services.provider_registry import (
+        DEEPGRAM_NOVA3_MULTI_LANGS as _DG_NOVA3_MULTI_LANGS,
+        DEEPGRAM_UNSUPPORTED_LANGS as _DG_UNSUPPORTED_LANGS,
+    )
 
     base = (language or "").split("-")[0]
 

@@ -1211,9 +1211,16 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
             if payload.llm_provider is not None:
                 # An unknown LLM id is legitimate IF it's a registered custom
                 # OpenAI-compatible endpoint with a base_url.
-                from backend.agent.resilience import _resolve_custom_provider
+                #
+                # This used to import backend.agent.resilience, which imports
+                # pipecat — not installed on the API service. So EVERY save that
+                # carried an llm_provider (i.e. every save from the agent editor)
+                # died with `500: No module named 'pipecat'`, which the dashboard
+                # could only show as "failed to save". The lookup now lives in
+                # provider_status, which has no pipecat dependency.
+                from backend.services.provider_status import resolve_custom_llm_endpoint
 
-                _custom = await _resolve_custom_provider(payload.llm_provider)
+                _custom = await resolve_custom_llm_endpoint(session, payload.llm_provider)
                 validate_or_raise("llm", payload.llm_provider, has_base_url=_custom is not None)
 
             # A clinic admin may configure everything about how their agent

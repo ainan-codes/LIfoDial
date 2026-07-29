@@ -67,6 +67,38 @@ BUILDABLE_BY_CATEGORY: dict[str, frozenset[str]] = {
 FALLBACK_BY_CATEGORY: dict[str, str] = {"stt": "sarvam", "tts": "sarvam", "llm": "gemini"}
 
 
+# ── Deepgram language/tier facts ──────────────────────────────────────────────
+# These live HERE, not in backend/agent/pipeline.py, for the same reason the
+# buildable sets do: the API process needs them (the widget path picks a Deepgram
+# language too) and it has NO pipecat installed. Importing them from pipeline.py
+# raised `No module named 'pipecat'` inside a request handler, which surfaces as a
+# 500 with no clue attached — that is exactly how "failed to save" happened.
+#
+# Verified by live probes against the Deepgram API on 2026-07-28/29.
+
+#: Our BCP-47 code -> the code Deepgram expects.
+DEEPGRAM_LANG_MAP: dict[str, str] = {
+    "en-IN": "en-IN", "en-US": "en-US", "en-GB": "en-GB",
+    "hi-IN": "hi",     "ta-IN": "ta",     "te-IN": "te",
+    "kn-IN": "kn",     "ml-IN": "ml",     "mr-IN": "mr",
+    "bn-IN": "bn",     "pa-IN": "pa",     "gu-IN": "gu",
+}
+
+#: Languages where nova-3's "multi" model is the right target — it code-switches
+#: inside ONE socket, which is what Indian callers actually do mid-sentence.
+DEEPGRAM_NOVA3_MULTI_LANGS: frozenset[str] = frozenset({"en", "hi"})
+
+#: Deepgram cannot do these on ANY tier — pick a different STT provider.
+DEEPGRAM_UNSUPPORTED_LANGS: frozenset[str] = frozenset({"ml", "pa"})
+
+#: nova-2 and the older base/enhanced tiers answer HTTP 400 for these; nova-3
+#: serves them. pipecat retries the 400 forever without transcribing, so this is
+#: "the agent is deaf", not "the transcript is worse".
+DEEPGRAM_NOVA2_UNSUPPORTED_LANGS: frozenset[str] = frozenset(
+    {"ta", "te", "kn", "ml", "mr", "bn", "pa", "gu"}
+)
+
+
 # ── Providers in the catalog that CANNOT currently be built ───────────────────
 # Kept explicit (rather than just "not in the buildable set") so the UI and the
 # API can explain *why* instead of silently rejecting. Reasons verified against

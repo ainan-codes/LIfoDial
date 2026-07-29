@@ -1102,40 +1102,40 @@ export default function AgentDetail() {
   }, [agentId, location.search, loading, agent]);
 
   // Fetch models when provider changes.
-  // FIX: Only auto-reset model when the current model does NOT belong to the
-  // newly selected provider — preserves the user's explicit model choice.
+  // The model catalogue is a SUGGESTION list, not an allow-list: whatever is
+  // already configured stays selected and stays selectable, so a model the
+  // catalogue happens not to list is never silently replaced (and never
+  // auto-saved over). Only an EMPTY model gets filled in. See the matching
+  // comment on the STT effect below for the incident this prevents.
+  const mergeCurrent = (current: string | undefined, catalogue: string[]) => {
+    const c = (current || '').trim();
+    return c && !catalogue.includes(c) ? [c, ...catalogue] : catalogue;
+  };
+
   useEffect(() => {
     if (!agent?.llm_provider) return;
+    const apply = (catalogue: string[]) => {
+      setLlmModels(mergeCurrent(agent.llm_model, catalogue));
+      if (!(agent.llm_model || '').trim() && catalogue.length) {
+        updateField('llm_model', catalogue[0]);
+      }
+    };
     fetchWithAuth(`/platform/models/${agent.llm_provider}`)
-      .then(d => {
-        const models = d.models?.length ? d.models : getLlmFallbackModels(agent.llm_provider);
-        setLlmModels(models);
-        // Only reset if current model is unknown for this provider
-        if (!agent.llm_model || !models.includes(agent.llm_model)) {
-          updateField('llm_model', models[0]);
-        }
-      })
-      .catch(() => {
-        const fallback = getLlmFallbackModels(agent.llm_provider);
-        setLlmModels(fallback);
-        if (!agent.llm_model || !fallback.includes(agent.llm_model)) {
-          updateField('llm_model', fallback[0]);
-        }
-      });
+      .then(d => apply(d.models?.length ? d.models : getLlmFallbackModels(agent.llm_provider)))
+      .catch(() => apply(getLlmFallbackModels(agent.llm_provider)));
   }, [agent?.llm_provider]);
 
   useEffect(() => {
     if (!agent?.tts_provider) return;
     fetchWithAuth(`/platform/models/${agent.tts_provider}?category=tts`)
       .then(d => {
-        const models = d.models?.length ? d.models : ['bulbul:v3'];
-        setTtsModels(models);
-        // Only reset if current model is unknown for this TTS provider
-        if (!agent.tts_model || !models.includes(agent.tts_model)) {
-          updateField('tts_model', models[0]);
+        const catalogue: string[] = d.models?.length ? d.models : [];
+        setTtsModels(mergeCurrent(agent.tts_model, catalogue));
+        if (!(agent.tts_model || '').trim() && catalogue.length) {
+          updateField('tts_model', catalogue[0]);
         }
       })
-      .catch(() => setTtsModels(['bulbul:v3']));
+      .catch(() => setTtsModels(agent.tts_model ? [agent.tts_model] : []));
   }, [agent?.tts_provider]);
 
   useEffect(() => {
@@ -1162,14 +1162,23 @@ export default function AgentDetail() {
     if (!agent?.stt_provider) return;
     fetchWithAuth(`/platform/models/${agent.stt_provider}?category=stt`)
       .then(d => {
-        const models = d.models?.length ? d.models : ['saarika:v2'];
-        setSttModels(models);
-        // Only reset if current model is unknown for this STT provider
-        if (!agent.stt_model || !models.includes(agent.stt_model)) {
-          updateField('stt_model', models[0]);
+        const catalogue: string[] = d.models?.length ? d.models : [];
+        const current = (agent.stt_model || '').trim();
+        // The catalogue is a SUGGESTION list, not an allow-list. Keep whatever is
+        // already configured as a selectable option so a model we don't happen to
+        // list — a new Deepgram tier, a private Sarvam build — is never silently
+        // replaced. This used to do
+        //     if (!models.includes(agent.stt_model)) updateField('stt_model', models[0])
+        // and auto-save, which is how simply selecting Deepgram overwrote a
+        // working nova-3 config with nova-2 (nova-3 wasn't in the catalogue at
+        // the time) and left the agent unable to hear Indian callers.
+        setSttModels(mergeCurrent(current, catalogue));
+        // Only fill in a model when there is genuinely none — never replace one.
+        if (!current && catalogue.length) {
+          updateField('stt_model', catalogue[0]);
         }
       })
-      .catch(() => setSttModels(['saarika:v2']));
+      .catch(() => setSttModels(agent.stt_model ? [agent.stt_model] : []));
   }, [agent?.stt_provider]);
 
   const updateField = useCallback((key: string, val: any) => {

@@ -140,25 +140,16 @@ _DEFAULT_WORKING_HOURS = "9 AM – 7 PM, Mon–Sat"
 # Deepgram rejects, and it is how this shipped broken: the 400 is swallowed by
 # pipecat's Deepgram _connection_handler (bare `except`, `while True`, no backoff),
 # so the agent greets the caller and then loops forever without transcribing.
-_DG_LANG_MAP = {
-    "en-IN": "en-IN", "en-US": "en-US", "en-GB": "en-GB",
-    "hi-IN": "hi",     "ta-IN": "ta",     "te-IN": "te",
-    "kn-IN": "kn",     "ml-IN": "ml",     "mr-IN": "mr",
-    "bn-IN": "bn",     "pa-IN": "pa",     "gu-IN": "gu",
-}
-
-#: Languages where nova-3's "multi" model is the right target (it code-switches
-#: inside one socket). Other nova-3-supported languages are pinned to their own
-#: code instead.
-_DG_NOVA3_MULTI_LANGS = {"en", "hi"}
-
-#: Languages Deepgram cannot do on any tier — use a different provider.
-_DG_UNSUPPORTED_LANGS = {"ml", "pa"}
-
-#: Languages nova-2 (and the older base/enhanced tiers) reject with HTTP 400 but
-#: nova-3 serves. Selecting one of these on nova-2 is not a degraded transcript,
-#: it is no transcript at all — pipecat retries the 400 in a hot loop.
-_DG_NOVA2_UNSUPPORTED_LANGS = {"ta", "te", "kn", "ml", "mr", "bn", "pa", "gu"}
+# Defined in backend/services/provider_registry.py, which imports no pipecat, so
+# the API process can share these facts. It needs them too (the widget path picks
+# a Deepgram language), and importing them from THIS module raised
+# `No module named 'pipecat'` inside a live request handler.
+from backend.services.provider_registry import (
+    DEEPGRAM_LANG_MAP as _DG_LANG_MAP,
+    DEEPGRAM_NOVA2_UNSUPPORTED_LANGS as _DG_NOVA2_UNSUPPORTED_LANGS,
+    DEEPGRAM_NOVA3_MULTI_LANGS as _DG_NOVA3_MULTI_LANGS,
+    DEEPGRAM_UNSUPPORTED_LANGS as _DG_UNSUPPORTED_LANGS,
+)
 
 
 # ── Sarvam STT model selection ────────────────────────────────────────────────

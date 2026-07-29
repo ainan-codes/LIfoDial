@@ -92,27 +92,11 @@ async def _resolve_custom_provider(provider: str) -> tuple[str, str] | None:
     key or no base_url configured — callers treat that as "not set up",
     not as a transient failure."""
     from backend.db import AsyncSessionLocal
-    from backend.models.api_key_config import ApiKeyConfig
-    from backend.services.provider_status import parse_extra_config
-    from sqlalchemy import select
+    from backend.services.provider_status import resolve_custom_llm_endpoint
 
     try:
         async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                select(ApiKeyConfig).where(
-                    ApiKeyConfig.provider == provider,
-                    ApiKeyConfig.category == "llm",
-                    ApiKeyConfig.is_active == True,  # noqa: E712
-                )
-            )
-            row = result.scalars().first()
-            if not row:
-                return None
-            key = row.get_key_raw()
-            base_url = (parse_extra_config(row.extra_config).get("base_url") or "").strip()
-            if not key or not base_url:
-                return None
-            return key, base_url
+            return await resolve_custom_llm_endpoint(db, provider)
     except Exception as e:
         log.warning("[RESILIENCE] custom LLM provider lookup failed for %s: %s", provider, e)
         return None
