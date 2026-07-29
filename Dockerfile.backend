@@ -1,4 +1,19 @@
-# Dockerfile.backend — Production image for Render.com (and any Linux host)
+# Dockerfile.backend — reference image for the backend, NOT what's actually
+# deployed. Verified 2026-07-29: the live `LIfoDial` service on Render
+# (srv-d7m7tnho3t8c73e19q30) runs on Render's native Python runtime
+# (serviceDetails.env == "python"), not Docker — this file is unused by that
+# service. Its real build/start commands are configured directly on Render
+# (dashboard or `PATCH /v1/services/:id`), currently:
+#   build: curl -O .../ffmpeg-release-amd64-static.tar.xz && tar xf ... &&
+#          mv ffmpeg/ffprobe ./ && chmod +x ffmpeg ffprobe && pip install -r requirements.txt
+#   start: export PATH="$PWD:$PATH" && (cd backend && PYTHONPATH="$OLDPWD"
+#          python -m alembic upgrade head || echo "[WARN] ...") &&
+#          uvicorn backend.main:app --host 0.0.0.0 --port $PORT --workers 1
+# render.yaml has the same stale-blueprint problem (see its own 2026-07-25
+# warning comment) — neither file governs the live services. Keep this
+# Dockerfile updated anyway for anyone deploying this backend to a real Docker
+# host, and to keep the CMD below as documentation of the intended startup
+# sequence, but do not assume editing it changes production.
 #
 # Includes:
 #   - ffmpeg (required for audio format conversion in WebSocket voice pipeline)
