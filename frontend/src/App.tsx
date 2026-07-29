@@ -1,22 +1,23 @@
+import { lazy, Suspense } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { ThemeProvider } from './context/ThemeContext';
 
 // Public pages
-import Docs from './pages/Docs';
-import Landing from './pages/Landing';
-import Login from './pages/Login';
-import Onboarding from './pages/Onboarding';
+const Docs = lazy(() => import('./pages/Docs'));
+const Landing = lazy(() => import('./pages/Landing'));
+const Login = lazy(() => import('./pages/Login'));
+const Onboarding = lazy(() => import('./pages/Onboarding'));
 
 // Protected pages
-import Analytics from './pages/Analytics';
-import Appointments from './pages/Appointments';
-import CallLogs from './pages/CallLogs';
-import Dashboard from './pages/Dashboard';
-import Doctors from './pages/Doctors';
-import MyAgent from './pages/MyAgent';
-import Settings from './pages/Settings';
-import VoiceRecorder from './pages/VoiceRecorder';
+const Analytics = lazy(() => import('./pages/Analytics'));
+const Appointments = lazy(() => import('./pages/Appointments'));
+const CallLogs = lazy(() => import('./pages/CallLogs'));
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Doctors = lazy(() => import('./pages/Doctors'));
+const MyAgent = lazy(() => import('./pages/MyAgent'));
+const Settings = lazy(() => import('./pages/Settings'));
+const VoiceRecorder = lazy(() => import('./pages/VoiceRecorder'));
 
 import { AgentRouteGuard } from './components/AgentRouteGuard';
 import Layout from './components/Layout';
@@ -25,33 +26,45 @@ import { SuperadminOnlyRoute } from './components/SuperadminOnlyRoute';
 
 // Super Admin Imports
 import { RequireSuperAdmin } from './components/superadmin/RequireSuperAdmin';
-import SuperAdminLayout from './components/superadmin/SuperAdminLayout';
-import AgentDetail from './pages/superadmin/AgentDetail';
-import SAAgents from './pages/superadmin/Agents';
-import AIPlatform from './pages/superadmin/AIPlatform';
-import SAAppointments from './pages/superadmin/Appointments';
-import SABilling from './pages/superadmin/Billing';
-import SACalls from './pages/superadmin/Calls';
-import SAClinics from './pages/superadmin/Clinics';
-import CreateAgent from './pages/superadmin/CreateAgent';
-import SADashboard from './pages/superadmin/Dashboard';
-import KnowledgeBase from './pages/superadmin/KnowledgeBase';
-import SAOnboardingReqs from './pages/superadmin/OnboardingReqs';
-import PhoneNumbers from './pages/superadmin/PhoneNumbers';
-import SuperAdminLogin from './pages/superadmin/SuperAdminLogin';
-import SASystemHealth from './pages/superadmin/SystemHealth';
-import VoiceLibrary from './pages/superadmin/VoiceLibrary';
-import SACredits from './pages/superadmin/Credits';
+const SuperAdminLayout = lazy(() => import('./components/superadmin/SuperAdminLayout'));
+const AgentDetail = lazy(() => import('./pages/superadmin/AgentDetail'));
+const SAAgents = lazy(() => import('./pages/superadmin/Agents'));
+const AIPlatform = lazy(() => import('./pages/superadmin/AIPlatform'));
+const SAAppointments = lazy(() => import('./pages/superadmin/Appointments'));
+const SABilling = lazy(() => import('./pages/superadmin/Billing'));
+const SACalls = lazy(() => import('./pages/superadmin/Calls'));
+const SAClinics = lazy(() => import('./pages/superadmin/Clinics'));
+const CreateAgent = lazy(() => import('./pages/superadmin/CreateAgent'));
+const SADashboard = lazy(() => import('./pages/superadmin/Dashboard'));
+const KnowledgeBase = lazy(() => import('./pages/superadmin/KnowledgeBase'));
+const SAOnboardingReqs = lazy(() => import('./pages/superadmin/OnboardingReqs'));
+const PhoneNumbers = lazy(() => import('./pages/superadmin/PhoneNumbers'));
+const SuperAdminLogin = lazy(() => import('./pages/superadmin/SuperAdminLogin'));
+const SASystemHealth = lazy(() => import('./pages/superadmin/SystemHealth'));
+const VoiceLibrary = lazy(() => import('./pages/superadmin/VoiceLibrary'));
+const SACredits = lazy(() => import('./pages/superadmin/Credits'));
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: false } },
 });
+
+// Route-level Suspense fallback. Each top-level page is its own chunk (see the
+// lazy() imports above), so this only ever shows for the ~100-300ms a chunk
+// takes to fetch on navigation — not on every render.
+function PageLoader() {
+  return (
+    <div className="flex h-screen w-full items-center justify-center">
+      <div className="h-8 w-8 animate-spin rounded-full border-2 border-gray-300 border-t-gray-600" />
+    </div>
+  );
+}
 
 function App() {
   return (
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>
         <BrowserRouter>
+          <Suspense fallback={<PageLoader />}>
           <Routes>
             {/* ── Public routes ── */}
             <Route path="/"       element={<Landing />} />
@@ -140,7 +153,7 @@ function App() {
 
             {/* Super Admin Routes */}
             <Route path="/superadmin/login" element={<SuperAdminLogin />} />
-            
+
             <Route element={<RequireSuperAdmin />}>
               <Route element={<SuperAdminLayout />}>
                 <Route path="/superadmin/dashboard" element={<SADashboard />} />
@@ -164,6 +177,7 @@ function App() {
             {/* Catch-all — redirect to landing */}
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
+          </Suspense>
         </BrowserRouter>
       </QueryClientProvider>
     </ThemeProvider>

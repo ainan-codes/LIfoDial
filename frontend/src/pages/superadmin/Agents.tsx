@@ -20,9 +20,11 @@ import {
     TrendingUp,
     Zap
 } from 'lucide-react';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import TestAgentModal from '../../components/TestAgentModal';
+// Lazy: pulls in the LiveKit/WebRTC client stack (~526kB alone, the single
+// largest chunk in the app) — only needed when the in-browser test modal opens.
+const TestAgentModal = lazy(() => import('../../components/TestAgentModal'));
 import { AgentStatus, FixtureAgent } from '../../fixtures/data';
 import fetchWithAuth from '../../api/client';
 
@@ -519,10 +521,12 @@ export default function SAAgents() {
 
       {/* In-browser Test Modal */}
       {testTarget && (
-        <TestAgentModal
-          agent={testTarget}
-          onClose={() => setTestTarget(null)}
-        />
+        <Suspense fallback={null}>
+          <TestAgentModal
+            agent={testTarget}
+            onClose={() => setTestTarget(null)}
+          />
+        </Suspense>
       )}
 
 

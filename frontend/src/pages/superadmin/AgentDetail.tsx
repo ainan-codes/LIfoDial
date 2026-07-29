@@ -25,11 +25,13 @@ import {
   Wrench,
   X
 } from 'lucide-react';
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import fetchWithAuth, { API_URL } from '../../api/client';
 import { getToken } from '../../api/auth';
-import TestAgentModal from '../../components/TestAgentModal';
+// Lazy: pulls in the LiveKit/WebRTC client stack (~526kB alone, the single
+// largest chunk in the app) — only needed when Simulation Testing is opened.
+const TestAgentModal = lazy(() => import('../../components/TestAgentModal'));
 import VoiceLibrary from './VoiceLibrary';
 import SimulationTab from './agent_detail/SimulationTab';
 import AgentHealthTab from './agent_detail/AgentHealthTab';
@@ -2255,12 +2257,14 @@ export default function AgentDetail() {
             {/* 12. SIMULATION TESTING / TEST PANEL */}
             <CollapsibleSection icon={Activity} title="Simulation Testing" summary="Run real-time voice and text patient scenarios">
               <div style={{ height: '600px', display: 'flex', flexDirection: 'column' }}>
-                <TestAgentModal 
-                  agent={{ ...agent, name: agent?.agent_name || agent?.name }}
-                  agentId={agentId}
-                  inline={true}
-                  onClose={() => {}}
-                />
+                <Suspense fallback={null}>
+                  <TestAgentModal
+                    agent={{ ...agent, name: agent?.agent_name || agent?.name }}
+                    agentId={agentId}
+                    inline={true}
+                    onClose={() => {}}
+                  />
+                </Suspense>
               </div>
             </CollapsibleSection>
 
