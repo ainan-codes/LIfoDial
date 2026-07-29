@@ -25,6 +25,14 @@ export default function Login() {
     setError('');
 
     const trimmedEmail = email.toLowerCase().trim();
+    // Trim the password too. Every password this system issues is machine
+    // generated (backend/routers/admin.py::generate_password) and contains no
+    // whitespace, so trimming can never lock anyone out — but pasting one out of
+    // an email or a chat reliably brings a trailing space along, and that scores
+    // a bare 401 that is indistinguishable from "wrong password". Verified
+    // against production: the correct password returns 200, the same password
+    // with one trailing space returns 401.
+    const submittedPassword = password.trim();
 
     try {
       // Try superadmin login first, then fall back to clinic login. Both
@@ -33,7 +41,7 @@ export default function Login() {
       let res = await fetch(`${API_URL}/auth/superadmin-login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
-        body: JSON.stringify({ email: trimmedEmail, password }),
+        body: JSON.stringify({ email: trimmedEmail, password: submittedPassword }),
       });
 
       if (res.ok) {
@@ -46,7 +54,7 @@ export default function Login() {
       res = await fetch(`${API_URL}/auth/clinic-login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
-        body: JSON.stringify({ email: trimmedEmail, password }),
+        body: JSON.stringify({ email: trimmedEmail, password: submittedPassword }),
       });
 
       if (res.ok) {

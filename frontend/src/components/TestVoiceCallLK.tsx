@@ -35,12 +35,13 @@ import '@livekit/components-styles';
 import fetchWithAuth from '../api/client';
 
 const SLOW_MS = 12_000;
-// Must exceed the backend's worker pre-warm budget (WARM_TIMEOUT_SECONDS = 90s in
-// backend/services/agent_worker.py). /web-call-token now blocks while a
-// spun-down free-tier agent worker cold-starts (measured ~55s) so the room is
-// never created before the worker can join it. At the old 60s the browser gave up
-// mid-warm and the user saw a timeout for a call that was about to succeed.
-const TIMEOUT_MS = 150_000;
+// Must exceed the backend's worker pre-warm budget (WARM_TIMEOUT_SECONDS = 150s
+// in backend/services/agent_worker.py). /web-call-token blocks while a spun-down
+// free-tier agent worker cold-starts (measured ~55s) so the room is never created
+// before the worker can join it. If the browser gives up first the user sees a
+// timeout for a call that was about to succeed — which is why this is deliberately
+// well above the server's own budget, not equal to it.
+const TIMEOUT_MS = 200_000;
 const AGENT_WAIT_MS = 45_000;
 const TRANSCRIPT_TOPIC = 'lifodial-transcript';
 // Stable id for the single in-progress user bubble. Interim STT results overwrite
@@ -603,6 +604,32 @@ export default function TestVoiceCallLK({
   const [micAvailable, setMicAvailable] = useState(true);
   const [slow, setSlow] = useState(false);
 
+  // ── Wake the voice worker as soon as this panel opens ─────────────────────
+  // The worker is on Render's free plan and sleeps after 15 min idle; booting it
+  // takes ~55s. Doing that when the user presses Start puts the whole boot in
+  // front of them (and used to time the call out entirely). Firing it on mount
+  // overlaps the boot with them reading this screen, so Start is usually instant.
+  // Fire-and-forget: a failure here changes nothing, startCall still waits.
+  const [workerWarm, setWorkerWarm] = useState<boolean | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetchWithAuth('/agents/voice-worker/warm', { method: 'POST' })
+      .then((d: any) => { if (!cancelled) setWorkerWarm(!!d?.warm); })
+      .catch(() => { if (!cancelled) setWorkerWarm(null); });
+
+    // Poll until it reports ready, so the button can say so honestly.
+    const iv = setInterval(() => {
+      fetchWithAuth('/agents/voice-worker/status')
+        .then((d: any) => {
+          if (cancelled) return;
+          setWorkerWarm(!!d?.warm);
+          if (d?.warm) clearInterval(iv);
+        })
+        .catch(() => {});
+    }, 5000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, []);
+
   const startCall = useCallback(async () => {
     setPhase('connecting');
     setError('');
@@ -750,6 +777,18 @@ export default function TestVoiceCallLK({
         >
           <Mic size={20} color="#051b11" /> Start Voice Call
         </button>
+
+        {/* Honest readiness signal — the worker sleeps after 15 min on the free
+            plan and takes ~55s to boot. Warming starts when this panel opens, so
+            this usually flips to ready before the user reaches for the button. */}
+        <div style={{
+          fontSize: 11, lineHeight: 1.5, maxWidth: 300,
+          color: workerWarm ? '#3ECF8E' : '#F59E0B',
+        }}>
+          {workerWarm
+            ? '● Voice service ready — the call will connect immediately.'
+            : '◌ Waking the voice service (up to a minute on the free plan). You can press Start now — it will wait rather than fail.'}
+        </div>
 
         <style>{`
           @keyframes pulseGlow {

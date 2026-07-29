@@ -122,6 +122,29 @@ def _spawn_dispatch_watcher(**kwargs) -> None:
     task.add_done_callback(_dispatch_watchers.discard)
 
 
+@router.post("/voice-worker/warm")
+async def warm_voice_worker(user: CurrentUser = None):
+    """Start waking the voice worker and return IMMEDIATELY.
+
+    The dashboard calls this the moment the Test Agent panel opens, so the
+    free-tier cold start (~55s, see backend/services/agent_worker.py) overlaps
+    with the admin reading the screen instead of landing on them after they press
+    Start. Returns the current belief, never blocks, never fails a request.
+    """
+    from backend.services import agent_worker
+
+    started = agent_worker.start_background_warm()
+    return {**agent_worker.state(), "started": started}
+
+
+@router.get("/voice-worker/status")
+async def voice_worker_status(user: CurrentUser = None):
+    """Non-blocking read of whether the voice worker is believed ready."""
+    from backend.services import agent_worker
+
+    return agent_worker.state()
+
+
 @router.post("/{agent_id}/web-call-token")
 async def create_web_call_token(
     agent_id: str,

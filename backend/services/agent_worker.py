@@ -50,18 +50,28 @@ log = logging.getLogger(__name__)
 # cold start is ~55s; 90s leaves headroom for a slow build/boot without hanging
 # the browser forever. Must stay BELOW the frontend's TIMEOUT_MS in
 # TestVoiceCallLK.tsx or the browser gives up before the worker is ready.
-WARM_TIMEOUT_SECONDS = 90.0
+WARM_TIMEOUT_SECONDS = 150.0
 
-# One probe ATTEMPT's timeout. Render does NOT reliably hold the connection open
-# for the whole boot — it frequently answers immediately from its edge with a
-# "service is starting"/404/502 page while the instance is still coming up. So
-# this is a short per-attempt timeout and `ensure_worker_awake` retries until the
-# worker itself answers (see _probe_once / WorkerState below).
-_PROBE_TIMEOUT_SECONDS = 15.0
+# One probe ATTEMPT's timeout, and it must be LONGER than a cold start, not
+# shorter. Render holds the connection open while a free instance boots and
+# answers when it is ready — measured directly on 2026-07-29:
+#
+#     curl https://lifodial-agent.onrender.com/worker  ->  HTTP 200 in 53.6s
+#
+# This was 15s, which abandoned the connection a third of the way through every
+# boot and then immediately reconnected. The result, from a real call attempt:
+#
+#     Agent worker did NOT come up within 90s (41 probes, last state=down)
+#
+# 41 fast failures instead of one patient success. A short timeout here doesn't
+# make the check more responsive, it makes it structurally unable to observe a
+# cold start — the one situation the whole function exists for.
+_PROBE_TIMEOUT_SECONDS = 75.0
 
-# Gap between probe attempts while a cold instance boots. Short enough that a
-# fast boot is noticed promptly, long enough not to hammer a booting free dyno.
-_PROBE_RETRY_GAP_SECONDS = 2.0
+# Gap between probe attempts. Only reached when an attempt genuinely fails
+# (connection refused / boot took longer than the attempt timeout), so this is a
+# backoff between full attempts, not a poll interval.
+_PROBE_RETRY_GAP_SECONDS = 3.0
 
 # Once the worker has answered, trust it for this long before probing again.
 # Well under Render's ~15-min (900s) idle window, so a cached "warm" verdict can
@@ -231,6 +241,55 @@ async def ensure_worker_awake(timeout: float = WARM_TIMEOUT_SECONDS) -> bool:
             time.monotonic() - started, attempts, last_state,
         )
         return False
+
+
+#: Retained so a detached warm-up task can't be garbage collected mid-flight.
+_background_warms: set = set()
+
+
+def state() -> dict:
+    """Cheap, non-blocking view of whether the worker is believed awake.
+
+    Used by the dashboard to show "warming up…" before the user commits to a
+    call, instead of discovering it during one.
+    """
+    return {
+        "configured": is_configured(),
+        "warm": _is_cached_warm(),
+        "warming": _warm_lock is not None and _warm_lock.locked(),
+    }
+
+
+def start_background_warm() -> bool:
+    """Kick off a warm-up WITHOUT blocking the caller. True if one is running.
+
+    This is the fix for the actual user-visible problem. Render sleeps a free
+    service after 15 minutes idle, and the keepalive that was supposed to prevent
+    that is a GitHub Actions `*/5` cron — which GitHub does NOT honour on a free
+    runner: the real run times on 2026-07-29 were 00:09, 03:33, 06:15, 09:10,
+    11:32, 13:16, i.e. gaps of one to three HOURS against a 15-minute window. So
+    the worker is asleep essentially whenever someone goes to use it, and the
+    ~55s boot lands entirely on whoever pressed the button.
+
+    Calling this when the Test Agent panel OPENS moves that boot off the critical
+    path: by the time the admin has read the screen and pressed Start, the worker
+    is already registered. Idempotent — a second call while one is in flight is a
+    no-op, because ensure_worker_awake serialises on _warm_lock and returns
+    immediately when the warm cache is still valid.
+    """
+    if not is_configured() or _is_cached_warm():
+        return False
+
+    async def _run() -> None:
+        try:
+            await ensure_worker_awake()
+        except Exception as exc:
+            log.warning("Background agent-worker warm failed (non-fatal): %s", exc)
+
+    task = asyncio.ensure_future(_run())
+    _background_warms.add(task)
+    task.add_done_callback(_background_warms.discard)
+    return True
 
 
 async def keep_warm_loop() -> None:
