@@ -85,7 +85,7 @@ if IS_SQLITE:
 else:
     # -- Supabase Session Pooler Configuration -----------------
     #
-    # WHY NullPool:
+    # WHY NullPool (the default here):
     #   Supabase manages connection pooling externally.
     #   SQLAlchemy's own pool causes connection exhaustion
     #   on free tier. NullPool = open/close per request.
@@ -98,15 +98,57 @@ else:
     # WHY jit=off:
     #   Supabase recommendation - improves query plan stability.
     #
-    engine = create_async_engine(
-        DATABASE_URL,
-        echo=False,
-        poolclass=NullPool,
-        connect_args={
-            "statement_cache_size": 0,
-            "server_settings": {"jit": "off"},
-        },
-    )
+    # ── DB_POOL_SIZE: keep connections alive instead (agent worker) ───────────
+    # NullPool is right for the API — many concurrent requests, and Supabase's
+    # connection budget is the scarce resource there. It is WRONG for the agent
+    # worker, where connections are few but latency is everything: a fresh
+    # asyncpg connect to Supabase is a TCP + TLS + auth round trip from
+    # Singapore, and the caller sits in a silent room while it happens.
+    #
+    # Measured on the live worker (the "Call setup DB work finished in …" log
+    # line, 2026-07-29): 2.94s / 3.10s / 3.88s / 3.96s / 5.04s per call — for
+    # ~6 small indexed queries. The queries themselves are ~0.15-0.3s each; the
+    # rest is the handshake, paid again on every single call.
+    #
+    # Set DB_POOL_SIZE=2 on lifodial-agent to amortise it across calls. Left at 0
+    # (NullPool, unchanged behaviour) everywhere else, so the API's connection
+    # accounting is untouched. pool_pre_ping discards a connection Supabase's
+    # pooler has already closed instead of failing the call with it; pool_recycle
+    # stays well under any idle cutoff.
+    try:
+        _pool_size = int(os.getenv("DB_POOL_SIZE", "0") or 0)
+    except ValueError:
+        _pool_size = 0
+
+    if _pool_size > 0:
+        logger.info(
+            "DB connection pooling ENABLED (DB_POOL_SIZE=%d) — connections are reused "
+            "across calls instead of re-handshaking with Supabase each time.",
+            _pool_size,
+        )
+        engine = create_async_engine(
+            DATABASE_URL,
+            echo=False,
+            pool_size=_pool_size,
+            max_overflow=_pool_size,
+            pool_pre_ping=True,
+            pool_recycle=280,
+            pool_timeout=10,
+            connect_args={
+                "statement_cache_size": 0,
+                "server_settings": {"jit": "off"},
+            },
+        )
+    else:
+        engine = create_async_engine(
+            DATABASE_URL,
+            echo=False,
+            poolclass=NullPool,
+            connect_args={
+                "statement_cache_size": 0,
+                "server_settings": {"jit": "off"},
+            },
+        )
 
 AsyncSessionLocal = async_sessionmaker(
     engine,

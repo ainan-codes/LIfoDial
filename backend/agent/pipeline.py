@@ -737,7 +737,8 @@ async def _create_call_record(
 
         from backend.models.call_record import CallRecord
 
-        call_id = str(uuid.uuid4())
+        call_id = call_meta.get("call_record_id") or str(uuid.uuid4())
+        call_meta["call_record_id"] = call_id
         async with _session_or(db) as db:
             record = CallRecord(
                 id=call_id,
@@ -895,15 +896,24 @@ async def entrypoint(ctx) -> None:
                 return
 
         # ── Create call record ──────────────────────────────────────────────
+        # The row is only READ at finalisation (CallLoggerProcessor writes
+        # duration/transcript into it when the call ends), so nothing between
+        # here and the greeting needs it. Reserving the id locally and writing
+        # the row in the background takes an INSERT + COMMIT round trip off the
+        # path the caller is listening to silence on. call_meta is the same dict
+        # CallLoggerProcessor holds a reference to, and it already has the id.
         call_meta = {
-            "caller_phone": caller_phone,
-            "call_type":    "inbound",
-            "room_name":    room_name,
+            "caller_phone":   caller_phone,
+            "call_type":      "inbound",
+            "room_name":      room_name,
+            "call_record_id": str(uuid.uuid4()),
         }
-        call_record_id = await _create_call_record(
-            tenant_id, agent_id, call_meta, db=setup_db
+        _record_task = asyncio.create_task(
+            _create_call_record(tenant_id, agent_id, call_meta)
         )
-        call_meta["call_record_id"] = call_record_id
+        # Retained so the task isn't garbage-collected mid-flight, and awaited in
+        # the finally block below so a fast hang-up can't race the INSERT.
+        call_record_id = call_meta["call_record_id"]
 
         # ── Resolve provider API keys (DB first, env fallback) ──────────────
         # Hoisted up here from the STT/TTS build sections purely so they share
@@ -1819,6 +1829,13 @@ async def entrypoint(ctx) -> None:
         for t in watchdog_tasks:
             if not t.done():
                 t.cancel()
+        # The CallRecord INSERT was moved off the greeting path; make sure it has
+        # landed before finalisation tries to UPDATE that same row, or a call that
+        # ends within a second or two would finalise a row that doesn't exist yet.
+        try:
+            await asyncio.wait_for(_record_task, timeout=10.0)
+        except Exception as exc:
+            log.warning("CallRecord insert did not complete before teardown: %s", exc)
         # Keep the job process alive until the CallRecord is finalized. The
         # end/cancel frame schedules finalization as a task; without this await
         # the process could exit before duration/transcript/latency persist
@@ -2013,6 +2030,29 @@ def prewarm(proc) -> None:
         log.info("Prewarm: DB layer imported (%.2fs)", time.monotonic() - t0)
     except Exception as exc:
         log.warning("Prewarm: DB layer import failed (non-fatal): %s", exc)
+
+    # Open a real connection so the first CALLER doesn't pay for the Supabase
+    # TCP+TLS+auth handshake. With DB_POOL_SIZE set (see backend/db.py) this
+    # connection stays in the pool and every later call reuses it; without it the
+    # warm-up still primes asyncpg's own machinery. Runs on its own loop because
+    # prewarm_fnc is synchronous — the connection lands in the process-wide pool
+    # either way, which is what matters.
+    try:
+        t2 = time.monotonic()
+        import asyncio as _asyncio
+
+        from sqlalchemy import text as _text
+
+        from backend.db import AsyncSessionLocal as _Session
+
+        async def _touch() -> None:
+            async with _Session() as s:
+                await s.execute(_text("SELECT 1"))
+
+        _asyncio.run(_touch())
+        log.info("Prewarm: Supabase connection opened (%.2fs)", time.monotonic() - t2)
+    except Exception as exc:
+        log.warning("Prewarm: DB connection warm-up failed (non-fatal): %s", exc)
 
     try:
         t1 = time.monotonic()
