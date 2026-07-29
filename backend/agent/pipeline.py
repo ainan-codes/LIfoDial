@@ -155,6 +155,11 @@ _DG_NOVA3_MULTI_LANGS = {"en", "hi"}
 #: Languages Deepgram cannot do on any tier — use a different provider.
 _DG_UNSUPPORTED_LANGS = {"ml", "pa"}
 
+#: Languages nova-2 (and the older base/enhanced tiers) reject with HTTP 400 but
+#: nova-3 serves. Selecting one of these on nova-2 is not a degraded transcript,
+#: it is no transcript at all — pipecat retries the 400 in a hot loop.
+_DG_NOVA2_UNSUPPORTED_LANGS = {"ta", "te", "kn", "ml", "mr", "bn", "pa", "gu"}
+
 
 # ── Sarvam STT model selection ────────────────────────────────────────────────
 #: Models pipecat's SarvamSTTService knows how to build (its MODEL_CONFIGS keys).
@@ -1144,6 +1149,37 @@ async def entrypoint(ctx) -> None:
             )
 
         _base = dg_lang.split("-")[0]
+
+        # ── nova-2 cannot serve this language: upgrade rather than go deaf ─────
+        # The tier table at the top of this file is not advisory. nova-2 answers
+        # HTTP 400 for ta/te/kn/ml/mr/bn/pa/gu, pipecat's Deepgram
+        # _connection_handler swallows it in a bare `except` and retries forever,
+        # and the only symptom is that the agent greets the caller and then never
+        # transcribes a word.
+        #
+        # An explicit nova-2 choice is not proof of intent here: until 2026-07-29
+        # the AI Platform catalog listed ONLY nova-2 models for Deepgram, and the
+        # agent dashboard auto-selects models[0] and saves it — so every agent
+        # switched to Deepgram through the UI was written a nova-2 id it never
+        # asked for. Those rows are still out there. Honour the choice where it
+        # can work, upgrade it where it provably cannot.
+        if not dg_model.startswith("nova-3") and _base in _DG_NOVA2_UNSUPPORTED_LANGS:
+            log.warning(
+                "Deepgram model %s cannot transcribe %s (nova-2 and older tiers answer "
+                "HTTP 400 for it, which pipecat retries silently forever) — using nova-3 "
+                "for room=%s so the agent can actually hear the caller.",
+                dg_model, _base, room_name,
+            )
+            dg_model = "nova-3"
+        elif not dg_model.startswith("nova-3"):
+            log.warning(
+                "Deepgram model %s has no multilingual tier, so it is pinned to a single "
+                "language (%s) and will not hear a caller who code-switches — which Indian "
+                "callers routinely do mid-sentence. nova-3 handles Hindi and English in one "
+                "socket; prefer it unless this model was chosen deliberately. room=%s",
+                dg_model, _base, room_name,
+            )
+
         if dg_model.startswith("nova-3"):
             # Prefer "multi" where nova-3 offers it: multilingual code-switches
             # inside ONE socket, so a caller moving English → Hindi mid-call costs

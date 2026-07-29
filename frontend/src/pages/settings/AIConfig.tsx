@@ -39,7 +39,10 @@ const PROVIDER_META: Record<string, ProviderMeta> = {
   mistral:   { id: 'mistral',   name: 'Mistral AI',       icon: 'M',  envKey: 'MISTRAL_API_KEY',   keyUrl: 'https://console.mistral.ai',                  category: 'llm', defaultModel: 'mistral-large-latest' },
   // STT
   sarvam:    { id: 'sarvam',    name: 'Sarvam AI',        icon: 'S',  envKey: 'SARVAM_API_KEY',    keyUrl: 'https://dashboard.sarvam.ai',                 category: 'stt', defaultModel: 'saarika:v2.5' },
-  deepgram:  { id: 'deepgram',  name: 'Deepgram',         icon: 'D',  envKey: 'DEEPGRAM_API_KEY',  keyUrl: 'https://console.deepgram.com',                category: 'stt', defaultModel: 'nova-2' },
+  // nova-3, not nova-2: nova-2 returns HTTP 400 for most Indian languages and has
+  // no "multi" tier, so it cannot code-switch Hindi/English. See the comment on the
+  // deepgram entry in backend/routers/platform.py::PROVIDERS.
+  deepgram:  { id: 'deepgram',  name: 'Deepgram',         icon: 'D',  envKey: 'DEEPGRAM_API_KEY',  keyUrl: 'https://console.deepgram.com',                category: 'stt', defaultModel: 'nova-3' },
   assemblyai:{ id: 'assemblyai',name: 'AssemblyAI',       icon: 'As', envKey: 'ASSEMBLYAI_API_KEY',keyUrl: 'https://www.assemblyai.com',                  category: 'stt', defaultModel: 'best' },
   elevenlabs:{ id: 'elevenlabs',name: 'ElevenLabs',       icon: 'El', envKey: 'ELEVENLABS_API_KEY',keyUrl: 'https://elevenlabs.io',                       category: 'tts', defaultModel: 'eleven_flash_v2_5' },
   openai_tts:{ id: 'openai_tts',name: 'OpenAI TTS',       icon: 'O',  envKey: 'OPENAI_API_KEY',    keyUrl: 'https://platform.openai.com/api-keys',        category: 'tts', defaultModel: 'tts-1' },

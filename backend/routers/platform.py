@@ -168,8 +168,31 @@ PROVIDERS = {
         {"id": "elevenlabs", "name": "ElevenLabs",     "env_var": "ELEVENLABS_API_KEY",
          "models": ["scribe_v2_realtime", "scribe_v2"],
          "key_label": "ELEVENLABS_API_KEY", "key_url": "https://elevenlabs.io",               "icon": "El"},
+        # ⚠️ ORDER MATTERS — nova-3 MUST be first, and nova-3 must be present at all.
+        # The agent dashboard (frontend/src/pages/superadmin/AgentDetail.tsx) does
+        #     if (!agent.stt_model || !models.includes(agent.stt_model))
+        #         updateField('stt_model', models[0]);
+        # and auto-saves. This list omitted nova-3 entirely and led with nova-2, so
+        # simply SELECTING Deepgram in the UI silently rewrote the agent's stt_model
+        # to nova-2 — verified live on 2026-07-29 (a config set to nova-3 at 12:45
+        # was nova-2 by 12:51, and the next three calls all logged
+        # "Deepgram STT: model=nova-2 language=en-IN").
+        #
+        # That is not a cosmetic default. Against the live Deepgram API:
+        #   nova-2 + ta/te/kn/ml/mr/bn/pa/gu -> HTTP 400, and pipecat retries the
+        #     failure in a hot loop, so the agent greets the caller and then never
+        #     transcribes a word.
+        #   nova-2 has no "multi" tier at all, so it cannot code-switch — an Indian
+        #     caller mixing Hindi and English is only half-heard.
+        # nova-3 + "multi" handles Hindi/English in one socket. It is the right
+        # default for this product and must be what models[0] hands the dashboard.
+        #
+        # Superset lives in DEEPGRAM_STT_MODELS below (defined after this dict, so
+        # it cannot be referenced here); test_deepgram_model_catalog.py asserts the
+        # two agree.
         {"id": "deepgram",   "name": "Deepgram",       "env_var": "DEEPGRAM_API_KEY",
-         "models": ["nova-2", "nova-2-medical", "nova-2-meeting", "nova-2-phonecall"],
+         "models": ["nova-3", "nova-3-general", "nova-3-medical",
+                    "nova-2", "nova-2-phonecall", "nova-2-medical"],
          "key_label": "DEEPGRAM_API_KEY",  "key_url": "https://console.deepgram.com",        "icon": "D"},
         {"id": "whisper",    "name": "OpenAI Whisper", "env_var": "OPENAI_API_KEY",
          "models": ["whisper-1"],
