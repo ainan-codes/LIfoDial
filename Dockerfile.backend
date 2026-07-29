@@ -33,4 +33,20 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
 
 # Render injects $PORT at runtime (default 10000).
 # Use shell form so the variable is expanded at container start.
-CMD uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1
+#
+# `alembic upgrade head` runs real migrations from backend/alembic/versions —
+# until now, deploy never ran this at all: init_db()'s create_all(checkfirst=True)
+# was the only schema sync, and checkfirst only creates missing TABLES, never
+# alters an existing one, so a migration that adds/changes a column on an
+# existing table would silently never reach production. Verified before wiring
+# this in: prod's alembic_version was already stamped at the migration chain's
+# head (a1b2c3d4e5f6), so this is a no-op today and only starts mattering the
+# next time someone adds a migration.
+#
+# Best-effort, matching init_db()'s own philosophy (see backend/db.py) of never
+# letting a schema-sync hiccup block boot: `|| true` means a transient DB
+# connection failure here logs and falls through to start the app rather than
+# crash-looping the whole service. `exec` replaces the shell with uvicorn so it
+# becomes PID 1 and receives Render's SIGTERM directly for a clean shutdown.
+CMD (cd backend && PYTHONPATH=/app python -m alembic upgrade head || echo "[WARN] alembic upgrade head failed — continuing on the existing schema") && \
+    exec uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1
