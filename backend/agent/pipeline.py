@@ -1296,10 +1296,18 @@ async def entrypoint(ctx) -> None:
                 # flushed on LLMFullResponseEndFrame — i.e. the caller waited for
                 # the whole LLM turn to finish before hearing the first word.
                 #
-                # 15/60 lets a short reply start synthesizing almost immediately
+                # 30/60 lets a short reply start synthesizing almost immediately
                 # while still batching enough text for natural prosody. Costs
                 # nothing but marginally more chunking on long replies.
-                min_buffer_size=15,
+                #
+                # min_buffer_size has a hard floor of 30 on Sarvam's side (range
+                # 30-200); this was shipped at 15 and Sarvam rejected the whole
+                # config with a generic "Input parameters has to be a valid
+                # dictionary" error, which pipecat's reconnect loop retried 3x and
+                # then gave up — the call went completely silent on TTS. Verified
+                # against a live production failure (room=testcall-72cb61a4-0dfb0a02,
+                # 2026-07-29 09:12 UTC) and Sarvam's documented bounds.
+                min_buffer_size=30,
                 max_chunk_length=60,
             ),
         )
