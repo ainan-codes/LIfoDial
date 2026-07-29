@@ -661,6 +661,9 @@ export default function TestVoiceCallLK({
   if (phase === 'idle') {
     const language = agent?.stt_language || agent?.tts_language || agent?.language || 'en-IN';
     const sttProvider = agent?.stt_provider || 'sarvam';
+    // Providers whose pipecat service emits InterimTranscriptionFrame. Kept in
+    // sync with _STT_REALTIME in backend/agent/pipeline.py.
+    const sttRealtime = ['deepgram', 'assemblyai', 'elevenlabs'].includes(sttProvider);
     const llmModel = (agent?.llm_model || 'llama-3.3-70b').replace('-versatile', '').replace('llama-3.3-70b', 'Llama-3.3');
     const ttsVoice = agent?.tts_voice || 'priya';
 
@@ -703,9 +706,28 @@ export default function TestVoiceCallLK({
           <Pill color="#3ECF8E">🌐 {language}</Pill>
           <Pill color="#60A5FA">⚡ {llmModel}</Pill>
           <Pill color="#A78BFA">🎙️ {ttsVoice}</Pill>
-          <Pill color={sttProvider === 'deepgram' ? '#F59E0B' : '#888'}>
+          <Pill color={sttRealtime ? '#F59E0B' : '#888'}>
             🎤 {sttProvider === 'deepgram' ? 'Deepgram' : sttProvider}
           </Pill>
+        </div>
+
+        {/*
+          Live transcription is a property of the STT PROVIDER, not of this widget.
+          Only providers that stream interim results (Deepgram, AssemblyAI,
+          ElevenLabs Realtime) put words on screen while the caller is still
+          talking. Sarvam's pipecat service emits a transcript only once the caller
+          pauses — so with Sarvam the transcript panel below legitimately stays
+          empty mid-sentence, and each turn also waits ~0.8s longer before the
+          agent replies (pipecat's measured p99: Sarvam 1.17s vs Deepgram 0.35s).
+          Saying so here stops that reading as "it isn't hearing me".
+        */}
+        <div style={{
+          fontSize: 11, color: sttRealtime ? '#3ECF8E' : '#F59E0B',
+          maxWidth: 300, lineHeight: 1.5,
+        }}>
+          {sttRealtime
+            ? 'Live transcription: words appear while you speak.'
+            : `${sttProvider} transcribes only after you pause — switch STT to Deepgram for real-time transcription and faster replies.`}
         </div>
 
         <button
@@ -750,8 +772,11 @@ export default function TestVoiceCallLK({
         <div style={{ fontSize: 14, fontWeight: 600 }}>Starting voice call…</div>
         <div style={{ fontSize: 12, color: '#555' }}>Setting up Pipecat + LiveKit pipeline</div>
         {slow && (
-          <div style={{ fontSize: 12, color: '#F59E0B', maxWidth: 300, lineHeight: 1.5, marginTop: 4 }}>
-            Worker may be cold-starting (~20–30s on Render free tier). Please wait…
+          <div style={{ fontSize: 12, color: '#F59E0B', maxWidth: 320, lineHeight: 1.5, marginTop: 4 }}>
+            Waiting for the voice worker to come up. On the free plan it spins down
+            after ~15 min idle and takes up to a minute to boot — the call won't
+            start until it's genuinely ready, so this wait replaces what used to be
+            a silent room.
           </div>
         )}
         <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>

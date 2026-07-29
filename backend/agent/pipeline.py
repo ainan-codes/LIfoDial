@@ -34,6 +34,7 @@ import json
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from loguru import logger as pipecat_logger
@@ -153,6 +154,76 @@ _DG_NOVA3_MULTI_LANGS = {"en", "hi"}
 
 #: Languages Deepgram cannot do on any tier — use a different provider.
 _DG_UNSUPPORTED_LANGS = {"ml", "pa"}
+
+
+# ── Sarvam STT model selection ────────────────────────────────────────────────
+#: Models pipecat's SarvamSTTService knows how to build (its MODEL_CONFIGS keys).
+SARVAM_STT_MODELS = frozenset({"saarika:v2.5", "saaras:v2.5", "saaras:v3"})
+
+#: Retired model ids the dashboard may still have stored. Sarvam answers HTTP 400
+#: for these ("Model 'saarika:v2' has been deprecated"), so they are upgraded
+#: rather than treated as unknown. Mirrors the same table in
+#: backend/routers/agent_test.py so the widget path and the live call path cannot
+#: disagree about what "saaras:v2" means.
+_SARVAM_STT_ALIASES = {
+    "saarika:v1": "saarika:v2.5",
+    "saarika:v2": "saarika:v2.5",
+    "saaras:v1":  "saaras:v3",
+    "saaras:v2":  "saaras:v3",
+}
+
+#: Transcribe, not translate — see resolve_sarvam_stt_model.
+SARVAM_STT_DEFAULT = "saaras:v3"
+
+
+def resolve_sarvam_stt_model(requested: str | None, *, room_name: str = "") -> str:
+    """Pick the Sarvam STT model to build, defaulting to TRANSCRIBE not translate.
+
+    ⚠️ saaras:v2.5 is Sarvam's speech-to-text-TRANSLATE model. Pipecat builds it
+    against ``speech_to_text_translate_streaming`` and its output is ENGLISH text
+    no matter what the caller spoke — verified against the live API on
+    2026-07-29 with identical audio:
+
+        caller says "नमस्ते, मुझे कल सुबह डॉक्टर से अपॉइंटमेंट चाहिए।"
+        saaras:v2.5 → "Hello, I need an appointment with the doctor tomorrow morning."
+        saaras:v3   → "नमस्ते, मुझे कल सुबह डॉक्टर से अपॉइंटमेंट चाहिए।"
+
+    That is what the model is for, not a bug in it — but it is catastrophic for
+    THIS product. The LLM only ever sees English, so the "reply in the caller's
+    language" rule answers a Hindi caller in English, and LanguageSwitchProcessor
+    (which detects the script of the transcript) can never see Devanagari and so
+    never retunes the TTS voice.
+
+    This used to coerce EVERY unrecognised model to exactly that model, including:
+      * the "saaras:v2" default in _load_tenant_and_config, i.e. every agent that
+        had never explicitly picked a model, and
+      * a leftover Deepgram model id like "nova-3" after someone switched
+        stt_provider from Deepgram back to Sarvam.
+
+    So silent English-translation was the effective default. saaras:v3
+    (transcribe, keeps the caller's language) is the right one.
+    """
+    requested = (requested or "").strip()
+    model = _SARVAM_STT_ALIASES.get(requested, requested)
+
+    if model not in SARVAM_STT_MODELS:
+        if requested:
+            log.info(
+                "STT model %r is not a Sarvam model (probably left over from another "
+                "provider) — using %s for room=%s",
+                requested, SARVAM_STT_DEFAULT, room_name,
+            )
+        return SARVAM_STT_DEFAULT
+
+    if model == "saaras:v2.5":
+        log.warning(
+            "STT model saaras:v2.5 is a TRANSLATE model — every caller utterance will "
+            "reach the LLM as ENGLISH text regardless of the language spoken, so the "
+            "agent will answer in English and mid-call language switching cannot work. "
+            "Choose saaras:v3 (transcribe) unless English-only output is intended. "
+            "room=%s", room_name,
+        )
+    return model
 
 
 def _clinic_facts_block(tenant: dict) -> str:
@@ -353,15 +424,46 @@ def _generate_agent_token(room_name: str) -> str:
     return token.to_jwt()
 
 
+@asynccontextmanager
+async def _session_or(db):
+    """Yield `db` when the caller already has a session, else open a fresh one.
+
+    Lets the whole call-setup path share ONE Supabase connection without every
+    helper needing two code paths. See _load_tenant_and_config's `db` docstring
+    for the measured cost of not doing this.
+    """
+    if db is not None:
+        yield db
+        return
+    from backend.db import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        yield session
+
+
 async def _load_tenant_and_config(
     tenant_id: Optional[str],
     agent_id: Optional[str],
     metadata: dict,
+    db=None,
 ) -> tuple[dict, dict]:
     """
     Load agent config and tenant data from DB.
 
     Falls back to metadata defaults if DB is unavailable (graceful degradation).
+
+    Args:
+        db: An already-open AsyncSession to reuse. Pass one whenever the caller
+            has more DB work to do in the same setup — backend/db.py configures
+            the Postgres engine with NullPool (Supabase manages pooling), so
+            every `async with AsyncSessionLocal()` is a fresh TCP+TLS+auth
+            handshake to Supabase. On the agent worker that is not a rounding
+            error: measured on a live call (room=testcall-72cb61a4-0dfb0a02,
+            2026-07-29 09:12 UTC) the four separate sessions this call path used
+            to open — config, call record, STT keys, TTS keys — cost 2.9s, 1.1s,
+            1.0s and 1.5s respectively, i.e. ~6.5 of the 13.2 seconds the caller
+            spent listening to nothing before the agent joined the room.
+            None (the default) opens and closes one, as before.
 
     Returns:
         (agent_config dict, tenant dict)
@@ -434,13 +536,12 @@ async def _load_tenant_and_config(
         return agent_config, tenant
 
     try:
-        from backend.db import AsyncSessionLocal
         from backend.models.agent_config import AgentConfig
         from backend.models.doctor import Doctor
         from backend.models.tenant import Tenant
         from sqlalchemy import select
 
-        async with AsyncSessionLocal() as db:
+        async with _session_or(db) as db:
             # Load AgentConfig
             if agent_id:
                 result = await db.execute(
@@ -571,14 +672,61 @@ async def _load_tenant_and_config(
         log.warning(
             "DB load failed — using metadata defaults. Error: %s", exc
         )
+        # The session now belongs to the CALLER (see the `db` arg), and a failed
+        # statement leaves SQLAlchemy's transaction needing a rollback — every
+        # later statement on it would raise PendingRollbackError. When we owned
+        # the session that was harmless (it was thrown away); sharing it means a
+        # single bad read here would otherwise take the credit gate, the key
+        # lookups and the CallRecord down with it. Roll back so the rest of call
+        # setup still runs on a usable connection.
+        if db is not None:
+            try:
+                await db.rollback()
+            except Exception as rb_exc:
+                log.warning("Rollback after failed config load also failed: %s", rb_exc)
 
     return agent_config, tenant
+
+
+async def _resolve_provider_keys(
+    db, stt_provider: str, tts_provider: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Resolve every API key this call could need, on ONE session.
+
+    Returns ``(stt_keys, tts_keys)`` — dicts keyed by provider id, always
+    populated with "" rather than missing, so the build chains below can use
+    ``.get()``/``[]`` without a KeyError killing the job before the agent joins
+    (that exact KeyError — a missing "sarvam" entry behind the TTS `else:` — is
+    why the fallback provider is always resolved, whichever one is selected).
+
+    Only the providers that can actually be read are resolved: the selected one,
+    the Sarvam fallback both chains end in, and the OpenAI key for the ids that
+    alias to it.
+    """
+    from backend.agent import providers as provider_registry
+
+    stt_needed = {stt_provider, "sarvam"}
+    if stt_provider in ("openai", "whisper"):
+        stt_needed.add("openai")
+
+    tts_needed = {tts_provider, "sarvam"}
+    if tts_provider == "openai_tts":
+        tts_needed.add("openai")
+
+    stt_keys = {
+        p: await provider_registry.resolve_key(db, p, category="stt") for p in stt_needed
+    }
+    tts_keys = {
+        p: await provider_registry.resolve_key(db, p, category="tts") for p in tts_needed
+    }
+    return stt_keys, tts_keys
 
 
 async def _create_call_record(
     tenant_id: Optional[str],
     agent_id: Optional[str],
     call_meta: dict,
+    db=None,
 ) -> Optional[str]:
     """
     Create a CallRecord row at call start and return its UUID.
@@ -591,11 +739,10 @@ async def _create_call_record(
     try:
         from datetime import datetime, timezone
 
-        from backend.db import AsyncSessionLocal
         from backend.models.call_record import CallRecord
 
         call_id = str(uuid.uuid4())
-        async with AsyncSessionLocal() as db:
+        async with _session_or(db) as db:
             record = CallRecord(
                 id=call_id,
                 tenant_id=tenant_id,
@@ -617,6 +764,13 @@ async def _create_call_record(
 
     except Exception as exc:
         log.error("Failed to create CallRecord: %s", exc, exc_info=True)
+        # Same reasoning as the rollback in _load_tenant_and_config: a caller-owned
+        # session must be left usable for whatever runs after this.
+        if db is not None:
+            try:
+                await db.rollback()
+            except Exception as rb_exc:
+                log.warning("Rollback after failed CallRecord insert also failed: %s", rb_exc)
         return None
 
 
@@ -654,6 +808,7 @@ async def entrypoint(ctx) -> None:
     # gate, and no CallRecord ("No call_record_id — skipping finalization").
     # ctx.job.room.metadata is the room's metadata as delivered with the job
     # dispatch and IS populated before connect — that's the authoritative source.
+    _entry_t0 = time.monotonic()
     metadata: dict = {}
     _raw_meta = ""
     try:
@@ -685,67 +840,105 @@ async def entrypoint(ctx) -> None:
         room_name, tenant_id, agent_id, caller_phone,
     )
 
-    # ── Load config from DB ────────────────────────────────────────────────
-    agent_config, tenant = await _load_tenant_and_config(tenant_id, agent_id, metadata)
+    # ── One DB connection for the whole of call setup ───────────────────────
+    # Everything that has to touch Postgres before the agent can speak — agent
+    # config, tenant, doctors, knowledge base, the credit gate, the CallRecord
+    # row and every provider API key — runs inside THIS session. backend/db.py
+    # uses NullPool (Supabase does the pooling), so each extra session is a
+    # complete TCP + TLS + auth handshake from Singapore, and this path used to
+    # open four of them. See _load_tenant_and_config's `db` docstring for the
+    # measured per-session cost on a real call.
+    _setup_t0 = time.monotonic()
+    from backend.db import AsyncSessionLocal
 
-    # ── Publish/Unpublish enforcement — single source of truth is
-    # AgentConfig.status (see backend/routers/embed.py's _is_published for the
-    # matching check on the widget side). Only enforced when this room is tied
-    # to a real agent_id — an unpublished agent must not take NEW calls, but a
-    # call already in progress when it's unpublished is unaffected (this check
-    # only runs once, at room-join time, not mid-call). Declining here — before
-    # ctx.connect() — means the room is never joined, so no call minutes/audio
-    # are billed or recorded for a call that was never allowed to start.
-    # test_mode (in-dashboard "Test Agent") bypasses the publish gate so an admin
-    # can test an agent that isn't ACTIVE yet — it's the same pipeline, just not
-    # a real/billable inbound call.
-    test_mode = bool(metadata.get("test_mode", False))
-    if agent_id and not test_mode and agent_config.get("status") != "ACTIVE":
-        log.warning(
-            "Declining call: agent_id=%s is unpublished (status=%s) — not joining room %s",
-            agent_id, agent_config.get("status"), room_name,
+    async with AsyncSessionLocal() as setup_db:
+        agent_config, tenant = await _load_tenant_and_config(
+            tenant_id, agent_id, metadata, db=setup_db
         )
-        return
-    if test_mode:
-        log.info("TEST MODE call — publish gate bypassed for agent_id=%s", agent_id)
 
-    # ── Pre-call credit gate (audit P4) ─────────────────────────────────────
-    # A real (non-test) call must not start unless the clinic's prepaid balance
-    # covers the worst-case cost of a full-length call. Declining here — before
-    # _create_call_record() / ctx.connect() — guarantees a call can never drive
-    # the balance negative (the bug that left a clinic at ₹-1.50: deduction ran
-    # post-call with no floor and nothing checked the balance up front). Same
-    # decline-before-connect shape as the publish gate above; test_mode bypasses
-    # it just like the publish gate.
-    if tenant_id and not test_mode:
-        from backend.db import AsyncSessionLocal
-        from backend.services.credit_service import CreditService
-
-        max_dur = int(agent_config.get("max_duration_seconds") or 300)
-        async with AsyncSessionLocal() as _credit_db:
-            gate = await CreditService.check_call_allowed(_credit_db, tenant_id, max_dur)
-        if not gate["allowed"]:
+        # ── Publish/Unpublish enforcement — single source of truth is
+        # AgentConfig.status (see backend/routers/embed.py's _is_published for the
+        # matching check on the widget side). Only enforced when this room is tied
+        # to a real agent_id — an unpublished agent must not take NEW calls, but a
+        # call already in progress when it's unpublished is unaffected (this check
+        # only runs once, at room-join time, not mid-call). Declining here — before
+        # ctx.connect() — means the room is never joined, so no call minutes/audio
+        # are billed or recorded for a call that was never allowed to start.
+        # test_mode (in-dashboard "Test Agent") bypasses the publish gate so an admin
+        # can test an agent that isn't ACTIVE yet — it's the same pipeline, just not
+        # a real/billable inbound call.
+        test_mode = bool(metadata.get("test_mode", False))
+        if agent_id and not test_mode and agent_config.get("status") != "ACTIVE":
             log.warning(
-                "Declining call: tenant=%s failed credit gate (reason=%s balance=₹%.2f "
-                "required=₹%.2f) — not joining room %s",
-                tenant_id, gate["reason"], gate["balance"], gate["required"], room_name,
+                "Declining call: agent_id=%s is unpublished (status=%s) — not joining room %s",
+                agent_id, agent_config.get("status"), room_name,
             )
             return
+        if test_mode:
+            log.info("TEST MODE call — publish gate bypassed for agent_id=%s", agent_id)
 
-    # ── Create call record ─────────────────────────────────────────────────
-    call_meta = {
-        "caller_phone": caller_phone,
-        "call_type":    "inbound",
-        "room_name":    room_name,
-    }
-    call_record_id = await _create_call_record(tenant_id, agent_id, call_meta)
-    call_meta["call_record_id"] = call_record_id
+        # ── Pre-call credit gate (audit P4) ─────────────────────────────────
+        # A real (non-test) call must not start unless the clinic's prepaid balance
+        # covers the worst-case cost of a full-length call. Declining here — before
+        # _create_call_record() / ctx.connect() — guarantees a call can never drive
+        # the balance negative (the bug that left a clinic at ₹-1.50: deduction ran
+        # post-call with no floor and nothing checked the balance up front). Same
+        # decline-before-connect shape as the publish gate above; test_mode bypasses
+        # it just like the publish gate.
+        if tenant_id and not test_mode:
+            from backend.services.credit_service import CreditService
+
+            max_dur = int(agent_config.get("max_duration_seconds") or 300)
+            gate = await CreditService.check_call_allowed(setup_db, tenant_id, max_dur)
+            if not gate["allowed"]:
+                log.warning(
+                    "Declining call: tenant=%s failed credit gate (reason=%s balance=₹%.2f "
+                    "required=₹%.2f) — not joining room %s",
+                    tenant_id, gate["reason"], gate["balance"], gate["required"], room_name,
+                )
+                return
+
+        # ── Create call record ──────────────────────────────────────────────
+        call_meta = {
+            "caller_phone": caller_phone,
+            "call_type":    "inbound",
+            "room_name":    room_name,
+        }
+        call_record_id = await _create_call_record(
+            tenant_id, agent_id, call_meta, db=setup_db
+        )
+        call_meta["call_record_id"] = call_record_id
+
+        # ── Resolve provider API keys (DB first, env fallback) ──────────────
+        # Hoisted up here from the STT/TTS build sections purely so they share
+        # `setup_db`. Which providers matter is decided by the config we just
+        # loaded; the resolution itself is one indexed SELECT each.
+        #
+        # Deliberately LAST inside this session: resolve_provider_key swallows its
+        # own DB errors and falls back to the env key, so a failure here leaves the
+        # transaction needing a rollback without ever telling us. Nothing else uses
+        # the session afterwards, so that can't poison the CallRecord insert or the
+        # credit gate the way it would if these ran first.
+        _stt_provider_cfg = agent_config.get("stt_provider", "sarvam") or "sarvam"
+        _tts_provider_cfg = agent_config.get("tts_provider", "sarvam") or "sarvam"
+        _stt_keys, _tts_keys = await _resolve_provider_keys(
+            setup_db, _stt_provider_cfg, _tts_provider_cfg
+        )
+
+    log.info(
+        "Call setup DB work finished in %.2fs (one connection) | room=%s",
+        time.monotonic() - _setup_t0, room_name,
+    )
 
     # ── Connect to LiveKit room (REQUIRED by livekit-agents framework) ────────
     # ctx.connect() MUST be called here so livekit-agents worker framework marks
     # the dispatched job as accepted with LiveKit Cloud. auto_subscribe=False so
     # Pipecat's LiveKitTransport handles audio stream subscriptions cleanly.
-    await ctx.connect(auto_subscribe=False)
+    #
+    # Started as a task rather than awaited: the LLM provider probe and the
+    # STT/TTS websocket handshakes below are all network waits too, and none of
+    # them depend on the room being joined. Awaited before the pipeline runs.
+    _connect_task = asyncio.create_task(ctx.connect(auto_subscribe=False))
 
     # ── Generate agent token ───────────────────────────────────────────────
     agent_token = _generate_agent_token(room_name)
@@ -783,11 +976,7 @@ async def entrypoint(ctx) -> None:
     )
 
     # ── STT Settings ───────────────────────────────────────────────────────
-    stt_model = agent_config.get("stt_model", "saaras:v2")
-    valid_stt_models = {"saarika:v2.5", "saaras:v2.5", "saaras:v3"}
-    if stt_model not in valid_stt_models:
-        # Legacy model name compat: "saaras:v2" → "saaras:v2.5"
-        stt_model = "saaras:v2.5"
+    stt_model = resolve_sarvam_stt_model(agent_config.get("stt_model"), room_name=room_name)
 
     # STT Language dropdown was previously ignored — _load_tenant_and_config
     # never loaded stt_language into agent_config, so this always fell back to
@@ -839,26 +1028,12 @@ async def entrypoint(ctx) -> None:
     stt_needs_language_switch = False
     stt_language_translator = None
 
-    # ── Resolve STT provider keys — DB (AI Platform dashboard) first, env
-    # fallback, via backend/agent/providers.py::resolve_key. A key saved
-    # through the dashboard now takes effect on the very next call: no
-    # redeploy, no env var edit, no worker restart. See providers.py for how
-    # to register a new provider here.
-    #
-    # Only the selected provider (plus "sarvam", the deaf-agent-guard fallback,
-    # and "openai" when stt_provider aliases to it) is ever read below, so only
-    # those are resolved — each is a DB round-trip, and this runs on every call
-    # setup on a latency-sensitive path.
-    from backend.db import AsyncSessionLocal
+    # STT/TTS provider keys were resolved during the single setup session above
+    # (_resolve_provider_keys) — DB (AI Platform dashboard) first, env fallback,
+    # via backend/agent/providers.py::resolve_key. A key saved through the
+    # dashboard takes effect on the very next call: no redeploy, no env var edit,
+    # no worker restart. See providers.py for how to register a new provider.
     from backend.agent import providers as provider_registry
-    _stt_needed = {stt_provider, "sarvam"}
-    if stt_provider in ("openai", "whisper"):
-        _stt_needed.add("openai")
-    async with AsyncSessionLocal() as _key_db:
-        _stt_keys = {
-            p: await provider_registry.resolve_key(_key_db, p, category="stt")
-            for p in _stt_needed
-        }
 
     # ── Deaf-agent guard ────────────────────────────────────────────────────
     # NONE of the STT services raise when handed an empty api_key — they build
@@ -1042,6 +1217,47 @@ async def entrypoint(ctx) -> None:
         stt_needs_language_switch = stt_model != "saaras:v2.5"
         stt_language_translator = _safe_lang
 
+    # ── One honest line about what the caller will actually be heard by ────────
+    # "Real-time" is a property of the SERVICE, not of the pipeline: only
+    # providers that emit InterimTranscriptionFrame put words on screen while the
+    # caller is still talking, and only they let end-of-turn fire quickly.
+    # Pipecat's own measured p99 "speech end → final transcript" figures
+    # (pipecat/services/stt_latency.py) are what the turn-stop strategy budgets
+    # against, so they are the honest number to log:
+    #
+    #     Deepgram  0.35s  + interim results   → live transcript, fast turns
+    #     AssemblyAI 0.42s + interim results
+    #     Sarvam    1.17s  NO interim results  → transcript only after the caller
+    #                                            stops, and ~0.8s more dead air
+    #                                            per turn than Deepgram
+    #
+    # Sarvam's pipecat service pushes a TranscriptionFrame only from a `data`
+    # message (services/sarvam/stt.py::_handle_message) and never an
+    # InterimTranscriptionFrame — so with Sarvam the live-transcript panel in the
+    # dashboard stays empty until the caller pauses. That is the provider, not a
+    # bug in this pipeline, and it is the single biggest lever on perceived
+    # latency for anyone reporting "it doesn't hear me".
+    _STT_REALTIME = {"deepgram", "assemblyai", "elevenlabs"}
+    log.info(
+        "STT ready | provider=%s model=%s language=%s realtime_interim=%s ttfs_p99=%.2fs | room=%s",
+        stt_provider,
+        getattr(getattr(stt, "_settings", None), "model", stt_model),
+        stt_language,
+        stt_provider in _STT_REALTIME,
+        float(getattr(stt, "_ttfs_p99_latency", 0.0) or 0.0),
+        room_name,
+    )
+    if stt_provider not in _STT_REALTIME:
+        log.info(
+            "STT provider '%s' emits no interim results — the live transcript will only "
+            "update when the caller pauses, and each turn waits ~%.2fs longer than "
+            "Deepgram before the agent replies. Switch STT to Deepgram for real-time "
+            "transcription. room=%s",
+            stt_provider,
+            max(0.0, float(getattr(stt, "_ttfs_p99_latency", 1.17) or 1.17) - 0.35),
+            room_name,
+        )
+
     # LLM — resilient provider selection (audit FIX 2). Probe the configured
     # provider first, fall back through healthy alternatives. This is what makes
     # a dead/leaked primary key (the Gemini key is currently revoked) non-fatal:
@@ -1168,23 +1384,12 @@ async def entrypoint(ctx) -> None:
     # API's write-time validation and this run-time guard can never disagree.
     from backend.services.provider_registry import BUILDABLE_TTS as _BUILDABLE_TTS
 
-    # Same DB-first (AI Platform dashboard), env-fallback key resolution as STT
-    # above — see backend/agent/providers.py. Only the keys actually read below are
-    # resolved (each is a DB round-trip on a latency-critical path).
-    #
-    # "sarvam" is ALWAYS resolved because the final `else:` is the Sarvam branch —
-    # it is the fallback every unrecognised provider lands on, and it reads
-    # _tts_keys["sarvam"]. Omitting it here raised KeyError: 'sarvam' inside
-    # entrypoint(), which kills the job before the agent joins the room: the
-    # caller hears dead air and the logs show no reason why.
-    _tts_needed = {tts_provider, "sarvam"}
-    if tts_provider == "openai_tts":
-        _tts_needed.add("openai")
-    async with AsyncSessionLocal() as _key_db:
-        _tts_keys = {
-            p: await provider_registry.resolve_key(_key_db, p, category="tts")
-            for p in _tts_needed
-        }
+    # _tts_keys came from the same single setup session as _stt_keys. "sarvam" is
+    # ALWAYS in it because the final `else:` is the Sarvam branch — the fallback
+    # every unrecognised provider lands on, reading _tts_keys["sarvam"]. Omitting
+    # it once raised KeyError: 'sarvam' inside entrypoint(), which kills the job
+    # before the agent joins the room: the caller hears dead air and the logs show
+    # no reason why.
 
     # Mute-agent guard — the TTS mirror of the deaf-agent guard above. Say so
     # loudly when the configured provider cannot be built, instead of quietly
@@ -1575,6 +1780,13 @@ async def entrypoint(ctx) -> None:
     # already handles graceful shutdown).
     runner = PipelineRunner(handle_sigint=False)
     try:
+        # The room join was kicked off before the services were built; it has to
+        # have completed before the transport starts publishing audio into it.
+        await _connect_task
+        log.info(
+            "Agent ready %.2fs after entrypoint | room=%s",
+            time.monotonic() - _entry_t0, room_name,
+        )
         await runner.run(task)
     finally:
         for t in watchdog_tasks:
@@ -1732,22 +1944,60 @@ async def _enforce_silence_timeout(
 
 # ── Worker bootstrap ──────────────────────────────────────────────────────────
 
-# Single source of truth for the dispatch name — MUST equal
-# backend/routers/web_calls.py::AGENT_NAME or dispatched calls connect but no
-# agent ever joins (audit FIX 1.2).
-AGENT_NAME = "lifodial-inbound-agent"
+# Single source of truth for the dispatch name — shared with
+# backend/routers/web_calls.py and the API's pre-warm probe. If these ever
+# disagree, dispatched calls connect but no agent ever joins (audit FIX 1.2), so
+# the constant lives in one import-free module rather than being re-typed here.
+from backend.agent.agent_name import AGENT_NAME
 
 _PLACEHOLDER_LK_URL = "wss://your-project.livekit.cloud"
 
 
 def prewarm(proc) -> None:
+    """Pay the one-off import/model costs at WORKER BOOT instead of mid-call.
+
+    livekit-agents calls this once per job process, before any job is assigned.
+    It used to be a no-op with a comment saying pipecat warms itself — which is
+    true of the Silero weights but not of everything else the first caller was
+    quietly funding. From the 2026-07-29 09:12 production call:
+
+        09:12:02.752  Agent entrypoint
+        09:12:04.929  "Database engine: Supabase PostgreSQL"   ← 2.2s
+
+    That 2.2s is SQLAlchemy + asyncpg + the model modules being imported for the
+    first time, inside the entrypoint, while a human sits in a silent room. The
+    same applies to the Silero ONNX session: constructing SileroVADAnalyzer loads
+    and initialises the model, and on Render's 0.1-CPU plan that is not free.
+
+    Everything here is best-effort — a warm-up failure must never stop a worker
+    from booting, because a worker that refuses to boot takes every call down
+    with it, whereas a cold one merely starts slowly.
     """
-    Pre-warm Silero VAD model before the first call.
-    Called once when the worker process starts.
-    """
-    # Pipecat's SileroVADAnalyzer loads the model lazily on first call.
-    # Pre-warming is handled internally by Pipecat — nothing to do here.
-    log.info("Agent worker pre-warmed.")
+    t0 = time.monotonic()
+
+    try:
+        import backend.db  # noqa: F401  — SQLAlchemy engine + asyncpg import
+        from backend.models.agent_config import AgentConfig  # noqa: F401
+        from backend.models.call_record import CallRecord  # noqa: F401
+        from backend.models.doctor import Doctor  # noqa: F401
+        from backend.models.knowledge_base import KnowledgeBase  # noqa: F401
+        from backend.models.tenant import Tenant  # noqa: F401
+        from backend.services import provider_status  # noqa: F401
+        log.info("Prewarm: DB layer imported (%.2fs)", time.monotonic() - t0)
+    except Exception as exc:
+        log.warning("Prewarm: DB layer import failed (non-fatal): %s", exc)
+
+    try:
+        t1 = time.monotonic()
+        # Constructing the analyzer is what loads + initialises the ONNX session.
+        # Discarded immediately; onnxruntime and the weights stay in the process,
+        # so the per-call construction in entrypoint() becomes cheap.
+        SileroVADAnalyzer(params=VADParams(stop_secs=0.2, start_secs=0.2, confidence=0.55))
+        log.info("Prewarm: Silero VAD model loaded (%.2fs)", time.monotonic() - t1)
+    except Exception as exc:
+        log.warning("Prewarm: Silero VAD load failed (non-fatal): %s", exc)
+
+    log.info("Agent worker pre-warmed in %.2fs.", time.monotonic() - t0)
 
 
 def _preflight_or_die() -> None:

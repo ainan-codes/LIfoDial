@@ -24,8 +24,10 @@ router = APIRouter(prefix="/agents", tags=["web-calls"])
 
 
 # Must match WorkerOptions(agent_name=...) in backend/agent/__main__.py and
-# pipeline.py so LiveKit dispatches OUR worker into the room.
-AGENT_NAME = "lifodial-inbound-agent"
+# pipeline.py so LiveKit dispatches OUR worker into the room. Imported (not
+# re-declared) from the one dependency-free module all three processes share —
+# see backend/agent/agent_name.py for why a drift here is invisible at runtime.
+from backend.agent.agent_name import AGENT_NAME
 
 # Retained refs so dispatch-watchers aren't GC'd mid-flight (audit R3:
 # fire-and-forget create_task can be collected before it runs).
@@ -238,12 +240,31 @@ async def create_web_call_token(
     #
     # Blocking here (instead of dispatching hopefully) means the room is only
     # ever created once the worker can actually accept the job. Warm calls cost
-    # ~0.2s. Never fatal: if the probe fails we still dispatch, the watchdog
-    # still alarms, and behaviour is exactly what it was before.
+    # ~0.2s.
+    #
+    # If it never comes up, REFUSE rather than dispatch hopefully. Issuing a token
+    # anyway is what produced the worst failure mode this product has: the browser
+    # connects, the visualiser spins, the caller talks into a room no agent is in,
+    # and 25s later a [DISPATCH-ALARM] appears in a log nobody is reading. A 503
+    # with a real reason is strictly better than silence that looks like a broken
+    # microphone. (Three consecutive calls failed exactly this way on 2026-07-29:
+    # 10:25, 10:26, 11:18 — see backend/services/agent_worker.py::_probe_once.)
     from backend.services import agent_worker
 
     if agent_worker.is_configured():
-        await agent_worker.ensure_worker_awake()
+        if not await agent_worker.ensure_worker_awake():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The voice service is still starting up and can't take a call yet. "
+                    "Please try again in a minute."
+                ),
+            )
+    else:
+        logger.warning(
+            "AGENT_WORKER_URL is not set — dispatching without a pre-warm check. If the "
+            "worker is spun down this room will have no agent."
+        )
 
     try:
         from livekit import api as livekit_api

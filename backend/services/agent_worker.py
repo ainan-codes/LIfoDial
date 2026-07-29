@@ -52,10 +52,16 @@ log = logging.getLogger(__name__)
 # TestVoiceCallLK.tsx or the browser gives up before the worker is ready.
 WARM_TIMEOUT_SECONDS = 90.0
 
-# A single probe attempt's timeout. Render holds the connection open while the
-# instance boots, so one long-lived GET is the reliable way to wait for a cold
-# start (repeated short probes just get repeated hangs).
-_PROBE_TIMEOUT_SECONDS = 95.0
+# One probe ATTEMPT's timeout. Render does NOT reliably hold the connection open
+# for the whole boot — it frequently answers immediately from its edge with a
+# "service is starting"/404/502 page while the instance is still coming up. So
+# this is a short per-attempt timeout and `ensure_worker_awake` retries until the
+# worker itself answers (see _probe_once / WorkerState below).
+_PROBE_TIMEOUT_SECONDS = 15.0
+
+# Gap between probe attempts while a cold instance boots. Short enough that a
+# fast boot is noticed promptly, long enough not to hammer a booting free dyno.
+_PROBE_RETRY_GAP_SECONDS = 2.0
 
 # Once the worker has answered, trust it for this long before probing again.
 # Well under Render's ~15-min (900s) idle window, so a cached "warm" verdict can
@@ -103,31 +109,87 @@ def _is_cached_warm() -> bool:
     return time.monotonic() < _warm_until
 
 
-async def _probe(timeout: float) -> bool:
-    """One GET against the worker's status endpoint. True on any HTTP response.
+async def _probe_once(timeout: float) -> str:
+    """One GET against the worker's own /worker endpoint.
 
-    ANY status code counts as awake: we only care that the instance is running
-    (that's what re-registers it with LiveKit), not what the route returns.
+    Returns one of:
+      "ready"      — the WORKER process answered, and it reports our agent_name.
+      "responding" — something answered, but it wasn't the worker (Render's edge
+                     serving a boot/404/502 page while the instance starts).
+      "down"       — nothing answered at all (connect error / timeout).
+
+    WHY THIS IS NOT "any HTTP response == awake" (it used to be, and that is the
+    bug this function exists to fix). Measured in production on 2026-07-29:
+
+        09:48:54  worker "draining / shutting down"      (free-tier spin-down)
+        10:25:23  API: "Pre-warming agent worker..."     → probe SUCCEEDED
+        10:25:52  [DISPATCH-ALARM] agent never joined room
+        11:18:55  API: "Agent worker awake after 0.2s"   → probe SUCCEEDED
+        11:19:23  [DISPATCH-ALARM] agent never joined room
+        11:32:52  worker actually boots, registers 11:33:04
+
+    A spun-down instance cannot answer in 0.2s. Render's router was replying
+    from the edge, the old probe counted that as awake, `mark_warm()` cached the
+    lie for 5 minutes (so the user's immediate retry did not even re-probe), and
+    every room created in that window got a caller and no agent. That is the
+    whole "sometimes it connects, sometimes it doesn't".
+
+    livekit-agents serves /worker from the worker process itself, and the body
+    carries `agent_name` — which is exactly the fact we need (the process is up
+    AND it is our worker, not some other service on that URL). Anything we can't
+    parse is treated as "not the worker yet".
     """
     import httpx
+
+    from backend.agent.agent_name import AGENT_NAME
 
     url = f"{worker_base_url()}/worker"
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             resp = await client.get(url)
-        log.debug("Agent worker probe %s -> HTTP %s", url, resp.status_code)
-        return True
     except Exception as exc:
-        log.warning("Agent worker probe failed (%s): %s", url, exc)
-        return False
+        log.debug("Agent worker probe %s failed: %s", url, exc)
+        return "down"
+
+    if resp.status_code != 200:
+        log.debug("Agent worker probe %s -> HTTP %s (not the worker)", url, resp.status_code)
+        return "responding"
+
+    try:
+        reported = (resp.json() or {}).get("agent_name")
+    except Exception:
+        return "responding"
+
+    if reported == AGENT_NAME:
+        return "ready"
+
+    # A 200 with a *different* agent_name is a real misconfiguration, not a cold
+    # start — retrying will never fix it, so say so loudly instead of burning the
+    # caller's whole warm budget on it.
+    log.error(
+        "Agent worker at %s reports agent_name=%r but this API dispatches %r. "
+        "Dispatched calls will NEVER be picked up until these match "
+        "(backend/agent/agent_name.py).",
+        url, reported, AGENT_NAME,
+    )
+    return "responding"
+
+
+async def _probe(timeout: float) -> bool:
+    """Back-compat single-shot boolean probe: True only when the worker is ready."""
+    return (await _probe_once(timeout)) == "ready"
 
 
 async def ensure_worker_awake(timeout: float = WARM_TIMEOUT_SECONDS) -> bool:
-    """Block until the agent worker is awake, or `timeout` elapses.
+    """Poll until the agent worker is genuinely up, or `timeout` elapses.
 
-    Returns True if the worker responded (or was recently known warm), False if
-    it is unreachable or no URL is configured. Callers should treat False as
-    "dispatch anyway, but expect a possible agent-less room" — never as fatal.
+    "Genuinely up" means the worker process itself answered /worker with our
+    agent_name — see _probe_once for why a mere HTTP response is not enough.
+
+    Returns True only in that case. False means the room should NOT be created:
+    the worker cannot accept the dispatch, so the caller would join a room no
+    agent ever enters (backend/routers/web_calls.py turns that into a clear 503
+    rather than 25 seconds of silence).
     """
     if not is_configured():
         return False
@@ -140,25 +202,35 @@ async def ensure_worker_awake(timeout: float = WARM_TIMEOUT_SECONDS) -> bool:
             return True
 
         started = time.monotonic()
+        deadline = started + timeout
         log.info("Pre-warming agent worker (cold start can take ~55s)...")
-        try:
-            ok = await asyncio.wait_for(
-                _probe(min(_PROBE_TIMEOUT_SECONDS, timeout)), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            ok = False
 
-        elapsed = time.monotonic() - started
-        if ok:
-            mark_warm()
-            log.info("Agent worker awake after %.1fs", elapsed)
-        else:
-            log.error(
-                "Agent worker did NOT respond within %.0fs — dispatching anyway, but "
-                "the room may have no agent. Check the lifodial-agent service on Render.",
-                elapsed,
-            )
-        return ok
+        attempts = 0
+        last_state = "down"
+        while True:
+            attempts += 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            last_state = await _probe_once(min(_PROBE_TIMEOUT_SECONDS, remaining))
+            if last_state == "ready":
+                mark_warm()
+                log.info(
+                    "Agent worker awake and registered after %.1fs (%d probe%s)",
+                    time.monotonic() - started, attempts, "" if attempts == 1 else "s",
+                )
+                return True
+            if deadline - time.monotonic() <= 0:
+                break
+            await asyncio.sleep(_PROBE_RETRY_GAP_SECONDS)
+
+        log.error(
+            "Agent worker did NOT come up within %.0fs (%d probes, last state=%s). NOT "
+            "creating a room — a dispatched call would find no agent and the caller "
+            "would hear silence. Check the lifodial-agent service on Render.",
+            time.monotonic() - started, attempts, last_state,
+        )
+        return False
 
 
 async def keep_warm_loop() -> None:
@@ -202,10 +274,14 @@ async def keep_warm_loop() -> None:
     while True:
         try:
             await asyncio.sleep(KEEP_WARM_INTERVAL_SECONDS)
-            if await _probe(_PROBE_TIMEOUT_SECONDS):
+            state = await _probe_once(_PROBE_TIMEOUT_SECONDS)
+            if state == "ready":
                 mark_warm()
             else:
-                log.warning("Agent-worker keep-warm ping failed — worker may be down.")
+                log.warning(
+                    "Agent-worker keep-warm ping did not reach the worker (state=%s) — "
+                    "it may have spun down or be crash-looping.", state,
+                )
         except asyncio.CancelledError:
             log.info("Agent-worker keep-warm stopped.")
             raise
