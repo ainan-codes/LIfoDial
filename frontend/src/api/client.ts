@@ -18,7 +18,7 @@ const getDynamicApiUrl = () => {
     }
   }
   if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
-  return 'https://lifodial.onrender.com';
+  return 'https://lifodial-backend-production.up.railway.app';
 };
 
 export const API_URL = getDynamicApiUrl();

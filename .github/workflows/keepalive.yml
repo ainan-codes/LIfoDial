@@ -39,12 +39,17 @@ name: Keep Render Services Awake
 # ping doubles as a registration check, not just a liveness ping.
 
 on:
-  schedule:
-    # Requested every 5 minutes. GitHub delivers roughly every 1-3 hours — see
-    # the measurements above. Left at */5 because asking for more often costs
-    # nothing and occasionally gets us a closer run.
-    - cron: '*/5 * * * *'
-  workflow_dispatch:  # run manually from the Actions tab — do this before a demo
+  # Scheduled trigger disabled 2026-07-31: backend + worker moved to Railway
+  # (sleepApplication: false — never sleeps, no keepalive needed there). Render
+  # is PAUSED, not deleted, as the rollback fallback, so pinging it on a
+  # schedule would just fail loudly. Re-enable the `schedule:` block below if
+  # Render is ever resumed as the live services again.
+  # schedule:
+  #   # Requested every 5 minutes. GitHub delivers roughly every 1-3 hours — see
+  #   # the measurements above. Left at */5 because asking for more often costs
+  #   # nothing and occasionally gets us a closer run.
+  #   - cron: '*/5 * * * *'
+  workflow_dispatch:  # run manually from the Actions tab if Render is ever resumed
 
 jobs:
   ping:

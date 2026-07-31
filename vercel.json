@@ -5,12 +5,12 @@
   "framework": null,
   "build": {
     "env": {
-      "VITE_API_URL": "https://lifodial.onrender.com",
+      "VITE_API_URL": "https://lifodial-backend-production.up.railway.app",
       "NODE_VERSION": "22"
     }
   },
   "env": {
-    "VITE_API_URL": "https://lifodial.onrender.com"
+    "VITE_API_URL": "https://lifodial-backend-production.up.railway.app"
   },
   "rewrites": [
     {

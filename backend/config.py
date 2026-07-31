@@ -54,11 +54,14 @@ class Settings(BaseSettings):
     livekit_api_secret: str = ""
 
     # ── Pipecat agent worker (cold-start pre-warm) ─────────────────────────
-    # Public HTTPS base URL of the `lifodial-agent` Render service, e.g.
-    # https://lifodial-agent.onrender.com — used by backend/services/agent_worker.py
-    # to wake the free-tier worker BEFORE dispatching a call into a room and to
-    # keep it warm on a timer. Leave blank to disable both (dispatch then behaves
-    # exactly as it did before, i.e. cold starts cause agent-less rooms).
+    # Public HTTPS base URL of the agent worker service — used by
+    # backend/services/agent_worker.py to wake the worker BEFORE dispatching a
+    # call into a room and to keep it warm on a timer. Leave blank to disable
+    # both (dispatch then behaves exactly as it did before, i.e. cold starts
+    # cause agent-less rooms). As of the 2026-07-31 Railway migration this
+    # points at the Railway worker (sleepApplication: false, so it never
+    # actually cold-starts) — kept set anyway so this still degrades gracefully
+    # if the worker is ever moved back to a plan that can sleep.
     agent_worker_url: str = ""
 
     # Background keep-warm pinger — DEFAULT OFF, deliberately.

@@ -682,12 +682,15 @@ async def serve_widget():
 # ── Public widget test page (HTTPS-served so mic permission works on any device) ──
 @app.get("/test", tags=["embed"])
 @app.get("/test/", tags=["embed"])
-async def widget_test_page(agent: str = "agent-001"):
+async def widget_test_page(request: Request, agent: str = "agent-001"):
     """Public test page for the embed widget. Reachable from any device:
-       https://lifodial.onrender.com/test?agent=agent-001
+       <this service's public URL>/test?agent=agent-001
     Defaults to agent-001 (Apollo Clinic Hindi receptionist).
     """
     from fastapi.responses import HTMLResponse
+    _proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    _host = request.headers.get("host", request.url.netloc)
+    base_url = f"{_proto}://{_host}"
     html = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"/>
@@ -735,14 +738,14 @@ async def widget_test_page(agent: str = "agent-001"):
       <li>Site must be served over <strong>HTTPS</strong> (browsers block mic on plain HTTP).</li>
       <li>Paste this single line before <code>&lt;/body&gt;</code>:</li>
     </ol>
-    <pre style="background:#1a1a1a;color:#3ECF8E;padding:12px;border-radius:6px;overflow:auto;font-size:11px;margin-top:8px">&lt;script src="https://lifodial.onrender.com/widget.js" data-agent-id="{agent}"&gt;&lt;/script&gt;</pre>
+    <pre style="background:#1a1a1a;color:#3ECF8E;padding:12px;border-radius:6px;overflow:auto;font-size:11px;margin-top:8px">&lt;script src="{base_url}/widget.js" data-agent-id="{agent}"&gt;&lt;/script&gt;</pre>
   </div>
 
   <!-- The actual embed -->
   <script
     src="/widget.js"
     data-agent-id="{agent}"
-    data-api-url="https://lifodial.onrender.com"
+    data-api-url="{base_url}"
     data-position="bottom-right"
     data-theme="dark"
     data-style="full"
