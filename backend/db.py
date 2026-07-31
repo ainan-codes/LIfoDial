@@ -110,11 +110,41 @@ else:
     # ~6 small indexed queries. The queries themselves are ~0.15-0.3s each; the
     # rest is the handshake, paid again on every single call.
     #
-    # Set DB_POOL_SIZE=2 on lifodial-agent to amortise it across calls. Left at 0
-    # (NullPool, unchanged behaviour) everywhere else, so the API's connection
-    # accounting is untouched. pool_pre_ping discards a connection Supabase's
-    # pooler has already closed instead of failing the call with it; pool_recycle
-    # stays well under any idle cutoff.
+    # ⚠️ DO NOT SET DB_POOL_SIZE > 0 ON THE AGENT WORKER. The paragraph above is the
+    # reasoning that led to DB_POOL_SIZE=2 there; it was measured, plausible, and
+    # WRONG, and it was reverted to 0 on 2026-07-31. Why it cannot work:
+    #
+    # livekit-agents runs each job with its own event loop and closes it when the job
+    # ends — livekit/agents/ipc/proc_client.py:61 does asyncio.new_event_loop() +
+    # set_event_loop(), then run_until_complete(), then shuts the loop down. This is
+    # true for JobExecutorType.THREAD (what the worker uses) as well as PROCESS.
+    # asyncpg connections are bound to the loop that created them, but SQLAlchemy's
+    # pool is process-global. So job 1 checks out a connection, uses it, returns it to
+    # the pool, and its loop dies; job 2 then checks out that dead-loop connection.
+    #
+    # That is not a theoretical race. It showed up in production as
+    #   Future exception was never retrieved
+    #   future: <Future finished exception=InternalClientError(
+    #       'got result for unknown protocol state 3')>
+    # and reproduces locally as RuntimeError('Event loop is closed') on the second
+    # loop. pool_pre_ping does NOT save you — the ping itself runs on the dead loop.
+    #
+    # And it bought nothing: per-call setup stayed at 1.65-2.89s with pooling
+    # "enabled", because every call re-handshook anyway. Worse, _load_tenant_and_config
+    # swallows DB errors and falls back to metadata defaults, so a corrupted
+    # connection silently costs a real call its doctors/knowledge-base/system-prompt
+    # instead of failing loudly.
+    #
+    # To actually amortise the handshake, the pool must be owned by ONE long-lived
+    # event loop that outlives individual jobs, with job code submitting work to it
+    # via asyncio.run_coroutine_threadsafe. That is a real refactor: EVERY worker DB
+    # path has to go through it (call setup AND the call-logger's finalisation
+    # writes), because one stray session on a job loop reintroduces the corruption.
+    # Until that exists, 0 is the only correct value here.
+    #
+    # pool_pre_ping discards a connection Supabase's pooler has already closed
+    # instead of failing the call with it; pool_recycle stays well under any idle
+    # cutoff. Both are still right for any NON-job-executor consumer.
     try:
         _pool_size = int(os.getenv("DB_POOL_SIZE", "0") or 0)
     except ValueError:

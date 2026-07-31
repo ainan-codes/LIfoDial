@@ -82,13 +82,22 @@ _WARM_CACHE_SECONDS = 300.0
 # host's idle window — it is _WARM_CACHE_SECONDS above, and this must stay BELOW
 # it. Each tick calls mark_warm(), which vouches for the worker for only 300s, so
 # at the previous 600s the cache sat STALE for half of every cycle: a call landing
-# in that half re-probed and paid the full network round trip even though the
-# pinger had the worker demonstrably awake. Measured on Railway 2026-07-31, that
-# probe is ~733ms, i.e. keep-warm was cancelling the cost it exists to cancel only
-# about half the time.
+# in that half re-probed and paid a full network round trip even though the pinger
+# had the worker demonstrably awake — keep-warm was cancelling the cost it exists
+# to cancel only about half the time.
 #
 # 240s keeps a valid cache at all times with one whole tick of slack for a missed
 # or slow ping, and is still far below any plausible idle window.
+#
+# Size the win honestly. From the BACKEND this probe is ~60-100ms: both services
+# sit in Railway sin1, and 2026-07-31 measurements show a 0.1s boot probe and 63ms
+# steady-state pings. An earlier revision of this comment claimed ~733ms — that was
+# measured from a laptop in India to Singapore and is NOT the path production
+# takes. So this fix is worth ~0.1s on a first call, not ~0.7s. The stale-cache bug
+# was real and worth fixing, but it is nowhere near the dominant term in call
+# latency: that is the ~1.25s Supabase connection handshake (see backend/db.py —
+# and note DB_POOL_SIZE>0 cannot help a THREAD-executor worker, because
+# livekit-agents gives every job a fresh event loop) and the ~4.4s greeting path.
 KEEP_WARM_INTERVAL_SECONDS = 240.0
 
 # Monotonic deadline until which the worker is assumed awake.
@@ -219,7 +228,7 @@ async def ensure_worker_awake(timeout: float = WARM_TIMEOUT_SECONDS) -> bool:
         # moment you want to tell them apart: during a live call.
         log.info(
             "Agent worker pre-warm SKIPPED — keep-warm cache still valid for %.0fs, "
-            "no probe needed (saves ~0.7s of call setup).",
+            "no probe needed (saves ~0.1s of call setup).",
             _warm_until - time.monotonic(),
         )
         return True

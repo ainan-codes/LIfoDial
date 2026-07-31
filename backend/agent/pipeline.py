@@ -1739,7 +1739,20 @@ async def entrypoint(ctx) -> None:
             log.info("Participant joined: %s — mode=wait, staying silent until caller speaks.", participant_id)
             context.add_message({"role": "assistant", "content": effective_first_message})
             return
-        log.info("Participant joined: %s — speaking first message.", participant_id)
+        # Timed from _entry_t0, deliberately. Railway stamps log lines at FLUSH
+        # time, so several lines can share one millisecond and sub-second maths on
+        # those timestamps is meaningless (observed 2026-07-31: one timestamp
+        # covering both "prewarm" and "DB work finished in 1.67s"). These deltas are
+        # monotonic and in-process, so they are the only trustworthy attribution of
+        # the greeting path — measured at 4.42s from agent-ready to audible audio,
+        # the single largest chunk of first-call latency, and until now completely
+        # opaque: this handler cannot even run until runner.run() starts the
+        # transport, which is after DB + provider setup + room join.
+        log.info(
+            "Participant joined: %s — speaking first message. "
+            "[greeting-path] participant_joined at %.2fs after entrypoint",
+            participant_id, time.monotonic() - _entry_t0,
+        )
         # TTSSpeakFrame (not TextFrame): TTSService handles TTSSpeakFrame as a
         # standalone utterance and synthesizes it immediately. A bare TextFrame
         # queued at the task source is only ever flushed as part of an LLM
@@ -1749,6 +1762,17 @@ async def entrypoint(ctx) -> None:
         await task.queue_frames([
             TTSSpeakFrame(effective_first_message, append_to_context=False)
         ])
+        # Everything after this point is TTS synthesis + WebRTC delivery, which the
+        # caller experiences as continued silence. Pair this number with the probe's
+        # wire-side dispatch_to_first_audio_ms to split the greeting path into
+        # "our setup" vs "the TTS round trip" — the two have completely different
+        # fixes (pre-synthesise vs switch/stream the provider), so guessing which
+        # one dominates would send the optimisation the wrong way.
+        log.info(
+            "[greeting-path] greeting queued for synthesis at %.2fs after entrypoint "
+            "(%d chars) — any further delay before audio is TTS TTFB + transport",
+            time.monotonic() - _entry_t0, len(effective_first_message),
+        )
 
     @transport.event_handler("on_participant_disconnected")
     async def on_participant_disconnected(transport_ref, participant_id: str) -> None:

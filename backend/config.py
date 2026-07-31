@@ -78,7 +78,10 @@ class Settings(BaseSettings):
     # every service. That constraint died with the Railway migration: both services
     # report sleepApplication=false, so nothing sleeps and nothing is metered by the
     # hour. What the flag still buys here is skipping the pre-warm probe on the
-    # request path (~733ms measured), which is why it is now on.
+    # request path — worth ~0.1s, since backend and worker are both in Railway sin1
+    # (boot probe 0.1s, steady pings 63ms, measured 2026-07-31). Do not expect more:
+    # first-call latency is dominated by the DB handshake and the greeting path, not
+    # by this.
     agent_worker_keep_warm: bool = False
 
     # Semantic end-of-turn detection (pipecat's Local Smart Turn v3 ONNX model).
