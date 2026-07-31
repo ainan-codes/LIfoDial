@@ -26,39 +26,57 @@ Environment variables required (.env):
 import os
 import sys
 
-from livekit.agents import WorkerOptions, JobExecutorType, cli
 
-from backend.agent.pipeline import AGENT_NAME, entrypoint, prewarm, _preflight_or_die
-from backend.config import settings
+def _configure_logging() -> None:
+    """Configure BOTH loguru (pipecat) and the stdlib `logging` module
+    (backend.config, backend.db, ...) before anything else is imported.
 
+    This has to run before the `backend.agent.pipeline` / `backend.config`
+    imports below, not after: pipecat prints its own banner via loguru at
+    import time, and `backend.config`'s `Settings()` validator logs through
+    the stdlib `logging` module at import time too (both would otherwise log
+    once, unconfigured, before this function ever got a chance to run).
 
-def _configure_pipecat_logging() -> None:
-    """Silence pipecat's DEBUG firehose unless explicitly asked for.
+    Silences pipecat's DEBUG firehose unless explicitly asked for: pipecat's
+    default sink is stderr at DEBUG, and a 20-second call produced ~130 lines,
+    competing with real-time audio for the event loop on a CPU-constrained
+    worker. INFO keeps everything this codebase logs deliberately (STT model
+    chosen, turn strategy, language switches, call summaries). Set
+    AGENT_LOG_LEVEL=DEBUG to get the firehose back while debugging a call.
 
-    Pipecat logs through loguru, whose default sink is stderr at DEBUG: every
-    frame link, every metrics sample, every websocket message. A 20-second call
-    produced ~130 lines. On the free-tier worker (0.1 CPU) that formatting and
-    stderr I/O competes with real-time audio for the event loop, and it buries
-    the lines that matter in the Render log viewer.
-
-    INFO keeps everything this codebase logs deliberately (STT model chosen, turn
-    strategy, language switches, call summaries). Set AGENT_LOG_LEVEL=DEBUG to get
-    the firehose back while debugging a specific call.
+    Both sinks emit JSON with an explicit "level" field rather than plain
+    text: Railway's log viewer determines severity from that field, falling
+    back to stream (stderr -> error, regardless of the level text in the
+    message) for unstructured lines — which is what loguru's/stdlib logging's
+    plain-text defaults are, so every routine INFO line was showing up as an
+    error.
     """
-    level = (os.environ.get("AGENT_LOG_LEVEL") or "INFO").upper()
-    try:
-        import json as _json
+    import json as _json
+    import logging as _logging
 
+    level = (os.environ.get("AGENT_LOG_LEVEL") or "INFO").upper()
+
+    class _RailwayJsonFormatter(_logging.Formatter):
+        def format(self, record: _logging.LogRecord) -> str:
+            payload = {
+                "level": record.levelname,
+                "message": record.getMessage(),
+                "logger": record.name,
+                "time": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            }
+            if record.exc_info:
+                payload["exc_info"] = self.formatException(record.exc_info)
+            return _json.dumps(payload, ensure_ascii=False)
+
+    _handler = _logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(_RailwayJsonFormatter())
+    _logging.basicConfig(level=_logging.INFO, handlers=[_handler], force=True)
+
+    try:
         from loguru import logger as _loguru
 
         _loguru.remove()
 
-        # Railway's log viewer determines severity from a JSON "level" field;
-        # a plain-text line falls back to stream (stderr -> error regardless
-        # of the level text in the message), which is loguru's default sink —
-        # so every routine INFO line (STT/TTS init, turn logs) was showing up
-        # as an error. Emit real JSON with a "level" key instead — this is the
-        # documented, reliable fix, independent of which stream it ends up on.
         def _railway_json_sink(message) -> None:
             record = message.record
             payload = {
@@ -74,6 +92,14 @@ def _configure_pipecat_logging() -> None:
         _loguru.add(_railway_json_sink, level=level)
     except Exception as exc:  # never let logging config stop the worker booting
         print(f"warning: could not configure pipecat log level: {exc}", file=sys.stderr)
+
+
+_configure_logging()
+
+from livekit.agents import WorkerOptions, JobExecutorType, cli  # noqa: E402
+
+from backend.agent.pipeline import AGENT_NAME, entrypoint, prewarm, _preflight_or_die  # noqa: E402
+from backend.config import settings  # noqa: E402
 
 
 def _worker_tuning() -> dict:
@@ -135,8 +161,7 @@ def _worker_tuning() -> dict:
 
     print(
         f"[worker] executor={job_executor_type.name} "
-        f"load_threshold={load_threshold} idle_processes={idle}",
-        file=sys.stderr,
+        f"load_threshold={load_threshold} idle_processes={idle}"
     )
     return {
         "job_executor_type": job_executor_type,
@@ -146,7 +171,6 @@ def _worker_tuning() -> dict:
 
 
 if __name__ == "__main__":
-    _configure_pipecat_logging()
     _preflight_or_die()
     port = int(os.environ.get("PORT") or 8081)
     cli.run_app(
