@@ -45,6 +45,27 @@ _dispatch_watchers: set = set()
 # the job. 15s was tight enough to alarm on healthy-but-freshly-woken workers.
 _AGENT_JOIN_DEADLINE_SECONDS = 25
 
+# How often to look, inside that deadline. This used to be a single check AFTER
+# sleeping the whole deadline, and that made the watchdog unable to tell the two
+# things apart that it exists to distinguish:
+#
+#   "the agent never joined"                (real: caller hears silence)
+#   "the call happened and the room is gone" (normal: any call shorter than 25s)
+#
+# The worker DELETES the room the moment the caller disconnects
+# (pipeline.py's on_participant_disconnected), so a short call erases the evidence
+# before a late poll can see it. Measured on 2026-07-31T12:18:21Z: the agent
+# demonstrably joined (worker logged "Connected to <room>", "Agent ready 4.56s",
+# then queued the greeting), the caller hung up ~2s in, the worker deleted the
+# room, and this watchdog reported `participants=0 room_gone=True` as
+# "Agent never joined ... may be crash-looping, or agent_name may not match".
+#
+# That false alarm cost real debugging time chasing a cold start that did not
+# exist. Polling instead means we observe the agent while it is actually present
+# and return silently, which is both correct and cheaper: a healthy join shows up
+# on the first or second poll, so the common case is 1-2 API calls, not 1 late one.
+_AGENT_POLL_INTERVAL_SECONDS = 2.0
+
 
 async def _alert_if_agent_absent(
     room_name: str, call_id: str, agent_id: str, tenant_id: str,
@@ -58,25 +79,67 @@ async def _alert_if_agent_absent(
     below), so any participant whose identity is NOT 'user-*' is the agent.
     """
     try:
-        await asyncio.sleep(_AGENT_JOIN_DEADLINE_SECONDS)
+        import time as _time
+
         from livekit import api as livekit_api
 
-        parts = []
+        deadline = _time.monotonic() + _AGENT_JOIN_DEADLINE_SECONDS
+        agent_seen = False
+        caller_seen = False
         room_gone = False
-        async with livekit_api.LiveKitAPI(lk_url, lk_key, lk_secret) as lk:
-            try:
-                res = await lk.room.list_participants(
-                    livekit_api.ListParticipantsRequest(room=room_name)
-                )
-                parts = list(res.participants)
-            except Exception:
-                # Room already vanished (empty_timeout) → nobody sustained a join.
-                room_gone = True
+        parts: list = []
 
-        agent_present = any(
-            not (getattr(p, "identity", "") or "").startswith("user-") for p in parts
-        )
-        if agent_present:
+        # One API session for the whole watch, reused across polls.
+        async with livekit_api.LiveKitAPI(lk_url, lk_key, lk_secret) as lk:
+            while True:
+                try:
+                    res = await lk.room.list_participants(
+                        livekit_api.ListParticipantsRequest(room=room_name)
+                    )
+                    parts = list(res.participants)
+                except Exception:
+                    # The room is gone. Either the call ended and the worker
+                    # deleted it, or nobody ever sustained a join. Which one is
+                    # decided below by what we saw while it existed — NOT by the
+                    # fact that it is gone, which is the mistake this replaces.
+                    room_gone = True
+                    break
+
+                for p in parts:
+                    if (getattr(p, "identity", "") or "").startswith("user-"):
+                        caller_seen = True
+                    else:
+                        agent_seen = True
+
+                # Dispatch worked. This is the overwhelmingly common outcome and it
+                # must stay completely silent, or the alarm becomes noise.
+                if agent_seen:
+                    return
+
+                if _time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(_AGENT_POLL_INTERVAL_SECONDS)
+
+        if agent_seen:
+            return
+
+        # ── Room vanished before we ever saw the agent ────────────────────────
+        # Not evidence of a dispatch failure. A dispatch failure leaves the CALLER
+        # sitting in the room hearing silence, and LiveKit's empty_timeout only
+        # reaps rooms that are empty — so a room that disappears means everyone
+        # left, i.e. the caller hung up. Report it, but do not claim a cause we
+        # have not established, and do not page anyone.
+        if room_gone:
+            logger.warning(
+                "[DISPATCH-WATCH] Room '%s' was deleted before the agent was "
+                "observed (call_id=%s agent_id=%s tenant_id=%s caller_seen=%s). "
+                "Almost always a caller who hung up within %ds — the worker deletes "
+                "the room on disconnect. NOT treated as a dispatch failure. If "
+                "callers report silence on SHORT calls, check the worker log for "
+                "'Connected to %s' to see whether the agent actually joined.",
+                room_name, call_id, agent_id, tenant_id, caller_seen,
+                _AGENT_JOIN_DEADLINE_SECONDS, room_name,
+            )
             return
 
         # Report whether the worker URL is even configured, and whether we
@@ -85,23 +148,37 @@ async def _alert_if_agent_absent(
         # free-tier cold start, which sent debugging down the wrong path.
         from backend.services import agent_worker
 
+        # State a NEXT STEP, not a cause. The previous wording asserted
+        # "crash-looping on boot, or agent_name may not match" on every alarm, and
+        # both were already excluded before the message was even written:
+        # _probe_once validates the reported agent_name against ours and logs a
+        # dedicated ERROR when they differ, and a crash-looping worker could not
+        # have answered the pre-warm probe that gates room creation. On
+        # 2026-07-31 that confident-but-wrong text sent debugging after a ~55s
+        # Render cold start on a host that does not sleep at all. An alarm that
+        # guesses is worse than one that reports only what it observed.
         if not agent_worker.is_configured():
             cause = (
-                "AGENT_WORKER_URL is NOT set, so the worker was never pre-warmed — on "
-                "Render's free plan it deregisters from LiveKit after ~15min idle and "
-                "takes ~55s to cold start. Set AGENT_WORKER_URL on lifodial-api."
+                "AGENT_WORKER_URL is NOT set, so the worker is never pre-warmed and "
+                "the room is dispatched blind. Set AGENT_WORKER_URL on the backend "
+                "service so call setup can verify the worker before creating a room."
             )
         else:
             cause = (
-                "Worker was pre-warmed but still didn't join — it may be crash-looping "
-                "on boot, or agent_name may not match WorkerOptions(agent_name=...). "
-                f"Check {agent_worker.worker_base_url()}/worker and the service logs."
+                "The worker answered its pre-warm probe (so the process is up and its "
+                "agent_name matches — a mismatch logs its own ERROR from "
+                "agent_worker._probe_once) yet no agent participant appeared. Look at "
+                f"the WORKER log for room '{room_name}': if 'Agent entrypoint' is "
+                "absent, LiveKit never delivered the job; if it is present but "
+                f"'Connected to {room_name}' is not, the job failed during setup. "
+                f"Worker state: {agent_worker.worker_base_url()}/worker"
             )
 
         msg = (
-            f"[DISPATCH-ALARM] Agent never joined room '{room_name}' within "
-            f"{_AGENT_JOIN_DEADLINE_SECONDS}s (call_id={call_id} agent_id={agent_id} "
-            f"tenant_id={tenant_id} participants={len(parts)} room_gone={room_gone}). "
+            f"[DISPATCH-ALARM] No agent participant in room '{room_name}' after "
+            f"{_AGENT_JOIN_DEADLINE_SECONDS}s of polling, and the room is still alive "
+            f"(call_id={call_id} agent_id={agent_id} tenant_id={tenant_id} "
+            f"participants={len(parts)} caller_seen={caller_seen}). "
             f"Callers in this room hear silence. {cause}"
         )
         logger.error(msg)
