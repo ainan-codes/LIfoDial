@@ -64,16 +64,21 @@ class Settings(BaseSettings):
     # if the worker is ever moved back to a plan that can sleep.
     agent_worker_url: str = ""
 
-    # Background keep-warm pinger — DEFAULT OFF, deliberately.
-    # Render's free tier bills ~730 instance-hours/month for ONE always-on
-    # service against a 750h ACCOUNT-WIDE allowance. Both lifodial-agent AND the
-    # API service (`LIfoDial`, srv-d7m7tnho3t8c73e19q30) are on the free plan as
-    # of 2026-07-25, so pinning the worker awake 24/7 would exhaust the allowance
-    # and get BOTH services suspended — far worse than one slow first call.
-    # Pre-warm on the request path (ensure_worker_awake) already prevents
-    # agent-less rooms without burning hours, so turn this on ONLY after moving
-    # to a paid plan. A free API service also sleeps, which makes the loop
-    # unreliable anyway.
+    # Background keep-warm pinger. Set to true on Railway 2026-07-31.
+    #
+    # This flag is about the HOST sleeping an idle service — nothing else. It starts
+    # keep_warm_loop(), which is one outbound GET {AGENT_WORKER_URL}/worker every
+    # KEEP_WARM_INTERVAL_SECONDS. It does NOT load or unload STT/TTS/VAD models, and
+    # there is no idle-unload cycle anywhere in this codebase for it to disable —
+    # model loading is prewarm() in backend/agent/pipeline.py, which is per
+    # job-process and has no timer.
+    #
+    # The default was False for Render's free tier, where holding ONE service awake
+    # (~730h/mo) would have exhausted a 750h ACCOUNT-WIDE allowance and suspended
+    # every service. That constraint died with the Railway migration: both services
+    # report sleepApplication=false, so nothing sleeps and nothing is metered by the
+    # hour. What the flag still buys here is skipping the pre-warm probe on the
+    # request path (~733ms measured), which is why it is now on.
     agent_worker_keep_warm: bool = False
 
     # Semantic end-of-turn detection (pipecat's Local Smart Turn v3 ONNX model).

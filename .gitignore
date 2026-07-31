@@ -97,3 +97,6 @@ cleanup_unimportant.ps1
 # Any dotenv variant except the example (belt-and-suspenders with the block above)
 .env.*
 !.env.example
+
+# voice_probe.py run artifacts (audio + reports from local test calls)
+scripts/voice_probe_runs/

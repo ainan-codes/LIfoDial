@@ -78,9 +78,18 @@ _PROBE_RETRY_GAP_SECONDS = 3.0
 # never outlive the instance it describes.
 _WARM_CACHE_SECONDS = 300.0
 
-# Interval for the background keep-warm pinger. Must be < Render's ~900s idle
-# timeout with margin for a missed tick.
-KEEP_WARM_INTERVAL_SECONDS = 600.0
+# Interval for the background keep-warm pinger. The binding constraint is NOT the
+# host's idle window — it is _WARM_CACHE_SECONDS above, and this must stay BELOW
+# it. Each tick calls mark_warm(), which vouches for the worker for only 300s, so
+# at the previous 600s the cache sat STALE for half of every cycle: a call landing
+# in that half re-probed and paid the full network round trip even though the
+# pinger had the worker demonstrably awake. Measured on Railway 2026-07-31, that
+# probe is ~733ms, i.e. keep-warm was cancelling the cost it exists to cancel only
+# about half the time.
+#
+# 240s keeps a valid cache at all times with one whole tick of slack for a missed
+# or slow ping, and is still far below any plausible idle window.
+KEEP_WARM_INTERVAL_SECONDS = 240.0
 
 # Monotonic deadline until which the worker is assumed awake.
 _warm_until: float = 0.0
@@ -204,6 +213,15 @@ async def ensure_worker_awake(timeout: float = WARM_TIMEOUT_SECONDS) -> bool:
     if not is_configured():
         return False
     if _is_cached_warm():
+        # Say so out loud. This is the path keep-warm exists to create, and it used
+        # to be the only outcome that left NO trace in the log — so "keep-warm is
+        # working" was indistinguishable from "keep-warm never ran" at exactly the
+        # moment you want to tell them apart: during a live call.
+        log.info(
+            "Agent worker pre-warm SKIPPED — keep-warm cache still valid for %.0fs, "
+            "no probe needed (saves ~0.7s of call setup).",
+            _warm_until - time.monotonic(),
+        )
         return True
 
     async with _get_lock():
@@ -306,17 +324,24 @@ async def keep_warm_loop() -> None:
         )
         return
 
-    # OFF by default — see Settings.agent_worker_keep_warm. On Render's free plan
-    # holding the worker awake 24/7 (~730h) against a 750h ACCOUNT-WIDE allowance
-    # would suspend every service on the account. Pre-warm already prevents
-    # agent-less rooms, so this is a paid-plan-only optimisation that trades the
-    # ~55s first-call delay for instance-hours.
+    # See Settings.agent_worker_keep_warm for why this was ever off.
+    #
+    # The message below deliberately does NOT promise a ~55s cold start any more.
+    # That number was Render's free-tier spin-down and it is host-specific, not a
+    # property of this code. Measured on Railway 2026-07-31, with
+    # sleepApplication=false on both services: after 18min of zero HTTP contact the
+    # worker answered /worker in 733ms with active_jobs=0 and no restart — i.e. it
+    # never slept and there was no cold start to pay. The old wording sent debugging
+    # after a 55s delay that does not exist on this host, so state the mechanism and
+    # let whoever reads it measure their own host rather than quoting a stale figure.
     if not settings.agent_worker_keep_warm:
         log.info(
-            "Agent-worker keep-warm is DISABLED (AGENT_WORKER_KEEP_WARM=false). Calls still "
-            "pre-warm the worker on demand, so rooms won't be agent-less — but the first "
-            "call after ~15min idle will wait ~55s for the free instance to boot. Set "
-            "AGENT_WORKER_KEEP_WARM=true once the services are on a paid plan."
+            "Agent-worker keep-warm is DISABLED (AGENT_WORKER_KEEP_WARM unset or false). "
+            "Calls still pre-warm the worker on demand, so rooms won't be agent-less. "
+            "The cost of leaving it off is one extra probe round trip on the first call "
+            "after %.0fs idle, PLUS a full cold start if — and only if — this host sleeps "
+            "idle services. Set AGENT_WORKER_KEEP_WARM=true to hold the worker awake.",
+            _WARM_CACHE_SECONDS,
         )
         return
 
@@ -333,9 +358,20 @@ async def keep_warm_loop() -> None:
     while True:
         try:
             await asyncio.sleep(KEEP_WARM_INTERVAL_SECONDS)
+            _ping_t0 = time.monotonic()
             state = await _probe_once(_PROBE_TIMEOUT_SECONDS)
             if state == "ready":
                 mark_warm()
+                # Logged, not silent. This doubles as a continuous latency probe of
+                # the worker, and it is the line that proves the loop is alive —
+                # without it the only evidence of a healthy pinger is the absence of
+                # warnings, which is not evidence.
+                log.info(
+                    "Agent-worker keep-warm ping OK in %.0fms — worker awake, cache "
+                    "renewed for %.0fs (next ping in %.0fs).",
+                    (time.monotonic() - _ping_t0) * 1000,
+                    _WARM_CACHE_SECONDS, KEEP_WARM_INTERVAL_SECONDS,
+                )
             else:
                 log.warning(
                     "Agent-worker keep-warm ping did not reach the worker (state=%s) — "
