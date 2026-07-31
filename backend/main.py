@@ -13,11 +13,44 @@ from backend.db import init_db, engine, Base
 from backend.auth import require_superadmin, get_current_user
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-)
+# Split by stream, not just level: Railway (unlike Render) tags every stderr
+# line as "error" severity in its log viewer regardless of the level text in
+# the message, so a plain basicConfig() (whose default handler is stderr) made
+# every INFO line show up as an error. INFO/DEBUG go to stdout; only real
+# WARNING+ goes to stderr, so Railway's severity tagging matches reality again.
+import sys as _sys
+
+
+class _MaxLevelFilter(logging.Filter):
+    def __init__(self, max_level: int):
+        super().__init__()
+        self.max_level = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno <= self.max_level
+
+
+def _stdout_stderr_handlers() -> list[logging.Handler]:
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
+    stdout_h = logging.StreamHandler(_sys.stdout)
+    stdout_h.addFilter(_MaxLevelFilter(logging.INFO))
+    stdout_h.setFormatter(fmt)
+    stderr_h = logging.StreamHandler(_sys.stderr)
+    stderr_h.setLevel(logging.WARNING)
+    stderr_h.setFormatter(fmt)
+    return [stdout_h, stderr_h]
+
+
+logging.basicConfig(level=logging.INFO, handlers=_stdout_stderr_handlers())
 logger = logging.getLogger(__name__)
+
+# uvicorn configures its own "uvicorn"/"uvicorn.error" loggers (both stderr-only,
+# including their INFO startup lines) before this module is imported — rewrite
+# their handler to the same stdout/stderr split rather than leaving it stderr-only.
+for _uv_name in ("uvicorn", "uvicorn.error"):
+    _uv_logger = logging.getLogger(_uv_name)
+    _uv_logger.handlers = _stdout_stderr_handlers()
+    _uv_logger.propagate = False
 
 # Filter to suppress noisy requests from other apps (LeadScout etc.)
 class _IgnoreNoiseFilter(logging.Filter):

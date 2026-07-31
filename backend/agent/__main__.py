@@ -50,7 +50,17 @@ def _configure_pipecat_logging() -> None:
         from loguru import logger as _loguru
 
         _loguru.remove()
-        _loguru.add(sys.stderr, level=level)
+        # Split by stream: Railway (unlike Render) tags every stderr line as
+        # "error" severity in its log viewer regardless of the level text in
+        # the message, so sending everything to stderr made routine INFO
+        # lines (STT/TTS init, turn logs) show up as errors. Only WARNING+
+        # goes to stderr now; INFO/DEBUG goes to stdout.
+        _loguru.add(
+            sys.stdout,
+            level=level,
+            filter=lambda record: record["level"].no < _loguru.level("WARNING").no,
+        )
+        _loguru.add(sys.stderr, level="WARNING")
     except Exception as exc:  # never let logging config stop the worker booting
         print(f"warning: could not configure pipecat log level: {exc}", file=sys.stderr)
 
