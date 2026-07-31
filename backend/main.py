@@ -13,43 +13,46 @@ from backend.db import init_db, engine, Base
 from backend.auth import require_superadmin, get_current_user
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-# Split by stream, not just level: Railway (unlike Render) tags every stderr
-# line as "error" severity in its log viewer regardless of the level text in
-# the message, so a plain basicConfig() (whose default handler is stderr) made
-# every INFO line show up as an error. INFO/DEBUG go to stdout; only real
-# WARNING+ goes to stderr, so Railway's severity tagging matches reality again.
+# Railway's log viewer determines severity by looking for a JSON "level" field
+# in the line; a plain-text line falls back to stream (stderr -> error), which
+# is what Python's `logging` module (and uvicorn's own loggers) write to by
+# default — so every plain INFO line was showing up as an error regardless of
+# which stream we pointed the handler at (verified: re-pointing the handler at
+# stdout did NOT fix it, since something between us and the container's stdout
+# still classified it as error — only an explicit JSON "level" field does).
+# Emitting real JSON with a "level" key is the documented, reliable fix.
+import json as _json
 import sys as _sys
 
 
-class _MaxLevelFilter(logging.Filter):
-    def __init__(self, max_level: int):
-        super().__init__()
-        self.max_level = max_level
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        return record.levelno <= self.max_level
-
-
-def _stdout_stderr_handlers() -> list[logging.Handler]:
-    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
-    stdout_h = logging.StreamHandler(_sys.stdout)
-    stdout_h.addFilter(_MaxLevelFilter(logging.INFO))
-    stdout_h.setFormatter(fmt)
-    stderr_h = logging.StreamHandler(_sys.stderr)
-    stderr_h.setLevel(logging.WARNING)
-    stderr_h.setFormatter(fmt)
-    return [stdout_h, stderr_h]
+class _RailwayJsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "logger": record.name,
+            "time": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return _json.dumps(payload, ensure_ascii=False)
 
 
-logging.basicConfig(level=logging.INFO, handlers=_stdout_stderr_handlers())
+def _json_handler() -> logging.Handler:
+    h = logging.StreamHandler(_sys.stdout)
+    h.setFormatter(_RailwayJsonFormatter())
+    return h
+
+
+logging.basicConfig(level=logging.INFO, handlers=[_json_handler()], force=True)
 logger = logging.getLogger(__name__)
 
-# uvicorn configures its own "uvicorn"/"uvicorn.error" loggers (both stderr-only,
-# including their INFO startup lines) before this module is imported — rewrite
-# their handler to the same stdout/stderr split rather than leaving it stderr-only.
+# uvicorn configures its own "uvicorn"/"uvicorn.error" loggers before this
+# module is imported (including their INFO startup lines) — rewrite them to
+# the same JSON handler instead of leaving their plain-text default.
 for _uv_name in ("uvicorn", "uvicorn.error"):
     _uv_logger = logging.getLogger(_uv_name)
-    _uv_logger.handlers = _stdout_stderr_handlers()
+    _uv_logger.handlers = [_json_handler()]
     _uv_logger.propagate = False
 
 # Filter to suppress noisy requests from other apps (LeadScout etc.)

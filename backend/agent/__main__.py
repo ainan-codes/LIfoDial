@@ -47,20 +47,31 @@ def _configure_pipecat_logging() -> None:
     """
     level = (os.environ.get("AGENT_LOG_LEVEL") or "INFO").upper()
     try:
+        import json as _json
+
         from loguru import logger as _loguru
 
         _loguru.remove()
-        # Split by stream: Railway (unlike Render) tags every stderr line as
-        # "error" severity in its log viewer regardless of the level text in
-        # the message, so sending everything to stderr made routine INFO
-        # lines (STT/TTS init, turn logs) show up as errors. Only WARNING+
-        # goes to stderr now; INFO/DEBUG goes to stdout.
-        _loguru.add(
-            sys.stdout,
-            level=level,
-            filter=lambda record: record["level"].no < _loguru.level("WARNING").no,
-        )
-        _loguru.add(sys.stderr, level="WARNING")
+
+        # Railway's log viewer determines severity from a JSON "level" field;
+        # a plain-text line falls back to stream (stderr -> error regardless
+        # of the level text in the message), which is loguru's default sink —
+        # so every routine INFO line (STT/TTS init, turn logs) was showing up
+        # as an error. Emit real JSON with a "level" key instead — this is the
+        # documented, reliable fix, independent of which stream it ends up on.
+        def _railway_json_sink(message) -> None:
+            record = message.record
+            payload = {
+                "level": record["level"].name,
+                "message": record["message"],
+                "logger": record["name"],
+                "time": record["time"].isoformat(),
+            }
+            if record["exception"]:
+                payload["exc_info"] = str(record["exception"])
+            print(_json.dumps(payload, ensure_ascii=False), flush=True)
+
+        _loguru.add(_railway_json_sink, level=level)
     except Exception as exc:  # never let logging config stop the worker booting
         print(f"warning: could not configure pipecat log level: {exc}", file=sys.stderr)
 
