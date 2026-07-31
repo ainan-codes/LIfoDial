@@ -173,6 +173,16 @@ def _worker_tuning() -> dict:
 if __name__ == "__main__":
     _preflight_or_die()
     port = int(os.environ.get("PORT") or 8081)
+    # cli.run_app() below calls livekit-agents' OWN setup_logging(), which does
+    # root.addHandler(...) rather than replacing — on top of the root handler
+    # _configure_logging() installed above (needed for the import-time window,
+    # e.g. backend.config's SUPERADMIN_PASSWORD warning, which fires before
+    # cli.run_app ever runs), that produced every worker log line twice. Clear
+    # ours right before handing off; livekit-agents' handler already emits the
+    # same Railway-compatible JSON shape with a "level" field.
+    import logging as _logging
+
+    _logging.getLogger().handlers.clear()
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
