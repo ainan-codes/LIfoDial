@@ -1,0 +1,35 @@
+name: Deploy backend + worker to AWS EC2
+
+# Runs after CI passes on main: SSHes into the EC2 box, pulls latest code,
+# rebuilds the backend + worker containers, and runs migrations against RDS.
+# The frontend is NOT deployed here — Vercel handles that independently via
+# its own GitHub integration (auto-deploy on push, configured in the Vercel
+# dashboard, not in this repo).
+#
+# Required GitHub repo secrets (Settings → Secrets and variables → Actions):
+#   EC2_HOST        - Elastic IP or DNS name of the EC2 instance
+#   EC2_SSH_KEY      - private key (PEM contents) matching the EC2 key pair
+#   EC2_USER         - SSH user, typically "ubuntu"
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /opt/lifodial
+            ./scripts/deploy_aws.sh update

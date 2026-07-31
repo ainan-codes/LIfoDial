@@ -1378,40 +1378,6 @@ export default function AgentDetail() {
                 )}
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '32px 24px', marginTop: '8px' }}>
-                {agent.tts_provider === 'sarvam' ? (
-                  <>
-                    <Slider value={agent.tts_pitch} min={-1} max={1} onChange={(v:any) => updateField('tts_pitch', v)} leftLabel="Low Pitch" rightLabel="High Pitch" />
-                    <Slider value={agent.tts_pace} min={0.5} max={2.0} onChange={(v:any) => updateField('tts_pace', v)} leftLabel="Slow" rightLabel="Fast" />
-                    <Slider value={agent.tts_loudness} min={0.5} max={2.0} onChange={(v:any) => updateField('tts_loudness', v)} leftLabel="Quiet" rightLabel="Loud" />
-                    <Toggle checked={agent.tts_input_preprocessing === 1} onChange={(v:any) => updateField('tts_input_preprocessing', v ? 1 : 0)} label="Input Preprocessing" />
-                  </>
-                ) : (
-                  <>
-                    <Slider value={agent.tts_stability} min={0} max={1} onChange={(v:any) => updateField('tts_stability', v)} leftLabel="More variable" rightLabel="More stable" />
-                    <Slider value={agent.tts_clarity} min={0} max={1} onChange={(v:any) => updateField('tts_clarity', v)} leftLabel="Low" rightLabel="High" />
-                    <Slider value={agent.tts_style} min={0} max={1} onChange={(v:any) => updateField('tts_style', v)} leftLabel="None" rightLabel="Exaggerated" />
-                    <Toggle checked={agent.tts_use_speaker_boost === 1} onChange={(v:any) => updateField('tts_use_speaker_boost', v ? 1 : 0)} label="Use Speaker Boost" />
-                  </>
-                )}
-                {/* Redundant with the Sarvam-only Pace slider above (both control
-                    playback speed for that provider) — only shown for providers
-                    where tts_speed is the sole speed control. */}
-                {agent.tts_provider !== 'sarvam' && (
-                  <Slider value={agent.tts_speed} min={0.5} max={2.0} onChange={(v:any) => updateField('tts_speed', v)} leftLabel="0.5x Speed" rightLabel="2.0x Speed" />
-                )}
-              </div>
-
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px', marginTop: '8px' }}>
-                <div style={{ opacity: 0.5 }}>
-                  <Label>Optimize for Streaming Latency</Label>
-                  <Select value={agent.tts_optimize_streaming_latency} onChange={() => {}} options={[0,1,2,3,4]} style={{ pointerEvents: 'none' }} />
-                  <Helper>Not supported by the currently-used Sarvam/ElevenLabs streaming integration — has no effect on calls.</Helper>
-                </div>
-                <div style={{ paddingTop: '16px', opacity: 0.5 }}>
-                  <Toggle checked={false} onChange={() => {}} label="Filler Injection" helper="Not yet implemented — has no effect on calls." />
-                </div>
-              </div>
             </CollapsibleSection>
 
             {/* 3. TRANSCRIBER (STT) — still in Assistant tab */}
@@ -1431,108 +1397,29 @@ export default function AgentDetail() {
                 }} options={sttModels.length ? sttModels : [agent.stt_model || 'saarika:v2']} /></div>
                 <div><Label>Language</Label><Select value={agent.stt_language} onChange={(v:any) => updateField('stt_language', v)} options={['en-IN', 'hi-IN', 'ta-IN', 'te-IN', 'ar-SA', 'en-US', 'Multilingual (English/Hindi/Regional)', 'auto-detect']} /></div>
               </div>
-              <div>
-                <Label>Keywords / Boost Terms</Label>
-                <TagInput tags={Array.isArray(agent.transcriber_keywords) ? agent.transcriber_keywords : (agent.transcriber_keywords ? (typeof agent.transcriber_keywords === 'string' ? JSON.parse(agent.transcriber_keywords) : []) : [])} onChange={(t:any) => updateField('transcriber_keywords', JSON.stringify(t))} placeholder="Type a word and press enter..." />
-                <Helper>Add clinic-specific terms to improve accuracy for names/medications.</Helper>
-              </div>
-              <div>
-                <Label>Fallback Transcribers</Label>
-                <TagInput
-                  tags={Array.isArray(agent.fallback_transcribers) ? agent.fallback_transcribers : (agent.fallback_transcribers ? (typeof agent.fallback_transcribers === 'string' ? JSON.parse(agent.fallback_transcribers) : []) : [])}
-                  onChange={(t: any) => updateField('fallback_transcribers', JSON.stringify(t))}
-                  placeholder="Type a provider name (e.g. deepgram) and press enter..."
-                />
-                <Helper>
-                  Persisted, but not yet consulted by the live pipeline — the currently-running STT service isn't
-                  retried against a fallback provider on failure. Configuring this list documents intent for now.
-                </Helper>
-              </div>
             </CollapsibleSection>
 
-            {/* 4. TELEPHONY */}
-            <CollapsibleSection icon={Phone} title="Telephony" summary={`${agent.telephony_option} · ${agent.ai_number||'None'}`}>
-              <div style={{ display: 'flex', gap: '12px' }}>
-                {['exotel', 'twilio', 'sip', 'livekit'].map(opt => (
-                  <div key={opt} onClick={() => updateField('telephony_option', opt)} style={{ flex: 1, padding: '16px', background: agent.telephony_option === opt ? 'rgba(0,212,170,0.1)' : 'rgba(255,255,255,0.03)', border: `1px solid ${agent.telephony_option === opt ? ACCENT : BORDER}`, borderRadius: '12px', cursor: 'pointer', textAlign: 'center', transition: 'all 0.2s' }}>
-                    <div style={{ fontSize: '14px', fontWeight: 600, color: agent.telephony_option === opt ? ACCENT : '#fff', textTransform: 'capitalize' }}>{opt}</div>
-                  </div>
-                ))}
-              </div>
-              <Helper>
-                {agent.telephony_option === 'livekit'
-                  ? 'LiveKit is what actually carries every call today (web + browser test), regardless of this setting.'
-                  : `Exotel/Twilio/SIP selection is saved, but no telephony integration is wired to it yet — calls still route through LiveKit. Configure keys under AI Platform → Telephony before relying on ${agent.telephony_option || 'this provider'}.`}
-              </Helper>
-
-              <div style={{ marginTop: '8px' }}>
-                {agent.telephony_option === 'exotel' && (
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
-                    <div><Label>API Key</Label><Input type="password" value="********" onChange={()=>{}} /></div>
-                    <div><Label>API Token</Label><Input type="password" value="********" onChange={()=>{}} /></div>
-                    <div><Label>Account SID</Label><Input value={agent.sip_account_sid} onChange={(v:any) => updateField('sip_account_sid', v)} /></div>
-                    <div><Label>Virtual Number</Label><Input value={agent.ai_number} onChange={(v:any) => updateField('ai_number', v)} /></div>
-                    <div style={{ gridColumn: '1 / -1' }}><Label>Webhook URL</Label><Input value={`https://api.lifodial.com/voice/incoming/${agent.id}`} locked /></div>
-                  </div>
-                )}
-                {agent.telephony_option === 'livekit' && (
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
-                    <div style={{ gridColumn: '1 / -1' }}><Label>LiveKit URL</Label><Input value={agent.livekit_url} onChange={(v:any) => updateField('livekit_url', v)} /></div>
-                    <div><Label>API Key</Label><Input type="password" value={agent.livekit_api_key} onChange={(v:any) => updateField('livekit_api_key', v)} /></div>
-                    <div><Label>API Secret</Label><Input type="password" value={agent.livekit_api_secret} onChange={(v:any) => updateField('livekit_api_secret', v)} /></div>
-                  </div>
-                )}
-                {agent.telephony_option === 'sip' && (
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
-                    <div><Label>SIP Domain</Label><Input value={agent.sip_domain} onChange={(v:any) => updateField('sip_domain', v)} /></div>
-                    <div><Label>SIP Provider Name</Label><Input value={agent.sip_provider} onChange={(v:any) => updateField('sip_provider', v)} /></div>
-                  </div>
-                )}
-              </div>
-
-              <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: `1px solid ${BORDER}` }}>
-                <Label>Existing Clinic Number</Label>
-                <div style={{ display: 'flex', gap: '12px' }}>
-                  <Select value={agent.country_code} onChange={(v:any) => updateField('country_code', v)} options={['+91', '+1', '+44', '+971']} style={{ width: '80px' }} />
-                  <Input value={agent.existing_clinic_number} onChange={(v:any) => updateField('existing_clinic_number', v)} placeholder="e.g. 9876543210" style={{ flex: 1 }} />
-                </div>
-                <Helper>The clinic's current phone number. Set up call forwarding from this to the AI number above.</Helper>
-              </div>
-            </CollapsibleSection>
-
-            {/* 5. CALL BEHAVIOR — still Assistant tab */}
-            {/* 5. CALL BEHAVIOR */}
+            {/* 4. CALL BEHAVIOR — still Assistant tab */}
             <CollapsibleSection icon={Settings} title="Call Behavior" summary={`Max ${agent.max_duration_seconds}s · ${agent.silence_timeout_seconds}s timeout`}>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-                  <div>
-                    <Label>Silence Timeout (Seconds)</Label>
-                    <Input type="number" value={agent.silence_timeout_seconds} onChange={(v:any) => updateField('silence_timeout_seconds', parseInt(v))} />
-                    <Helper>Hang up if patient is silent for this long</Helper>
-                  </div>
-                  <div>
-                    <Label>Maximum Call Duration (Seconds)</Label>
-                    <Input type="number" value={agent.max_duration_seconds} onChange={(v:any) => updateField('max_duration_seconds', parseInt(v))} />
-                    <Helper>Maximum length of any single call</Helper>
-                  </div>
-                  <div>
-                    <Label>Background Sound</Label>
-                    <Select value={agent.background_sound} onChange={(v:any) => updateField('background_sound', v)} options={['none', 'office_ambience', 'soft_music']} />
-                  </div>
-                  <Toggle checked={agent.background_denoising === 1} onChange={(v:any) => updateField('background_denoising', v?1:0)} label="Background Denoising" helper="Filter out clinic noise" />
+                <div>
+                  <Label>Silence Timeout (Seconds)</Label>
+                  <Input type="number" value={agent.silence_timeout_seconds} onChange={(v:any) => updateField('silence_timeout_seconds', parseInt(v))} />
+                  <Helper>Hang up if patient is silent for this long</Helper>
                 </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-                  <Toggle checked={agent.record_calls === 1} onChange={(v:any) => updateField('record_calls', v?1:0)} label="Record Calls" helper="Store call recordings for quality review" />
-                  <Toggle checked={agent.model_output_in_realtime === 1} onChange={(v:any) => updateField('model_output_in_realtime', v?1:0)} label="Real-time Model Output" helper="Stream AI responses word by word" />
-                  <div>
-                    <Label>End Call Phrases</Label>
-                    <TagInput tags={Array.isArray(agent.end_call_phrases) ? agent.end_call_phrases : (agent.end_call_phrases ? (typeof agent.end_call_phrases === 'string' ? JSON.parse(agent.end_call_phrases) : ['goodbye']) : ['goodbye', 'thank you, bye'])} onChange={(t:any) => updateField('end_call_phrases', JSON.stringify(t))} />
-                    <Helper>If patient says these, end call.</Helper>
-                  </div>
-                  <div>
-                    <Label>End Call Message</Label>
-                    <Textarea value={agent.end_call_message ?? 'Thank you for calling. Goodbye!'} onChange={(v:any) => updateField('end_call_message', v)} rows={2} />
-                  </div>
+                <div>
+                  <Label>Maximum Call Duration (Seconds)</Label>
+                  <Input type="number" value={agent.max_duration_seconds} onChange={(v:any) => updateField('max_duration_seconds', parseInt(v))} />
+                  <Helper>Maximum length of any single call</Helper>
+                </div>
+                <div>
+                  <Label>End Call Phrases</Label>
+                  <TagInput tags={Array.isArray(agent.end_call_phrases) ? agent.end_call_phrases : (agent.end_call_phrases ? (typeof agent.end_call_phrases === 'string' ? JSON.parse(agent.end_call_phrases) : ['goodbye']) : ['goodbye', 'thank you, bye'])} onChange={(t:any) => updateField('end_call_phrases', JSON.stringify(t))} />
+                  <Helper>If patient says these, end call.</Helper>
+                </div>
+                <div>
+                  <Label>End Call Message</Label>
+                  <Textarea value={agent.end_call_message ?? 'Thank you for calling. Goodbye!'} onChange={(v:any) => updateField('end_call_message', v)} rows={2} />
                 </div>
               </div>
             </CollapsibleSection>

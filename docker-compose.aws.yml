@@ -1,0 +1,69 @@
+version: '3.9'
+
+# ── AWS variant of docker-compose.yml ────────────────────────────────────────
+# Postgres and Redis are NOT run as containers here — they're managed AWS
+# services (RDS + ElastiCache). DATABASE_URL / REDIS_URL in .env must point
+# at those endpoints. The frontend is NOT built/served here either — it's
+# deployed separately on Vercel. This box only runs backend + worker + nginx.
+
+services:
+
+  # ── Backend (FastAPI) ────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ENVIRONMENT: production
+      # Dockerfile.backend defaults to $PORT or 10000 (Render's convention) —
+      # pin it to 8001 to match the port mapping/healthcheck below.
+      PORT: "8001"
+    ports:
+      - "8001:8001"
+    networks:
+      - lifodial_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+
+  # ── LiveKit / Pipecat Agent Worker ───────────────────────────────────────
+  livekit-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ENVIRONMENT: production
+    depends_on:
+      - backend
+    networks:
+      - lifodial_net
+
+  # ── Nginx reverse proxy — API only; the frontend lives on Vercel ────────
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.aws.conf:/etc/nginx/nginx.conf:ro
+      - certbot_certs:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    depends_on:
+      - backend
+    networks:
+      - lifodial_net
+
+volumes:
+  certbot_certs:
+  certbot_www:
+
+networks:
+  lifodial_net:
+    driver: bridge
