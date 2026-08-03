@@ -56,7 +56,10 @@ TTS_SAMPLE_TEXT: dict[str, str] = {
     "hi-IN": "नमस्ते! मैं आपकी सहायता के लिए यहाँ हूँ।",
     "mr-IN": "नमस्कार! मी तुमच्या मदतीसाठी येथे आहे.",
     "gu-IN": "નમસ્તે! હું તમારી મદદ માટે અહીં છું.",
-    "pa-IN": "ਸਤ ਸ੍ਰੀ ਅਕਾਲ! ਮੈਂ ਤੁਹਾਡੀ ਮਦਦ ਲਈ ਇੱਥੇ ਹਾਂ।",
+    # ਨਮਸਕਾਰ, not ਸਤ ਸ੍ਰੀ ਅਕਾਲ: the latter is the standard Punjabi greeting but is
+    # culturally marked as Sikh, which is the wrong default for a clinic line
+    # whose callers are not assumed to be of any one community.
+    "pa-IN": "ਨਮਸਕਾਰ! ਮੈਂ ਤੁਹਾਡੀ ਮਦਦ ਲਈ ਇੱਥੇ ਹਾਂ।",
 
     # ── "Hello! How can I help you?" (no gender marking on the verb) ──────────
     "ta-IN": "வணக்கம்! நான் உங்களுக்கு எப்படி உதவ முடியும்?",
