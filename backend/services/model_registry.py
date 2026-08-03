@@ -139,6 +139,33 @@ GEMINI_FALLBACK_MODELS = [
 ]
 
 # ── Sarvam Voices ─────────────────────────────────────────────
+# Built from backend/services/sarvam_catalog.py rather than restated. The list
+# that used to live here had drifted badly from the one in
+# backend/routers/providers.py that the Voice Library serves: it was missing 17
+# real bulbul:v3 speakers and offered "sophia", which Sarvam does not recognise.
+# The agent-creation wizard reads this, the Voice Library reads that — they now
+# describe the same 37 speakers because there is only one list.
+from backend.services.sarvam_catalog import (
+    BULBUL_V2_VOICES,
+    BULBUL_V3_VOICES,
+    SARVAM_TTS_LANGUAGE_CODES,
+    SARVAM_TTS_LANGUAGES,
+)
+
+
+def _wizard_voices(catalog: list[dict], gender: str) -> list[dict]:
+    """Catalogue rows -> the {id, name, style} shape the wizard's cards render."""
+    out = []
+    for v in catalog:
+        if v["gender"] != gender:
+            continue
+        entry = {"id": v["id"], "name": v["name"], "style": v.get("description", "")}
+        if v.get("default"):
+            entry["default"] = True
+        out.append(entry)
+    return out
+
+
 SARVAM_VOICES_DATA = {
     "bulbul:v3": {
         "model_label": "Bulbul v3 (Latest — Recommended)",
@@ -147,31 +174,11 @@ SARVAM_VOICES_DATA = {
         "supports_temperature": True,
         "pace_range": [0.5, 2.0],
         "sample_rate": 24000,
-        "male_voices": [
-            {"id": "shubh", "name": "Shubh", "default": True, "style": "Professional, clear"},
-            {"id": "aditya", "name": "Aditya", "style": "Warm, conversational"},
-            {"id": "rahul", "name": "Rahul", "style": "Friendly, neutral"},
-            {"id": "rohan", "name": "Rohan", "style": "Energetic, young"},
-            {"id": "amit", "name": "Amit", "style": "Professional"},
-            {"id": "dev", "name": "Dev", "style": "Deep, authoritative"},
-            {"id": "kabir", "name": "Kabir", "style": "Warm, mature"},
-            {"id": "anand", "name": "Anand", "style": "Neutral, clear"},
-            {"id": "manan", "name": "Manan", "style": "Casual, friendly"},
-            {"id": "sumit", "name": "Sumit", "style": "Professional"},
-        ],
-        "female_voices": [
-            {"id": "ritu", "name": "Ritu", "style": "Warm, professional"},
-            {"id": "priya", "name": "Priya", "style": "Friendly, clear"},
-            {"id": "neha", "name": "Neha", "style": "Energetic, young"},
-            {"id": "pooja", "name": "Pooja", "style": "Soft, caring"},
-            {"id": "simran", "name": "Simran", "style": "Professional, neutral"},
-            {"id": "kavya", "name": "Kavya", "style": "Warm, expressive"},
-            {"id": "ishita", "name": "Ishita", "style": "Clear, professional"},
-            {"id": "shreya", "name": "Shreya", "style": "Pleasant, friendly"},
-            {"id": "roopa", "name": "Roopa", "style": "Mature, warm"},
-            {"id": "tanya", "name": "Tanya", "style": "Modern, crisp"},
-            {"id": "sophia", "name": "Sophia", "style": "International, clear"},
-        ]
+        # Every speaker below renders every one of these languages.
+        "languages": SARVAM_TTS_LANGUAGES,
+        "language_codes": list(SARVAM_TTS_LANGUAGE_CODES),
+        "male_voices": _wizard_voices(BULBUL_V3_VOICES, "male"),
+        "female_voices": _wizard_voices(BULBUL_V3_VOICES, "female"),
     },
     "bulbul:v2": {
         "model_label": "Bulbul v2 (Stable — Pitch control)",
@@ -180,17 +187,12 @@ SARVAM_VOICES_DATA = {
         "supports_temperature": False,
         "pace_range": [0.3, 3.0],
         "sample_rate": 22050,
-        "male_voices": [
-            {"id": "abhilash", "name": "Abhilash", "style": "Professional"},
-            {"id": "karun", "name": "Karun", "style": "Warm, deep"},
-            {"id": "hitesh", "name": "Hitesh", "style": "Energetic"},
-        ],
-        "female_voices": [
-            {"id": "anushka", "name": "Anushka", "default": True, "style": "Warm, natural"},
-            {"id": "manisha", "name": "Manisha", "style": "Professional"},
-            {"id": "vidya", "name": "Vidya", "style": "Clear, authoritative"},
-            {"id": "arya", "name": "Arya", "style": "Youthful, friendly"},
-        ]
+        # bulbul:v2 serves the same 11 GA languages as v3 — verified: it answers
+        # "<code> is only supported by bulbul:v3" for exactly the gated twelve.
+        "languages": SARVAM_TTS_LANGUAGES,
+        "language_codes": list(SARVAM_TTS_LANGUAGE_CODES),
+        "male_voices": _wizard_voices(BULBUL_V2_VOICES, "male"),
+        "female_voices": _wizard_voices(BULBUL_V2_VOICES, "female"),
     }
 }
 

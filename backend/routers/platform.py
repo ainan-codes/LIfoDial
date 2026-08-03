@@ -1136,21 +1136,34 @@ async def fetch_provider_models(
 @router.get("/platform/tts/voices/sarvam")
 async def sarvam_voices(model: Optional[str] = Query(default=None), user: CurrentUser = None):
     """Return Sarvam voices, optionally filtered by model (e.g. bulbul:v3)."""
-    from backend.routers.providers import SARVAM_VOICES as _SARVAM_V
-    voices = _SARVAM_V
-    if model:
-        voices = [v for v in voices if v.get("model") == model]
+    from backend.services.sarvam_catalog import (
+        SARVAM_TTS_LANGUAGE_CODES,
+        SARVAM_TTS_LANGUAGES,
+        voices_for_model,
+    )
+    voices = voices_for_model(model)
     return {
         "provider": "sarvam",
         "model": model,
+        # The languages this provider can synthesize, with display names, so the
+        # Voice Library's Language filter and the agent's Voice Configuration
+        # build their dropdowns from the same payload instead of two hardcoded
+        # lists that silently disagreed.
+        "languages": SARVAM_TTS_LANGUAGES,
         "voices": [
             {
                 "id": v["id"],
                 "voice_id": v["id"],
                 "name": v["name"],
                 "gender": v["gender"],
+                # `language` stays the voice's primary display tag — unchanged,
+                # so existing cards look exactly as they did.
                 "language": v["language"],
                 "language_code": v["language"],
+                # ...but `languages` is what the voice can actually be asked to
+                # speak. Sarvam ties no speaker to a language: all 37 bulbul:v3
+                # speakers render all 11 GA languages (verified against the API).
+                "languages": list(SARVAM_TTS_LANGUAGE_CODES),
                 "model": v.get("model", ""),
                 "description": v.get("description", ""),
             } for v in voices
@@ -1169,14 +1182,19 @@ async def list_voices(
     if provider == "sarvam":
         return await sarvam_voices(model=model, user=user)
 
+    # `languages` below is empty for every provider except Sarvam: none of them
+    # expose a BCP-47 language catalogue we can enumerate (ElevenLabs reports a
+    # free-text accent label, the static catalogues are English-only). The Voice
+    # Library treats an empty list as "contributes no new filter options", which
+    # is why its existing options are untouched by this.
     elif provider == "openai_tts":
         raw_key = await _get_raw_key("openai_tts", db)
-        return {"provider": "openai_tts", "has_key": bool(raw_key), "voices": OPENAI_TTS_VOICES}
+        return {"provider": "openai_tts", "has_key": bool(raw_key), "languages": [], "voices": OPENAI_TTS_VOICES}
 
     elif provider == "elevenlabs":
         raw_key = await _get_raw_key("elevenlabs", db)
         if not raw_key:
-            return {"provider": "elevenlabs", "has_key": False, "voices": []}
+            return {"provider": "elevenlabs", "has_key": False, "languages": [], "voices": []}
         try:
             async with httpx.AsyncClient(timeout=8) as client:
                 r = await client.get(
@@ -1196,7 +1214,7 @@ async def list_voices(
                     }
                     for v in r.json().get("voices", [])
                 ]
-            return {"provider": "elevenlabs", "has_key": True, "voices": voices}
+            return {"provider": "elevenlabs", "has_key": True, "languages": [], "voices": voices}
         except Exception as e:
             raise HTTPException(500, f"ElevenLabs voice fetch failed: {e}")
 
@@ -1208,6 +1226,7 @@ async def list_voices(
         return {
             "provider": provider,
             "has_key": bool(raw_key),
+            "languages": [],
             "voices": STATIC_TTS_VOICE_CATALOG[provider] if raw_key else [],
         }
 

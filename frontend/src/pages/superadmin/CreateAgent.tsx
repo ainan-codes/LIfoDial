@@ -15,7 +15,7 @@ import {
   Stethoscope,
   X
 } from 'lucide-react';
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import VoiceLibrary from './VoiceLibrary';
 import { useProviders } from '../../hooks/useProviders';
@@ -70,7 +70,10 @@ const INITIAL_STATE: WizardState = {
   system_prompt: '',
   stt_provider: 'sarvam', stt_model: 'saaras:v3',
   tts_provider: 'sarvam', tts_model: 'bulbul:v3',
-  tts_voice: 'anushka', tts_language: 'hi-IN',
+  // 'shubh' is Sarvam's default speaker for bulbul:v3 (the default model above).
+  // This was 'anushka', which is bulbul:v2-only — every new agent shipped with a
+  // voice that 400s on its own model until someone happened to change it.
+  tts_voice: 'shubh', tts_language: 'hi-IN',
   tts_pitch: 0, tts_pace: 1.0, tts_loudness: 1.0,
   llm_model: 'gemini-2.5-flash', llm_temperature: 0.3, max_tokens: 150,
   telephony_option: 'skip',
@@ -391,7 +394,41 @@ function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
   // Voices logic
   const maleVoices = selectedModelData?.voices?.male_voices || []
   const femaleVoices = selectedModelData?.voices?.female_voices || []
-  
+  // Languages this voice model can synthesize, straight from the provider
+  // payload — the same catalogue the Voice Library filters on.
+  const modelLanguages: { code: string; name: string }[] = selectedModelData?.voices?.languages || []
+
+  // Sarvam's bulbul:v2 and bulbul:v3 speaker rosters are disjoint: sending a v2
+  // speaker to v3 is a hard 400 ("Speaker 'x' is not compatible with model
+  // bulbul:v3"). Switching the model tab therefore has to move the speaker with
+  // it, or the wizard silently builds an agent whose voice cannot speak at all.
+  const selectModel = (modelId: string) => {
+    onChange('tts_model', modelId)
+    const roster = sarvamModels.find(m => m.id === modelId)?.voices
+    if (!roster) return
+    const ids = [...(roster.male_voices || []), ...(roster.female_voices || [])]
+    if (ids.some((v: any) => v.id === state.tts_voice)) return
+    const fallback = ids.find((v: any) => v.default) || ids[0]
+    if (fallback) onChange('tts_voice', fallback.id)
+  }
+
+  // Same guard for the initial render: the wizard's default voice must be valid
+  // for its default model before the admin touches anything.
+  useEffect(() => {
+    const ids = [...maleVoices, ...femaleVoices]
+    if (!ids.length || ids.some((v: any) => v.id === state.tts_voice)) return
+    const fallback = ids.find((v: any) => v.default) || ids[0]
+    if (fallback) onChange('tts_voice', fallback.id)
+  }, [selectedModelData])
+
+  // Likewise the language: a clinic's primary language (which can be ar-AE) or a
+  // stale saved value is a 400 from Sarvam, so fall back to one it can speak.
+  useEffect(() => {
+    if (!modelLanguages.length) return
+    if (modelLanguages.some(l => l.code === state.tts_language)) return
+    onChange('tts_language', modelLanguages[0].code)
+  }, [selectedModelData, state.tts_language])
+
   const [playingVoice, setPlayingVoice] = useState<string>("")
   const [audioCache, setAudioCache] = useState<Record<string, string>>({})
 
@@ -457,7 +494,7 @@ function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
             <button
               key={model.id}
               className={`tab ${state.tts_model === model.id ? 'active' : ''}`}
-              onClick={() => onChange('tts_model', model.id)}
+              onClick={() => selectModel(model.id)}
               style={{
                 padding: '8px 16px', borderRadius: '6px', cursor: 'pointer',
                 background: state.tts_model === model.id ? '#3ECF8E' : '#1A1A1A',
@@ -471,6 +508,25 @@ function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
           ))}
         </div>
         
+        {modelLanguages.length > 0 && (
+          <div style={{ marginBottom: '16px' }}>
+            <label htmlFor="tts-language" style={{ fontSize: '12px', color: '#A1A1A1', marginBottom: '8px', display: 'block' }}>Voice Language</label>
+            <select
+              id="tts-language"
+              value={state.tts_language}
+              onChange={e => onChange('tts_language', e.target.value)}
+              style={{ padding: '10px 12px', borderRadius: '8px', background: '#1A1A1A', border: '1px solid #2E2E2E', color: '#fff', fontSize: '14px', outline: 'none', minWidth: '260px' }}
+            >
+              {modelLanguages.map(l => (
+                <option key={l.code} value={l.code}>{l.name} ({l.code})</option>
+              ))}
+            </select>
+            <div style={{ fontSize: '11px', color: '#555', marginTop: '6px' }}>
+              Every voice below can speak any of these {modelLanguages.length} languages.
+            </div>
+          </div>
+        )}
+
         <div className="voice-gender-group" style={{ marginBottom: '16px' }}>
           <label style={{ fontSize: '12px', color: '#A1A1A1', marginBottom: '8px', display: 'block' }}>Female Voices</label>
           <div className="voice-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '10px' }}>

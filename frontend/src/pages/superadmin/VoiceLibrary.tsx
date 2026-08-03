@@ -24,6 +24,21 @@ const TTS_PROVIDER_META: Record<string, { name: string; icon: string; defaultMod
   deepgram_aura: { name: 'Deepgram Aura',    icon: '🔊', defaultModel: 'aura-2',            defaultLang: 'en-US' },
 };
 
+// The Language/Accent options this page has always offered. Kept verbatim and
+// always first so existing filters behave exactly as before; anything a
+// provider reports (see `languages` in /platform/tts/voices/<id>) is appended
+// after these. Sarvam contributes Kannada, Malayalam, Marathi, Bengali,
+// Gujarati, Punjabi and Odia — all of which its API confirms it can speak, and
+// none of which were selectable here before.
+const BASE_LANGUAGE_OPTIONS: { code: string; label: string }[] = [
+  { code: 'hi-IN', label: 'Hindi (hi-IN)' },
+  { code: 'en-IN', label: 'English - Indian (en-IN)' },
+  { code: 'en-US', label: 'English - American (en-US)' },
+  { code: 'ta-IN', label: 'Tamil (ta-IN)' },
+  { code: 'te-IN', label: 'Telugu (te-IN)' },
+  { code: 'ar-SA', label: 'Arabic (ar-SA)' },
+];
+
 export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, readOnly = false }: VoiceLibraryProps) {
   const [search, setSearch] = useState('');
   const [provider, setProvider] = useState('');
@@ -36,6 +51,9 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
   // Configured TTS providers (ids) in the order they should appear.
   const [ttsProviders, setTtsProviders] = useState<string[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Language options contributed by the configured providers themselves, so
+  // this filter can never again list fewer languages than the voices support.
+  const [providerLanguages, setProviderLanguages] = useState<{ code: string; name: string }[]>([]);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -57,6 +75,10 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
         accent: String(lang).substring(0, 5),
         model: v.model || meta?.defaultModel || '',
         voice_id: v.voice_id || v.id,
+        // Every language this voice can actually be asked to speak. Sarvam ties
+        // no speaker to a language, so its voices report all 11; providers that
+        // publish no language catalogue report none and fall back to `language`.
+        languages: Array.isArray(v.languages) ? v.languages : [],
         tags: [lang, v.gender].filter(Boolean),
         sample_text: v.description || 'Hello! I am your AI receptionist. How can I help you today?',
         recommended_for: [],
@@ -69,6 +91,16 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
         const data = await fetchWithAuth(`/platform/tts/voices/${providerId}`);
         const voices: any[] = Array.isArray(data?.voices) ? data.voices : [];
         setProviderStatus(prev => ({ ...prev, [providerId]: { connected: true, voice_count: voices.length } }));
+        const langs: any[] = Array.isArray(data?.languages) ? data.languages : [];
+        if (langs.length) {
+          setProviderLanguages(prev => {
+            const seen = new Set(prev.map(l => l.code));
+            const added = langs
+              .filter(l => l?.code && !seen.has(l.code))
+              .map(l => ({ code: String(l.code), name: String(l.name || l.code) }));
+            return added.length ? [...prev, ...added] : prev;
+          });
+        }
         if (voices.length) {
           const mapped = voices.map(v => normalize(providerId, v));
           setLocalVoices(prev => [...prev.filter(p => p.provider !== providerId), ...mapped]);
@@ -132,7 +164,9 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
       
       const v_id = voice.voice_id || voice.id;
       // FIX: use voice.language (which is a proper BCP-47 code like 'hi-IN') NOT language_label
-      const lang = voice.language || 'hi-IN';
+      // Synthesize in whatever language the card is currently showing, so
+      // previewing under the Malayalam filter actually produces Malayalam.
+      const lang = effectiveLanguage(voice) || 'hi-IN';
       const prov = voice.provider || 'sarvam';
       const sampleText = voice.sample_text || 'Hello! I am your AI receptionist. How can I help you today?';
       
@@ -227,11 +261,23 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
     setSyncing(false);
   };
 
+  // Which language this card is currently being shown AS. With no filter that
+  // is the voice's own primary tag (so the unfiltered library looks exactly as
+  // it always has); with a filter active it is the language the user asked for,
+  // which is what gets synthesized and what gets saved onto the agent.
+  const effectiveLanguage = (voice: any): string =>
+    language && Array.isArray(voice.languages) && voice.languages.includes(language)
+      ? language
+      : voice.language;
+
   const filtered = localVoices.filter(voice => {
     const matchSearch = voice.name.toLowerCase().includes(search.toLowerCase());
     const matchProvider = !provider || voice.provider === provider;
     const matchGender = !gender || voice.gender === gender;
-    const matchLang = !language || voice.language === language;
+    // A voice matches a language if it is tagged with it OR can speak it.
+    const matchLang = !language
+      || voice.language === language
+      || (Array.isArray(voice.languages) && voice.languages.includes(language));
     return matchSearch && matchProvider && matchGender && matchLang;
   });
 
@@ -249,6 +295,14 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
   // Provider order for display + filter: configured providers first, then any
   // provider that actually returned voices (defensive), de-duplicated.
   const displayProviders = Array.from(new Set([...ttsProviders, ...Object.keys(grouped)]));
+
+  // Existing options first and unchanged, then whatever the providers reported.
+  const languageOptions = [
+    ...BASE_LANGUAGE_OPTIONS,
+    ...providerLanguages
+      .filter(l => !BASE_LANGUAGE_OPTIONS.some(b => b.code === l.code))
+      .map(l => ({ code: l.code, label: `${l.name} (${l.code})` })),
+  ];
 
   const wrapContent = (content: React.ReactNode) => {
      if (isPickerModal) {
@@ -328,12 +382,9 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
               }}
             >
                <option value="">Language/Accent ▼</option>
-               <option value="hi-IN">Hindi (hi-IN)</option>
-               <option value="en-IN">English - Indian (en-IN)</option>
-               <option value="en-US">English - American (en-US)</option>
-               <option value="ta-IN">Tamil (ta-IN)</option>
-               <option value="te-IN">Telugu (te-IN)</option>
-               <option value="ar-SA">Arabic (ar-SA)</option>
+               {languageOptions.map(l => (
+                 <option key={l.code} value={l.code}>{l.label}</option>
+               ))}
             </select>
          </div>
 
@@ -467,7 +518,7 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
                                    fontSize: '10px', fontWeight: 600, textTransform: 'uppercase', 
                                    letterSpacing: '0.05em', padding: '2px 6px', borderRadius: '4px' 
                                  }}>
-                                   {voice.accent.substring(0, 5)}
+                                   {String(effectiveLanguage(voice) || voice.accent).substring(0, 5)}
                                  </span>
                               </div>
                            </div>
@@ -500,7 +551,14 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
                                opacity: 0, transition: 'opacity 0.2s'
                              }}>
                                <button 
-                                 onClick={(e) => { e.stopPropagation(); if (onSelectVoice) onSelectVoice(voice); }}
+                                 onClick={(e) => {
+                                   e.stopPropagation();
+                                   // Hand back the language the card is shown as, so
+                                   // picking a voice under the Malayalam filter sets the
+                                   // agent's tts_language to ml-IN rather than the voice's
+                                   // primary display tag.
+                                   if (onSelectVoice) onSelectVoice({ ...voice, language: effectiveLanguage(voice) });
+                                 }}
                                  style={{ padding: '8px 16px', borderRadius: '8px', background: 'var(--accent)', color: '#000', border: 'none', fontWeight: 600, fontSize: '13px', cursor: 'pointer' }}>
                                  Use {voice.name}
                                </button>

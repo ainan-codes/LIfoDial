@@ -444,6 +444,7 @@ export default function AgentDetail() {
   const [llmModels, setLlmModels] = useState<string[]>([]);
   const [ttsModels, setTtsModels] = useState<string[]>([]);
   const [ttsVoices, setTtsVoices] = useState<any[]>([]);
+  const [ttsLanguages, setTtsLanguages] = useState<{ value: string; label: string }[]>([]);
   const [sttModels, setSttModels] = useState<string[]>([]);
 
   // Phase B — providers that actually have a key configured. The provider
@@ -560,8 +561,14 @@ export default function AgentDetail() {
         } else {
           setTtsVoices([]);
         }
+        // Same payload, same list the Voice Library builds its filter from, so
+        // a language can never be pickable in one place and missing in the other.
+        const langs = Array.isArray(d.languages) ? d.languages : [];
+        setTtsLanguages(langs.map((l: any) => ({
+          value: String(l.code), label: `${l.name || l.code} (${l.code})`
+        })));
       })
-      .catch(() => setTtsVoices([]));
+      .catch(() => { setTtsVoices([]); setTtsLanguages([]); });
   // Re-fetch any time provider OR model changes
   }, [agent?.tts_provider, agent?.tts_model]);
 
@@ -1348,6 +1355,20 @@ export default function AgentDetail() {
                   <Select value={agent.tts_model} onChange={(v:any) => {
                     updateField('tts_model', v);
                   }} options={ttsModels.length ? ttsModels : [agent.tts_model || 'bulbul:v3']} />
+                </div>
+                <div>
+                  <Label>Language</Label>
+                  {ttsLanguages.length > 0 ? (
+                    <Select
+                      value={agent.tts_language}
+                      onChange={(v:any) => updateField('tts_language', v)}
+                      options={ttsLanguages}
+                    />
+                  ) : (
+                    // Providers that publish no language catalogue (ElevenLabs,
+                    // OpenAI TTS) keep the free-text field they had.
+                    <Input value={agent.tts_language} onChange={(v:any) => updateField('tts_language', v)} />
+                  )}
                 </div>
               </div>
 

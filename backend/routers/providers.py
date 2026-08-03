@@ -23,51 +23,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# ── Sarvam voices catalogue — bulbul:v3 authoritative list (from API) ──────────
-# Source: Sarvam API error response listing ALL valid speakers for bulbul:v3.
-# DO NOT add voices not in this list — Sarvam will reject them with a 400 error.
-
-SARVAM_VOICES = [
-    # ── bulbul:v3 — 38 officially confirmed speakers ──
-    {"id": "priya",    "name": "Priya",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Soft Hindi female (Recommended)", "recommended": True},
-    {"id": "ritu",     "name": "Ritu",     "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Premium Hindi female"},
-    {"id": "neha",     "name": "Neha",     "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Young Hindi female"},
-    {"id": "simran",   "name": "Simran",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Hindi / Punjabi female"},
-    {"id": "kavya",    "name": "Kavya",    "model": "bulbul:v3", "language": "kn-IN", "gender": "female", "description": "Kannada / Hindi female"},
-    {"id": "ishita",   "name": "Ishita",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Polite Hindi female"},
-    {"id": "shreya",   "name": "Shreya",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Warm professional Hindi"},
-    {"id": "tanya",    "name": "Tanya",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Modern Hindi female"},
-    {"id": "pooja",    "name": "Pooja",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Sweet Hindi female"},
-    {"id": "roopa",    "name": "Roopa",    "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Kannada / Hindi female"},
-    {"id": "kavitha",  "name": "Kavitha",  "model": "bulbul:v3", "language": "ta-IN", "gender": "female", "description": "Tamil / Telugu female"},
-    {"id": "suhani",   "name": "Suhani",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Soft Hindi female"},
-    {"id": "shruti",   "name": "Shruti",   "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Clear Hindi female"},
-    {"id": "niharika", "name": "Niharika", "model": "bulbul:v3", "language": "hi-IN", "gender": "female", "description": "Hindi female"},
-    {"id": "rupali",   "name": "Rupali",   "model": "bulbul:v3", "language": "mr-IN", "gender": "female", "description": "Marathi / Hindi female"},
-    {"id": "rahul",    "name": "Rahul",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Hindi / English male"},
-    {"id": "aditya",   "name": "Aditya",   "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Hindi male"},
-    {"id": "ashutosh", "name": "Ashutosh", "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Deep resonant Hindi male"},
-    {"id": "rohan",    "name": "Rohan",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Hindi male"},
-    {"id": "amit",     "name": "Amit",     "model": "bulbul:v3", "language": "en-IN", "gender": "male",   "description": "Neutral Indian English male"},
-    {"id": "dev",      "name": "Dev",      "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Hindi / English male"},
-    {"id": "ratan",    "name": "Ratan",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Mature Hindi male"},
-    {"id": "varun",    "name": "Varun",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Confident Hindi male"},
-    {"id": "manan",    "name": "Manan",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Calm Hindi male"},
-    {"id": "sumit",    "name": "Sumit",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Friendly Hindi male"},
-    {"id": "kabir",    "name": "Kabir",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Authoritative Hindi male"},
-    {"id": "aayan",    "name": "Aayan",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Youthful Hindi male"},
-    {"id": "shubh",    "name": "Shubh",    "model": "bulbul:v3", "language": "en-IN", "gender": "male",   "description": "Professional English male"},
-    {"id": "advait",   "name": "Advait",   "model": "bulbul:v3", "language": "mr-IN", "gender": "male",   "description": "Marathi male"},
-    {"id": "anand",    "name": "Anand",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Classic Hindi male"},
-    {"id": "tarun",    "name": "Tarun",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Energetic Hindi male"},
-    {"id": "sunny",    "name": "Sunny",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Casual Hindi male"},
-    {"id": "mani",     "name": "Mani",     "model": "bulbul:v3", "language": "ta-IN", "gender": "male",   "description": "Tamil / Hindi male"},
-    {"id": "gokul",    "name": "Gokul",    "model": "bulbul:v3", "language": "ta-IN", "gender": "male",   "description": "Tamil / Kannada male"},
-    {"id": "vijay",    "name": "Vijay",    "model": "bulbul:v3", "language": "te-IN", "gender": "male",   "description": "Tamil / Telugu male"},
-    {"id": "mohit",    "name": "Mohit",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Standard Hindi male"},
-    {"id": "rehan",    "name": "Rehan",    "model": "bulbul:v3", "language": "hi-IN", "gender": "male",   "description": "Hindi / Urdu male"},
-    {"id": "soham",    "name": "Soham",    "model": "bulbul:v3", "language": "bn-IN", "gender": "male",   "description": "Bengali / Hindi male"},
-]
+# ── Sarvam voices catalogue ────────────────────────────────────────────────────
+# Moved to backend/services/sarvam_catalog.py so the Voice Library page, the
+# agent-creation wizard and this router cannot drift apart again (they had:
+# three lists, two of them containing speakers Sarvam rejects). Re-exported here
+# because several modules already import SARVAM_VOICES from this router.
+from backend.services.sarvam_catalog import (  # noqa: E402
+    SARVAM_TTS_LANGUAGE_CODES,
+    SARVAM_TTS_LANGUAGES,
+    SARVAM_VOICES,
+    voices_for_model,
+)
 
 GEMINI_MODELS = [
     {"id": "gemini-2.5-flash",               "name": "Gemini 2.5 Flash",            "tier": "fast",    "context": 1048576, "recommended": True},
@@ -147,11 +113,14 @@ async def get_providers(user: CurrentUser = None) -> dict:
 @router.get("/providers/voices")
 async def list_all_voices(language: str | None = None, model: str | None = None, gender: str | None = None, user: CurrentUser = None) -> dict:
     """Returns all Sarvam voices with optional filtering."""
-    voices = SARVAM_VOICES
-    if language:
-        voices = [v for v in voices if v["language"] == language]
-    if model:
-        voices = [v for v in voices if v["model"] == model]
+    voices = voices_for_model(model)
+    # No Sarvam speaker is restricted to one language — verified against the API:
+    # every bulbul:v3 speaker renders all 11 GA languages. So a language filter
+    # selects voices that CAN speak it, which for a supported language is all of
+    # them. Matching on the per-voice display tag instead is exactly why
+    # Malayalam looked like it had no voices at all.
+    if language and language not in SARVAM_TTS_LANGUAGE_CODES:
+        voices = []
     if gender:
         voices = [v for v in voices if v["gender"] == gender]
 
@@ -164,8 +133,12 @@ async def list_all_voices(language: str | None = None, model: str | None = None,
         "total": len(voices),
         "voices": voices,
         "by_model": by_model,
-        "models_available": ["bulbul:v3", "bulbul:v3"],
-        "languages_available": sorted({v["language"] for v in SARVAM_VOICES}),
+        "models_available": ["bulbul:v3", "bulbul:v2"],
+        # Every voice speaks every one of these, so this is the whole GA list,
+        # not the distinct set of per-voice display tags (which was missing
+        # Malayalam, Gujarati, Punjabi and Odia entirely).
+        "languages_available": list(SARVAM_TTS_LANGUAGE_CODES),
+        "languages": SARVAM_TTS_LANGUAGES,
     }
 
 
@@ -206,6 +179,12 @@ async def preview_voice_by_id(voice_id: str, language: str = "hi-IN", model: str
         "ta-IN": "Vanakkam! Naan ungalukkku eppadi udavi seyya mudiyum?",
         "te-IN": "Namaskaram! Meeru ela sahayam kavaalantunnaru?",
         "ml-IN": "Namaskaram! Njan ningale enthu sahayikkam?",
+        "kn-IN": "Namaskara! Naanu nimage hege sahaya maadali?",
+        "mr-IN": "Namaskar! Mi tumchi kashi madat karu shakto?",
+        "bn-IN": "Nomoskar! Ami apnake kivabe sahajjo korte pari?",
+        "gu-IN": "Namaste! Hu tamari kevi rite madad kari shaku?",
+        "pa-IN": "Sat sri akal! Main tuhadi kiven madad kar sakda haan?",
+        "od-IN": "Namaskar! Mu apananku kipari sahajya kari paribi?",
         "ar-SA": "مرحباً! كيف يمكنني مساعدتك اليوم؟",
     }
     sample_text = samples.get(language, samples["en-IN"])

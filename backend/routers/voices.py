@@ -162,11 +162,11 @@ async def get_voices(user: CurrentUser = None):
 
 
 
-# bulbul:v3 only supports these language codes officially
-SARVAM_V3_SUPPORTED_LANGS = {
-    "hi-IN", "en-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN",
-    "mr-IN", "bn-IN", "gu-IN", "od-IN", "pa-IN", "raj-IN"
-}
+# Sourced from the one catalogue rather than restated here: the local copy had
+# drifted to include `raj-IN`, which Sarvam has never accepted for any model.
+from backend.services.sarvam_catalog import SARVAM_TTS_LANGUAGE_CODES
+
+SARVAM_V3_SUPPORTED_LANGS = frozenset(SARVAM_TTS_LANGUAGE_CODES)
 
 @router.post("/preview")
 async def preview_voice(req: PreviewRequest, user: CurrentUser = None):
