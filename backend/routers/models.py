@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -40,12 +41,20 @@ class PreviewRequest(BaseModel):
     model: str
     voice_id: str
     language: str
-    text: str
+    # Optional: when omitted, the sentence is chosen from `language` so the
+    # words and the language they are spoken in cannot disagree. The wizard
+    # used to carry its own four-language table and fall back to English for
+    # everything else.
+    text: Optional[str] = None
 
 @router.post("/models/voices/preview")
 async def voice_preview(req: PreviewRequest, user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
     """Calls provider TTS -> returns base64 audio. Used by the agent-creation
     "Play Sample" button (frontend/src/pages/superadmin/CreateAgent.tsx)."""
+    from backend.services.tts_samples import sample_text_for
+    if not (req.text or "").strip():
+        req.text = sample_text_for(req.language)
+
     if req.provider == "sarvam":
         api_key = await resolve_provider_key(db, "sarvam", category="tts")
         if not api_key:

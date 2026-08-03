@@ -168,16 +168,17 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
       // previewing under the Malayalam filter actually produces Malayalam.
       const lang = effectiveLanguage(voice) || 'hi-IN';
       const prov = voice.provider || 'sarvam';
-      const sampleText = voice.sample_text || 'Hello! I am your AI receptionist. How can I help you today?';
-      
+
       // FIX: Use URLSearchParams so ALL values are properly percent-encoded.
       // Raw template strings DON'T encode values — spaces/special chars break the URL
       // causing TypeError: Failed to fetch at the browser network level.
+      // No `text`: the backend picks a sentence written in `lang`. Sending the
+      // voice's English catalogue blurb here is what made a Kannada preview read
+      // "Soft Hindi female (Recommended)" with Kannada phonetics.
       const params = new URLSearchParams({
         provider: prov,
         voice_id: v_id,
         language: lang,
-        text: sampleText,
         model: voice.model || '',
       });
 

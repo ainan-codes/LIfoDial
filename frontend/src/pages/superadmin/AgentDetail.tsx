@@ -878,7 +878,13 @@ export default function AgentDetail() {
     const voice = overrideParams?.voice_id || agent?.tts_voice || 'meera';
     const mdl = overrideParams?.model || agent?.tts_model || '';
     const lang = overrideParams?.language || agent?.tts_language || 'hi-IN';
-    const txt = overrideParams?.text || agent?.first_message || 'Hello! I am your AI receptionist. How can I help you today?';
+    // Only an explicit override supplies text (the STT-provider announcements and
+    // chat playback below). Otherwise the backend picks a sentence written in
+    // `lang`, so Play Sample follows the Language dropdown beside it. It used to
+    // fall back to the agent's own greeting, which ignored that dropdown
+    // entirely — switching to Malayalam changed the language code and left the
+    // words in Hindi/English.
+    const txt = overrideParams?.text;
 
     setSampleError(null);
     setSamplePlayer('loading');
@@ -888,7 +894,7 @@ export default function AgentDetail() {
         provider: prov,
         voice_id: voice,
         language: lang,
-        text: txt,
+        ...(txt ? { text: txt } : {}),
         pitch: String(agent?.tts_pitch ?? 0),
         pace: String(agent?.tts_pace ?? 1),
         loudness: String(agent?.tts_loudness ?? 1),

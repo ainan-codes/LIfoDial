@@ -172,22 +172,12 @@ async def preview_voice_by_id(voice_id: str, language: str = "hi-IN", model: str
     if not settings.sarvam_api_key:
         raise HTTPException(status_code=400, detail="Sarvam API key not configured")
 
-    # Sample text per language
-    samples = {
-        "hi-IN": "Namaste! Main aapki kaise madad kar sakti hoon?",
-        "en-IN": "Hello! How can I assist you today?",
-        "ta-IN": "Vanakkam! Naan ungalukkku eppadi udavi seyya mudiyum?",
-        "te-IN": "Namaskaram! Meeru ela sahayam kavaalantunnaru?",
-        "ml-IN": "Namaskaram! Njan ningale enthu sahayikkam?",
-        "kn-IN": "Namaskara! Naanu nimage hege sahaya maadali?",
-        "mr-IN": "Namaskar! Mi tumchi kashi madat karu shakto?",
-        "bn-IN": "Nomoskar! Ami apnake kivabe sahajjo korte pari?",
-        "gu-IN": "Namaste! Hu tamari kevi rite madad kari shaku?",
-        "pa-IN": "Sat sri akal! Main tuhadi kiven madad kar sakda haan?",
-        "od-IN": "Namaskar! Mu apananku kipari sahajya kari paribi?",
-        "ar-SA": "مرحباً! كيف يمكنني مساعدتك اليوم؟",
-    }
-    sample_text = samples.get(language, samples["en-IN"])
+    # Sample text per language — from the shared table, which is written in each
+    # language's own script. The copy that used to live here was romanised
+    # ("Namaskara! Naanu nimage hege sahaya maadali?"), which makes a voice sound
+    # like it is reading English with an accent rather than speaking Kannada.
+    from backend.services.tts_samples import sample_text_for
+    sample_text = sample_text_for(language)
 
     try:
         import base64

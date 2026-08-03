@@ -448,13 +448,10 @@ function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
     
     setPlayingVoice(`loading-${voiceId}`)
     try {
-      const sampleTexts: Record<string, string> = {
-        "hi-IN": "नमस्ते! मैं आपकी रिसेप्शनिस्ट हूँ। आज मैं आपकी कैसे मदद कर सकती हूँ?",
-        "en-IN": "Hello! I'm your AI receptionist. How may I help you today?",
-        "ta-IN": "வணக்கம்! நான் உங்கள் AI receptionist. நான் உதவலாமா?",
-        "ar-SA": "مرحباً! أنا مساعدتك الذكية. كيف يمكنني مساعدتك؟",
-      }
-      
+      // No `text`: the backend resolves the sentence from `language`, using the
+      // same table the Voice Library and Voice Configuration previews use. This
+      // used to be a local four-language map that fell back to English for the
+      // other nine — so a Kannada or Malayalam preview spoke English.
       const data = await fetchWithAuth(`/models/voices/preview`, {
         method: 'POST',
         body: JSON.stringify({
@@ -462,7 +459,6 @@ function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
           model: state.tts_model,
           voice_id: voiceId,
           language: state.tts_language,
-          text: sampleTexts[state.tts_language] || sampleTexts["en-IN"]
         })
       })
 

@@ -1238,7 +1238,10 @@ async def tts_preview(
     provider: str = "sarvam",
     voice_id: str = "shreya",
     language: str = "hi-IN",
-    text: str = "Hello! I am your AI receptionist. How can I help you today?",
+    # Defaults to a sentence written IN `language` rather than a fixed English
+    # one. Callers that genuinely want specific words (the STT-provider
+    # announcements, chat playback) still pass `text` and still win.
+    text: Optional[str] = Query(default=None),
     pitch: float = 0.0,
     pace: float = 1.0,
     loudness: float = 1.0,
@@ -1255,6 +1258,13 @@ async def tts_preview(
     # Friendly provider label for error messages — never Sarvam-only.
     _prov_meta = next((p for p in PROVIDERS["tts"] if p["id"] == provider), None)
     prov_label = _prov_meta["name"] if _prov_meta else provider
+
+    # Resolve the sample sentence from the language, so the words spoken and the
+    # language they are spoken in can never disagree. Previously the caller chose
+    # both independently and the Voice Library sent the voice's English blurb.
+    from backend.services.tts_samples import sample_text_for
+    if not (text or "").strip():
+        text = sample_text_for(language)
 
     if provider == "sarvam":
         api_key = os.getenv("SARVAM_API_KEY") or await _get_raw_key("sarvam", db)
