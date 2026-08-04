@@ -20,6 +20,10 @@ import { useNavigate } from 'react-router-dom';
 import VoiceLibrary from './VoiceLibrary';
 import { useProviders } from '../../hooks/useProviders';
 import fetchWithAuth from '../../api/client';
+import {
+  DEFAULT_LANGUAGE, DEFAULT_STT_MODEL, DEFAULT_STT_PROVIDER,
+  DEFAULT_TTS_MODEL, DEFAULT_TTS_PROVIDER,
+} from '../../api/lockedDefaults';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -39,16 +43,23 @@ interface WizardState {
   first_message: string;
   system_prompt: string;
   // Step 3
+  // ONE language for the agent (see backend/services/agent_defaults.py) — the
+  // wizard collects a single value, not the three that used to disagree.
+  //
+  // The llm_ provider+model fields are gone for good: the LLM is locked
+  // platform-wide, so there is nothing to collect. The stt_/tts_ pairs ARE
+  // collected, because switching transcriber or voice vendor is the product's
+  // fallback story when one degrades — but only from the backend's whitelist of
+  // providers that are genuinely configured and buildable.
+  language: string;
   stt_provider: string;
   stt_model: string;
   tts_provider: string;
   tts_model: string;
   tts_voice: string;
-  tts_language: string;
   tts_pitch: number;
   tts_pace: number;
   tts_loudness: number;
-  llm_model: string;
   llm_temperature: number;
   max_tokens: number;
   // Step 4
@@ -68,14 +79,19 @@ const INITIAL_STATE: WizardState = {
   template: 'clinic_receptionist',
   first_message: '',
   system_prompt: '',
-  stt_provider: 'sarvam', stt_model: 'saaras:v3',
-  tts_provider: 'sarvam', tts_model: 'bulbul:v3',
-  // 'shubh' is Sarvam's default speaker for bulbul:v3 (the default model above).
+  // 'shubh' is Sarvam's default speaker for bulbul:v3 (the locked TTS model).
   // This was 'anushka', which is bulbul:v2-only — every new agent shipped with a
   // voice that 400s on its own model until someone happened to change it.
-  tts_voice: 'shubh', tts_language: 'hi-IN',
+  tts_voice: 'shubh',
+  language: DEFAULT_LANGUAGE,
+  // Defaults, not locks. Overwritten from GET /platform/agent/config-options on
+  // mount so the wizard can never offer or submit a pair the backend will reject.
+  stt_provider: DEFAULT_STT_PROVIDER,
+  stt_model: DEFAULT_STT_MODEL,
+  tts_provider: DEFAULT_TTS_PROVIDER,
+  tts_model: DEFAULT_TTS_MODEL,
   tts_pitch: 0, tts_pace: 1.0, tts_loudness: 1.0,
-  llm_model: 'gemini-2.5-flash', llm_temperature: 0.3, max_tokens: 150,
+  llm_temperature: 0.3, max_tokens: 150,
   telephony_option: 'skip',
   country_code: 'IN', sip_account_sid: '', sip_auth_token: '', sip_domain: '',
 };
@@ -382,35 +398,94 @@ function ChatBubble({ from, text, muted }: { from: 'AI' | 'Patient'; text: strin
   );
 }
 
+// A labelled <select>, so the four provider/model pickers below do not repeat the
+// same 6 lines of inline styling four times.
+function WizardSelect({ id, label, value, onChange, options }: {
+  id: string; label: string; value: string;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+}) {
+  return (
+    <div>
+      <label htmlFor={id} style={{ fontSize: '12px', color: '#A1A1A1', marginBottom: '8px', display: 'block' }}>{label}</label>
+      <select
+        id={id}
+        value={value ?? ''}
+        onChange={e => onChange(e.target.value)}
+        style={{ width: '100%', padding: '10px 12px', borderRadius: '8px', background: '#1A1A1A', border: '1px solid #2E2E2E', color: '#fff', fontSize: '14px', outline: 'none' }}
+      >
+        {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+      </select>
+    </div>
+  );
+}
+
 // ── Step 3 — Voice ────────────────────────────────────────────────────────────
 
-function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof WizardState | 'open_voice_modal', v: any) => void }) {
-  const { data: providers, loading, refresh } = useProviders()
-  const llmModels = providers?.providers.llm[0]?.models || []
+function Step3({ state, onChange, onChangeMany }: {
+  state: WizardState;
+  onChange: (k: keyof WizardState | 'open_voice_modal', v: any) => void;
+  // Needed because changing a PROVIDER must clear its model in the same render:
+  // two sequential onChange calls would fire the config-options fetch against a
+  // half-updated pair (new provider, old provider's model), and the response
+  // would briefly describe a combination the wizard is not in.
+  onChangeMany: (updates: Partial<WizardState>) => void;
+}) {
+  const { data: providers, loading } = useProviders()
   const ttsProviders = providers?.providers.tts || []
   const sarvamModels = ttsProviders[0]?.models || []
+  // Keyed on the wizard's OWN tts_model, not on a constant: the voice roster
+  // differs per model (bulbul:v2's speakers are disjoint from v3's), so reading it
+  // from anything other than the model actually being submitted is how a new agent
+  // gets born with a speaker its own model answers 400 for.
   const selectedModelData = sarvamModels.find(m => m.id === state.tts_model)
-  
+
   // Voices logic
   const maleVoices = selectedModelData?.voices?.male_voices || []
   const femaleVoices = selectedModelData?.voices?.female_voices || []
-  // Languages this voice model can synthesize, straight from the provider
-  // payload — the same catalogue the Voice Library filters on.
-  const modelLanguages: { code: string; name: string }[] = selectedModelData?.voices?.languages || []
+
+  // Provider/model options + the per-language compatibility verdict, from the same
+  // endpoint the agent editor uses. Deliberately NOT from useProviders(): that
+  // reads the aspirational /platform PROVIDERS catalogue, which lists providers
+  // with no key and no pipeline branch — offering those is what let an agent be
+  // created on a provider that could not run its first call.
+  const [cfg, setCfg] = useState<any>(null)
+  useEffect(() => {
+    const q = new URLSearchParams({
+      stt_provider: state.stt_provider, stt_model: state.stt_model,
+      tts_provider: state.tts_provider, tts_model: state.tts_model,
+      language: state.language,
+    })
+    fetchWithAuth(`/platform/agent/config-options?${q}`)
+      .then(setCfg)
+      .catch(() => setCfg(null))
+  }, [state.stt_provider, state.stt_model, state.tts_provider, state.tts_model, state.language])
+
+  // Adopt the backend's normalized model whenever the wizard's value is not one the
+  // selected provider serves — which is exactly the state a provider change leaves
+  // behind, since it clears the model to ''. Without this the model box would sit
+  // blank and the submitted pair would depend on the backend repairing it silently.
+  useEffect(() => {
+    if (cfg?.stt?.model && !(cfg.stt.models || []).includes(state.stt_model)) {
+      onChange('stt_model', cfg.stt.model)
+    }
+    if (cfg?.tts?.model && !(cfg.tts.models || []).includes(state.tts_model)) {
+      onChange('tts_model', cfg.tts.model)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfg])
+
+  // Languages the SELECTED voice provider can really speak, each carrying whether
+  // the SELECTED transcriber can hear it.
+  const modelLanguages: { code: string; name: string; stt_ok?: boolean }[] = cfg?.languages || []
 
   // Sarvam's bulbul:v2 and bulbul:v3 speaker rosters are disjoint: sending a v2
   // speaker to v3 is a hard 400 ("Speaker 'x' is not compatible with model
   // bulbul:v3"). Switching the model tab therefore has to move the speaker with
   // it, or the wizard silently builds an agent whose voice cannot speak at all.
-  const selectModel = (modelId: string) => {
-    onChange('tts_model', modelId)
-    const roster = sarvamModels.find(m => m.id === modelId)?.voices
-    if (!roster) return
-    const ids = [...(roster.male_voices || []), ...(roster.female_voices || [])]
-    if (ids.some((v: any) => v.id === state.tts_voice)) return
-    const fallback = ids.find((v: any) => v.default) || ids[0]
-    if (fallback) onChange('tts_voice', fallback.id)
-  }
+  // selectModel was removed with the bulbul:v2/v3 model tabs — the TTS model is
+  // locked, so there is no longer a model switch that could strand the speaker on
+  // an incompatible roster. The initial-render guard below still applies.
 
   // Same guard for the initial render: the wizard's default voice must be valid
   // for its default model before the admin touches anything.
@@ -425,9 +500,9 @@ function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
   // stale saved value is a 400 from Sarvam, so fall back to one it can speak.
   useEffect(() => {
     if (!modelLanguages.length) return
-    if (modelLanguages.some(l => l.code === state.tts_language)) return
-    onChange('tts_language', modelLanguages[0].code)
-  }, [selectedModelData, state.tts_language])
+    if (modelLanguages.some(l => l.code === state.language)) return
+    onChange('language', modelLanguages[0].code)
+  }, [selectedModelData, state.language])
 
   const [playingVoice, setPlayingVoice] = useState<string>("")
   const [audioCache, setAudioCache] = useState<Record<string, string>>({})
@@ -455,10 +530,10 @@ function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
       const data = await fetchWithAuth(`/models/voices/preview`, {
         method: 'POST',
         body: JSON.stringify({
-          provider: 'sarvam',
+          provider: state.tts_provider,
           model: state.tts_model,
           voice_id: voiceId,
-          language: state.tts_language,
+          language: state.language,
         })
       })
 
@@ -483,43 +558,69 @@ function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
         <p style={{ fontSize: '14px', color: '#666' }}>Powered by dynamic provider configuration.</p>
       </div>
 
+      {/* Transcriber + voice provider. Both dropdowns are populated from the
+          backend whitelist, so the wizard cannot create an agent on a provider the
+          editor will not show or the pipeline cannot build. The LLM has no such
+          section on purpose — it is locked. */}
+      <div style={{ border: '1px solid #2E2E2E', borderRadius: '12px', padding: '24px', background: '#111', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+        <WizardSelect
+          id="stt-provider" label="Transcriber (speech to text)"
+          value={state.stt_provider}
+          onChange={v => onChangeMany({ stt_provider: v, stt_model: '' })}
+          options={(cfg?.stt?.providers || []).map((pr: any) => ({ value: pr.id, label: pr.name }))}
+        />
+        <WizardSelect
+          id="stt-model" label="Transcriber model"
+          value={state.stt_model}
+          onChange={v => onChange('stt_model', v)}
+          options={(cfg?.stt?.models || []).map((m: string) => ({ value: m, label: m }))}
+        />
+        <WizardSelect
+          id="tts-provider" label="Voice (text to speech)"
+          value={state.tts_provider}
+          onChange={v => onChangeMany({ tts_provider: v, tts_model: '' })}
+          options={(cfg?.tts?.providers || []).map((pr: any) => ({ value: pr.id, label: pr.name }))}
+        />
+        <WizardSelect
+          id="tts-model" label="Voice model"
+          value={state.tts_model}
+          onChange={v => onChange('tts_model', v)}
+          options={(cfg?.tts?.models || []).map((m: string) => ({ value: m, label: m }))}
+        />
+      </div>
+
       <div className="voice-section" style={{ border: '1px solid #2E2E2E', borderRadius: '12px', padding: '24px', background: '#111' }}>
         <h3 style={{ fontSize: '15px', fontWeight: 600, color: '#fff', marginBottom: '16px' }}>Voice Selection</h3>
-        <div className="voice-model-tabs" style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
-          {sarvamModels.map(model => (
-            <button
-              key={model.id}
-              className={`tab ${state.tts_model === model.id ? 'active' : ''}`}
-              onClick={() => selectModel(model.id)}
-              style={{
-                padding: '8px 16px', borderRadius: '6px', cursor: 'pointer',
-                background: state.tts_model === model.id ? '#3ECF8E' : '#1A1A1A',
-                color: state.tts_model === model.id ? '#000' : '#A1A1A1',
-                border: '1px solid #2E2E2E'
-              }}
-            >
-              {model.name}
-              {model.recommended && ' ★'}
-            </button>
-          ))}
-        </div>
-        
+
         {modelLanguages.length > 0 && (
           <div style={{ marginBottom: '16px' }}>
-            <label htmlFor="tts-language" style={{ fontSize: '12px', color: '#A1A1A1', marginBottom: '8px', display: 'block' }}>Voice Language</label>
+            <label htmlFor="agent-language" style={{ fontSize: '12px', color: '#A1A1A1', marginBottom: '8px', display: 'block' }}>Language</label>
             <select
-              id="tts-language"
-              value={state.tts_language}
-              onChange={e => onChange('tts_language', e.target.value)}
+              id="agent-language"
+              value={state.language}
+              onChange={e => onChange('language', e.target.value)}
               style={{ padding: '10px 12px', borderRadius: '8px', background: '#1A1A1A', border: '1px solid #2E2E2E', color: '#fff', fontSize: '14px', outline: 'none', minWidth: '260px' }}
             >
               {modelLanguages.map(l => (
-                <option key={l.code} value={l.code}>{l.name} ({l.code})</option>
+                <option key={l.code} value={l.code}>
+                  {l.name} ({l.code}){l.stt_ok === false ? ' — transcribed by Sarvam AI' : ''}
+                </option>
               ))}
             </select>
             <div style={{ fontSize: '11px', color: '#555', marginTop: '6px' }}>
-              Every voice below can speak any of these {modelLanguages.length} languages.
+              Sets what the agent hears, speaks and replies in. Every voice below
+              can speak any of these {modelLanguages.length} languages.
             </div>
+            {/* The chosen transcriber cannot hear every language its voice can
+                speak. The call still works — the pipeline substitutes a capable
+                transcriber — but that substitution is stated here rather than
+                discovered on a live call. */}
+            {(cfg?.selected?.errors || []).map((m: string) => (
+              <div key={m} style={{ fontSize: '11px', color: '#ff6b6b', marginTop: '6px' }}>⚠ {m}</div>
+            ))}
+            {(cfg?.selected?.warnings || []).map((m: string) => (
+              <div key={m} style={{ fontSize: '11px', color: '#f0b429', marginTop: '6px' }}>⚠ {m}</div>
+            ))}
           </div>
         )}
 
@@ -584,36 +685,11 @@ function Step3({ state, onChange }: { state: WizardState; onChange: (k: keyof Wi
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px', padding: '20px', background: '#111', borderRadius: '12px', border: '1px solid #2E2E2E' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <h3 style={{ fontSize: '13px', fontWeight: 600, color: '#A1A1A1', margin: 0 }}>LLM Model</h3>
-            <button onClick={refresh} style={{ fontSize: '11px', color: '#3ECF8E', background: 'none', border: 'none', cursor: 'pointer' }}>↻ Refresh Models</button>
-          </div>
-          {loading ? (
-            <div style={{ height: 48, background: '#1A1A1A', borderRadius: '8px', animation: 'pulse 2s infinite' }} />
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              {llmModels.map((model: any) => (
-                <button
-                  key={model.id}
-                  onClick={() => onChange('llm_model', model.id)}
-                  style={{
-                    display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
-                    padding: '12px', borderRadius: '8px', cursor: 'pointer',
-                    background: state.llm_model === model.id ? 'rgba(62,207,142,0.1)' : '#1A1A1A',
-                    border: `1px solid ${state.llm_model === model.id ? '#3ECF8E' : '#2E2E2E'}`,
-                  }}
-                >
-                  <div style={{ color: '#fff', fontSize: '13px', fontWeight: 500 }}>{model.name}</div>
-                  <div style={{ display: 'flex', gap: '4px', marginTop: '4px', flexWrap: 'wrap' }}>
-                    {model.is_recommended && <span style={{ fontSize: '10px', background: '#3ECF8E', color: '#000', padding: '2px 4px', borderRadius: '4px' }}>★ Recommended</span>}
-                    {model.tags?.map((tag: string) => (
-                      <span key={tag} style={{ fontSize: '10px', background: '#2E2E2E', color: '#A1A1A1', padding: '2px 4px', borderRadius: '4px' }}>{tag}</span>
-                    ))}
-                  </div>
-                </button>
-              ))}
-            </div>
-          )}
+          {/* The LLM Model picker was here. Removed — the model is locked
+              (see backend/services/agent_defaults.py). It was also a live bug
+              source: this wizard sent llm_provider:'gemini' hardcoded alongside
+              whatever model was picked from this list, so choosing a Groq model
+              here created an agent whose provider and model disagreed. */}
           <SliderField label="Temperature" value={state.llm_temperature} min={0} max={1} step={0.1} onChange={v => onChange('llm_temperature', v)} />
           <SliderField label="Max Tokens" value={state.max_tokens} min={50} max={300} step={10} onChange={v => onChange('max_tokens', v)} />
         </div>
@@ -703,9 +779,10 @@ function Step5({ state, selectedClinicName }: { state: WizardState; selectedClin
       { k: 'First message', v: `"${state.first_message.slice(0, 60)}…"` },
     ] },
     { title: 'VOICE PIPELINE', rows: [
-      { k: 'STT',  v: `${state.stt_provider} ${state.stt_model}` },
-      { k: 'LLM',  v: `${state.llm_model} (temp: ${state.llm_temperature})` },
-      { k: 'TTS',  v: `${state.tts_provider} ${state.tts_model} · ${state.tts_voice} · ${state.tts_language}` },
+      // Provider/model rows removed — they are locked, so there is nothing here
+      // for the admin to review or change. Language and voice are what they chose.
+      { k: 'Language', v: state.language },
+      { k: 'Voice',    v: state.tts_voice },
       { k: 'Est. latency', v: '~780ms per turn ✅' },
     ] },
     { title: 'TELEPHONY', rows: [
@@ -863,7 +940,7 @@ export default function CreateAgent() {
   React.useEffect(() => {
     if (step !== 1 || promptEdited || state.template === 'custom') return;
     const clinicName = state.clinic_selection === 'new' ? state.new_clinic_name : selectedClinicName;
-    const language = state.clinic_selection === 'new' ? state.new_language : state.tts_language;
+    const language = state.language;
     let cancelled = false;
     fetchWithAuth('/agents/render-template-prompt', {
       method: 'POST',
@@ -896,13 +973,13 @@ export default function CreateAgent() {
       const picked = clinicResults.find(c => c.id === value);
       setSelectedClinicName(picked?.name || '');
       // Default the agent's voice language to the selected clinic's language.
-      setState(prev => ({ ...prev, tenant_id: value, ...(picked?.language ? { tts_language: picked.language } : {}) }));
+      setState(prev => ({ ...prev, tenant_id: value, ...(picked?.language ? { language: picked.language } : {}) }));
       return;
     }
     if (key === 'new_language') {
-      // Clinic primary language drives the agent's default TTS language (audit
-      // P4). A later explicit voice pick still overrides it (handleSelectVoice).
-      setState(prev => ({ ...prev, new_language: value, tts_language: value }));
+      // A new clinic's primary language seeds its first agent's language. Picking
+      // a voice no longer overrides this — see handleSelectVoice.
+      setState(prev => ({ ...prev, new_language: value, language: value }));
       return;
     }
     if (key === 'template') {
@@ -920,15 +997,25 @@ export default function CreateAgent() {
     setState(prev => ({ ...prev, [key as keyof WizardState]: value }));
   };
 
+  // Several fields in one commit. A blank model means "give me this provider's
+  // default"; the backend fills it (agent_defaults.normalize_provider_choice), and
+  // the config-options response fills the dropdown, so the wizard never has to
+  // hardcode which model belongs to which vendor.
+  const onChangeMany = (updates: Partial<WizardState>) => {
+    setState(prev => ({ ...prev, ...updates }));
+  };
+
   const handleSelectVoice = (voice: any) => {
     setState(prev => ({
        ...prev,
-       tts_provider: voice.provider,
-       tts_model: voice.model,
+       // ONLY the voice. This used to also copy the voice's provider, model and
+       // catalog language onto the agent, so picking a voice silently changed the
+       // agent's language to whatever that voice happened to be tagged with —
+       // one of the writers behind the four-way language mismatch.
+       //
        // Use the provider's canonical voice id (e.g. Sarvam 'priya'), NOT the
        // display name ('Priya') — the TTS API rejects the display name.
        tts_voice: voice.voice_id || voice.id || voice.name,
-       tts_language: voice.language
     }));
     setShowVoiceModal(false);
   };
@@ -963,11 +1050,19 @@ export default function CreateAgent() {
           new_clinic: state.clinic_selection === 'new' ? { clinic_name: state.new_clinic_name, admin_name: state.new_admin_name, admin_email: state.new_admin_email, phone: state.new_phone, location: state.new_location, language: state.new_language } : null,
           agent_name: state.agent_name, template: state.template,
           first_message: state.first_message, system_prompt: state.system_prompt,
-          stt_provider: state.stt_provider, stt_model: state.stt_model,
-          tts_provider: state.tts_provider, tts_model: state.tts_model,
-          tts_voice: state.tts_voice, tts_language: state.tts_language,
+          // ONE language, and no LLM provider/model at all — that pair is locked
+          // and the backend applies it itself, so the agent is born consistent with
+          // no post-creation correction.
+          //
+          // The STT/TTS pairs ARE sent and ARE honoured, validated against the same
+          // whitelist that populated the dropdowns.
+          language: state.language,
+          stt_provider: state.stt_provider,
+          stt_model: state.stt_model,
+          tts_provider: state.tts_provider,
+          tts_model: state.tts_model,
+          tts_voice: state.tts_voice,
           tts_pitch: state.tts_pitch, tts_pace: state.tts_pace, tts_loudness: state.tts_loudness,
-          llm_provider: 'gemini', llm_model: state.llm_model,
           llm_temperature: state.llm_temperature, max_response_tokens: state.max_tokens,
           telephony_option: state.telephony_option,
         }),
@@ -999,7 +1094,7 @@ export default function CreateAgent() {
       clinicsError={clinicsError}
     />,
     <Step2 state={state} onChange={(k, v) => onChange(k, v)} />,
-    <Step3 state={state} onChange={(k, v) => onChange(k, v)} />,
+    <Step3 state={state} onChange={(k, v) => onChange(k, v)} onChangeMany={onChangeMany} />,
     <Step4 state={state} onChange={(k, v) => onChange(k, v)} />,
     <Step5 state={state} selectedClinicName={selectedClinicName} />,
   ];

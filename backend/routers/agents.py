@@ -24,6 +24,7 @@ from backend.models.api_key_config import ApiKeyConfig
 from backend.models.doctor import Doctor
 from backend.models.tenant import Tenant
 from backend.agent.prompt_templates import TEMPLATES, get_template, render_prompt
+from backend.services import agent_defaults
 from backend.services.tenant_service import create_tenant as create_tenant_row
 from backend.config import settings
 
@@ -78,16 +79,30 @@ class AgentCreatePayload(BaseModel):
     system_prompt: str = ""
 
     # Step 3 — Voice
-    stt_provider: str = "sarvam"
-    stt_model: str = "saaras:v3"
-    stt_language: str = "en-IN"
+    #
+    # THE one language field. Everything language-related derives from it; see
+    # backend/services/agent_defaults.py.
+    language: str | None = None
+
+    # stt/tts provider+model ARE honoured — they are a real operator choice, and
+    # the wizard collects them. They are validated against
+    # agent_defaults.SELECTABLE_BY_CATEGORY (buildable AND configured) rather than
+    # trusted, and normalized into a coherent pair by apply_locked_defaults.
+    #
+    # stt_language / tts_language are ACCEPTED BUT IGNORED: they are derived mirrors
+    # of `language` now. Honouring a client-supplied value is precisely what let one
+    # agent end up transcribing Tamil while speaking Malayalam. They stay on the
+    # schema so an older frontend build does not start getting 422s mid-deploy.
+    stt_provider: str = "deepgram"
+    stt_model: str = "nova-3"
+    stt_language: str | None = None
     transcriber_keywords: str | None = None
     fallback_transcribers: str | None = None
 
     tts_provider: str = "sarvam"
     tts_model: str = "bulbul:v3"
     tts_voice: str = "priya"
-    tts_language: str = "hi-IN"
+    tts_language: str | None = None
     tts_pitch: float = Field(0.0, ge=-1.0, le=1.0)
     tts_pace: float = Field(1.0, ge=0.5, le=2.0)
     tts_loudness: float = Field(1.0, ge=0.5, le=2.0)
@@ -102,8 +117,11 @@ class AgentCreatePayload(BaseModel):
     add_voice_manually: str | None = None
     fallback_voices: str | None = None
 
-    llm_provider: str = "openai"
-    llm_model: str = "gpt-4o"
+    # Also accepted-but-ignored. The old defaults here were openai/gpt-4o while no
+    # OPENAI_API_KEY is configured, so every agent created through the wizard was
+    # born with a dead LLM.
+    llm_provider: str = "groq"
+    llm_model: str = "llama-3.3-70b-versatile"
     llm_temperature: float = Field(0.7, ge=0.0, le=1.0)
     max_response_tokens: int = Field(500, ge=50, le=2000)
     llm_max_tokens: int = Field(250, ge=50, le=4000)
@@ -163,6 +181,16 @@ class AgentPatchPayload(BaseModel):
     clinic_info: dict | str | None = None
 
 
+    # THE one language field.
+    language: str | None = None
+
+    # stt/tts provider+model are HONOURED and validated (see AgentCreatePayload).
+    # stt_language / tts_language are accepted but IGNORED — derived from
+    # `language`. See agent_defaults.DERIVED_FIELDS. Kept on the schema so an
+    # in-flight older frontend build does not get 422s during a deploy; silently
+    # dropped rather than rejected because the auto-save UI fires these on every
+    # keystroke. llm_provider/llm_model are likewise dropped — the LLM is locked.
+    # tts_voice is NOT derived — the voice/speaker choice stays fully editable.
     stt_provider: str | None = None
     stt_model: str | None = None
     stt_language: str | None = None
@@ -961,7 +989,7 @@ async def generate_system_prompt(agent_id: str, user: CurrentUser = None):
                 "and answers clinic questions"
             ),
             "first_message": agent.first_message or "",
-            "primary_language": agent.tts_language or agent.stt_language or "en-IN",
+            "primary_language": agent.language or agent_defaults.DEFAULT_LANGUAGE,
             "existing_system_prompt": agent.system_prompt or "",
             "capabilities": capabilities,
             "doctors": doctors,
@@ -991,7 +1019,7 @@ async def generate_first_message(agent_id: str, user: CurrentUser = None):
         ctx = {
             "clinic_name": clinic_name or "the clinic",
             "agent_name": agent.agent_name or "",
-            "primary_language": agent.tts_language or agent.stt_language or "en-IN",
+            "primary_language": agent.language or agent_defaults.DEFAULT_LANGUAGE,
             "existing_first_message": agent.first_message or "",
         }
         meta_prompt = _build_first_message_instruction(ctx)
@@ -1145,6 +1173,56 @@ async def create_agent(payload: AgentCreatePayload, user: SuperAdmin = None) -> 
             mapper = sa_inspect(AgentConfig)
             valid_columns = {col.key for col in mapper.columns}
             
+            # ── Selectable providers ──────────────────────────────────────────
+            # Same whitelist the dropdowns are built from, so a wizard submission
+            # can never create an agent on a provider the editor cannot display.
+            for _cat, _prov in (("stt", payload.stt_provider), ("tts", payload.tts_provider)):
+                if (_prov or "").strip().lower() not in agent_defaults.SELECTABLE_BY_CATEGORY[_cat]:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"'{_prov}' is not a selectable {_cat.upper()} provider. "
+                            "Available: "
+                            + ", ".join(
+                                f"{o['name']} ({o['id']})"
+                                for o in agent_defaults.selectable_providers(_cat)
+                            )
+                            + "."
+                        ),
+                    )
+
+            # ── The one language ──────────────────────────────────────────────
+            # A brand-new agent gets ONE language, validated once, here. There is
+            # no separate STT-language contract to satisfy any more: stt_language
+            # and tts_language are derived mirrors written by
+            # apply_locked_defaults, so they cannot disagree with each other or
+            # with what the UI displays.
+            #
+            # When the clinic is being created in the same request, its language is
+            # the natural default for its first agent — that is what the wizard
+            # already collected on step 1.
+            _requested_language = (
+                payload.language
+                or (payload.new_clinic.language if payload.new_clinic else None)
+                or agent_defaults.DEFAULT_LANGUAGE
+            ).strip()
+
+            if not agent_defaults.is_supported_language(
+                _requested_language, payload.tts_provider
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"'{_requested_language}' is not a language this platform can "
+                        "run an agent in. Supported: "
+                        + ", ".join(
+                            f"{o['code']} ({o['name']})"
+                            for o in agent_defaults.supported_languages(payload.tts_provider)
+                        )
+                        + "."
+                    ),
+                )
+
             # Start with the dumped payload, then inject manual overrides
             raw_kwargs = payload.model_dump()
             raw_kwargs.update({
@@ -1158,13 +1236,20 @@ async def create_agent(payload: AgentCreatePayload, user: SuperAdmin = None) -> 
                 "ai_number": ai_number,
             })
             
-            # Filter kwargs to only valid columns
+            # Filter kwargs to only valid columns, and drop every DERIVED field so
+            # a client-supplied provider/model/language can never reach the row.
+            # Dropped here rather than after construction so the object is never
+            # even transiently built from them.
             safe_kwargs = {
-                k: v for k, v in raw_kwargs.items() 
-                if k in valid_columns
+                k: v for k, v in raw_kwargs.items()
+                if k in valid_columns and k not in agent_defaults.DERIVED_FIELDS
             }
 
             agent = AgentConfig(**safe_kwargs)
+            # The single place that decides language + providers, for create and
+            # update alike. A brand-new agent is therefore born already consistent
+            # and already on the locked defaults — no post-creation correction.
+            agent_defaults.apply_locked_defaults(agent, language=_requested_language)
             session.add(agent)
             await session.commit()
             await session.refresh(agent)
@@ -1208,6 +1293,29 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
 
             validate_or_raise("stt", payload.stt_provider)
             validate_or_raise("tts", payload.tts_provider)
+
+            # Buildable is necessary but not sufficient. ElevenLabs and Whisper are
+            # both buildable, and both were removed from the dropdowns — so a save
+            # naming one is not an operator choice, it is a stale client or a
+            # hand-crafted request, and accepting it would put the agent back on a
+            # provider nobody can see in the UI.
+            # Falsy means "not changing it" — the editor sends `stt_model: ''` to ask
+            # for the new provider's default, and must not be read as a provider of "".
+            for _cat, _prov in (("stt", payload.stt_provider), ("tts", payload.tts_provider)):
+                if _prov and _prov.strip() and _prov.strip().lower() not in agent_defaults.SELECTABLE_BY_CATEGORY[_cat]:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"'{_prov}' is not a selectable {_cat.upper()} provider. "
+                            "Available: "
+                            + ", ".join(
+                                f"{o['name']} ({o['id']})"
+                                for o in agent_defaults.selectable_providers(_cat)
+                            )
+                            + "."
+                        ),
+                    )
+
             if payload.llm_provider is not None:
                 # An unknown LLM id is legitimate IF it's a registered custom
                 # OpenAI-compatible endpoint with a base_url.
@@ -1222,6 +1330,35 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
 
                 _custom = await resolve_custom_llm_endpoint(session, payload.llm_provider)
                 validate_or_raise("llm", payload.llm_provider, has_base_url=_custom is not None)
+
+            # ── The one language ───────────────────────────────────────────────
+            # Validated once, against what the SELECTED TTS provider can actually
+            # speak. The old code validated stt_language against a separately
+            # chosen STT provider/model, which is what made it possible to save a
+            # transcriber language that disagreed with the voice language.
+            #
+            # Checked against the provider this save will LEAVE the agent on —
+            # payload value if the same request is also changing it, otherwise the
+            # stored one. Validating against the stored value alone would let a
+            # request that switches provider and language together be judged by the
+            # provider it is moving away from.
+            _eff_tts_provider = payload.tts_provider or agent.tts_provider
+            if payload.language is not None:
+                _lang = payload.language.strip()
+                if not agent_defaults.is_supported_language(_lang, _eff_tts_provider):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"'{_lang}' is not a language this platform can run an "
+                            "agent in. Supported: "
+                            + ", ".join(
+                                f"{o['code']} ({o['name']})"
+                                for o in agent_defaults.supported_languages(_eff_tts_provider)
+                            )
+                            + "."
+                        ),
+                    )
+                payload.language = _lang
 
             # A clinic admin may configure everything about how their agent
             # BEHAVES, but not the platform credentials it runs on. Writing
@@ -1258,15 +1395,39 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
                 if new_value is not None and new_value != old_value:
                     await _record_prompt_history(session, agent.id, tracked_field, old_value)
 
-            # Only set fields that actually exist as DB columns on AgentConfig
+            # Only set fields that actually exist as DB columns on AgentConfig, and
+            # never a DERIVED one — those are computed below from `language` and the
+            # locked defaults. Silently skipped rather than rejected: the editor
+            # auto-saves on a debounce and an older in-flight build still sends
+            # tts_language/provider pairs, which must not start failing mid-deploy.
             _model_columns = {c.name for c in AgentConfig.__table__.columns}
             for field, value in payload.model_dump(exclude_none=True).items():
-                if field in _model_columns:
+                if field in _model_columns and field not in agent_defaults.DERIVED_FIELDS:
                     setattr(agent, field, value)
+
+            # Re-apply on EVERY update, not just when language changed. That makes
+            # this endpoint self-healing: any row still carrying a legacy
+            # provider/model pair or a stale mirror is corrected the first time
+            # anything about the agent is saved.
+            agent_defaults.apply_locked_defaults(agent)
 
             await session.commit()
             await session.refresh(agent)
-            return {"id": agent.id, "status": agent.status, "updated": True}
+            # Returned on every save so the editor can show a provider/language
+            # incompatibility the moment it is created, rather than letting the
+            # operator discover it on a live call. It is not an error — the pipeline
+            # substitutes a capable transcriber — but it must not be silent.
+            return {
+                "id": agent.id,
+                "status": agent.status,
+                "updated": True,
+                "language_support": agent_defaults.language_support(
+                    agent.language,
+                    stt_provider=agent.stt_provider,
+                    stt_model=agent.stt_model,
+                    tts_provider=agent.tts_provider,
+                ),
+            }
     except HTTPException:
         raise
     except Exception as e:

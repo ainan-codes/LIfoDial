@@ -37,18 +37,57 @@ class AgentConfig(Base):
     first_message_mode = Column(String(50), default="assistant-speaks-first")
     system_prompt = Column(Text, nullable=False, default="")
 
+    # ── Language — THE single source of truth ─────
+    # One agent, one language. BCP-47, never "auto".
+    #
+    # This column exists because there used to be two independently editable
+    # language columns (stt_language, tts_language) plus a third de-facto source
+    # (the voice catalog's static per-voice language). On agent
+    # f367e0e2-4e31-41fd-8a4a-df0f6ebbd8d7 that produced four disagreeing values
+    # at once, and pinned STT to Tamil while TTS spoke Malayalam — so a Malayalam
+    # caller could not be understood. See backend/services/agent_defaults.py for
+    # the full evidence and the migration's conflict-resolution rule.
+    #
+    # Everything language-related derives from this: the STT language code, the
+    # TTS language, every UI label, and an explicit instruction in the LLM system
+    # prompt. Whether the transcriber PINS to it or lets the provider detect is
+    # the separate, pre-existing auto_detect_language boolean below.
+    language = Column(String(20), default="en-IN", nullable=False, server_default="en-IN")
+
     # ── STT (Speech to Text) ─────────────────────
-    stt_provider = Column(String(30), default="sarvam")
-    stt_model = Column(String(50), default="saaras:v3")
-    stt_language = Column(String(10), default="hi-IN")
+    # provider/model are LOCKED (deepgram/nova-3) — not configurable per agent.
+    # agent_defaults.apply_locked_defaults is the only writer.
+    stt_provider = Column(String(30), default="deepgram")
+    stt_model = Column(String(50), default="nova-3")
+    # DERIVED MIRROR of `language` — do not write directly, do not expose in UI.
+    # Holds "auto" when auto_detect_language is set, otherwise `language`.
+    # Written only by agent_defaults.apply_locked_defaults.
+    #
+    # Kept as a column rather than dropped because a deployed agent worker may
+    # still be running a revision that reads it; dropping it would break live
+    # calls the moment this migration lands. Safe to drop once every worker is
+    # confirmed on a revision that reads `language`.
+    #
+    # varchar(20) to match the column the migration actually created
+    # (2026_04_07_1512-bbf25bb3c633). Deliberately NOT widened: every real code is
+    # <= 7 characters (see backend/services/stt_catalog.py), so a narrow column is
+    # the backstop that catches a label-as-value bug instead of silently
+    # persisting one — which is how a 37-character description
+    # ("Multilingual (English/Hindi/Regional)") once reached this column.
+    stt_language = Column(String(20), default="en-IN")
     transcriber_keywords = Column(Text, nullable=True)
     fallback_transcribers = Column(Text, nullable=True)
 
     # ── TTS (Text to Speech) ─────────────────────
+    # provider/model are LOCKED (sarvam/bulbul:v3). tts_voice is NOT locked —
+    # the voice/speaker choice and the Voice Library are deliberately preserved.
     tts_provider = Column(String(30), default="sarvam")
     tts_model = Column(String(50), default="bulbul:v3")
     tts_voice = Column(String(50), default="priya")
-    tts_language = Column(String(10), default="hi-IN")
+    # DERIVED MIRROR of `language` — see stt_language above. Always equals
+    # `language`. Widened 10 -> 20 to match it, so the two mirrors can never
+    # disagree by truncation.
+    tts_language = Column(String(20), default="en-IN")
     tts_pitch = Column(Float, default=0.0)
     tts_pace = Column(Float, default=1.0)
     tts_loudness = Column(Float, default=1.0)
@@ -64,8 +103,11 @@ class AgentConfig(Base):
     fallback_voices = Column(Text, nullable=True)
 
     # ── LLM ──────────────────────────────────────
-    llm_provider = Column(String(30), default="gemini")
-    llm_model = Column(String(100), default="gemini-2.5-flash")
+    # LOCKED (groq/llama-3.3-70b-versatile). The old defaults let provider and
+    # model drift apart: one live agent held llm_provider='groq' with
+    # llm_model='gemini-2.5-flash-8b', which Groq answers 404 for.
+    llm_provider = Column(String(30), default="groq")
+    llm_model = Column(String(100), default="llama-3.3-70b-versatile")
     llm_temperature = Column(Float, default=0.3)
     max_response_tokens = Column(Integer, default=500)
     llm_max_tokens = Column(Integer, default=250)
@@ -95,6 +137,10 @@ class AgentConfig(Base):
     can_check_availability = Column(Boolean, default=True)
     can_transfer_emergency = Column(Boolean, default=True)
     emergency_transfer_number = Column(String(20), nullable=True)
+    # Whether the transcriber PINS to `language` or lets the provider detect.
+    # This is the only language-adjacent knob besides `language` itself, and it
+    # predates the unification — no new knob was added. See
+    # agent_defaults.effective_stt_language.
     auto_detect_language = Column(Boolean, default=True)
 
     # ── Voicemail ─────────────────────────────────

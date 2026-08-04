@@ -105,9 +105,21 @@ from backend.config import settings  # noqa: E402
 def _worker_tuning() -> dict:
     """Worker concurrency/isolation settings, and why they are what they are.
 
-    These three defaults exist because this worker runs on Render's FREE plan
-    (0.1 CPU, see render.yaml). They are NOT arbitrary, and two of them are
-    actively dangerous to "improve" without also upgrading the plan:
+    ⚠️ These three defaults were chosen for Render's FREE plan (0.1 CPU). Hosting
+    moved to Railway on 2026-07-31, so the PREMISE below is stale even though the
+    settings themselves have not been re-derived. They are NOT arbitrary, and two
+    of them are actively dangerous to "improve" without also upgrading the plan:
+
+    MEMORY WARNING (added 2026-08-03). Railway killed lifodial-agent-worker for
+    running out of memory. `load_threshold = inf` is the most likely contributor:
+    it disables livekit-agents' own overload protection (its prod default is 0.7),
+    so this worker accepts UNBOUNDED concurrent jobs, and under the THREAD executor
+    every one of them lives in this single process. Measured 2026-08-03: ~212 MB
+    RSS before any call, +~8 MB per concurrent call for its Silero VAD analyzer
+    alone. Note livekit-agents' `job_memory_limit_mb` (default 0 = off) cannot
+    protect a THREAD-executor worker, because a thread's memory is not separable
+    from the process's. To cap concurrency WITHOUT a code change or redeploy, set
+    AGENT_LOAD_THRESHOLD (e.g. 0.75) in the Railway service env.
 
     job_executor_type = THREAD
         Runs each job as a thread in the worker process instead of livekit-agents'
@@ -123,10 +135,16 @@ def _worker_tuning() -> dict:
 
     load_threshold = inf
         Accept every dispatch regardless of reported load. This looks reckless but
-        is deliberate: on 0.1 CPU the load metric sits permanently near saturation,
-        so ANY finite threshold makes the worker refuse every job and the product
-        goes completely dark. Set a real value (e.g. 0.75) only once the plan has
-        headroom for the metric to mean something.
+        was deliberate: on Render's 0.1 CPU the load metric sat permanently near
+        saturation, so ANY finite threshold made the worker refuse every job and
+        the product went completely dark.
+
+        On Railway that trade-off has flipped: the CPU starvation this worked
+        around is gone, and what remains is the downside — no ceiling on how many
+        concurrent jobs land in one process, which is how the worker OOMs. This is
+        now the FIRST setting to revisit, via AGENT_LOAD_THRESHOLD, and it is worth
+        confirming against the Railway memory graph before spending money on a
+        bigger plan.
 
     num_idle_processes = 0
         No pre-warmed processes — they would each hold memory this plan doesn't

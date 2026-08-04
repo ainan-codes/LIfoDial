@@ -1316,11 +1316,20 @@ export default function TestAgentModal({ agent, agentId: directId, agentName: di
     return () => document.removeEventListener('keydown', handler);
   }, [onClose, inline]);
 
-  // Badge pills for agent config info
-  // Show the conversation language (what the user speaks) — STT is the source
-  // of truth. Fall back to tts_language / generic language for older configs.
-  const language = agent?.stt_language || agent?.tts_language || agent?.language || '';
-  const llmModel = agent?.llm_model || '';
+  // Badge pills for agent config info. THE one language — this used to prefer
+  // stt_language over tts_language, so it could disagree with the editor.
+  //
+  // The llm_model pill that used to sit between these two is gone. It rendered a
+  // raw vendor model id ("llama-3.3-70b") into a widget an admin uses to test their
+  // clinic's receptionist, which is an internal implementation detail leaking into
+  // a product surface — and it is a detail nobody can act on, since the LLM is
+  // locked platform-wide and there is no dropdown to change it.
+  //
+  // The two that stay are both things the tester can act on: `language` is what
+  // they must speak for the test to mean anything, and `tts_voice` is a product
+  // persona name ("shruti") the admin picked themselves from the Voice Library, not
+  // a vendor brand.
+  const language = agent?.language || '';
   const ttsVoice = agent?.tts_voice || '';
 
   return (
@@ -1417,7 +1426,6 @@ export default function TestAgentModal({ agent, agentId: directId, agentName: di
             {/* Status badges */}
             <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', flex: 1 }}>
               {language && <span style={{ fontSize: '10px', padding: '2px 7px', borderRadius: '10px', background: 'rgba(62,207,142,0.08)', border: '1px solid #3ECF8E20', color: '#3ECF8E', fontWeight: 600 }}>{language}</span>}
-              {llmModel && <span style={{ fontSize: '10px', padding: '2px 7px', borderRadius: '10px', background: 'rgba(96,165,250,0.08)', border: '1px solid #60A5FA20', color: '#60A5FA', fontWeight: 600 }}>{llmModel.replace('gemini-', 'g-').replace('-versatile', '')}</span>}
               {ttsVoice && <span style={{ fontSize: '10px', padding: '2px 7px', borderRadius: '10px', background: 'rgba(167,139,250,0.08)', border: '1px solid #A78BFA20', color: '#A78BFA', fontWeight: 600 }}>{ttsVoice}</span>}
             </div>
           </div>

@@ -138,7 +138,7 @@ def _greeting_cache_key(agent: AgentConfig, text: str) -> str:
         str(agent.tts_provider or "sarvam"),
         str(agent.tts_model or "bulbul:v3"),
         str(agent.tts_voice or ""),
-        str(agent.tts_language or "en-IN"),
+        str(agent.language or "en-IN"),
         str((text or "").strip()),
     ])
 
@@ -594,11 +594,11 @@ async def _send_greeting_audio_fast(websocket: WebSocket, agent: AgentConfig, te
         tts_provider = agent.tts_provider or "sarvam"
         if tts_provider == "sarvam":
             audio_bytes = await sarvam_synthesize_with_retry(
-                agent, text, language_override=agent.tts_language or "en-IN"
+                agent, text, language_override=agent.language or "en-IN"
             )
         else:
             audio_bytes = await synthesize_speech(
-                agent, text, language_override=agent.tts_language or "en-IN"
+                agent, text, language_override=agent.language or "en-IN"
             )
 
         if audio_bytes and len(audio_bytes) >= 512:
@@ -780,7 +780,7 @@ async def manage_sarvam_streaming_tts(
                             ),
                             "target_language_code": buffered_config.get(
                                 "target_language_code",
-                                agent.tts_language or "en-IN"
+                                agent.language or "en-IN"
                             ),
                             "pace": buffered_config.get("pace", agent.tts_pace or 1.0),
                             # 30/60 — same tuning as pipeline.py's live-call path
@@ -1046,7 +1046,7 @@ async def get_tts_streaming_test_client(agent_id: str, user: CurrentUser = None,
     <body>
         <h1>Streaming Text-to-Speech Test</h1>
         <p><strong>Agent:</strong> {agent.agent_name} (ID: {agent_id})</p>
-        <p><strong>Provider:</strong> {agent.tts_provider} | <strong>Voice:</strong> {agent.tts_voice or 'default'} | <strong>Language:</strong> {agent.tts_language or 'en-IN'}</p>
+        <p><strong>Provider:</strong> {agent.tts_provider} | <strong>Voice:</strong> {agent.tts_voice or 'default'} | <strong>Language:</strong> {agent.language or 'en-IN'}</p>
         
         <div class="section">
             <h2>1. Configuration</h2>
@@ -1054,7 +1054,7 @@ async def get_tts_streaming_test_client(agent_id: str, user: CurrentUser = None,
             <input type="text" id="speaker" value="{(agent.tts_voice or 'shubh').lower()}" placeholder="e.g., shubh, shreya">
             
             <label>Language Code:</label>
-            <input type="text" id="language" value="{agent.tts_language or 'en-IN'}" placeholder="e.g., hi-IN, en-IN">
+            <input type="text" id="language" value="{agent.language or 'en-IN'}" placeholder="e.g., hi-IN, en-IN">
             
             <label>Pace (speed):</label>
             <input type="number" id="pace" value="{agent.tts_pace or 1.0}" step="0.1" min="0.5" max="2.0">
@@ -1269,7 +1269,7 @@ async def handle_text_command(
         # Use explicit override if set, else fall back to ratio-based dominant
         current_dominant = _session_language_override.get(
             session_id,
-            get_dominant_language(session_id, agent.tts_language or "en-IN"),
+            get_dominant_language(session_id, agent.language or "en-IN"),
         )
         
         response_text = await generate_llm_response(agent, user_text, db, session_id=session_id, user_language=current_dominant, websocket=websocket)
@@ -1396,7 +1396,7 @@ async def handle_audio_turn(
             return
 
         # Determine which language to use for STT based on ratio tracking
-        dominant_lang = get_dominant_language(session_id, agent.tts_language or "en-IN")
+        dominant_lang = get_dominant_language(session_id, agent.language or "en-IN")
 
         # ── Step 1: STT ──────────────────────────────────────────────────────────
         stt_start = time.monotonic()
@@ -1478,7 +1478,7 @@ async def handle_audio_turn(
         # Use explicit override if set, else fall back to ratio-based dominant
         current_dominant = _session_language_override.get(
             session_id,
-            get_dominant_language(session_id, agent.tts_language or "en-IN"),
+            get_dominant_language(session_id, agent.language or "en-IN"),
         )
 
         # Send user transcript back
@@ -1815,7 +1815,15 @@ async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint
         logger.warning(f"No API key for STT provider: {stt_provider}")
         return "", ""
     
-    lang = language_hint or agent.stt_language or agent.tts_language or "en-IN"
+    from backend.services import stt_catalog
+
+    # agent.stt_language is stored CANONICALLY — "auto" for auto-detect, otherwise
+    # BCP-47. It is translated into each provider's own spelling at the call sites
+    # below, never sent verbatim: Sarvam answers 400 for anything outside its 24
+    # enumerated codes (so "auto" is a 400), and Deepgram wants "kn"/"multi", not
+    # "kn-IN". Keep `lang` canonical up here so both branches translate from the
+    # same value.
+    lang = language_hint or agent.language or "en-IN"
 
     if stt_provider == "sarvam":
         stt_model = agent.stt_model or "saaras:v3"
@@ -1833,14 +1841,22 @@ async def transcribe_audio(agent: AgentConfig, audio_bytes: bytes, language_hint
             # Misdetections are caught by the post-STT smart retry in
             # handle_audio_turn() which re-calls with force_language=True.
             lang = "unknown"
-        # When force_language=True, 'lang' keeps the explicit language_hint
-        # value — used for retry calls after misdetection.
+        else:
+            # When force_language=True, 'lang' keeps the explicit language_hint
+            # value — used for retry calls after misdetection. Translated so a
+            # saarika model never receives a saaras-only code, and so "auto"
+            # becomes Sarvam's own "unknown" instead of a 400.
+            lang = stt_catalog.to_provider_code("sarvam", stt_model, lang) or "unknown"
         return await sarvam_transcribe(api_key, audio_bytes, stt_model, lang)
-    
+
     elif stt_provider == "deepgram":
         # Empty language ⇒ Deepgram auto-detect (nova-2) / multi (nova-3), same
         # policy as the Sarvam branch above. A retry pins the language.
-        dg_lang = lang if (force_language or not getattr(agent, "auto_detect_language", True)) else ""
+        dg_lang = ""
+        if force_language or not getattr(agent, "auto_detect_language", True):
+            dg_lang = stt_catalog.to_provider_code(
+                "deepgram", agent.stt_model or "nova-3", lang
+            ) or ""
         return await deepgram_transcribe(
             api_key, audio_bytes, agent.stt_model or "nova-3", language=dg_lang
         )
@@ -3147,7 +3163,7 @@ async def synthesize_speech(agent: AgentConfig, text: str, language_override: st
     """Convert text to speech using configured TTS provider"""
     
     tts_provider = agent.tts_provider or "sarvam"
-    tts_language = language_override or agent.tts_language or "en-IN"
+    tts_language = language_override or agent.language or "en-IN"
     
     # Get API key from environment (avoid opening a new DB session to prevent pool exhaustion)
     api_key = None
@@ -3267,7 +3283,7 @@ async def sarvam_synthesize_with_retry(
         logger.warning("sarvam_synthesize_with_retry: no API key")
         return None
 
-    tts_language = normalize_sarvam_language(language_override or agent.tts_language or "en-IN")
+    tts_language = normalize_sarvam_language(language_override or agent.language or "en-IN")
 
     # Apply the same legacy-voice → v3-speaker mapping used by synthesize_speech()
     # so that v2-only voices (meera, pavithra, etc.) are remapped before reaching

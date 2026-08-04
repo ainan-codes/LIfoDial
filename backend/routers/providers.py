@@ -34,6 +34,16 @@ from backend.services.sarvam_catalog import (  # noqa: E402
     SARVAM_VOICES,
     voices_for_model,
 )
+from backend.services import stt_catalog  # noqa: E402
+
+
+def _stt_langs(model: str) -> list[str]:
+    """Sarvam STT codes this model really accepts, in picker order (no auto)."""
+    return [
+        o["code"]
+        for o in stt_catalog.stt_language_options("sarvam", model)
+        if o["code"] != stt_catalog.AUTO
+    ]
 
 GEMINI_MODELS = [
     {"id": "gemini-2.5-flash",               "name": "Gemini 2.5 Flash",            "tier": "fast",    "context": 1048576, "recommended": True},
@@ -43,9 +53,21 @@ GEMINI_MODELS = [
     {"id": "gemini-1.5-pro",                 "name": "Gemini 1.5 Pro",              "tier": "pro",     "context": 2097152, "recommended": False},
 ]
 
+# Languages are read from backend/services/stt_catalog.py rather than restated.
+# What used to be written here was wrong in two ways, both verified against the
+# live Sarvam API on 2026-08-03:
+#   * "or-IN" is not one of Sarvam STT's 24 accepted codes — Odia is "od-IN".
+#   * "ar-SA" was fabricated; Sarvam rejects it on every model.
+# And saaras:v3 actually serves 23 languages, not 12.
 STT_MODELS = [
-    {"id": "saarika:v2.5",  "name": "Saarika v2.5",  "provider": "sarvam", "languages": ["hi-IN","en-IN","ta-IN","te-IN","bn-IN","mr-IN","gu-IN","kn-IN","ml-IN","pa-IN","or-IN"], "recommended": False},
-    {"id": "saaras:v3",   "name": "Saaras v3",   "provider": "sarvam", "languages": ["hi-IN","en-IN","ta-IN","te-IN","bn-IN","mr-IN","gu-IN","kn-IN","ml-IN","pa-IN","or-IN","ar-SA"], "recommended": True},
+    {
+        "id": "saarika:v2.5", "name": "Saarika v2.5", "provider": "sarvam",
+        "languages": _stt_langs("saarika:v2.5"), "recommended": False,
+    },
+    {
+        "id": "saaras:v3", "name": "Saaras v3", "provider": "sarvam",
+        "languages": _stt_langs("saaras:v3"), "recommended": True,
+    },
 ]
 
 

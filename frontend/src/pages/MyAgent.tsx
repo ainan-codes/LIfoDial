@@ -24,7 +24,7 @@ interface AgentInfo {
   clinic_name: string;
   status: string;
   tts_voice: string;
-  tts_language: string;
+  language: string;
   tts_model: string;
   stt_model: string;
   llm_model: string;
@@ -412,7 +412,7 @@ export default function MyAgent() {
               <StatCard icon={<Clock size={20} />} label="Total Minutes"
                 value={String(totalMinutes)} detail={`₹${(credits?.total_deducted ?? 0).toFixed(2)} spent`} accent="#8B5CF6" />
               <StatCard icon={<Activity size={20} />} label="Agent"
-                value={agent.agent_name} detail={LANG_MAP[agent.tts_language] || agent.tts_language} accent="#F59E0B" />
+                value={agent.agent_name} detail={LANG_MAP[agent.language] || agent.language} accent="#F59E0B" />
             </div>
 
             {/* Two Columns: Voice Config + Recent Calls */}
@@ -449,7 +449,7 @@ export default function MyAgent() {
                       <ConfigRow
                         icon={<Mic size={16} />}
                         label="Language"
-                        value={LANG_MAP[agent.tts_language] || agent.tts_language || '—'}
+                        value={LANG_MAP[agent.language] || agent.language || '—'}
                       />
                     </>
                   )}
@@ -1008,7 +1008,7 @@ function AdvancedTab({
       title: 'Supported Languages',
       icon: Globe,
       rows: [
-        { label: 'Primary',     value: LANG_MAP[agent.tts_language] || agent.tts_language },
+        { label: 'Primary',     value: LANG_MAP[agent.language] || agent.language },
         { label: 'Auto-detect', value: 'Hindi, English, Tamil, Malayalam, Telugu, Kannada, Bengali, Arabic, Marathi' },
         { label: 'Barge-in',    value: 'Enabled (patient can interrupt AI)' },
       ],

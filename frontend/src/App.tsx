@@ -29,7 +29,6 @@ import { RequireSuperAdmin } from './components/superadmin/RequireSuperAdmin';
 const SuperAdminLayout = lazy(() => import('./components/superadmin/SuperAdminLayout'));
 const AgentDetail = lazy(() => import('./pages/superadmin/AgentDetail'));
 const SAAgents = lazy(() => import('./pages/superadmin/Agents'));
-const AIPlatform = lazy(() => import('./pages/superadmin/AIPlatform'));
 const SAAppointments = lazy(() => import('./pages/superadmin/Appointments'));
 const SACalls = lazy(() => import('./pages/superadmin/Calls'));
 const SAClinics = lazy(() => import('./pages/superadmin/Clinics'));
@@ -159,7 +158,6 @@ function App() {
                 <Route path="/superadmin/calls" element={<SACalls />} />
                 <Route path="/superadmin/appointments" element={<SAAppointments />} />
                 <Route path="/superadmin/knowledge" element={<KnowledgeBase />} />
-                <Route path="/superadmin/ai-platform" element={<AIPlatform />} />
                 <Route path="/superadmin/voice-library" element={<VoiceLibrary />} />
               </Route>
             </Route>

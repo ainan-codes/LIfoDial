@@ -1,6 +1,20 @@
 """
 backend/routers/platform.py
-AI Platform configuration: API key management + provider selection.
+Provider catalogue, voice previews and the agent editor's option lists.
+
+The superadmin "Platform" PAGE that this router was originally built for is gone —
+removed as unnecessary configuration surface for the MVP. These ROUTES stay,
+because the rest of the product depends on them: the Voice Library, the voice
+previews, /platform/tts/voices, /platform/stt/languages and
+/platform/agent/config-options are all served from here.
+
+Removing the page also does not change how a live call resolves a provider key.
+That is backend/services/provider_status.py::resolve_provider_key (an active
+ApiKeyConfig row first, then the environment), called directly by the agent
+worker. No frontend route has ever participated in it. What the page's removal DOES
+mean, stated plainly: there is no longer a UI for creating or editing an
+ApiKeyConfig row, so a key that is not in the environment cannot be added without
+one. Every key this deployment uses is in the environment.
 Includes: env-sync, model fetching, TTS preview, voice listing.
 """
 import json
@@ -8,7 +22,7 @@ import logging
 import uuid
 import base64
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Depends, Query, File, UploadFile
 from fastapi.responses import StreamingResponse, Response
@@ -273,9 +287,11 @@ ELEVENLABS_STT_MODELS = ["scribe_v2_realtime", "scribe_v2"]
 # Deepgram STT models. Streaming-capable only — Deepgram's whisper-* models are
 # batch-only and would leave a live call deaf, so they are deliberately absent.
 DEEPGRAM_STT_MODELS = [
-    # nova-3 — English + "multi" (best accuracy, lowest latency)
+    # nova-3 — the ONLY Indic-capable family (hi ta te kn mr bn gu ur), plus
+    # "multi" for code-switching. Verified live against GET /v1/models 2026-08-03.
     "nova-3", "nova-3-general", "nova-3-medical",
-    # nova-2 — the Indic-capable family, plus domain-tuned variants
+    # nova-2 — NOT Indic-capable beyond Hindi: it 400s on ta/te/kn/ml/mr/bn/pa/gu.
+    # Kept because it is real and domain-tuned, not because it is a good default.
     "nova-2", "nova-2-general", "nova-2-meeting", "nova-2-phonecall",
     "nova-2-finance", "nova-2-conversationalai", "nova-2-voicemail",
     "nova-2-video", "nova-2-medical", "nova-2-drivethru", "nova-2-automotive",
@@ -355,19 +371,30 @@ class KeyUpsert(BaseModel):
     display_name: Optional[str] = None
 
 # ── Helper: get raw key for a provider ────────────────────────────────────────
-async def _get_raw_key(provider: str, db: AsyncSession) -> str | None:
-    result = await db.execute(
-        select(ApiKeyConfig).where(ApiKeyConfig.provider == provider, ApiKeyConfig.is_active == True)
-    )
-    rec = result.scalar_one_or_none()
-    if rec:
-        return rec.get_key_raw()
-    # fallback: check all records (not just active)
-    result2 = await db.execute(
-        select(ApiKeyConfig).where(ApiKeyConfig.provider == provider)
-    )
-    rec2 = result2.scalar_one_or_none()
-    return rec2.get_key_raw() if rec2 and rec2.api_key_enc else None
+async def _get_raw_key(provider: str, db: AsyncSession, category: str | None = None) -> str | None:
+    """Effective key for a provider — active DB row first, then the environment.
+
+    Delegates to provider_status.resolve_provider_key so there is ONE definition of
+    "is this provider configured?", shared with the agent worker. The local copy
+    this replaced was subtly different in two ways, both of which were live bugs
+    found by probing the real database on 2026-08-04:
+
+    1. **It raised on any provider with more than one row.** It used
+       ``scalar_one_or_none()`` with no category filter, and ``sarvam`` legitimately
+       has two rows (one ``stt``, one ``tts``), so ``_get_raw_key("sarvam", db)``
+       raised ``MultipleResultsFound`` → HTTP 500 from whichever endpoint asked.
+
+    2. **It never consulted the environment.** So a provider whose DB row was
+       missing or undecryptable reported "no key configured" even with a perfectly
+       good value in ``.env``. That was already wrong; removing the Platform UI
+       makes it worse, because there is no longer any way to repair a bad row.
+       ``deepgram``'s row is exactly that case — its ``fernet:`` value decrypts to
+       an empty string under the current SECRET_KEY, so this function returned None
+       for a provider the pipeline uses on every call.
+    """
+    from backend.services.provider_status import resolve_provider_key
+
+    return await resolve_provider_key(db, provider, category=category)
 
 # ── ENV SYNC (called on startup + via endpoint) ───────────────────────────────
 async def sync_keys_from_env(db: AsyncSession) -> int:
@@ -1269,7 +1296,7 @@ async def tts_preview(
     if provider == "sarvam":
         api_key = os.getenv("SARVAM_API_KEY") or await _get_raw_key("sarvam", db)
         if not api_key:
-            raise HTTPException(400, "Sarvam AI: no API key configured. Add SARVAM_API_KEY in AI Platform → Text-to-Speech.")
+            raise HTTPException(400, "Sarvam AI: no API key configured. Set SARVAM_API_KEY in the environment.")
 
         # Reflect the actually-selected model (was previously hardcoded to
         # bulbul:v3 regardless of the Voice Model dropdown) so "Play Sample"
@@ -1326,7 +1353,7 @@ async def tts_preview(
     # ── All other providers: resolve the configured key, then dispatch ──────────
     raw_key = await _get_raw_key(provider, db)
     if not raw_key:
-        raise HTTPException(400, f"{prov_label}: no API key configured. Add it in AI Platform → Text-to-Speech.")
+        raise HTTPException(400, f"{prov_label}: no API key configured. Set its API key in the environment.")
 
     try:
         async with httpx.AsyncClient(timeout=_TTS_PREVIEW_TIMEOUT) as client:
@@ -1494,7 +1521,7 @@ async def transcribe_audio(
             api_key = await _get_raw_key("sarvam", s)
 
     if not api_key:
-        raise HTTPException(status_code=400, detail="No Sarvam API key configured. Add one under AI Platform → Speech-to-Text.")
+        raise HTTPException(status_code=400, detail="No Sarvam API key configured. Set SARVAM_API_KEY in the environment.")
 
     audio_bytes = await audio_file.read()
     
@@ -1570,6 +1597,208 @@ async def get_models_for_provider(
     return {"provider": provider, "category": category, "models": [], "source": "unknown"}
 
 
+# ── GET /platform/stt/languages/{provider} ────────────────────────────────────
+# Serves the Transcriber Language dropdown. Mirrors /platform/tts/voices/{provider}
+# exactly: the frontend re-fetches whenever the provider OR model changes, so the
+# option list can never describe a provider other than the selected one.
+#
+# Deepgram is the one STT provider with a real live "list supported languages"
+# API (GET /v1/models returns a `languages` array per model plus a code -> display
+# name dict), so it is fetched live and the catalogue is only the offline
+# fallback. Every other provider has no such endpoint — verified, see
+# backend/services/stt_catalog.py — so it is served from that catalogue, which is
+# the single place to change when a provider's support changes.
+
+_DG_LANG_CACHE: dict[str, object] = {"data": None, "expires": None}
+
+
+async def _deepgram_live_languages(api_key: str) -> dict[str, list[str]] | None:
+    """``{canonical_model_name: [language codes]}`` plus ``__names__``, or None.
+
+    Cached for an hour: this is dropdown-population traffic, and Deepgram's
+    catalogue changes on the order of weeks.
+    """
+    now = datetime.now(timezone.utc)
+    exp = _DG_LANG_CACHE.get("expires")
+    if _DG_LANG_CACHE.get("data") and exp and now < exp:  # type: ignore[operator]
+        return _DG_LANG_CACHE["data"]  # type: ignore[return-value]
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                "https://api.deepgram.com/v1/models",
+                headers={"Authorization": f"Token {api_key}"},
+            )
+            r.raise_for_status()
+            payload = r.json()
+    except Exception as e:
+        logger.warning("Deepgram /v1/models fetch failed (%s) — using offline catalogue", e)
+        return None
+
+    by_model: dict[str, list[str]] = {}
+    for m in payload.get("stt", []) or []:
+        name = m.get("canonical_name") or m.get("name") or ""
+        if not name:
+            continue
+        seen = set(by_model.get(name, ()))
+        seen.update(m.get("languages") or [])
+        by_model[name] = sorted(seen)
+    by_model["__names__"] = payload.get("languages", {}) or {}  # type: ignore[assignment]
+    _DG_LANG_CACHE.update(
+        {"data": by_model, "expires": now + timedelta(hours=1)}
+    )
+    return by_model
+
+
+def _deepgram_model_key(model: str | None, available: dict) -> str | None:
+    """Map a stored model id ('nova-3') onto a canonical name ('nova-3-general')."""
+    m = (model or "nova-3").strip() or "nova-3"
+    for candidate in (m, f"{m}-general", f"{m}-general".replace("--", "-")):
+        if candidate in available:
+            return candidate
+    # Longest-prefix match, so 'nova-3-phonecall' still resolves to something real.
+    matches = [k for k in available if k != "__names__" and k.startswith(m)]
+    return sorted(matches, key=len)[0] if matches else None
+
+
+@router.get("/platform/stt/languages/{provider}")
+async def stt_languages(
+    provider: str,
+    model: Optional[str] = Query(default=None),
+    user: CurrentUser = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Real, currently-supported transcription languages for one STT provider.
+
+    Every ``code`` returned is a value that is safe to STORE in
+    ``agent_configs.stt_language``: short, real, and accepted by this provider.
+    The first entry is always auto-detect. A description label is never a code —
+    that was the ``varchar(20)`` truncation bug this endpoint exists to make
+    impossible.
+    """
+    from backend.services import stt_catalog
+
+    prov = (provider or "").strip().lower()
+    spec = stt_catalog.spec_for(prov)
+    known = prov in stt_catalog.STT_PROVIDERS
+
+    # ── Deepgram: live from the provider's own API ─────────────────────────────
+    if prov == "deepgram":
+        raw_key = await _get_raw_key("deepgram", db)
+        live = await _deepgram_live_languages(raw_key) if raw_key else None
+        if live:
+            names: dict = live.get("__names__", {})  # type: ignore[assignment]
+            key = _deepgram_model_key(model, live)
+            native = set(live.get(key, [])) if key else set()
+            options = [{"code": stt_catalog.AUTO, "name": spec.auto_label}]
+            for ours, dg in stt_catalog.DEEPGRAM_LANG_MAP.items():
+                base = dg.split("-")[0]
+                if dg in native or base in native:
+                    options.append({
+                        "code": ours,
+                        "name": names.get(dg) or names.get(base) or stt_catalog.language_name(ours),
+                    })
+            # Non-Indic codes Deepgram serves natively and we store verbatim.
+            for extra in ("en-US", "en-GB", "ar-SA"):
+                if extra in native and all(o["code"] != extra for o in options):
+                    options.append({
+                        "code": extra,
+                        "name": names.get(extra) or stt_catalog.language_name(extra),
+                    })
+            return {
+                "provider": prov,
+                "model": key or model,
+                "source": "live",
+                "has_key": True,
+                "languages": options,
+                "note": spec.note,
+            }
+
+    # ── Everything else: the catalogue ─────────────────────────────────────────
+    raw_key = await _get_raw_key(prov, db)
+    return {
+        "provider": prov,
+        "model": model,
+        "source": "static" if known else "unknown-provider",
+        "has_key": bool(raw_key),
+        "languages": stt_catalog.stt_language_options(prov, model),
+        "note": spec.note,
+    }
+
+
+# ── GET /platform/agent/config-options ────────────────────────────────────────
+# Everything the agent editor's Transcriber and Voice sections need, in ONE
+# response: which providers may be offered, which models each really has, the
+# language list, and whether the currently-selected combination actually works.
+#
+# One endpoint rather than four, because the four answers are not independent —
+# the language list depends on the TTS provider, and the per-language warnings
+# depend on the STT provider AND model. Serving them separately is what let the
+# old UI render a language list from one vendor's catalogue while the agent ran on
+# another's, which is the shape of the original four-way mismatch.
+#
+# Deliberately NOT sourced from `PROVIDERS` in this module: that catalogue is
+# aspirational (it lists providers the product would like to support), which is
+# why the old dropdowns offered ElevenLabs, Whisper, PlayHT and Azure alongside
+# the two that work. The whitelist lives in backend/services/agent_defaults.py.
+@router.get("/platform/agent/config-options")
+async def agent_config_options(
+    stt_provider: Optional[str] = Query(default=None),
+    stt_model: Optional[str] = Query(default=None),
+    tts_provider: Optional[str] = Query(default=None),
+    tts_model: Optional[str] = Query(default=None),
+    language: Optional[str] = Query(default=None),
+    user: CurrentUser = None,
+):
+    from backend.services import agent_defaults
+
+    stt_prov, stt_mdl = agent_defaults.normalize_provider_choice("stt", stt_provider, stt_model)
+    tts_prov, tts_mdl = agent_defaults.normalize_provider_choice("tts", tts_provider, tts_model)
+
+    # Every language the SELECTED TTS provider can speak, each annotated with
+    # whether the SELECTED transcriber can hear it. Unhearable languages stay in
+    # the list — the pipeline substitutes Sarvam and the call works — but they
+    # carry the warning that says so, so the operator chooses with the trade-off
+    # visible instead of discovering it on a live call.
+    languages = []
+    for lang in agent_defaults.supported_languages(tts_prov):
+        support = agent_defaults.language_support(
+            lang["code"], stt_provider=stt_prov, stt_model=stt_mdl, tts_provider=tts_prov
+        )
+        languages.append({
+            "code": lang["code"],
+            "name": lang["name"],
+            "stt_ok": support["stt_ok"],
+            "realtime": support["realtime"],
+            "stt_runtime_provider": support["stt_runtime_provider"],
+            "warnings": support["warnings"],
+            "errors": support["errors"],
+        })
+
+    return {
+        "stt": {
+            "providers": agent_defaults.selectable_providers("stt"),
+            "provider": stt_prov,
+            "models": agent_defaults.models_for("stt", stt_prov),
+            "model": stt_mdl,
+        },
+        "tts": {
+            "providers": agent_defaults.selectable_providers("tts"),
+            "provider": tts_prov,
+            "models": agent_defaults.models_for("tts", tts_prov),
+            "model": tts_mdl,
+        },
+        "languages": languages,
+        # The compatibility verdict for what is currently configured, so the editor
+        # can show one clear line instead of making the UI re-derive it.
+        "selected": agent_defaults.language_support(
+            language or agent_defaults.DEFAULT_LANGUAGE,
+            stt_provider=stt_prov,
+            stt_model=stt_mdl,
+            tts_provider=tts_prov,
+        ),
+    }
+
+
 # ── GET /platform/env-status — show which .env keys are configured ───────────
 @router.get("/platform/env-status")
 async def env_status(user: SuperAdmin = None):
@@ -1612,7 +1841,9 @@ async def sarvam_languages(user: CurrentUser = None):
             {"code": "bn-IN", "name": "Bengali",          "script": "\u09ac\u09be\u0982\u09b2\u09be",       "default_speaker": "rohan"},
             {"code": "gu-IN", "name": "Gujarati",         "script": "\u0a97\u0ac1\u0a9c\u0ab0\u0abe\u0aa4\u0ac0",     "default_speaker": "amit"},
             {"code": "pa-IN", "name": "Punjabi",          "script": "\u0a2a\u0a70\u0a1c\u0a3e\u0a2c\u0a40",       "default_speaker": "simran"},
-            {"code": "or-IN", "name": "Odia",             "script": "\u0b13\u0b21\u0b3c\u0b3f\u0b06",       "default_speaker": "ritu"},
+            # od-IN, NOT or-IN: "or-IN" is not one of the 24 codes Sarvam STT
+            # accepts (verified live 2026-08-03), so this row never worked.
+            {"code": "od-IN", "name": "Odia",             "script": "\u0b13\u0b21\u0b3c\u0b3f\u0b06",       "default_speaker": "ritu"},
             {"code": "unknown","name": "Auto-detect",     "script": "Auto",           "default_speaker": "shreya"},
         ]
     }

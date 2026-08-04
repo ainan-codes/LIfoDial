@@ -390,7 +390,7 @@ export default function SAAgents() {
         const mapped = data.map((a: any) => ({
           ...a,
           name: a.agent_name || a.name || 'AI Receptionist',
-          languages: a.tts_language ? [a.tts_language.split('-')[0].toUpperCase()] : ['EN'],
+          languages: a.language ? [a.language.split('-')[0].toUpperCase()] : ['EN'],
           // Stats: default 0, will be loaded individually via health API
           calls_today: 0,
           bookings_today: 0,

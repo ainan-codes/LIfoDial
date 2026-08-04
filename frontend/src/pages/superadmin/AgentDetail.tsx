@@ -1,5 +1,4 @@
 import {
-  Activity,
   AlertTriangle,
   Brain,
   CheckCircle2,
@@ -19,6 +18,10 @@ import {
 import React, { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import fetchWithAuth, { API_URL } from '../../api/client';
+import {
+  DEFAULT_LANGUAGE, DEFAULT_STT_MODEL, DEFAULT_STT_PROVIDER,
+  DEFAULT_TTS_MODEL, DEFAULT_TTS_PROVIDER,
+} from '../../api/lockedDefaults';
 import { getToken } from '../../api/auth';
 // Lazy: pulls in the LiveKit/WebRTC client stack (~526kB alone, the single
 // largest chunk in the app) — only needed when Test Agent is opened.
@@ -336,18 +339,11 @@ const CollapsibleSection = ({ icon: Icon, title, summary, children }: any) => {
 
 // ── Main Page ────────────────────────────────────────────────────────────────
 
-function getLlmFallbackModels(provider: string): string[] {
-  const map: Record<string, string[]> = {
-    gemini: ['gemini-2.5-flash', 'gemini-2.5-flash-8b', 'gemini-2.0-flash', 'gemini-1.5-pro'],
-    openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'o3-mini'],
-    anthropic: ['claude-sonnet-4-5', 'claude-haiku-4-5', 'claude-3-5-sonnet-20241022', 'claude-3-haiku-20240307'],
-    groq: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'gemma2-9b-it', 'deepseek-r1-distill-llama-70b', 'compound-beta-mini'],
-    deepseek: ['deepseek-chat', 'deepseek-reasoner'],
-    mistral: ['mistral-large-latest', 'mistral-small-latest', 'open-mistral-nemo'],
-    cerebras: ['llama-3.3-70b', 'llama3.1-8b'],
-  };
-  return map[provider] || ['gemini-2.5-flash'];
-}
+// getLlmFallbackModels was removed with the LLM Model dropdown. It listed
+// gemini-2.5-flash-8b among Gemini's models, which is also the exact string one
+// live agent had stored against provider 'groq' — Groq answers 404 for it. A
+// per-provider model catalogue on the client is precisely the affordance that let
+// that pair be assembled, so it is not being kept "just in case".
 
 export default function AgentDetail() {
   const { agentId } = useParams();
@@ -440,30 +436,33 @@ export default function AgentDetail() {
   // Voice picker modal
   const [showVoiceModal, setShowVoiceModal] = useState(false);
 
-  // Dynamic model lists
-  const [llmModels, setLlmModels] = useState<string[]>([]);
-  const [ttsModels, setTtsModels] = useState<string[]>([]);
+  // Label for THE one language, e.g. "Malayalam (ml-IN)". Falls back to the bare
+  // code until the catalogue arrives, so this never renders blank.
+  //
+  // Reads the raw catalogue rather than the dropdown's option labels: those carry
+  // an inline "— transcribed by Sarvam AI" caveat, which belongs in the picker but
+  // not in a section header.
+  const languageLabel = (code?: string) => {
+    if (!code) return '—';
+    const hit = (cfgOptions?.languages || []).find((l: any) => l.code === code);
+    return hit ? `${hit.name} (${hit.code})` : code;
+  };
+
   const [ttsVoices, setTtsVoices] = useState<any[]>([]);
   const [ttsLanguages, setTtsLanguages] = useState<{ value: string; label: string }[]>([]);
-  const [sttModels, setSttModels] = useState<string[]>([]);
 
-  // Phase B — providers that actually have a key configured. The provider
-  // dropdowns show ONLY these (never a hardcoded catalog), and if the agent is
-  // currently assigned to a provider that's no longer configured we warn rather
-  // than silently keep a dead selection.
-  const [configuredProviders, setConfiguredProviders] = useState<Record<string, { id: string; display_name: string }[]>>({});
-  useEffect(() => {
-    fetchWithAuth('/platform/configured-providers').then(setConfiguredProviders).catch(() => {});
-  }, []);
-  const configuredIds = (cat: string) => (configuredProviders[cat] || []).map(p => p.id);
-  // Options = configured providers, plus the agent's current value if it's set
-  // (so the current selection is always visible even when its key was removed).
-  const providerOptions = (cat: string, current?: string) => {
-    const ids = configuredIds(cat);
-    return current && !ids.includes(current) ? [current, ...ids] : (ids.length ? ids : (current ? [current] : []));
-  };
-  const isDeadProvider = (cat: string, current?: string) =>
-    !!current && Object.keys(configuredProviders).length > 0 && !configuredIds(cat).includes(current);
+  // Everything the Transcriber and Voice sections offer, from ONE backend call:
+  // the selectable providers, each provider's real models, the language list, and
+  // whether the currently-configured combination genuinely works.
+  //
+  // The LLM provider/model dropdowns are NOT here and are not coming back — the
+  // LLM is locked platform-wide (backend/services/agent_defaults.py). STT and TTS
+  // provider/model ARE here: switching provider is the product's fallback story
+  // when a vendor degrades, so the choice stays. What changed is that the option
+  // list is a whitelist of providers that are genuinely configured and buildable,
+  // instead of the aspirational /platform PROVIDERS catalogue that used to offer
+  // ElevenLabs, Whisper, PlayHT and Azure alongside the two that work.
+  const [cfgOptions, setCfgOptions] = useState<any>(null);
 
   const loadAgent = useCallback(async () => {
     setLoading(true);
@@ -509,91 +508,63 @@ export default function AgentDetail() {
     }
   }, [agentId]);
 
-  // Fetch models when provider changes.
-  // The model catalogue is a SUGGESTION list, not an allow-list: whatever is
-  // already configured stays selected and stays selectable, so a model the
-  // catalogue happens not to list is never silently replaced (and never
-  // auto-saved over). Only an EMPTY model gets filled in. See the matching
-  // comment on the STT effect below for the incident this prevents.
-  const mergeCurrent = (current: string | undefined, catalogue: string[]) => {
-    const c = (current || '').trim();
-    return c && !catalogue.includes(c) ? [c, ...catalogue] : catalogue;
-  };
+  // Voice list, from the agent's SELECTED TTS provider/model.
+  //
+  // Falls back to the platform default while the agent row is still loading, so
+  // the picker is never populated from a vendor the agent is not on — reading a
+  // provider off a stale row is how a voice list could describe one vendor while
+  // the call ran on another.
+  const ttsProvider = agent?.tts_provider || DEFAULT_TTS_PROVIDER;
+  const ttsModel = agent?.tts_model || DEFAULT_TTS_MODEL;
 
   useEffect(() => {
-    if (!agent?.llm_provider) return;
-    const apply = (catalogue: string[]) => {
-      setLlmModels(mergeCurrent(agent.llm_model, catalogue));
-      if (!(agent.llm_model || '').trim() && catalogue.length) {
-        updateField('llm_model', catalogue[0]);
-      }
-    };
-    fetchWithAuth(`/platform/models/${agent.llm_provider}`)
-      .then(d => apply(d.models?.length ? d.models : getLlmFallbackModels(agent.llm_provider)))
-      .catch(() => apply(getLlmFallbackModels(agent.llm_provider)));
-  }, [agent?.llm_provider]);
-
-  useEffect(() => {
-    if (!agent?.tts_provider) return;
-    fetchWithAuth(`/platform/models/${agent.tts_provider}?category=tts`)
+    fetchWithAuth(`/platform/tts/voices/${ttsProvider}?model=${encodeURIComponent(ttsModel)}`)
       .then(d => {
-        const catalogue: string[] = d.models?.length ? d.models : [];
-        setTtsModels(mergeCurrent(agent.tts_model, catalogue));
-        if (!(agent.tts_model || '').trim() && catalogue.length) {
-          updateField('tts_model', catalogue[0]);
-        }
-      })
-      .catch(() => setTtsModels(agent.tts_model ? [agent.tts_model] : []));
-  }, [agent?.tts_provider]);
-
-  useEffect(() => {
-    if (!agent?.tts_provider) return;
-    // Pass model as a filter param so the dropdown only shows voices for the selected model
-    const modelParam = agent.tts_model ? `?model=${encodeURIComponent(agent.tts_model)}` : '';
-    fetchWithAuth(`/platform/tts/voices/${agent.tts_provider}${modelParam}`)
-      .then(d => {
-        if (d.voices && Array.isArray(d.voices)) {
-          const mapped = d.voices.map((v: any) => ({
-            value: v.voice_id || v.id || v.name,
-            label: `${v.name} (${v.language || v.gender || 'Unknown'})`
-          }));
-          setTtsVoices(mapped);
-        } else {
-          setTtsVoices([]);
-        }
-        // Same payload, same list the Voice Library builds its filter from, so
-        // a language can never be pickable in one place and missing in the other.
-        const langs = Array.isArray(d.languages) ? d.languages : [];
-        setTtsLanguages(langs.map((l: any) => ({
-          value: String(l.code), label: `${l.name || l.code} (${l.code})`
+        const voices = Array.isArray(d.voices) ? d.voices : [];
+        // NO language suffix in the label. Sarvam's speakers are
+        // language-agnostic — every bulbul voice renders every one of its
+        // languages — so the old `(${v.language})` tag was a second, independent
+        // language display AND factually wrong: it labelled shruti "hi-IN" while
+        // shruti speaks Malayalam correctly. That tag is what made the stakeholder's
+        // Voice field disagree with the Language field beside it.
+        setTtsVoices(voices.map((v: any) => ({
+          value: v.voice_id || v.id || v.name,
+          label: v.gender ? `${v.name} · ${v.gender}` : v.name,
         })));
       })
-      .catch(() => { setTtsVoices([]); setTtsLanguages([]); });
-  // Re-fetch any time provider OR model changes
-  }, [agent?.tts_provider, agent?.tts_model]);
+      .catch(() => { setTtsVoices([]); });
+  }, [ttsProvider, ttsModel]);
+
+  // Provider/model/language options + the compatibility verdict. Re-fetched
+  // whenever any input to that verdict changes, so the warning under the Language
+  // field can never describe a provider other than the selected one.
+  //
+  // The LANGUAGE list comes from here rather than from the voices payload because
+  // it now carries per-language STT support flags, which depend on the transcriber
+  // — a fact the TTS endpoint has no way to know.
+  const sttProvider = agent?.stt_provider || DEFAULT_STT_PROVIDER;
+  const sttModel = agent?.stt_model || DEFAULT_STT_MODEL;
 
   useEffect(() => {
-    if (!agent?.stt_provider) return;
-    fetchWithAuth(`/platform/models/${agent.stt_provider}?category=stt`)
+    const q = new URLSearchParams({
+      stt_provider: sttProvider, stt_model: sttModel,
+      tts_provider: ttsProvider, tts_model: ttsModel,
+      language: agent?.language || DEFAULT_LANGUAGE,
+    });
+    fetchWithAuth(`/platform/agent/config-options?${q}`)
       .then(d => {
-        const catalogue: string[] = d.models?.length ? d.models : [];
-        const current = (agent.stt_model || '').trim();
-        // The catalogue is a SUGGESTION list, not an allow-list. Keep whatever is
-        // already configured as a selectable option so a model we don't happen to
-        // list — a new Deepgram tier, a private Sarvam build — is never silently
-        // replaced. This used to do
-        //     if (!models.includes(agent.stt_model)) updateField('stt_model', models[0])
-        // and auto-save, which is how simply selecting Deepgram overwrote a
-        // working nova-3 config with nova-2 (nova-3 wasn't in the catalogue at
-        // the time) and left the agent unable to hear Indian callers.
-        setSttModels(mergeCurrent(current, catalogue));
-        // Only fill in a model when there is genuinely none — never replace one.
-        if (!current && catalogue.length) {
-          updateField('stt_model', catalogue[0]);
-        }
+        setCfgOptions(d);
+        const langs = Array.isArray(d?.languages) ? d.languages : [];
+        // The label carries the honest caveat inline, so an operator scanning the
+        // dropdown sees which languages the selected transcriber cannot actually
+        // hear before choosing one — not afterwards, on a live call.
+        setTtsLanguages(langs.map((l: any) => ({
+          value: String(l.code),
+          label: `${l.name || l.code} (${l.code})${l.stt_ok ? '' : ' — transcribed by Sarvam AI'}`,
+        })));
       })
-      .catch(() => setSttModels(agent.stt_model ? [agent.stt_model] : []));
-  }, [agent?.stt_provider]);
+      .catch(() => { setCfgOptions(null); setTtsLanguages([]); });
+  }, [sttProvider, sttModel, ttsProvider, ttsModel, agent?.language]);
 
   const updateField = useCallback((key: string, val: any) => {
     setAgent(prev => {
@@ -647,6 +618,37 @@ export default function AgentDetail() {
       return next;
     });
   }, [agentId]);
+
+  // Provider/model changes save IMMEDIATELY and then re-read the row, unlike every
+  // other field's 1.5s debounce-and-assume.
+  //
+  // Two reasons, both about not showing the operator something untrue:
+  //   * the backend may legitimately change MORE than what was sent — switching
+  //     transcriber to Sarvam AI makes 'nova-3' meaningless, and switching voice
+  //     model to bulbul:v2 invalidates a v3-only speaker. Optimistic local state
+  //     would leave a model in the box that the row does not hold.
+  //   * these are the fields whose disagreement with the row was the original bug.
+  //     Reading back what was actually stored is the cheap way to guarantee the UI
+  //     and the DB agree.
+  const changeProviderOrModel = useCallback(async (updates: Record<string, any>) => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    setSaveStatus('saving');
+    setAgent((prev: any) => ({ ...prev, ...updates }));
+    try {
+      await fetchWithAuth(`/agents/${agentId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(updates),
+      });
+      await loadAgent();
+      setSaveStatus('saved');
+      setTimeout(() => setSaveStatus(null), 3000);
+    } catch {
+      setSaveStatus('error');
+      // Re-read so a rejected change (e.g. a language the new provider cannot
+      // speak) does not linger in the UI as if it had been accepted.
+      loadAgent();
+    }
+  }, [agentId, loadAgent]);
 
   const handleGeneratePrompt = useCallback(async () => {
     if (generatingPrompt) return; // debounce: ignore clicks while one is in flight
@@ -863,13 +865,60 @@ export default function AgentDetail() {
   };
 
   // Button handler: toggle between playing and idle.
+  //
+  // The PRIMARY preview is the agent's real first message, so what an admin hears
+  // is literally what a caller hears when the agent picks up — not a generic
+  // demo sentence that happens to be in the right language. The generic sentence
+  // is still reachable (second button) because it is the right tool for auditioning
+  // a voice, and it is the only option when no greeting has been written yet.
   const toggleSamplePlayback = () => {
     if (samplePlayer === 'playing') {
       stopAudio();
     } else {
-      playTTSPreview();
+      playTTSPreview({ text: (agent?.first_message || '').trim() || undefined });
     }
   };
+
+  const previewFirstMessage = Boolean((agent?.first_message || '').trim());
+
+  // Does the first message appear to be WRITTEN in the configured language?
+  //
+  // Detected from the Unicode block the text actually uses, which is decisive for
+  // Indian languages: each has its own block, so this is a fact about the string,
+  // not a guess. Latin text is deliberately not flagged — an Indian clinic greeting
+  // routinely mixes in Latin ("KMCT", "aster clinic kochi"), and English is a
+  // legitimate greeting for any agent.
+  const greetingScriptWarning = (() => {
+    const text = (agent?.first_message || '').trim();
+    const lang = agent?.language || '';
+    if (!text || !lang) return null;
+
+    const SCRIPTS: Record<string, { re: RegExp; langs: string[] }> = {
+      Devanagari: { re: /[ऀ-ॿ]/, langs: ['hi-IN', 'mr-IN'] },
+      Bengali:    { re: /[ঀ-৿]/, langs: ['bn-IN', 'as-IN'] },
+      Gurmukhi:   { re: /[਀-੿]/, langs: ['pa-IN'] },
+      Gujarati:   { re: /[઀-૿]/, langs: ['gu-IN'] },
+      Odia:       { re: /[଀-୿]/, langs: ['od-IN', 'or-IN'] },
+      Tamil:      { re: /[஀-௿]/, langs: ['ta-IN'] },
+      Telugu:     { re: /[ఀ-౿]/, langs: ['te-IN'] },
+      Kannada:    { re: /[ಀ-೿]/, langs: ['kn-IN'] },
+      Malayalam:  { re: /[ഀ-ൿ]/, langs: ['ml-IN'] },
+      Arabic:     { re: /[؀-ۿ]/, langs: ['ar-SA', 'ur-IN'] },
+    };
+
+    const found = Object.entries(SCRIPTS).filter(([, v]) => v.re.test(text));
+    if (!found.length) return null;                       // Latin only — fine.
+    if (found.some(([, v]) => v.langs.includes(lang))) return null;  // Agrees.
+
+    const scriptNames = found.map(([name]) => name).join(' and ');
+    return (
+      `The first message is written in ${scriptNames} script, but this agent's ` +
+      `language is ${languageLabel(lang)}. The voice will read it with ` +
+      `${languageLabel(lang)} pronunciation, which will sound wrong. Press ` +
+      `Play First Message to hear it, then either rewrite the greeting or change ` +
+      `the language.`
+    );
+  })();
 
   const playTTSPreview = async (overrideParams?: { provider?: string; voice_id?: string; model?: string; language?: string; text?: string }) => {
     stopAudio();
@@ -877,13 +926,12 @@ export default function AgentDetail() {
     const prov = overrideParams?.provider || agent?.tts_provider || 'sarvam';
     const voice = overrideParams?.voice_id || agent?.tts_voice || 'meera';
     const mdl = overrideParams?.model || agent?.tts_model || '';
-    const lang = overrideParams?.language || agent?.tts_language || 'hi-IN';
-    // Only an explicit override supplies text (the STT-provider announcements and
-    // chat playback below). Otherwise the backend picks a sentence written in
-    // `lang`, so Play Sample follows the Language dropdown beside it. It used to
-    // fall back to the agent's own greeting, which ignored that dropdown
-    // entirely — switching to Malayalam changed the language code and left the
-    // words in Hindi/English.
+    const lang = overrideParams?.language || agent?.language || 'en-IN';
+    // With no `text`, the backend picks a neutral sentence written in `lang`, so the
+    // preview follows the Language dropdown. Callers that want to hear the agent's
+    // OWN words pass the first message explicitly (see toggleSamplePlayback) —
+    // deliberately as an override rather than as a silent default here, because the
+    // chat-playback and voice-picker callers below want the neutral sentence.
     const txt = overrideParams?.text;
 
     setSampleError(null);
@@ -1159,27 +1207,17 @@ export default function AgentDetail() {
             {/* ══ ASSISTANT SECTION ════════════════════════════════════════════ */}
             <div ref={el => { sectionRefs.current.assistant = el; }} data-section="assistant">
             {/* 1. MODEL */}
-            <CollapsibleSection icon={Brain} title="Model" summary={`${agent.llm_provider} · ${agent.llm_model}`}>
-              {isDeadProvider('llm', agent.llm_provider) && (
-                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '12px 14px', marginBottom: '16px', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)', borderRadius: '10px' }}>
-                  <AlertTriangle size={16} color="#f59e0b" style={{ flexShrink: 0 }} />
-                  <span style={{ fontSize: '13px', color: '#f59e0b' }}>
-                    This agent uses <strong>{agent.llm_provider}</strong>, which is no longer configured in AI Platform. Add its key or pick a configured provider — calls will fall back until then.
-                  </span>
-                </div>
-              )}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                  <div>
-                    <Label>Provider</Label>
-                    <Select value={agent.llm_provider} onChange={(v:any) => updateField('llm_provider', v)} options={providerOptions('llm', agent.llm_provider)} />
-                  </div>
-                  <div>
-                    <Label>Model</Label>
-                    <Select value={agent.llm_model} onChange={(v:any) => updateField('llm_model', v)} options={llmModels.length ? llmModels : [agent.llm_model || 'gemini-2.5-flash']} />
-                    <Helper>Models are auto-fetched from your API key. <span style={{color: ACCENT, cursor:'pointer', fontSize:'11px'}} onClick={() => { fetchWithAuth(`/platform/providers/${agent.llm_provider}/fetch-models`, {method:'POST'}).then(d=>{if(d.models?.length) setLlmModels(d.models)}); }}>⟳ Refresh Models</span></Helper>
-                  </div>
-                </div>
+            {/* LLM Provider + Model dropdowns REMOVED — the platform locks one
+                known-working combination (see backend/services/agent_defaults.py).
+                They were a real source of breakage, not just clutter: one live
+                agent had llm_provider='groq' with llm_model='gemini-2.5-flash-8b',
+                which Groq answers 404 for. Nothing here replaces them; the
+                backend applies the locked pair on every write. */}
+            <CollapsibleSection icon={Brain} title="Model" summary={agent.agent_name || 'Assistant'}>
+              {/* Was a two-column grid: Provider/Model on the left, First Message
+                  on the right. With the left column gone, one column is all that
+                  is left to lay out — kept as a grid so nothing else here moved. */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '24px' }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                   <div>
                     <Label>First Message Mode</Label>
@@ -1309,14 +1347,18 @@ export default function AgentDetail() {
             </CollapsibleSection>
 
             {/* 2. VOICE CONFIGURATION */}
-            <CollapsibleSection icon={Mic} title="Voice Configuration" summary={`${agent.tts_provider} · ${agent.tts_voice} · ${agent.tts_language}`}>
+            <CollapsibleSection icon={Mic} title="Voice & Language" summary={`${agent.tts_voice} · ${languageLabel(agent.language)}`}>
                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255,255,255,0.02)', padding: '16px', borderRadius: '12px', border: `1px solid ${BORDER}` }}>
                  <div>
                     <div style={{ fontSize: '11px', fontWeight: 700, color: ACCENT, letterSpacing: '0.05em', marginBottom: '4px' }}>SELECTED VOICE</div>
+                    {/* Reads `agent.language` — THE one field. This header used to
+                        render tts_language while the Voice field below rendered the
+                        catalog's per-voice tag and the test widget rendered
+                        stt_language, which is how one agent displayed Malayalam,
+                        Hindi and Tamil simultaneously. */}
                     <div style={{ fontSize: '16px', fontWeight: 600, color: '#fff', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                       {agent.tts_voice} · {agent.tts_language}
+                       {agent.tts_voice} · {languageLabel(agent.language)}
                     </div>
-                    <div style={{ fontSize: '13px', color: 'rgba(255,255,255,0.45)', marginTop: '4px' }}>{agent.tts_provider} · {agent.tts_model}</div>
                  </div>
                  <button
                    onClick={() => setShowVoiceModal(true)}
@@ -1329,54 +1371,102 @@ export default function AgentDetail() {
                  </button>
                </div>
 
+              {/* Voice provider + model. Options come from the backend whitelist
+                  (agent_defaults.SELECTABLE_TTS_PROVIDERS), not from the
+                  aspirational /platform PROVIDERS catalogue these used to read —
+                  that is what offered ElevenLabs and PlayHT, neither of which could
+                  run a call. Today the whitelist has exactly one entry, so this
+                  renders one option; that is the honest state of the platform, not
+                  a placeholder. */}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px', marginTop: '8px' }}>
                 <div>
-                  <Label>Provider</Label>
-                  <Select value={agent.tts_provider} onChange={(v:any) => {
-                    updateField('tts_provider', v);
-                  }} options={[
-                    { value: 'sarvam', label: 'Sarvam AI' },
-                    { value: 'elevenlabs', label: 'ElevenLabs' },
-                    { value: 'openai_tts', label: 'OpenAI TTS' }
-                  ]} />
+                  <Label>Voice Provider</Label>
+                  <Select
+                    value={ttsProvider}
+                    onChange={(v:any) => changeProviderOrModel({ tts_provider: v, tts_model: '' })}
+                    options={(cfgOptions?.tts?.providers || []).map((p:any) => ({ value: p.id, label: p.name }))}
+                  />
+                  <Helper>Only providers with a working key and a live pipeline branch are listed.</Helper>
                 </div>
+                <div>
+                  <Label>Voice Model</Label>
+                  <Select
+                    value={ttsModel}
+                    onChange={(v:any) => changeProviderOrModel({ tts_model: v })}
+                    options={cfgOptions?.tts?.models || [ttsModel]}
+                  />
+                  {/* bulbul:v2's speakers are a different roster from v3's, and an
+                      unmatched (speaker, model) pair is a Sarvam 400 — an agent that
+                      answers with silence. The backend repairs the voice on save
+                      rather than letting that ship. */}
+                  <Helper>Changing this may reset the voice, since each model has its own speakers.</Helper>
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px', marginTop: '8px' }}>
                 <div>
                   <Label>Voice</Label>
                   {ttsVoices.length > 0 ? (
-                    <Select 
-                       value={agent.tts_voice} 
+                    <Select
+                       value={agent.tts_voice}
                        onChange={(v:any) => {
                          updateField('tts_voice', v);
-                       }} 
-                       options={ttsVoices} 
+                       }}
+                       options={ttsVoices}
                     />
                   ) : (
                     <Input value={agent.tts_voice} onChange={(v:any) => {
                       updateField('tts_voice', v);
                     }} />
                   )}
-                </div>
-                <div>
-                  <Label>Voice Model</Label>
-                  <Select value={agent.tts_model} onChange={(v:any) => {
-                    updateField('tts_model', v);
-                  }} options={ttsModels.length ? ttsModels : [agent.tts_model || 'bulbul:v3']} />
+                  {/* No per-voice language tag here any more — see the ttsVoices
+                      effect. Sarvam's speakers are language-agnostic, so the old
+                      "(hi-IN)" suffix was both a second language display AND
+                      factually wrong: shruti speaks Malayalam perfectly. */}
+                  <Helper>Every voice speaks the language selected below.</Helper>
                 </div>
                 <div>
                   <Label>Language</Label>
+                  {/* THE one language field. Writes `language`; the backend derives
+                      the STT and TTS values from it. */}
                   {ttsLanguages.length > 0 ? (
                     <Select
-                      value={agent.tts_language}
-                      onChange={(v:any) => updateField('tts_language', v)}
+                      value={agent.language}
+                      onChange={(v:any) => updateField('language', v)}
                       options={ttsLanguages}
                     />
                   ) : (
-                    // Providers that publish no language catalogue (ElevenLabs,
-                    // OpenAI TTS) keep the free-text field they had.
-                    <Input value={agent.tts_language} onChange={(v:any) => updateField('tts_language', v)} />
+                    <Select
+                      value={agent.language}
+                      onChange={(v:any) => updateField('language', v)}
+                      options={[agent.language || 'en-IN']}
+                    />
                   )}
+                  <Helper>Sets what the agent hears, speaks and replies in.</Helper>
                 </div>
               </div>
+
+              {/* The honesty requirement, rendered. A language whose transcriber
+                  cannot hear it still WORKS — the pipeline swaps in Sarvam — but the
+                  swap must not be silent, because "silently ran on a provider that
+                  could not handle the configured language" is the failure this
+                  whole change exists to end. Errors are red because they mean the
+                  agent genuinely cannot function; warnings are amber because the
+                  call works with a real trade-off. */}
+              {(cfgOptions?.selected?.errors?.length || cfgOptions?.selected?.warnings?.length) ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  {(cfgOptions.selected.errors || []).map((m: string) => (
+                    <div key={m} style={{ fontSize: '12px', color: '#ff6b6b', display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
+                      <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: '1px' }} /> <span>{m}</span>
+                    </div>
+                  ))}
+                  {(cfgOptions.selected.warnings || []).map((m: string) => (
+                    <div key={m} style={{ fontSize: '12px', color: '#f0b429', display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
+                      <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: '1px' }} /> <span>{m}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', padding: '12px 16px', background: 'rgba(255,255,255,0.03)', borderRadius: '12px', border: `1px solid ${BORDER}` }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
@@ -1389,6 +1479,8 @@ export default function AgentDetail() {
                       <><Loader2 size={14} style={{ animation: 'spin 0.8s linear infinite' }} /> Synthesizing…</>
                     ) : samplePlayer === 'playing' ? (
                       <><Pause size={14} fill="#000" /> Stop</>
+                    ) : previewFirstMessage ? (
+                      <><Play size={14} fill="#000" /> Play First Message</>
                     ) : (
                       <><Play size={14} fill="#000" /> Play Sample</>
                     )}
@@ -1403,26 +1495,124 @@ export default function AgentDetail() {
                 {samplePlayer === 'error' && sampleError && (
                   <span style={{ fontSize: '12px', color: '#ff6b6b' }}>{sampleError}</span>
                 )}
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+                  {previewFirstMessage ? (
+                    <>
+                      <Helper>
+                        {agent.first_message_mode === 'wait'
+                          // Worth saying: this agent is set to stay silent until the
+                          // caller speaks, so the greeting below is real but is NOT
+                          // what a caller hears first. Playing it without that caveat
+                          // would be a preview of something that never happens.
+                          ? 'This is the agent’s first message — but the agent is set to wait for the caller to speak first, so a caller will not hear it as a greeting.'
+                          : 'Exactly what a caller hears when the agent picks up.'}
+                      </Helper>
+                      <button
+                        onClick={() => playTTSPreview()}
+                        style={{ padding: '4px 10px', borderRadius: '6px', background: 'transparent', color: '#888', border: `1px solid ${BORDER}`, fontSize: '11px', cursor: 'pointer' }}
+                      >
+                        Voice sample instead
+                      </button>
+                    </>
+                  ) : (
+                    <Helper>
+                      No first message written yet, so this plays a sample sentence in
+                      the selected language. Write a first message to hear the real
+                      greeting.
+                    </Helper>
+                  )}
+                </div>
+
+                {/* The greeting is free text and the language is a dropdown, so
+                    nothing stops them disagreeing — and on the live database they
+                    already did: the 'aster clnic kochi' agent was set to Kannada with
+                    a Hindi greeting. Sarvam then renders Devanagari text with Kannada
+                    settings, which is exactly the kind of "configured one thing, got
+                    another" the single language field exists to end. Detected from the
+                    text's own script rather than guessed, and only ever a warning —
+                    an admin may have a real reason to greet in another language. */}
+                {greetingScriptWarning && (
+                  <div style={{ fontSize: '12px', color: '#f0b429', display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
+                    <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: '1px' }} /> <span>{greetingScriptWarning}</span>
+                  </div>
+                )}
               </div>
 
             </CollapsibleSection>
 
-            {/* 3. TRANSCRIBER (STT) — still in Assistant tab */}
-            {/* 3. TRANSCRIBER (STT) */}
-            <CollapsibleSection icon={Activity} title="Transcriber" summary={`${agent.stt_provider} · ${agent.stt_language}`}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '24px' }}>
-                <div><Label>Provider</Label><Select value={agent.stt_provider} onChange={(v:any) => {
-                  updateField('stt_provider', v);
-                }} options={[
-                  { value: 'sarvam', label: 'Sarvam AI' },
-                  { value: 'elevenlabs', label: 'ElevenLabs' },
-                  { value: 'deepgram', label: 'Deepgram' },
-                  { value: 'whisper', label: 'OpenAI Whisper' }
-                ]} /></div>
-                <div><Label>Model</Label><Select value={agent.stt_model} onChange={(v:any) => {
-                  updateField('stt_model', v);
-                }} options={sttModels.length ? sttModels : [agent.stt_model || 'saarika:v2']} /></div>
-                <div><Label>Language</Label><Select value={agent.stt_language} onChange={(v:any) => updateField('stt_language', v)} options={['en-IN', 'hi-IN', 'ta-IN', 'te-IN', 'ar-SA', 'en-US', 'Multilingual (English/Hindi/Regional)', 'auto-detect']} /></div>
+            {/* 3. TRANSCRIBER (STT)
+                Provider and Model are back — switching transcriber is the fallback
+                story when one vendor degrades, and Sarvam AI is the correct choice
+                for Malayalam/Punjabi/Odia, which Deepgram serves on no tier.
+
+                What is NOT back, and must not come back, is this section's old
+                LANGUAGE dropdown. That was the SECOND language field, and it is the
+                one that made the kmct agent transcribe Tamil while speaking
+                Malayalam. The transcriber language is derived from the single
+                Language field in Voice & Language above; what remains here is only
+                whether the transcriber PINS to it or lets the provider detect. */}
+            <CollapsibleSection
+              icon={Headphones}
+              title="Transcriber"
+              summary={`${(cfgOptions?.stt?.providers || []).find((p:any) => p.id === sttProvider)?.name || sttProvider} · ${sttModel}`}
+            >
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
+                <div>
+                  <Label>Provider</Label>
+                  <Select
+                    value={sttProvider}
+                    onChange={(v:any) => changeProviderOrModel({ stt_provider: v, stt_model: '' })}
+                    options={(cfgOptions?.stt?.providers || []).map((p:any) => ({ value: p.id, label: p.name }))}
+                  />
+                  <Helper>Only providers with a working key and a live pipeline branch are listed.</Helper>
+                </div>
+                <div>
+                  <Label>Model</Label>
+                  <Select
+                    value={sttModel}
+                    onChange={(v:any) => changeProviderOrModel({ stt_model: v })}
+                    options={cfgOptions?.stt?.models || [sttModel]}
+                  />
+                  <Helper>
+                    {sttProvider === 'sarvam'
+                      ? 'saaras:v3 serves 23 languages; saarika:v2.5 serves 11.'
+                      : 'nova-3 is the only Deepgram tier with Indic support.'}
+                  </Helper>
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
+                <div>
+                  <Label>Language Detection</Label>
+                  {/* The one language-adjacent knob that is NOT a second language
+                      field: it decides whether the transcriber is pinned to the
+                      agent's language or lets the provider detect. It predates this
+                      change — no new knob was added. */}
+                  <Select
+                    value={agent.auto_detect_language ? 'auto' : 'pinned'}
+                    onChange={(v:any) => updateField('auto_detect_language', v === 'auto')}
+                    options={[
+                      { value: 'pinned', label: `Pin to ${languageLabel(agent.language)}` },
+                      { value: 'auto', label: 'Let the provider detect' },
+                    ]}
+                  />
+                  <Helper>
+                    Pinning is more accurate for a single-language clinic. Detection
+                    helps when callers switch language mid-sentence.
+                  </Helper>
+                </div>
+                <div>
+                  <Label>Transcription Language</Label>
+                  {/* Read-only on purpose. It is the derived mirror of the Language
+                      field above, shown so an operator can SEE that the two agree
+                      rather than having to trust it — the original complaint was
+                      four values disagreeing, so the fix has to be visible. */}
+                  <div style={{ padding: '10px 12px', borderRadius: '8px', background: 'rgba(255,255,255,0.03)', border: `1px solid ${BORDER}`, fontSize: '13px', color: '#888' }}>
+                    {agent.auto_detect_language ? 'Auto-detect' : languageLabel(agent.language)}
+                  </div>
+                  <Helper>Derived from the Language field above — set it there.</Helper>
+                </div>
               </div>
             </CollapsibleSection>
 
@@ -1480,19 +1670,21 @@ export default function AgentDetail() {
                    isPickerModal 
                    onSelectVoice={(voice) => {
                      const newVoiceId = voice.voice_id || voice.id || voice.name;
-                     updateFields({
-                       tts_provider: voice.provider,
-                       tts_model: voice.model,
-                       tts_voice: newVoiceId,
-                       tts_language: voice.language
-                     });
+                     // ONLY the voice changes. This used to also write
+                     // tts_provider, tts_model and — critically — tts_language
+                     // from the voice's catalog tag, so picking a voice silently
+                     // changed the agent's language to whatever that voice was
+                     // labelled with. That is one of the writers that produced the
+                     // four-way mismatch. Provider/model are locked; language is
+                     // owned by the Language field alone.
+                     updateFields({ tts_voice: newVoiceId });
                      setShowVoiceModal(false);
+                     // Preview in the agent's OWN language, not the voice's tag —
+                     // every Sarvam voice can speak it.
                      setTimeout(() => {
                        playTTSPreview({
-                         provider: voice.provider,
                          voice_id: newVoiceId,
-                         model: voice.model,
-                         language: voice.language
+                         language: agent?.language,
                        });
                      }, 300);
                    }} 

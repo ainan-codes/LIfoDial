@@ -3,38 +3,64 @@ backend/services/agent_worker.py — keeps the Pipecat agent worker reachable.
 
 WHY THIS EXISTS
 ───────────────
-`lifodial-agent` runs on Render's FREE plan, which spins the instance down after
-~15 minutes without an HTTP request. A spun-down worker is DEREGISTERED from
-LiveKit, so `RoomAgentDispatch(agent_name=...)` has nothing to dispatch to: the
-room gets created, the browser joins, and the caller hears silence. That is
-exactly the [DISPATCH-ALARM] in backend/routers/web_calls.py.
+If the worker is not registered with LiveKit, `RoomAgentDispatch(agent_name=...)`
+has nothing to dispatch to: the room gets created, the browser joins, and the
+caller hears silence. That is exactly the [DISPATCH-ALARM] in
+backend/routers/web_calls.py.
 
-The numbers, measured against production on 2026-07-25:
+⚠️ HOSTING MOVED TO RAILWAY (2026-07-31). Everything below was written for Render
+and its numbers are host-specific. The service is now `lifodial-agent-worker` on
+Railway; there is no `.onrender.com` URL and no Render dashboard to check. See
+`RENDER-ERA, NOW STALE` at the bottom of this docstring for what no longer holds.
 
-    GET https://lifodial-agent.onrender.com/  ->  HTTP 200 in 54.4s   (cold)
-    GET https://lifodial-agent.onrender.com/worker -> HTTP 200 (warm, ~0.2s)
+WHAT ACTUALLY TAKES THE WORKER DOWN (confirmed 2026-08-03)
+Railway's own crash email showed `lifodial-agent-worker` was killed for running
+OUT OF MEMORY, and three real calls hit [DISPATCH-ALARM] because the process was
+simply dead at that moment. So an unregistered worker is NOT automatically a
+sleep/cold-start problem any more, and it is NOT an agent_name mismatch:
 
-54s cold start vs. a 15s dispatch deadline means the first call after an idle
-period fails 100% of the time. Nothing is misconfigured — the worker simply
-isn't awake yet. (`agent_name` matched and worker_load was 0.025 when probed.)
+    check, in this order:  (1) is the process alive?  (2) its memory graph
+                           (3) only then, dispatch/registration config
+
+Measured baseline (2026-08-03): importing livekit.agents + pipecat + SQLAlchemy
+and loading ONE Silero VAD model costs ~212 MB RSS before a single call is taken.
+Per CONCURRENT call adds ~8 MB for its VAD analyzer alone. The worker also runs
+with `load_threshold=inf` (see backend/agent/__main__.py), which disables
+livekit-agents' built-in overload protection, so it accepts unbounded concurrent
+jobs into ONE process under the THREAD executor. That combination — not a leak —
+is the most likely OOM mechanism. A per-call Silero analyzer was measured NOT to
+leak: 25 sequential build/drop cycles retained 1.8 MB.
 
 TWO DEFENCES, both in this module:
 
   1. `ensure_worker_awake()` — called on the request path in web_calls.py BEFORE
      the room is created. Blocks until the worker answers HTTP, so we never
-     dispatch into a room the worker can't join. Warm calls cost ~0.2s.
+     dispatch into a room the worker can't join. Warm calls cost ~60-100ms
+     backend-to-worker (both services sit in Railway sin1).
 
-  2. `keep_warm_loop()` — started from main.py's lifespan on the ALWAYS-ON
-     `lifodial-api` service (plan: starter). Pings the worker inside Render's
-     15-min idle window so it never spins down in the first place, making
-     defence #1 a no-op in the common case.
+  2. `keep_warm_loop()` — started from main.py's lifespan. Pings the worker so a
+     probe on the call path is a no-op in the common case.
 
-Note on hours: keeping ONE free service always-on costs ~730 instance-hours per
-month, inside Render's 750h free allowance. Only `lifodial-agent` is on the free
-plan — the API and frontend are `starter` — so this does not overrun it.
+     ⚠️ Its ORIGINAL purpose (defeating Render's 15-min free-tier spin-down) no
+     longer applies on Railway. What it now does is keep the worker permanently
+     resident, which on usage-billed Railway means it never stops accruing cost
+     OR releasing memory. Whether to keep it is a hosting decision, not a
+     correctness one — deliberately left running rather than changed silently.
 
 Everything here is best-effort and fully guarded: if the worker URL is unset or
 unreachable, calls proceed exactly as they did before rather than failing.
+
+RENDER-ERA, NOW STALE — do not act on these without re-measuring on Railway:
+  * "~15 minutes without an HTTP request spins the instance down" — Render's idle
+    policy. Railway does not do this.
+  * "54.4s cold start" / "~55s" — measured against a spun-down Render free
+    instance. Railway has no equivalent spin-down, so a slow first call needs a
+    fresh explanation rather than this one.
+  * "730 instance-hours inside Render's 750h free allowance" — Render billing.
+  * `_PROBE_TIMEOUT_SECONDS`, `WARM_TIMEOUT_SECONDS` and `_WARM_CACHE_SECONDS`
+    below were all sized against those Render numbers and are almost certainly
+    far larger than Railway needs. Left as-is (generous timeouts are safe; the
+    failure mode of shrinking them wrongly is a dropped call).
 """
 from __future__ import annotations
 
@@ -264,7 +290,11 @@ async def ensure_worker_awake(timeout: float = WARM_TIMEOUT_SECONDS) -> bool:
         log.error(
             "Agent worker did NOT come up within %.0fs (%d probes, last state=%s). NOT "
             "creating a room — a dispatched call would find no agent and the caller "
-            "would hear silence. Check the lifodial-agent service on Render.",
+            "would hear silence. Check lifodial-agent-worker on RAILWAY: its deploy "
+            "logs and its MEMORY graph. Confirmed 2026-08-03: this alarm fires when "
+            "the worker process is simply dead, and the cause on that occasion was an "
+            "out-of-memory crash — not a dispatch/registration fault. Do not debug "
+            "agent_name matching or LiveKit config until the worker is confirmed UP.",
             time.monotonic() - started, attempts, last_state,
         )
         return False

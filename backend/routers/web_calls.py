@@ -272,6 +272,10 @@ async def create_web_call_token(
         "first_message": agent.first_message,
         "system_prompt": agent.system_prompt,
         "tts_voice": agent.tts_voice,
+        # THE one language. The tts_language/stt_language keys below are the
+        # derived mirrors, sent only so an agent worker still running an older
+        # revision (which reads them) keeps working across a deploy.
+        "language": agent.language,
         "tts_language": agent.tts_language,
         "tts_model": agent.tts_model,
         "tts_provider": getattr(agent, "tts_provider", "sarvam") or "sarvam",

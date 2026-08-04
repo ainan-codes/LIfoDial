@@ -115,13 +115,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     asyncio.create_task(_run_startup_migrations())
     asyncio.create_task(_warmup())
 
-    # Keep the free-tier Pipecat agent worker from spinning down. This service is
-    # `plan: starter` (always on), so it is the right place to ping the free
-    # `lifodial-agent` service inside Render's ~15min idle window. Without this,
-    # the worker deregisters from LiveKit and the next call lands in an
-    # agent-less room (~55s cold start vs a 15s dispatch deadline) — the
+    # Ping the Pipecat agent worker so it stays registered with LiveKit; an
+    # unregistered worker means the next call lands in an agent-less room — the
     # [DISPATCH-ALARM] in routers/web_calls.py. No-ops when AGENT_WORKER_URL is
     # unset. Ref held so the task isn't garbage-collected mid-flight.
+    #
+    # ⚠️ This comment used to justify itself with "Render's ~15min idle window" and
+    # a "~55s cold start". Hosting moved to Railway on 2026-07-31, which has no
+    # such spin-down, and the ~55s figure was a Render free-instance boot — both
+    # premises are dead. What the loop still does on Railway is keep the worker
+    # PERMANENTLY resident, which on usage-based billing means it never stops
+    # accruing cost. If the Railway budget is the binding constraint, this is a
+    # candidate to disable (just unset AGENT_WORKER_URL) — but note that makes the
+    # first call after an idle period pay whatever Railway's real start cost is,
+    # which has never been measured. See backend/services/agent_worker.py.
     from backend.services.agent_worker import keep_warm_loop
     app.state._agent_keepwarm_task = asyncio.create_task(keep_warm_loop())
 
@@ -642,7 +649,7 @@ async def sync_tenants_from_agents(_user=Depends(require_superadmin)):
                     clinic_name=f"{name} Clinic",
                     admin_email=f"admin@{name.lower().replace(' ', '')}.com",
                     admin_password=hash_password("changeme123"),
-                    language=agent.tts_language or "hi-IN",
+                    language=agent.language or "en-IN",
                     status="active",
                     is_active=True,
                     plan="Free",

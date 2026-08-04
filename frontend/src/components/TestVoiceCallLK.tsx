@@ -19,6 +19,7 @@
  *                             TranscriptionReceived (LiveKit protocol)
  */
 import { Headphones, Mic, PhoneOff, RotateCcw } from 'lucide-react';
+import { DEFAULT_STT_PROVIDER } from '../api/lockedDefaults';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import {
   LiveKitRoom,
@@ -686,12 +687,20 @@ export default function TestVoiceCallLK({
   );
 
   if (phase === 'idle') {
-    const language = agent?.stt_language || agent?.tts_language || agent?.language || 'en-IN';
-    const sttProvider = agent?.stt_provider || 'sarvam';
-    // Providers whose pipecat service emits InterimTranscriptionFrame. Kept in
-    // sync with _STT_REALTIME in backend/agent/pipeline.py.
-    const sttRealtime = ['deepgram', 'assemblyai', 'elevenlabs'].includes(sttProvider);
-    const llmModel = (agent?.llm_model || 'llama-3.3-70b').replace('-versatile', '').replace('llama-3.3-70b', 'Llama-3.3');
+    // THE one language. This badge used to read stt_language, which is exactly
+    // how it came to display "ta-IN" while the editor's header and Language field
+    // both said Malayalam — the two columns were independently editable.
+    const language = agent?.language || 'en-IN';
+    const sttProvider = agent?.stt_provider || DEFAULT_STT_PROVIDER;
+    // Providers whose pipecat service actually constructs an
+    // InterimTranscriptionFrame. Kept in sync with _STT_REALTIME in
+    // backend/agent/pipeline.py — 'elevenlabs' was listed here but pipecat 1.5.0's
+    // ElevenLabs STT emits no interim frames at all, so it was reported as
+    // real-time when it is not.
+    const sttRealtime = ['deepgram', 'assemblyai'].includes(sttProvider);
+    // NO llmModel here any more. It rendered a raw vendor model id into a widget a
+    // clinic admin uses to test their own receptionist — an internal detail leaking
+    // into a product surface, and one they cannot act on since the LLM is locked.
     const ttsVoice = agent?.tts_voice || 'priya';
 
     return shell(
@@ -725,28 +734,39 @@ export default function TestVoiceCallLK({
         </div>
 
         <div style={{ fontSize: 17, fontWeight: 700 }}>{agentName || 'AI Receptionist'}</div>
+        {/* Was "Pipecat + LiveKit + Deepgram Nova-3" — four vendor names in a line
+            of copy aimed at a clinic admin. What they need to know is that it is a
+            live voice call, not which stack builds it. */}
         <div style={{ fontSize: 12, color: '#666', maxWidth: 280, lineHeight: 1.5 }}>
-          Real-time AI voice — Pipecat + LiveKit + {sttProvider === 'deepgram' ? 'Deepgram Nova-3' : sttProvider === 'sarvam' ? 'Sarvam STT' : sttProvider}
+          Real-time AI voice — speak as a patient would on the phone.
         </div>
 
+        {/* Two pills, both actionable by the tester:
+              language  — what they have to speak for the test to prove anything;
+              voice     — the persona name they chose in the Voice Library. A
+                          product name, not a vendor brand.
+            Removed: the LLM model id and the STT provider brand. The transcription
+            BEHAVIOUR those implied is genuinely useful, so it survives as the line
+            below, phrased as what the tester will observe rather than as a vendor. */}
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'center', margin: '4px 0' }}>
           <Pill color="#3ECF8E">🌐 {language}</Pill>
-          <Pill color="#60A5FA">⚡ {llmModel}</Pill>
           <Pill color="#A78BFA">🎙️ {ttsVoice}</Pill>
-          <Pill color={sttRealtime ? '#F59E0B' : '#888'}>
-            🎤 {sttProvider === 'deepgram' ? 'Deepgram' : sttProvider}
-          </Pill>
         </div>
 
         {/*
           Live transcription is a property of the STT PROVIDER, not of this widget.
-          Only providers that stream interim results (Deepgram, AssemblyAI,
-          ElevenLabs Realtime) put words on screen while the caller is still
-          talking. Sarvam's pipecat service emits a transcript only once the caller
-          pauses — so with Sarvam the transcript panel below legitimately stays
-          empty mid-sentence, and each turn also waits ~0.8s longer before the
-          agent replies (pipecat's measured p99: Sarvam 1.17s vs Deepgram 0.35s).
-          Saying so here stops that reading as "it isn't hearing me".
+          Only providers that stream interim results put words on screen while the
+          caller is still talking; the others emit a transcript once the caller
+          pauses — so the transcript panel below legitimately stays empty
+          mid-sentence, and each turn also waits ~0.8s longer before the agent
+          replies (pipecat's measured p99: 1.17s vs 0.35s). Saying so here stops
+          that reading as "it isn't hearing me".
+
+          Phrased WITHOUT naming the provider. The old copy said "sarvam transcribes
+          only after you pause — switch STT to Deepgram", which both exposed two
+          vendor names and told a clinic admin to change a setting they cannot see.
+          What is left describes what the tester will observe, which is the part that
+          actually helps them interpret the test.
         */}
         <div style={{
           fontSize: 11, color: sttRealtime ? '#3ECF8E' : '#F59E0B',
@@ -754,7 +774,7 @@ export default function TestVoiceCallLK({
         }}>
           {sttRealtime
             ? 'Live transcription: words appear while you speak.'
-            : `${sttProvider} transcribes only after you pause — switch STT to Deepgram for real-time transcription and faster replies.`}
+            : 'Transcription appears after each pause, so replies come a moment later. This language does not support live transcription yet.'}
         </div>
 
         <button
@@ -809,7 +829,7 @@ export default function TestVoiceCallLK({
           borderRadius: '50%', animation: 'spin 0.8s linear infinite',
         }} />
         <div style={{ fontSize: 14, fontWeight: 600 }}>Starting voice call…</div>
-        <div style={{ fontSize: 12, color: '#555' }}>Setting up Pipecat + LiveKit pipeline</div>
+        <div style={{ fontSize: 12, color: '#555' }}>Setting up the voice pipeline</div>
         {slow && (
           <div style={{ fontSize: 12, color: '#F59E0B', maxWidth: 320, lineHeight: 1.5, marginTop: 4 }}>
             Waiting for the voice worker to come up. On the free plan it spins down
@@ -851,7 +871,7 @@ export default function TestVoiceCallLK({
     return shell(
       <>
         <div style={{ fontSize: 32 }}>🔌</div>
-        <div style={{ fontSize: 14, fontWeight: 600 }}>LiveKit not configured</div>
+        <div style={{ fontSize: 14, fontWeight: 600 }}>Voice service not configured</div>
         <div style={{ fontSize: 12, color: '#666', maxWidth: 300 }}>
           Set <code>LIVEKIT_URL</code>, <code>LIVEKIT_API_KEY</code>, <code>LIVEKIT_API_SECRET</code> in <code>.env</code>.
         </div>

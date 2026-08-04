@@ -24,8 +24,11 @@ export interface ConfigurableAgent {
   first_message?: string;
   system_prompt?: string;
   tts_voice?: string;
-  tts_language?: string;
+  language?: string;
   tts_provider?: string;
+  // Read only to ask which languages this agent's transcriber can hear. This tab
+  // never renders or writes it — provider choice is a superadmin concern.
+  stt_provider?: string;
   llm_temperature?: number;
   max_response_tokens?: number;
   silence_timeout_seconds?: number;
@@ -38,15 +41,15 @@ export interface ConfigurableAgent {
   emergency_transfer_number?: string;
 }
 
-/** Languages the voice pipeline genuinely supports (Sarvam codes + fallback
- *  phrases in backend/agent/resilience.py). Deliberately not a longer list —
- *  offering a language the TTS cannot speak is worse than not offering it. */
-const LANGUAGES: [string, string][] = [
-  ['en-IN', '🇮🇳 English'], ['hi-IN', '🇮🇳 Hindi'], ['ta-IN', '🇮🇳 Tamil'],
-  ['te-IN', '🇮🇳 Telugu'], ['kn-IN', '🇮🇳 Kannada'], ['ml-IN', '🇮🇳 Malayalam'],
-  ['mr-IN', '🇮🇳 Marathi'], ['bn-IN', '🇮🇳 Bengali'], ['gu-IN', '🇮🇳 Gujarati'],
-  ['pa-IN', '🇮🇳 Punjabi'],
-];
+/* The hardcoded LANGUAGES array that used to live here is gone.
+ *
+ * It carried a comment telling the next reader to "keep it in step with" the
+ * backend list — which is an instruction that a duplicate source of truth exists,
+ * and it had already drifted once (Odia was missing here while the superadmin
+ * editor offered it, so the two surfaces disagreed about what a clinic could
+ * pick). The list is fetched from GET /platform/agent/config-options now, the same
+ * endpoint the superadmin editor and the creation wizard read, so there is nothing
+ * left to keep in step. */
 
 /** The subset of fields this tab owns. Only these are ever PATCHed, so the tab
  *  can never accidentally clobber something it doesn't render. */
@@ -55,7 +58,7 @@ type Draft = {
   first_message: string;
   system_prompt: string;
   tts_voice: string;
-  tts_language: string;
+  language: string;
   llm_temperature: number;
   max_response_tokens: number;
   silence_timeout_seconds: number;
@@ -74,7 +77,7 @@ function toDraft(a: ConfigurableAgent): Draft {
     first_message: a.first_message ?? '',
     system_prompt: a.system_prompt ?? '',
     tts_voice: a.tts_voice ?? '',
-    tts_language: a.tts_language ?? 'en-IN',
+    language: a.language ?? 'en-IN',
     llm_temperature: a.llm_temperature ?? 0.3,
     max_response_tokens: a.max_response_tokens ?? 120,
     silence_timeout_seconds: a.silence_timeout_seconds ?? 10,
@@ -194,6 +197,29 @@ export default function ConfigureTab({ agent, onSaved }: {
       .catch(() => { if (!cancelled) setVoices([]); });
     return () => { cancelled = true; };
   }, [agent.tts_provider]);
+
+  // The languages this agent's OWN providers genuinely support, from the one
+  // endpoint that knows. Asked per-agent rather than fetched once for the app,
+  // because the answer depends on the transcriber and voice provider this agent is
+  // on — a platform-wide list is precisely what drifted before.
+  const [languages, setLanguages] = useState<{ code: string; name: string }[]>([]);
+  useEffect(() => {
+    const q = new URLSearchParams({
+      stt_provider: agent.stt_provider || '',
+      tts_provider: agent.tts_provider || '',
+      language: agent.language || '',
+    });
+    let cancelled = false;
+    fetchWithAuth(`/platform/agent/config-options?${q}`)
+      .then((res: any) => {
+        if (!cancelled) setLanguages(Array.isArray(res?.languages) ? res.languages : []);
+      })
+      // A failed fetch must not strand the clinic on a dropdown with no options:
+      // fall back to whatever the agent is already set to, so the field still shows
+      // the truth and a save does not silently change the language.
+      .catch(() => { if (!cancelled) setLanguages([]); });
+    return () => { cancelled = true; };
+  }, [agent.stt_provider, agent.tts_provider, agent.language]);
 
   const set = <K extends keyof Draft>(key: K) => (v: Draft[K]) =>
     setDraft(d => ({ ...d, [key]: v }));
@@ -315,9 +341,15 @@ export default function ConfigureTab({ agent, onSaved }: {
           <p style={subtitle}>How your receptionist sounds.</p>
 
           <Field labelText="Language" hint="The language the agent speaks by default. It can still switch mid-call if the caller does.">
-            <select style={{ ...inputBase, cursor: 'pointer' }} value={draft.tts_language}
-                    onChange={e => set('tts_language')(e.target.value)}>
-              {LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}
+            <select style={{ ...inputBase, cursor: 'pointer' }} value={draft.language}
+                    onChange={e => set('language')(e.target.value)}>
+              {/* Keep the current value selectable even if the fetch failed or the
+                  agent sits on a legacy code, so opening this tab can never
+                  silently change the agent's language just by rendering. */}
+              {!languages.some(l => l.code === draft.language) && draft.language && (
+                <option value={draft.language}>{draft.language}</option>
+              )}
+              {languages.map(l => <option key={l.code} value={l.code}>{l.name} ({l.code})</option>)}
             </select>
           </Field>
 

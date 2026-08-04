@@ -125,7 +125,7 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
         await Promise.all(configured.map(fetchVoicesFor));
       } catch (err) {
         console.error('Failed to load configured providers:', err);
-        setLoadError('Could not load configured providers. Check your connection or AI Platform settings.');
+        setLoadError('Could not load the voice providers. Check your connection and try again.');
       }
     };
 

@@ -19,10 +19,31 @@ frames:
 
 Both frames carry ``service=`` so only the intended service reacts to them.
 
-Detection is Unicode-script based, which is what actually distinguishes the
-languages this product serves (Devanagari vs Tamil vs Telugu vs …). It cannot
-tell Hindi from Marathi (both Devanagari) or romanised Hindi from English —
-those are handled by the STT model's own language detection, not here.
+There are TWO independent detectors, because callers change language in two
+different ways and only one of them was handled:
+
+1. ``detect_language_from_text`` — the caller simply STARTS SPEAKING another
+   language. Unicode-script based, which is what actually distinguishes the
+   languages this product serves (Devanagari vs Tamil vs Telugu vs …). It cannot
+   tell Hindi from Marathi (both Devanagari) or romanised Hindi from English —
+   those are handled by the STT model's own language detection, not here.
+
+2. ``detect_language_request`` — the caller ASKS, in their current language, to be
+   answered in another one: *"Aap English mein baat kar sakte ho kya?"*
+
+   Detector 1 is structurally blind to this, and not by accident: that sentence IS
+   Hindi, so script detection correctly reports "still Hindi, no change". The
+   request is about the language of the NEXT REPLY, which is a fact about meaning,
+   not about characters. A real call transcript in this project shows a caller
+   asking exactly that and the agent carrying on in Hindi as if nothing had been
+   said.
+
+   The prompt made it worse than an oversight. The rule shipped to the LLM was
+   "Always reply in the SAME language the caller used in their most recent
+   message" — which, read literally, *instructs* the model to ignore the request
+   and answer a Hindi question in Hindi. The model was obeying. See
+   ``_build_system_prompt`` in backend/agent/pipeline.py, which now carries an
+   explicit carve-out for a request.
 
 Nothing in here may break a call: every switch is wrapped so a bad settings
 delta degrades to "keep the current language" instead of killing the pipeline.
@@ -106,6 +127,100 @@ def detect_language_from_text(
     return "en-IN" if latin / total >= dominance else ""
 
 
+# ── Explicit "please speak X" requests ────────────────────────────────────────
+# Two vocabularies, and a match needs ONE FROM EACH: a language NAME and a
+# request CUE. Requiring both is what separates "can you speak English?" from
+# "sorry, my English is not good" — the second names a language but asks for
+# nothing, and switching on it would be worse than not switching at all.
+#
+# Names are listed in Latin AND in every script a caller might see them
+# transcribed in, because the transcript's script follows whatever language the
+# caller is currently speaking: a Malayalam caller asking for English gets
+# "ഇംഗ്ലീഷ്", a Hindi caller gets "इंग्लिश" or romanised "English", and Deepgram's
+# Hindi model returns Devanagari while its multilingual model may return Latin.
+# Anything missing here degrades to "no request detected", which is the old
+# behaviour, never a wrong switch.
+_LANGUAGE_NAMES: dict[str, tuple[str, ...]] = {
+    "en-IN": (
+        "english", "englis", "inglish", "angrezi", "angreji", "ingles",
+        "इंग्लिश", "इंग्लिस", "अंग्रेजी", "अंग्रेज़ी", "इंग्रजी",
+        "ഇംഗ്ലീഷ്", "ஆங்கிலம்", "இங்கிலீஷ்", "ఇంగ్లీష్", "ఆంగ్ల",
+        "ಇಂಗ್ಲಿಷ್", "ಆಂಗ್ಲ", "ইংরেজি", "અંગ્રેજી", "ਅੰਗਰੇਜ਼ੀ", "ଇଂରାଜୀ",
+    ),
+    "hi-IN": (
+        "hindi", "हिंदी", "हिन्दी", "ഹിന്ദി", "இந்தி", "హిందీ",
+        "ಹಿಂದಿ", "হিন্দি", "હિન્દી", "ਹਿੰਦੀ", "ହିନ୍ଦୀ",
+    ),
+    "ml-IN": ("malayalam", "മലയാളം", "मलयालम", "മലയാളത്ത"),
+    "ta-IN": ("tamil", "தமிழ்", "तमिल", "തമിഴ്", "ತಮಿಳು"),
+    "te-IN": ("telugu", "తెలుగు", "तेलुगु", "തെലുങ്ക്", "ತೆಲುಗು"),
+    "kn-IN": ("kannada", "ಕನ್ನಡ", "कन्नड", "കന്നഡ"),
+    "mr-IN": ("marathi", "मराठी", "മറാത്തി"),
+    "bn-IN": ("bengali", "bangla", "বাংলা", "बंगाली", "ബംഗാളി"),
+    "gu-IN": ("gujarati", "ગુજરાતી", "गुजराती"),
+    "pa-IN": ("punjabi", "panjabi", "ਪੰਜਾਬੀ", "पंजाबी"),
+    "od-IN": ("odia", "oriya", "ଓଡ଼ିଆ", "ଓଡିଆ", "ओड़िया", "उड़िया"),
+}
+
+#: Words that make an utterance a REQUEST rather than a mention. Deliberately
+#: broad and multilingual — a false negative just leaves the old behaviour, while
+#: the name requirement above is what keeps false positives away.
+_REQUEST_CUES: tuple[str, ...] = (
+    # English / romanised
+    "speak", "spoke", "talk", "say", "switch", "change", "reply", "answer",
+    "continue", "prefer", "understand", "know", "can you", "could you",
+    "please", "in ",
+    # Hindi / Urdu, Devanagari and romanised
+    "बात", "बोल", "बोलिए", "बोलो", "कर सकते", "कर सकती", "समझ", "जानते",
+    "baat", "bol", "boliye", "bolo", "kar sakte", "kar sakti", "samajh",
+    "mein", "me ", "karo", "kijiye", "kariye",
+    # Malayalam
+    "സംസാരി", "പറയ", "പറയാമോ", "അറിയാമോ", "മാറ്റ",
+    # Tamil
+    "பேச", "பேசு", "சொல்ல", "தெரியும", "மாற்ற",
+    # Telugu
+    "మాట్లాడ", "చెప్ప", "తెలుసా", "మార్చ",
+    # Kannada
+    "ಮಾತನಾಡ", "ಹೇಳ", "ಗೊತ್ತ", "ಬದಲಾಯಿ",
+    # Bengali / Gujarati / Punjabi / Odia
+    "বল", "কথা", "বোঝ", "બોલ", "વાત", "ਬੋਲ", "ਗੱਲ", "କହ", "କଥା",
+)
+
+
+def detect_language_request(text: str, supported: set[str] | None = None) -> str:
+    """BCP-47 code the caller ASKED to be answered in, or "" if they did not.
+
+    Independent of ``detect_language_from_text``: that answers "what language is
+    this sentence?", this answers "what language did this sentence ask for?".
+    Those are different questions with different answers, and conflating them is
+    the bug — *"Aap English mein baat kar sakte ho kya?"* is a Hindi sentence
+    requesting English.
+
+    ``supported`` restricts the answer to languages this deployment can actually
+    run. A caller asking for a language the platform cannot serve gets "" here, so
+    the pipeline keeps working in the current language rather than retuning onto a
+    provider that would answer HTTP 400 mid-call. The LLM still sees the request in
+    the transcript and can decline it in words, which is the honest outcome.
+    """
+    if not text:
+        return ""
+    low = text.lower()
+
+    if not any(cue in low for cue in _REQUEST_CUES):
+        return ""
+
+    # Longest alias first, so "angrezi" is not shadowed by a shorter substring of
+    # another entry, and a two-word name beats a one-word one.
+    best: tuple[int, str] = (0, "")
+    for code, aliases in _LANGUAGE_NAMES.items():
+        if supported is not None and code not in supported:
+            continue
+        for alias in aliases:
+            if alias in low and len(alias) > best[0]:
+                best = (len(alias), code)
+    return best[1]
+
+
 class LanguageSwitchProcessor(FrameProcessor):
     """Retunes STT/TTS language mid-call when the caller changes language.
 
@@ -123,6 +238,9 @@ class LanguageSwitchProcessor(FrameProcessor):
             1 = switch on the first clear signal (most responsive).
         on_switch: Optional callback ``(new_language) -> None`` for side effects
             (e.g. retargeting the never-silence fallback phrase). Must not raise.
+        supported_languages: Codes this deployment can actually run. An explicit
+            request for anything outside this set is ignored at the service level
+            rather than retuning onto a provider that would 400 mid-call.
     """
 
     def __init__(
@@ -136,6 +254,7 @@ class LanguageSwitchProcessor(FrameProcessor):
         min_chars: int = 8,
         confirm_turns: int = 1,
         on_switch: Callable[[str], None] | None = None,
+        supported_languages: set[str] | None = None,
     ) -> None:
         super().__init__()
         self._tts = tts
@@ -146,9 +265,11 @@ class LanguageSwitchProcessor(FrameProcessor):
         self._min_chars = min_chars
         self._confirm_turns = max(1, confirm_turns)
         self._on_switch = on_switch
+        self._supported = supported_languages
         self._pending: str = ""
         self._streak = 0
         self.switch_count = 0  # observability: surfaced in call logs
+        self.requested_count = 0  # how many switches came from an explicit ask
 
     @property
     def current_language(self) -> str:
@@ -173,6 +294,26 @@ class LanguageSwitchProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
     async def _maybe_switch(self, text: str) -> None:
+        # An explicit ASK is checked first and bypasses the confirmation streak
+        # entirely. A caller who says "can you speak English?" has given a
+        # deliberate, unambiguous instruction — making them repeat it to satisfy a
+        # heuristic streak counter is the same "the agent ignored me" experience the
+        # request handling exists to fix.
+        #
+        # It also has to come first because the two detectors DISAGREE on exactly
+        # this input by design: the request sentence is in the caller's CURRENT
+        # language, so script detection would return "no change" and return early.
+        requested = detect_language_request(text, self._supported)
+        if requested and requested != self._current:
+            log.info(
+                "Caller explicitly requested %s (current %s) — switching now: %r",
+                requested, self._current, text[:120],
+            )
+            self.requested_count += 1
+            await self._apply(requested)
+            self._pending, self._streak = "", 0
+            return
+
         detected = detect_language_from_text(text, min_chars=self._min_chars)
         if not detected or detected == self._current:
             self._pending, self._streak = "", 0

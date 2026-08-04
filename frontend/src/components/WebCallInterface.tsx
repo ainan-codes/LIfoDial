@@ -8,7 +8,7 @@ interface WebCallInterfaceProps {
     id: string;
     name: string;
     clinic_name: string;
-    tts_language: string;
+    language: string;
     tts_voice: string;
   };
   onClose: () => void;
@@ -68,7 +68,7 @@ export function WebCallInterface({ agent, onClose }: WebCallInterfaceProps) {
   } = useStreamingSTT({
     tenantId,
     agentId: agent.id,
-    languageCode: agent.tts_language || 'en-IN',
+    languageCode: agent.language || 'en-IN',
     mode: 'transcribe',
     onTranscript: (text, confidence) => {
       if (text && text.trim().length > 0) {
@@ -209,7 +209,7 @@ export function WebCallInterface({ agent, onClose }: WebCallInterfaceProps) {
         ...t,
         {
           role: 'ai',
-          text: agent.name + ' connected. LiveKit keys not configured — this is a demo preview of the web call UI.',
+          text: agent.name + ' connected. The voice service is not configured — this is a demo preview of the web call UI.',
           time: new Date().toLocaleTimeString(),
         },
       ]);
@@ -345,7 +345,7 @@ export function WebCallInterface({ agent, onClose }: WebCallInterfaceProps) {
               background: '#F59E0B15', borderRadius: '6px',
               border: '1px solid #F59E0B30',
             }}>
-              Demo Mode — Configure LiveKit keys for real calls
+              Demo Mode — the voice service is not configured yet
             </p>
           )}
         </div>
@@ -401,7 +401,7 @@ export function WebCallInterface({ agent, onClose }: WebCallInterfaceProps) {
           textAlign: 'center', padding: '8px',
           borderTop: '1px solid #111', fontSize: '11px', color: '#555',
         }}>
-          {LANG_LABELS[agent.tts_language] || agent.tts_language} · {agent.tts_voice}
+          {LANG_LABELS[agent.language] || agent.language} · {agent.tts_voice}
           {callId && <span style={{ marginLeft: '8px' }}>· {callId.slice(0, 8)}</span>}
         </div>
       </div>

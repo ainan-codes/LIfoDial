@@ -17,7 +17,7 @@ interface Agent {
   id: string
   name: string
   clinic_name: string
-  tts_language: string
+  language: string
   tts_voice: string
   llm_model: string
 }
@@ -220,7 +220,7 @@ function CallUI({ agent, duration, formatTime, onClose }: { agent: Agent, durati
     "ml-IN": "🇮🇳 Malayalam", "ar-SA": "🇦🇪 Arabic",
     "en-IN": "🇮🇳 English", "te-IN": "🇮🇳 Telugu",
     "kn-IN": "🇮🇳 Kannada", "bn-IN": "🇮🇳 Bengali",
-  } as Record<string, string>)[agent.tts_language] || agent.tts_language
+  } as Record<string, string>)[agent.language] || agent.language
   
   return (
     <div className="call-ui">

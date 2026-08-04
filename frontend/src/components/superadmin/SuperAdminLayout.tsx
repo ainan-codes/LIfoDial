@@ -4,7 +4,6 @@ import {
     CalendarCheck,
     ChevronLeft,
     Headphones,
-    Key,
     LayoutDashboard,
     LogOut,
     Menu,
@@ -27,8 +26,16 @@ const SA_NAV = [
   { path: '/superadmin/voice-library',label: 'Voice Library',    icon: Music,           section: 'COMMUNITY' },
   { path: '/superadmin/appointments', label: 'All Appointments', icon: CalendarCheck,   section: 'COMMUNITY' },
   { path: '/superadmin/knowledge',    label: 'Knowledge Base',   icon: BookOpen,        section: 'COMMUNITY' },
-  // ─── ACCOUNT ───
-  { path: '/superadmin/ai-platform',  label: 'Platform',         icon: Key,             section: 'ACCOUNT' },
+  // The ACCOUNT section held one item, 'Platform' — the AI Platform provider and
+  // API-key management UI. Removed as unnecessary configuration surface for the
+  // MVP; provider keys come from the environment.
+  //
+  // Removing the PAGE does not touch how a live call resolves a provider key:
+  // that path is backend/services/provider_status.py::resolve_provider_key
+  // (active ApiKeyConfig row first, then env), which the agent worker calls
+  // directly and which no frontend route participates in. The /platform/* API
+  // routes also stay — the Voice Library, the voice previews and the agent
+  // editor's language/provider options are all served from them.
 ];
 
 /** Build breadcrumb segments from pathname */

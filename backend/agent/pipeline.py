@@ -151,6 +151,11 @@ from backend.services.provider_registry import (
     DEEPGRAM_UNSUPPORTED_LANGS as _DG_UNSUPPORTED_LANGS,
 )
 
+# Which languages each STT provider can really transcribe, and how to spell our
+# stored code in that provider's own API. Imports no pipecat, same as above, so
+# the API process can serve the Transcriber Language dropdown from it.
+from backend.services import agent_defaults, stt_catalog
+
 
 # ── Sarvam STT model selection ────────────────────────────────────────────────
 #: Models pipecat's SarvamSTTService knows how to build (its MODEL_CONFIGS keys).
@@ -312,6 +317,31 @@ def _doctor_availability_block(tenant: dict) -> str:
 from backend.agent.booking_rules import BOOKING_RULES_BLOCK as _BOOKING_RULES_BLOCK
 
 
+# Also appended to EVERY system prompt. The blocks above each forbid inventing one
+# SPECIFIC class of fact — a doctor, an opening time, a booking confirmation, a KB
+# answer — because each was added in response to a specific incident. That leaves a
+# gap by construction: anything not on the list (a price, a phone number, a
+# department, whether the clinic accepts an insurer, whether parking exists) had no
+# rule at all, and a helpful model fills those in.
+#
+# The instruction to say "I don't have that information" is the important half.
+# "Don't invent" on its own leaves the model with no sanctioned way to answer, and
+# a model with no permitted answer tends to guess anyway.
+_NO_FABRICATION_RULE = (
+    "\n\n--- ONLY SAY WHAT YOU KNOW ---\n"
+    "Every fact you state about this clinic must come from the CLINIC DETAILS, "
+    "DOCTOR AVAILABILITY or CLINIC KNOWLEDGE BASE sections above, or from something "
+    "the caller told you in this conversation. That includes doctor names, "
+    "specializations, timings, prices, fees, phone numbers, addresses, departments, "
+    "services, insurance or payment options, and waiting times.\n"
+    "If you are asked something those sections do not answer, say plainly that you "
+    "do not have that information and offer to take the caller's details so the "
+    "clinic can call them back. A short honest answer is always better than a "
+    "plausible guess — never fill a gap with something that sounds reasonable, and "
+    "never state a detail merely because it is typical of clinics generally.\n"
+)
+
+
 def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
     """
     Build the LLM system prompt from stored config, or render from template,
@@ -323,15 +353,53 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
       2. Rendered prompt_templates entry for agent_config['template']
       3. Hardcoded fallback
     """
-    # Pairs with LanguageSwitchProcessor: that processor retunes STT/TTS when the
-    # caller changes language, but the words themselves come from the LLM, so the
-    # model has to be told to follow the caller. Appended to every prompt path
-    # (custom, template, fallback) so a clinic's own prompt can't lose it.
+    # The LLM is the third consumer of THE one language field (STT and TTS are the
+    # other two). Naming the configured language explicitly is what makes the
+    # single source of truth reach the actual words: previously the prompt only
+    # said "mirror the caller", so an agent configured for Malayalam would happily
+    # hold the whole call in English if the caller opened in English — the
+    # configured language had no influence on the LLM at all.
+    #
+    # Still paired with LanguageSwitchProcessor, which retunes STT/TTS when the
+    # caller genuinely switches. So the rule is: default to the configured
+    # language, but follow the caller when they clearly choose another one.
+    # Appended to every prompt path (custom, template, fallback) so a clinic's own
+    # prompt cannot lose it.
+    _configured = agent_config.get("language") or agent_defaults.DEFAULT_LANGUAGE
+    _lang_name = agent_defaults.language_name(_configured)
+    #
+    # The REQUEST rule below is not a refinement of the mirror rule — it is a
+    # carve-out from it, and the mirror rule without it was an active bug. "Always
+    # reply in the SAME language the caller used in their most recent message",
+    # applied to a caller asking *in Hindi* "Aap English mein baat kar sakte ho
+    # kya?", instructs the model to answer that Hindi question in Hindi. A real
+    # transcript from this project shows exactly that: the request was ignored and
+    # the call continued in Hindi. The model was following its instructions.
+    #
+    # Paired with LanguageSwitchProcessor.detect_language_request, which retunes the
+    # voice for the same utterance. Both halves are needed: the processor alone
+    # would give English audio of Hindi words, and this rule alone would give
+    # English words in a voice still tuned for Hindi.
     _LANGUAGE_MIRROR_RULE = (
         "\n\n--- LANGUAGE ---\n"
-        "Always reply in the SAME language the caller used in their most recent message, "
-        "even if that changes part-way through the call. Never announce the switch or "
+        f"This agent is configured for {_lang_name} ({_configured}). Speak "
+        f"{_lang_name} by default, including your very first message.\n"
+        "If the caller clearly speaks a different language, switch to THAT language "
+        "and continue in it for as long as they use it. Never announce the switch or "
         "comment on which language is being spoken — just answer in it.\n"
+        f"Never reply in English merely because a few English words appear in "
+        f"{_lang_name} speech — Indian callers code-switch constantly, and that is "
+        f"still {_lang_name}.\n"
+        "IF THE CALLER ASKS YOU TO SPEAK A PARTICULAR LANGUAGE — for example "
+        "\"can you speak English?\", \"Aap English mein baat kar sakte ho kya?\", or "
+        "the same question in any other language — that request OVERRIDES every rule "
+        "above. Switch to the language they asked for immediately, acknowledge it in "
+        "one short sentence in that new language, and stay in it for the rest of the "
+        "call. Do this even though their request itself was made in a different "
+        "language: answer the request, do not mirror the language it was asked in. "
+        "If you genuinely cannot speak the language they asked for, say so plainly "
+        "in one sentence and continue in the current language — never ignore the "
+        "question.\n"
     )
 
     kb_block = (
@@ -341,6 +409,7 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
         + _clinic_facts_block(tenant)
         + _doctor_availability_block(tenant)
         + _BOOKING_RULES_BLOCK
+        + _NO_FABRICATION_RULE
         + _LANGUAGE_MIRROR_RULE
     )
 
@@ -352,7 +421,7 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
     try:
         from backend.agent.prompt_templates import get_template, render_prompt
 
-        lang = agent_config.get("tts_language", "hi-IN")
+        lang = agent_config.get("language") or agent_defaults.DEFAULT_LANGUAGE
         template_key = agent_config.get("template", "clinic_receptionist")
         tmpl = get_template(template_key, lang)
 
@@ -361,7 +430,24 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
             f"- {d['name']} ({d.get('specialization', 'Specialist')})"
             + ("" if d.get("is_available", True) else " — ON LEAVE, do not book")
             for d in doctors
-        ) or "- General Physician available"
+        ) or (
+            # This used to fall back to "- General Physician available", which
+            # FABRICATED a doctor. Two things were wrong with it:
+            #
+            #   * it is not true. Both live clinics have an empty roster, so every
+            #     templated prompt was telling the model a General Physician was
+            #     bookable. A caller asking "who can I see?" gets an invented answer,
+            #     and the booking then fails at doctor lookup — after the caller has
+            #     been told someone is available.
+            #   * it CONTRADICTED _clinic_facts_block, which is appended to the same
+            #     prompt and says "No doctors have been added to this clinic yet …
+            #     never invent a doctor's name." The model was handed both statements
+            #     and had to pick.
+            #
+            # The honest rendering of an empty roster is that it is empty.
+            "- (none yet — no doctors have been added to this clinic, so you cannot "
+            "book with a named doctor)"
+        )
 
         rendered = render_prompt(
             tmpl["system_prompt"],
@@ -470,6 +556,14 @@ async def _load_tenant_and_config(
         "first_message_mode": metadata.get("first_message_mode", "assistant-speaks-first"),
         "system_prompt":   metadata.get("system_prompt", ""),
         "template":        metadata.get("template", "clinic_receptionist"),
+        # THE one language. Everything language-related below derives from it.
+        # Falls back through the legacy mirrors so a room dispatched by an older
+        # backend revision (whose metadata predates this key) still works.
+        "language":        (
+            metadata.get("language")
+            or metadata.get("tts_language")
+            or agent_defaults.DEFAULT_LANGUAGE
+        ),
         "stt_provider":    metadata.get("stt_provider", "sarvam"),
         "tts_provider":    metadata.get("tts_provider", "sarvam"),
         "tts_voice":       metadata.get("tts_voice", "priya"),
@@ -551,6 +645,15 @@ async def _load_tenant_and_config(
                         "first_message_mode":  getattr(cfg, "first_message_mode", "assistant-speaks-first") or "assistant-speaks-first",
                         "system_prompt":       cfg.system_prompt or "",
                         "template":            getattr(cfg, "template", "clinic_receptionist"),
+                        # THE one language — see agent_defaults. getattr-guarded so an
+                        # agent worker running this revision against a database that has
+                        # not had the migration applied yet still resolves a language
+                        # from the legacy mirror instead of crashing the job.
+                        "language":            agent_defaults.resolve_language(
+                            language=getattr(cfg, "language", None),
+                            tts_language=cfg.tts_language,
+                            stt_language=cfg.stt_language,
+                        )[0],
                         "stt_provider":        getattr(cfg, "stt_provider", "sarvam") or "sarvam",
                         "tts_provider":        getattr(cfg, "tts_provider", "sarvam") or "sarvam",
                         "tts_voice":           cfg.tts_voice or "priya",
@@ -937,7 +1040,11 @@ async def entrypoint(ctx) -> None:
     tts_model_str = agent_config.get("tts_model", "bulbul:v3")
     tts_voice     = agent_config.get("tts_voice", "priya")
     tts_pace      = min(max(float(agent_config.get("tts_pace", 1.05)), 0.5), 2.0)
-    tts_language  = _safe_lang(agent_config.get("tts_language", "hi-IN"))
+    # Derived from THE one language field, not from a separate tts_language column.
+    # _safe_lang still maps it onto Sarvam's own code table (Sarvam is the only TTS
+    # that takes a language at all).
+    agent_language = agent_config.get("language") or agent_defaults.DEFAULT_LANGUAGE
+    tts_language  = _safe_lang(agent_language)
     # bulbul:v2 is the only Sarvam model that accepts pitch/loudness — Pipecat's
     # SarvamTTSService silently ignores them for v3/v3-beta, so it's always
     # safe to pass through (unlike the raw-httpx Sarvam calls elsewhere, which
@@ -972,17 +1079,38 @@ async def entrypoint(ctx) -> None:
     # never loaded stt_language into agent_config, so this always fell back to
     # the TTS language. Now wired: use the agent's own STT language setting,
     # falling back to TTS language only if it's genuinely unset.
-    stt_language = _safe_lang(agent_config.get("stt_language") or tts_language)
+    #
+    # Kept CANONICAL here (BCP-47, or "auto") and translated per provider in the
+    # build branches below via stt_catalog.to_provider_code. This used to run
+    # through _safe_lang — which is *Sarvam's* eleven-code table with a "hi-IN"
+    # fallback — for EVERY provider. So selecting ar-SA, en-US, od-IN or
+    # auto-detect silently transcribed HINDI, including on Deepgram, which serves
+    # ar-SA and en-US natively. The dropdown said Arabic, the agent listened in
+    # Hindi, and nothing logged a warning. _safe_lang is still correct for TTS
+    # (Sarvam is the only TTS that takes a language) and is left alone there.
+    # Derived from THE one language field plus the auto_detect_language boolean —
+    # the only two inputs there are. This used to read a separate stt_language
+    # column, which is how one agent came to transcribe Tamil while speaking
+    # Malayalam: the two columns were independently editable and had drifted apart.
+    stt_language = stt_catalog.canonicalize(
+        agent_defaults.effective_stt_language(
+            agent_language,
+            auto_detect=bool(agent_config.get("auto_detect_language", False)),
+        )
+    )
 
-    # saaras:v2.5 auto-detects language — don't pass language for it
-    if stt_model == "saaras:v2.5":
+    # saaras:v2.5 takes no language at all (pipecat marks it
+    # supports_language=False and raises if one is passed); the catalogue returns
+    # None for it, and for any language this model cannot actually serve.
+    _sarvam_stt_lang = stt_catalog.to_provider_code("sarvam", stt_model, stt_language)
+    if _sarvam_stt_lang is None:
         stt_settings = SarvamSTTService.Settings(
             model=stt_model,
         )
     else:
         stt_settings = SarvamSTTService.Settings(
             model=stt_model,
-            language=stt_language,
+            language=_sarvam_stt_lang,
         )
 
     # ── Instantiate Pipecat services ───────────────────────────────────────
@@ -1087,13 +1215,39 @@ async def entrypoint(ctx) -> None:
     # it the other way round (breaking the elif chain into separate `if`s) would let
     # a SUCCESSFUL Deepgram build get silently overwritten by that same `else:`.
     if stt_provider == "deepgram":
-        _dg_base = (_DG_LANG_MAP.get(stt_language, "en-IN") or "").split("-")[0]
-        if _dg_base in _DG_UNSUPPORTED_LANGS:
+        # ⚠️ Ask this about the agent's CONFIGURED language, never about
+        # `stt_language` — which is "auto" whenever auto_detect_language is set.
+        #
+        # "Can Deepgram do auto?" answers YES (nova-3 has a multi mode), so an
+        # auto-detect Malayalam agent used to sail past this guard and get built on
+        # nova-3 "multi" — a mode whose language set does NOT include Malayalam. It
+        # would transcribe Malayalam speech as whatever multi could nearest-match,
+        # silently, with no 400 to reveal it.
+        #
+        # Auto-detect changes whether we PIN a language, not which languages the
+        # provider can hear. A Malayalam agent needs a provider that can hear
+        # Malayalam either way. This was latent until STT was locked to Deepgram:
+        # before that, such agents happened to be on Sarvam already.
+        _capability_lang = agent_language
+        _dg_base = (_DG_LANG_MAP.get(_capability_lang, "en-IN") or "").split("-")[0]
+        # Ask the catalogue, not just the ml/pa set: it also covers od-IN and the
+        # rest of the Sarvam-only codes, which used to reach here as "hi-IN"
+        # because _safe_lang had already flattened them.
+        #
+        # Deliberately asked against "nova-3", NOT the configured model: the block
+        # below UPGRADES a nova-2 row to nova-3 for exactly the languages nova-2
+        # rejects, so "can Deepgram do this at all?" is a question about its best
+        # tier. Passing the stored model here would send every nova-2 agent to
+        # Sarvam instead of letting that upgrade happen.
+        if _dg_base in _DG_UNSUPPORTED_LANGS or not stt_catalog.is_supported(
+            "deepgram", "nova-3", _capability_lang
+        ):
             log.warning(
-                "Deepgram has no model/tier for %s (%s) — using Sarvam STT for room=%s so "
-                "the agent can actually hear the caller. Deepgram would answer HTTP 400 and "
-                "pipecat would retry it in a hot loop without ever transcribing.",
-                stt_language, _dg_base, room_name,
+                "Deepgram has no model/tier for the agent's language %s (%s) — using Sarvam "
+                "STT for room=%s so the agent can actually hear the caller. Deepgram would "
+                "answer HTTP 400 (or, on auto-detect, silently mis-transcribe via 'multi') "
+                "and pipecat would retry in a hot loop without ever transcribing.",
+                _capability_lang, _dg_base, room_name,
             )
             stt_provider = "sarvam"
 
@@ -1101,7 +1255,18 @@ async def entrypoint(ctx) -> None:
         # Deepgram: real-time streaming, ~200ms TTFB (vs ~800ms Sarvam batch).
         log.info("Instantiating Deepgram streaming STT...")
         DeepgramSTTService = _import_deepgram_stt()
-        dg_lang = _DG_LANG_MAP.get(stt_language, "en-IN")
+        # AUTO means "let nova-3 code-switch": seeding en-IN makes _base "en",
+        # which the nova-3 block below turns into "multi".
+        #
+        # Anything else falls back to the code ITSELF, not to "en-IN". Deepgram
+        # serves ar-SA / en-US / en-GB natively but DEEPGRAM_LANG_MAP has no entry
+        # for them (it exists to translate the Indic codes, not to enumerate), so
+        # the old `.get(stt_language, "en-IN")` collapsed Arabic to English — the
+        # second half of the "selectable but silently wrong" bug.
+        if stt_language == stt_catalog.AUTO:
+            dg_lang = "en-IN"
+        else:
+            dg_lang = _DG_LANG_MAP.get(stt_language) or stt_language
 
         # ── Model/language selection ─────────────────────────────────────────
         # This block used to have the tier logic BACKWARDS, and the failure was
@@ -1208,10 +1373,12 @@ async def entrypoint(ctx) -> None:
         log.info("Instantiating ElevenLabs Realtime STT...")
         from pipecat.services.elevenlabs.stt import ElevenLabsRealtimeSTTService
 
-        # ElevenLabs Scribe uses ISO 2-letter or 3-letter language code
-        stt_lang = agent_config.get("stt_language") or tts_language
-        if stt_lang and "-" in stt_lang:
-            stt_lang = stt_lang.split("-")[0]
+        # ElevenLabs Scribe takes ISO-639-3 THREE-letter codes ("hin", "kan"), which
+        # a bogus language_code makes it enumerate. This used to send
+        # `stt_language.split("-")[0]` — two-letter "hi"/"kn" — which is not a value
+        # Scribe accepts, so picking a language for ElevenLabs never took effect.
+        # None == blank == Scribe auto-detects, which is what AUTO should mean.
+        stt_lang = stt_catalog.to_provider_code("elevenlabs", None, stt_language)
 
         stt = ElevenLabsRealtimeSTTService(
             api_key=_stt_keys["elevenlabs"],
@@ -1220,7 +1387,9 @@ async def entrypoint(ctx) -> None:
             )
         )
         stt_needs_language_switch = bool(stt_lang)
-        stt_language_translator = lambda code: code.split("-")[0]
+        stt_language_translator = lambda code: (
+            stt_catalog.to_provider_code("elevenlabs", None, code) or ""
+        )
     elif stt_provider == "assemblyai":
         log.info("Instantiating AssemblyAI streaming STT...")
         stt = provider_registry.build_assemblyai_stt(api_key=_stt_keys["assemblyai"])
@@ -1234,9 +1403,16 @@ async def entrypoint(ctx) -> None:
             settings=stt_settings,
         )
         # saaras:v2.5 was built with no language at all (it auto-detects); the
-        # pinned models (saarika, saaras:v3) need to be told.
-        stt_needs_language_switch = stt_model != "saaras:v2.5"
-        stt_language_translator = _safe_lang
+        # pinned models (saarika, saaras:v3) need to be told. Keyed off what was
+        # actually passed rather than re-deriving the model name.
+        stt_needs_language_switch = _sarvam_stt_lang is not None
+        # Was _safe_lang, whose fallback is "hi-IN" — so a mid-call switch into
+        # Odia or any saaras-only language retuned STT to Hindi. The catalogue
+        # knows this model's real set and returns "unknown" (Sarvam's own
+        # auto-detect) rather than a wrong language.
+        stt_language_translator = lambda code, _m=stt_model: (
+            stt_catalog.to_provider_code("sarvam", _m, code) or ""
+        )
 
     # ── One honest line about what the caller will actually be heard by ────────
     # "Real-time" is a property of the SERVICE, not of the pipeline: only
@@ -1258,7 +1434,13 @@ async def entrypoint(ctx) -> None:
     # dashboard stays empty until the caller pauses. That is the provider, not a
     # bug in this pipeline, and it is the single biggest lever on perceived
     # latency for anyone reporting "it doesn't hear me".
-    _STT_REALTIME = {"deepgram", "assemblyai", "elevenlabs"}
+    # Providers whose pipecat service actually constructs an
+    # InterimTranscriptionFrame. Verified against the installed pipecat-ai 1.5.0
+    # source on 2026-08-03: elevenlabs was listed here but its STT service emits
+    # NO interim frames and is not even websocket-based, so it was being reported
+    # as real-time when it is not. Kept in sync with the same set in
+    # frontend/src/components/TestVoiceCallLK.tsx.
+    _STT_REALTIME = {"deepgram", "assemblyai"}
     log.info(
         "STT ready | provider=%s model=%s language=%s realtime_interim=%s ttfs_p99=%.2fs | room=%s",
         stt_provider,
@@ -1587,6 +1769,13 @@ async def entrypoint(ctx) -> None:
         # in the new language on the very next reply, not two turns later.
         confirm_turns=1,
         on_switch=resilience.set_language,
+        # Bounds what an explicit "please speak X" request may switch TO. Sourced
+        # from the TTS provider's real catalogue, because TTS is the half with no
+        # fallback: honouring a request for a language the voice cannot speak would
+        # replace "the agent ignored me" with "the agent stopped talking".
+        supported_languages={
+            lang["code"] for lang in agent_defaults.tts_languages(tts_provider)
+        },
     )
 
     # ── Build the Pipeline ─────────────────────────────────────────────────

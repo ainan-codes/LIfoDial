@@ -132,7 +132,10 @@ async def embed_config(agent_id: str, request: Request) -> JSONResponse:
         "greeting": agent.first_message or "Hello! How can I help you today?",
         "first_message": agent.first_message or "Hello! How can I help you today?",
         "first_message_mode": getattr(agent, "first_message_mode", "assistant-speaks-first") or "assistant-speaks-first",
-        "language": agent.stt_language or "en-IN",
+        # THE one language. Was assembled here from the two legacy mirrors with
+        # an "auto" guard; now it is simply the canonical field, so the widget can
+        # no longer label itself with a language that disagrees with the editor.
+        "language": agent.language,
         "theme": {
             "primary_color": getattr(agent, "embed_primary_color", "#3ECF8E"),
             "position": getattr(agent, "embed_position", "bottom-right"),
