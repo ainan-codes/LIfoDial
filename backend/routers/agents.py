@@ -1331,6 +1331,44 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
                 _custom = await resolve_custom_llm_endpoint(session, payload.llm_provider)
                 validate_or_raise("llm", payload.llm_provider, has_base_url=_custom is not None)
 
+            # ── The LLM model ──────────────────────────────────────────────────
+            # The provider is locked to Groq, but the model is a real choice from a
+            # live-fetched dropdown, so it is validated against what Groq is serving
+            # RIGHT NOW rather than against a list maintained in this repo.
+            #
+            # If Groq cannot be reached, the save is REFUSED with a 503 rather than
+            # accepted unverified. That is the right way round for this field: an
+            # unverifiable model id is not a cosmetic defect — the agent silently
+            # answers 404 on its first call and the caller hears dead air. The
+            # operator can retry in a moment; a dead agent may go unnoticed for days.
+            if payload.llm_model is not None and payload.llm_model.strip():
+                from backend.services import groq_catalog
+                from backend.services.provider_status import resolve_provider_key
+
+                _model = payload.llm_model.strip()
+                _key = await resolve_provider_key(
+                    session, agent_defaults.LOCKED_LLM_PROVIDER, category="llm"
+                )
+                try:
+                    _live = {m["id"] for m in await groq_catalog.fetch_models(_key or "")}
+                except groq_catalog.GroqModelsUnavailable as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            f"Cannot verify the model '{_model}' because Groq's model "
+                            f"list is unavailable ({exc}). Nothing was saved — try again."
+                        ),
+                    )
+                if _model not in _live:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"'{_model}' is not a Groq model this platform can run an "
+                            "agent on. Available now: " + ", ".join(sorted(_live)) + "."
+                        ),
+                    )
+                payload.llm_model = _model
+
             # ── The one language ───────────────────────────────────────────────
             # Validated once, against what the SELECTED TTS provider can actually
             # speak. The old code validated stt_language against a separately

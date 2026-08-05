@@ -1044,16 +1044,24 @@ async def fetch_provider_models(
             elif provider == "groq":
                 if not raw_key:
                     raise HTTPException(400, "Groq API key not configured")
-                r = await client.get(
-                    "https://api.groq.com/openai/v1/models",
-                    headers={"Authorization": f"Bearer {raw_key}"}
-                )
-                r.raise_for_status()
-                # Filter to language models only (exclude audio/vision)
-                models = sorted([
-                    m["id"] for m in r.json().get("data", [])
-                    if m.get("object") == "model"
-                ])
+                # Delegated to groq_catalog so this "Refresh Models" action and the
+                # dropdown at GET /platform/llm/models can never disagree about
+                # which models exist.
+                #
+                # The code here previously carried the comment "Filter to language
+                # models only (exclude audio/vision)" above the predicate
+                # `m.get("object") == "model"` — which every single Groq entry
+                # satisfies, including whisper-large-v3 (audio -> transcription) and
+                # canopylabs/orpheus-* (text -> audio). So the filter excluded
+                # nothing and the comment described behaviour that did not exist.
+                # Picking Whisper as an agent's LLM yields an agent that cannot
+                # speak, and nothing would have refused it.
+                from backend.services import groq_catalog
+
+                try:
+                    models = [m["id"] for m in await groq_catalog.fetch_models(raw_key, force=True)]
+                except groq_catalog.GroqModelsUnavailable as exc:
+                    raise HTTPException(503, str(exc))
 
             elif provider == "mistral":
                 if not raw_key:
@@ -1722,6 +1730,43 @@ async def stt_languages(
         "has_key": bool(raw_key),
         "languages": stt_catalog.stt_language_options(prov, model),
         "note": spec.note,
+    }
+
+
+# ── GET /platform/llm/models ──────────────────────────────────────────────────
+# Populates the agent editor's LLM Model dropdown.
+#
+# There is no provider parameter and no provider dropdown: the LLM provider is
+# locked to Groq (backend/services/agent_defaults.py). The MODEL is a real
+# per-agent choice, so it is fetched live from Groq's own API on every cache miss.
+#
+# Failure answers 503 with Groq's own reason, and NO models. That is deliberate:
+# a stale or invented list is how the product came to offer four models Groq had
+# already decommissioned (see the rewrite rule in backend/agent/resilience.py).
+# An empty dropdown with a visible error is recoverable; a plausible-looking list
+# that 404s in the middle of a live call is not.
+@router.get("/platform/llm/models")
+async def llm_models(
+    refresh: bool = Query(default=False, description="Bypass the cache and re-ask Groq."),
+    user: CurrentUser = None,
+    db: AsyncSession = Depends(get_db),
+):
+    from backend.services import agent_defaults, groq_catalog
+
+    raw_key = await _get_raw_key(agent_defaults.LOCKED_LLM_PROVIDER, db, category="llm")
+    try:
+        models = await groq_catalog.fetch_models(raw_key or "", force=refresh)
+    except groq_catalog.GroqModelsUnavailable as exc:
+        # 503, not 500: the request was valid and the fault is upstream/transient,
+        # so the UI should invite a retry rather than present a broken page.
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    return {
+        "provider": agent_defaults.LOCKED_LLM_PROVIDER,
+        "source": "live",
+        "models": models,
+        "default": agent_defaults.DEFAULT_LLM_MODEL,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
 

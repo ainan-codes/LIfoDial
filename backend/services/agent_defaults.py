@@ -1,6 +1,6 @@
 """
-backend/services/agent_defaults.py — the ONE language field, the locked LLM, and
-the whitelist of STT/TTS providers a dropdown may offer.
+backend/services/agent_defaults.py — the ONE language field, the locked LLM
+provider, and the whitelist of STT/TTS providers a dropdown may offer.
 
 Why this module exists
 ----------------------
@@ -41,8 +41,11 @@ with a dead LLM too.
 The fix for the first is one language field. The fix for the second is narrower
 than it first looks, and the difference matters:
 
-* **The LLM choice is removed outright.** There is one locked provider/model,
-  decided here, applied by the API to every agent, and shown in no dropdown.
+* **The LLM PROVIDER choice is removed outright.** It is locked to Groq here,
+  applied by the API to every agent, and shown in no dropdown. The LLM *model*
+  remains a per-agent choice, but from a list fetched LIVE from Groq's own API
+  (``backend/services/groq_catalog.py``) rather than a hardcoded one — a hardcoded
+  list is how the product came to offer four models Groq had decommissioned.
 
 * **STT and TTS keep their provider/model choice** — but the *option list* is now
   a whitelist of providers that are genuinely configured AND genuinely buildable,
@@ -61,14 +64,25 @@ The provider choices, and the evidence for each
 ----------------------------------------------
 All were probed live against the keys in ``.env`` on 2026-08-03.
 
-* **LLM — LOCKED to groq / llama-3.3-70b-versatile.** Groq per explicit stakeholder
-  preference and prior Gemini reliability problems in this project. Both
-  ``llama-3.3-70b-versatile`` and ``llama-3.1-8b-instant`` answer 200; the 70b is
-  locked because booking is a tool-calling task and reliability there matters more
-  than the small latency win from 8b. (Groq's API rejects a
-  ``Python-urllib`` User-Agent with Cloudflare error 1010 — that is a local probe
-  artifact, not an auth failure. The agent worker uses the Groq SDK and is
-  unaffected.)
+* **LLM — PROVIDER locked to groq; MODEL selectable, defaulting to
+  llama-3.3-70b-versatile.** Groq per explicit stakeholder preference and prior
+  Gemini reliability problems in this project.
+
+  The default is the model this project has actually run on throughout its history.
+  An earlier version of this note justified it as "booking is a tool-calling task
+  and reliability there matters" — **that reasoning was wrong** and is recorded here
+  so it is not repeated: verified 2026-08-04, there is no ``register_function``, no
+  ``tools=`` and no ``FunctionSchema`` anywhere in ``backend/agent/``. Booking runs
+  on ``BookingProcessor``'s regex matching plus an injected ``[BOOKING_RESULT ...]``
+  system message; the LLM only ever emits text. The default stands on track record.
+
+  The offered list is live — see ``groq_catalog``, which filters Groq's 15-model
+  response down to the ones that can actually hold a conversation using Groq's own
+  per-model metadata (Whisper is audio→transcription, Orpheus is text→audio, and the
+  prompt-guard entries are 512-token classifiers).
+
+  (Groq's API rejects a ``Python-urllib`` User-Agent with Cloudflare error 1010 —
+  that is a client artifact, not an auth failure. Send a normal User-Agent.)
 
 * **STT — DEFAULT deepgram / nova-3; Sarvam AI also selectable.** The product's own UI warned that Sarvam
   "transcribes only after you pause". **That warning is accurate.** Confirmed
@@ -111,6 +125,7 @@ What is deliberately NOT locked
 * The **voice/speaker** choice and the Voice Library stay exactly as they are.
   The stakeholder preserved them explicitly ("let it be there. no problem.").
 * The **STT and TTS provider + model** stay selectable, from the whitelists below.
+* The **LLM model** stays selectable, from Groq's live catalogue.
 
 Why ElevenLabs is not on those whitelists even though its key IS set
 -------------------------------------------------------------------
@@ -136,7 +151,27 @@ from __future__ import annotations
 # write. There is deliberately no per-agent override and no UI that exposes one.
 
 LOCKED_LLM_PROVIDER = "groq"
-LOCKED_LLM_MODEL = "llama-3.3-70b-versatile"
+
+#: The model a NEW agent starts on, and the repair value for a row holding a model
+#: Groq no longer serves. This is a starting value, not a lock: the agent editor has
+#: a Model dropdown populated LIVE from Groq's own API
+#: (backend/services/groq_catalog.py), and a chosen model is honoured.
+#:
+#: Only the PROVIDER is locked. Nothing about a clinic makes one vendor the right
+#: answer, so that is a platform decision; but call volume and triage complexity do
+#: differ per clinic, so the model is theirs to choose.
+#:
+#: 70b-versatile as the default because it is the model this project has actually
+#: run on throughout its history. Note the earlier justification recorded here —
+#: "booking is a tool-calling task and reliability there matters" — was WRONG:
+#: verified 2026-08-04, nothing in backend/agent/ registers a single LLM tool.
+#: Booking is regex + injected system messages. The default stands on track record,
+#: not on that reasoning.
+DEFAULT_LLM_MODEL = "llama-3.3-70b-versatile"
+
+#: Retained alias — several call sites and tests import LOCKED_LLM_MODEL. It is a
+#: DEFAULT now, not a lock. Delete once no caller reads it.
+LOCKED_LLM_MODEL = DEFAULT_LLM_MODEL
 
 # ── STT / TTS: selectable, from a whitelist ───────────────────────────────────
 # These are DEFAULTS for a new agent and the repair value for a row naming a
@@ -180,10 +215,11 @@ PROVIDER_LABELS: dict[str, str] = {
 #: the Sarvam fallback before anyone has chosen anything.
 DEFAULT_LANGUAGE = "en-IN"
 
-#: Locked provider/model by category, for the API's write path. LLM only — STT and
-#: TTS are selectable, so they have defaults (above), not locks.
+#: Locked PROVIDER by category. LLM only, and only the provider half — the LLM
+#: model is selectable (live from groq_catalog), and STT/TTS have both halves
+#: selectable from their whitelists.
 LOCKED_BY_CATEGORY: dict[str, tuple[str, str]] = {
-    "llm": (LOCKED_LLM_PROVIDER, LOCKED_LLM_MODEL),
+    "llm": (LOCKED_LLM_PROVIDER, DEFAULT_LLM_MODEL),
 }
 
 #: Selectable providers and the default model per category, for the write-time
@@ -205,9 +241,12 @@ SELECTABLE_BY_CATEGORY: dict[str, tuple[str, ...]] = {
 #: ``normalize_provider_choice`` so an unbuildable or unconfigured value cannot
 #: land in the row. Only the two language MIRRORS and the locked LLM pair are
 #: computed rather than accepted.
+#: ``llm_model`` is NOT here: it is a real choice made in the editor's Model
+#: dropdown, so it must be accepted and persisted. ``llm_provider`` stays derived
+#: (locked to Groq).
 DERIVED_FIELDS: frozenset[str] = frozenset({
     "stt_language", "tts_language",
-    "llm_provider", "llm_model",
+    "llm_provider",
 })
 
 
@@ -529,8 +568,12 @@ def apply_locked_defaults(target, *, language: str | None = None) -> str:
 
     target.language = resolved
 
+    # PROVIDER is locked. MODEL is not: it is only defaulted when absent, so a
+    # model chosen from the live Groq dropdown survives every subsequent save.
+    # Overwriting it here is what made the dropdown cosmetic in an earlier draft.
     target.llm_provider = LOCKED_LLM_PROVIDER
-    target.llm_model = LOCKED_LLM_MODEL
+    if not (getattr(target, "llm_model", None) or "").strip():
+        target.llm_model = DEFAULT_LLM_MODEL
 
     # Validated, not overwritten. A row naming a provider that was dropped from
     # the whitelist (elevenlabs, whisper, openai) falls back to the default pair.
