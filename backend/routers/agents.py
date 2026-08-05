@@ -1334,7 +1334,22 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
             # ── The LLM model ──────────────────────────────────────────────────
             # The provider is locked to Groq, but the model is a real choice from a
             # live-fetched dropdown, so it is validated against what Groq is serving
-            # RIGHT NOW rather than against a list maintained in this repo.
+            # rather than against a list maintained in this repo.
+            #
+            # The cache is consulted for a HIT ONLY. That asymmetry is the whole
+            # design, so it is worth being explicit about:
+            #
+            #   * A hit is proof. Groq listed this id, recently. The dropdown the
+            #     operator just picked from was almost certainly built from this very
+            #     cache entry, so the common save costs no network call at all.
+            #
+            #   * A miss proves NOTHING, and must never reject. The cache can be up
+            #     to 15 minutes stale and starts out empty after a restart, so a
+            #     model Groq added minutes ago is absent from it. Rejecting on a miss
+            #     would refuse a perfectly good model with a message claiming Groq
+            #     does not serve it — a lie the operator cannot act on.
+            #
+            # So a miss escalates to a live fetch, and only that fetch may reject.
             #
             # If Groq cannot be reached, the save is REFUSED with a 503 rather than
             # accepted unverified. That is the right way round for this field: an
@@ -1346,27 +1361,38 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
                 from backend.services.provider_status import resolve_provider_key
 
                 _model = payload.llm_model.strip()
-                _key = await resolve_provider_key(
-                    session, agent_defaults.LOCKED_LLM_PROVIDER, category="llm"
-                )
-                try:
-                    _live = {m["id"] for m in await groq_catalog.fetch_models(_key or "")}
-                except groq_catalog.GroqModelsUnavailable as exc:
-                    raise HTTPException(
-                        status_code=503,
-                        detail=(
-                            f"Cannot verify the model '{_model}' because Groq's model "
-                            f"list is unavailable ({exc}). Nothing was saved — try again."
-                        ),
+
+                if _model not in groq_catalog.cached_ids():
+                    _key = await resolve_provider_key(
+                        session, agent_defaults.LOCKED_LLM_PROVIDER, category="llm"
                     )
-                if _model not in _live:
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            f"'{_model}' is not a Groq model this platform can run an "
-                            "agent on. Available now: " + ", ".join(sorted(_live)) + "."
-                        ),
-                    )
+                    try:
+                        # force=True is REQUIRED, not an optimisation knob. A plain
+                        # fetch_models() consults the same cache this branch just
+                        # missed in and would hand back that identical stale list, so
+                        # the check below would reject a live model on the strength of
+                        # the very cache entry that failed to know about it.
+                        _live = {
+                            m["id"]
+                            for m in await groq_catalog.fetch_models(_key or "", force=True)
+                        }
+                    except groq_catalog.GroqModelsUnavailable as exc:
+                        raise HTTPException(
+                            status_code=503,
+                            detail=(
+                                f"Cannot verify the model '{_model}' because Groq's model "
+                                f"list is unavailable ({exc}). Nothing was saved — try again."
+                            ),
+                        )
+                    if _model not in _live:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                f"'{_model}' is not a Groq model this platform can run an "
+                                "agent on. Available now: " + ", ".join(sorted(_live)) + "."
+                            ),
+                        )
+
                 payload.llm_model = _model
 
             # ── The one language ───────────────────────────────────────────────
