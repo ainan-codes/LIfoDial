@@ -1240,9 +1240,18 @@ async def create_agent(payload: AgentCreatePayload, user: SuperAdmin = None) -> 
             # a client-supplied provider/model/language can never reach the row.
             # Dropped here rather than after construction so the object is never
             # even transiently built from them.
+            #
+            # DERIVED_ON_CREATE, not DERIVED_FIELDS: it additionally scrubs
+            # llm_model. The wizard has no Model dropdown, so an llm_model here is a
+            # stale build echoing a dead value — `gpt-4o` on a Groq-locked provider
+            # is the observed one, and it reproduces exactly the provider/model
+            # mismatch that had a live agent's LLM answering HTTP 404. The editor's
+            # PATCH refuses such a value; create scrubs it, because refusing would
+            # let one stale tab block onboarding a clinic and there is no operator
+            # intent to honour.
             safe_kwargs = {
                 k: v for k, v in raw_kwargs.items()
-                if k in valid_columns and k not in agent_defaults.DERIVED_FIELDS
+                if k in valid_columns and k not in agent_defaults.DERIVED_ON_CREATE
             }
 
             agent = AgentConfig(**safe_kwargs)
@@ -1333,67 +1342,58 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
 
             # ── The LLM model ──────────────────────────────────────────────────
             # The provider is locked to Groq, but the model is a real choice from a
-            # live-fetched dropdown, so it is validated against what Groq is serving
+            # live-fetched dropdown, so it is checked against what Groq is serving
             # rather than against a list maintained in this repo.
             #
-            # The cache is consulted for a HIT ONLY. That asymmetry is the whole
-            # design, so it is worth being explicit about:
+            # The response splits on the CAUSE, because "Groq says that model does
+            # not exist" and "we could not ask Groq" are different facts:
             #
-            #   * A hit is proof. Groq listed this id, recently. The dropdown the
-            #     operator just picked from was almost certainly built from this very
-            #     cache entry, so the common save costs no network call at all.
+            #   DEAD    -> 422. A positive statement from Groq. Worth refusing: the
+            #              agent would answer 404 on its first call and the caller
+            #              would hear dead air, which goes unnoticed for days.
+            #   UNKNOWN -> accept the save, drop this one field. Refusing would mean
+            #              a Groq outage makes every agent on the platform
+            #              read-only — a bigger, wider failure than briefly keeping
+            #              a model whose liveness we cannot confirm. The row keeps
+            #              the model it already had, which was live when it was set.
+            #   LIVE    -> write it.
             #
-            #   * A miss proves NOTHING, and must never reject. The cache can be up
-            #     to 15 minutes stale and starts out empty after a restart, so a
-            #     model Groq added minutes ago is absent from it. Rejecting on a miss
-            #     would refuse a perfectly good model with a message claiming Groq
-            #     does not serve it — a lie the operator cannot act on.
-            #
-            # So a miss escalates to a live fetch, and only that fetch may reject.
-            #
-            # If Groq cannot be reached, the save is REFUSED with a 503 rather than
-            # accepted unverified. That is the right way round for this field: an
-            # unverifiable model id is not a cosmetic defect — the agent silently
-            # answers 404 on its first call and the caller hears dead air. The
-            # operator can retry in a moment; a dead agent may go unnoticed for days.
+            # A model already in the cache costs no network call at all; see
+            # groq_catalog.check_model.
+            _llm_model_ok: bool | None = None
+
             if payload.llm_model is not None and payload.llm_model.strip():
                 from backend.services import groq_catalog
                 from backend.services.provider_status import resolve_provider_key
 
                 _model = payload.llm_model.strip()
+                _key = await resolve_provider_key(
+                    session, agent_defaults.LOCKED_LLM_PROVIDER, category="llm"
+                )
+                _verdict = await groq_catalog.check_model(_key or "", _model)
 
-                if _model not in groq_catalog.cached_ids():
-                    _key = await resolve_provider_key(
-                        session, agent_defaults.LOCKED_LLM_PROVIDER, category="llm"
+                if _verdict == groq_catalog.DEAD:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"'{_model}' is not a Groq model this platform can run an "
+                            "agent on. Available now: "
+                            + ", ".join(sorted(groq_catalog.cached_ids()))
+                            + "."
+                        ),
                     )
-                    try:
-                        # force=True is REQUIRED, not an optimisation knob. A plain
-                        # fetch_models() consults the same cache this branch just
-                        # missed in and would hand back that identical stale list, so
-                        # the check below would reject a live model on the strength of
-                        # the very cache entry that failed to know about it.
-                        _live = {
-                            m["id"]
-                            for m in await groq_catalog.fetch_models(_key or "", force=True)
-                        }
-                    except groq_catalog.GroqModelsUnavailable as exc:
-                        raise HTTPException(
-                            status_code=503,
-                            detail=(
-                                f"Cannot verify the model '{_model}' because Groq's model "
-                                f"list is unavailable ({exc}). Nothing was saved — try again."
-                            ),
-                        )
-                    if _model not in _live:
-                        raise HTTPException(
-                            status_code=422,
-                            detail=(
-                                f"'{_model}' is not a Groq model this platform can run an "
-                                "agent on. Available now: " + ", ".join(sorted(_live)) + "."
-                            ),
-                        )
-
-                payload.llm_model = _model
+                if _verdict == groq_catalog.UNKNOWN:
+                    # Unverifiable: let the rest of the save through untouched rather
+                    # than failing it, and leave the row on its existing model.
+                    logger.warning(
+                        "Could not verify LLM model %r for agent %s; keeping the "
+                        "stored model and saving the rest of the request.",
+                        _model, agent_id,
+                    )
+                    payload.llm_model = None
+                else:
+                    payload.llm_model = _model
+                    _llm_model_ok = True
 
             # ── The one language ───────────────────────────────────────────────
             # Validated once, against what the SELECTED TTS provider can actually
@@ -1469,11 +1469,44 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
                 if field in _model_columns and field not in agent_defaults.DERIVED_FIELDS:
                     setattr(agent, field, value)
 
+            # A row can be sitting on a model Groq has since decommissioned without
+            # this request mentioning llm_model at all — that is the real kmct row,
+            # stuck on gemini-2.5-flash-8b and 404ing every call. So when the payload
+            # did not supply a model to check, check the STORED one and let
+            # apply_locked_defaults repair it. Resolved here because that function is
+            # sync and confirming a model means asking Groq.
+            #
+            # UNKNOWN maps to None, never False: an unverifiable model must be left
+            # alone, or a Groq outage would blank every working configuration it
+            # touched. Cost is bounded — a healthy model is a cache hit and free once
+            # the catalogue has been fetched; only a row that really is on a dead
+            # model pays a fetch per save, and it gets repaired in exchange.
+            if _llm_model_ok is None and (getattr(agent, "llm_model", None) or "").strip():
+                from backend.services import groq_catalog
+                from backend.services.provider_status import resolve_provider_key
+
+                _stored = agent.llm_model.strip()
+                _stored_verdict = await groq_catalog.check_model(
+                    await resolve_provider_key(
+                        session, agent_defaults.LOCKED_LLM_PROVIDER, category="llm"
+                    ) or "",
+                    _stored,
+                )
+                if _stored_verdict == groq_catalog.DEAD:
+                    _llm_model_ok = False
+                    logger.warning(
+                        "Agent %s was on LLM model %r, which Groq no longer serves; "
+                        "repairing to %s.",
+                        agent_id, _stored, agent_defaults.DEFAULT_LLM_MODEL,
+                    )
+                elif _stored_verdict == groq_catalog.LIVE:
+                    _llm_model_ok = True
+
             # Re-apply on EVERY update, not just when language changed. That makes
             # this endpoint self-healing: any row still carrying a legacy
             # provider/model pair or a stale mirror is corrected the first time
             # anything about the agent is saved.
-            agent_defaults.apply_locked_defaults(agent)
+            agent_defaults.apply_locked_defaults(agent, llm_model_ok=_llm_model_ok)
 
             await session.commit()
             await session.refresh(agent)

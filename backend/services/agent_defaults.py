@@ -249,6 +249,19 @@ DERIVED_FIELDS: frozenset[str] = frozenset({
     "llm_provider",
 })
 
+#: What a CREATE additionally refuses to take from the client: ``llm_model``.
+#:
+#: The wizard has no model dropdown — the Model picker lives in the agent editor —
+#: so an ``llm_model`` in a create payload is never a choice anyone made. It is a
+#: stale frontend build echoing a field it used to send, and the values observed
+#: doing so are exactly the dangerous ones (``gpt-4o`` on a Groq-locked provider).
+#: Scrubbing it to DEFAULT_LLM_MODEL is therefore not information loss.
+#:
+#: This is also why create scrubs where the editor's PATCH refuses: refusing here
+#: would let one stale browser tab, or a Groq outage, block onboarding a clinic —
+#: and there is no operator intent to honour by refusing.
+DERIVED_ON_CREATE: frozenset[str] = DERIVED_FIELDS | {"llm_model"}
+
 
 def normalize_provider_choice(category: str, provider: str | None, model: str | None) -> tuple[str, str]:
     """Coerce a client-supplied ``(provider, model)`` to something that can run.
@@ -535,7 +548,9 @@ def effective_stt_language(language: str, *, auto_detect: bool) -> str:
     return "auto" if auto_detect else (language or DEFAULT_LANGUAGE)
 
 
-def apply_locked_defaults(target, *, language: str | None = None) -> str:
+def apply_locked_defaults(
+    target, *, language: str | None = None, llm_model_ok: bool | None = None
+) -> str:
     """Settle language + providers on an AgentConfig-shaped object (an ORM instance
     or anything with attributes).
 
@@ -546,7 +561,10 @@ def apply_locked_defaults(target, *, language: str | None = None) -> str:
 
     1. **Language** — collapse the historical fields to one value and write the two
        derived mirrors. Never accepted from a client.
-    2. **LLM** — overwritten with the locked pair. Never accepted from a client.
+    2. **LLM** — the PROVIDER is overwritten with the locked value and never
+       accepted from a client. The MODEL is kept, because it is a real choice from
+       the editor's live Groq dropdown; it is replaced only when absent, or when the
+       caller has established that Groq no longer serves it (``llm_model_ok``).
     3. **STT/TTS provider+model** — *kept* if selectable and coherent, repaired if
        not. This is the part that changed when the decision narrowed to LLM-only:
        these used to be overwritten like the LLM pair, which silently discarded a
@@ -554,6 +572,20 @@ def apply_locked_defaults(target, *, language: str | None = None) -> str:
 
     Called on both create and update, so a legacy row self-heals the first time
     anything about the agent is saved.
+
+    ``llm_model_ok`` is the liveness verdict for whatever model ``target`` is
+    carrying, and it must come from the caller: this function is sync and does no
+    I/O, while confirming a model means asking Groq. The API resolves it (see
+    ``groq_catalog.check_model``) and passes it down. Tri-state on purpose:
+
+    * ``True`` — Groq serves it. Keep it.
+    * ``False`` — Groq answered and does not serve it. Repair to
+      DEFAULT_LLM_MODEL. This is the self-heal that rescues a row like the real
+      kmct one, stuck on ``gemini-2.5-flash-8b`` and answering HTTP 404 on every
+      call until someone noticed.
+    * ``None`` — not checked, or unverifiable because Groq could not be reached.
+      Leave it alone. Blanking a working model because a network call failed would
+      manufacture the outage it was trying to avoid.
     """
     resolved, conflicting = resolve_language(
         language=language if language is not None else getattr(target, "language", None),
@@ -568,11 +600,12 @@ def apply_locked_defaults(target, *, language: str | None = None) -> str:
 
     target.language = resolved
 
-    # PROVIDER is locked. MODEL is not: it is only defaulted when absent, so a
-    # model chosen from the live Groq dropdown survives every subsequent save.
-    # Overwriting it here is what made the dropdown cosmetic in an earlier draft.
+    # PROVIDER is locked. MODEL is not: it is only replaced when absent, or when
+    # the caller has confirmed Groq no longer serves it. Overwriting it
+    # unconditionally is what made the dropdown cosmetic in an earlier draft;
+    # NEVER overwriting it is what left a dead model in the row forever.
     target.llm_provider = LOCKED_LLM_PROVIDER
-    if not (getattr(target, "llm_model", None) or "").strip():
+    if not (getattr(target, "llm_model", None) or "").strip() or llm_model_ok is False:
         target.llm_model = DEFAULT_LLM_MODEL
 
     # Validated, not overwritten. A row naming a provider that was dropped from

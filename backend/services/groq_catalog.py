@@ -249,6 +249,45 @@ async def fetch_models(api_key: str, *, force: bool = False) -> list[dict]:
     return usable
 
 
+#: The three answers ``check_model`` can give. "unknown" is not a failure mode to
+#: be collapsed into "dead" — see check_model's docstring for why the distinction
+#: decides whether a Groq outage makes every agent read-only.
+LIVE, DEAD, UNKNOWN = "live", "dead", "unknown"
+
+
+async def check_model(api_key: str, model: str) -> str:
+    """Is ``model`` one Groq is serving right now? Returns LIVE, DEAD or UNKNOWN.
+
+    The tri-state is the whole point. Callers must not collapse UNKNOWN into DEAD:
+
+    * ``LIVE`` — Groq listed it. Safe to write.
+    * ``DEAD`` — Groq answered, and this id was not in the reply. A positive
+      statement that the model does not exist, so a caller may refuse the write.
+    * ``UNKNOWN`` — we could not ask (no key, network error, non-200). This says
+      nothing about the model. Refusing on UNKNOWN would turn any Groq outage into
+      "no agent on this platform can be edited", which is a worse failure than
+      briefly keeping a model whose liveness we cannot confirm.
+
+    The cache is consulted for a HIT ONLY, then a miss escalates to a forced fetch:
+    a hit is proof, a miss just means our 15-minute cache has not heard of it yet.
+    """
+    wanted = (model or "").strip()
+    if not wanted:
+        return UNKNOWN
+
+    if wanted in cached_ids():
+        return LIVE
+
+    try:
+        # force=True is required: a plain fetch would re-read the cache we just
+        # missed in and report DEAD on the strength of that same stale entry.
+        live = {m["id"] for m in await fetch_models(api_key or "", force=True)}
+    except GroqModelsUnavailable:
+        return UNKNOWN
+
+    return LIVE if wanted in live else DEAD
+
+
 def cached_ids() -> set[str]:
     """Model ids from the last successful fetch, or an empty set.
 

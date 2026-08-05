@@ -271,21 +271,83 @@ async def test_client_supplied_language_mirrors_are_ignored_not_honoured(app_cli
 
 
 @pytest.mark.asyncio
-async def test_the_llm_pair_is_locked_against_client_writes(app_client):
-    """The LLM is the ONE pair with no dropdown. A client sending one — including the
-    exact gemini-on-groq combination that left a live agent's LLM answering HTTP 404
-    — must not be able to write it."""
+async def test_the_llm_provider_is_locked_and_a_dead_model_is_refused(app_client):
+    """The two halves of the LLM pair are protected DIFFERENTLY, because only one of
+    them is a choice.
+
+    * The PROVIDER has no dropdown, so a client sending one is echoing a field it
+      should not be sending. Silently ignored.
+    * The MODEL does have a dropdown, so a wrong value means someone (or some stale
+      build) is really trying to write it. Refused with a 422, loudly.
+
+    Both halves of the exact gemini-on-groq combination that left a live agent's LLM
+    answering HTTP 404 must still be unable to reach the row.
+    """
     _, agent_id = await _make_agent()
 
     r = await app_client.patch(
         f"/agents/{agent_id}", headers=_super(),
         json={"llm_provider": "gemini", "llm_model": "gemini-2.5-flash-8b"},
     )
+    assert r.status_code == 422, r.text
+    assert "gemini-2.5-flash-8b" in r.json()["detail"]
+
+    # Refused, so NOTHING was written — not even the ignorable provider.
+    row = await _row(agent_id)
+    assert row.llm_provider == agent_defaults.LOCKED_LLM_PROVIDER
+    assert row.llm_model != "gemini-2.5-flash-8b"
+
+
+@pytest.mark.asyncio
+async def test_a_groq_outage_does_not_make_agents_read_only(app_client, monkeypatch):
+    """When Groq cannot be reached we cannot tell a live model from a dead one — and
+    that must NOT fail the save.
+
+    The alternative was a 503, which reads as safe and is not: it means one upstream
+    outage makes every agent on the platform uneditable, so nobody can fix a prompt
+    or a phone number until Groq comes back. Refusing is reserved for Groq positively
+    telling us the model does not exist.
+
+    The unverifiable model is dropped, so the row keeps the model it already had —
+    which was verified live at the time it was set.
+    """
+    from backend.services import groq_catalog
+
+    _, agent_id = await _make_agent(llm_model=agent_defaults.DEFAULT_LLM_MODEL)
+
+    async def _down(*a, **kw):
+        raise groq_catalog.GroqModelsUnavailable("simulated outage")
+
+    # Both halves of the lookup must be dark: an empty cache so there is no hit to
+    # short-circuit on, and a fetch that fails so the escalation cannot rescue it.
+    monkeypatch.setattr(groq_catalog, "fetch_models", _down)
+    monkeypatch.setitem(groq_catalog._cache, "models", None)
+
+    r = await app_client.patch(
+        f"/agents/{agent_id}", headers=_super(),
+        json={"agent_name": "Front Desk", "llm_model": "some-unverifiable-model"},
+    )
     assert r.status_code == 200, r.text
 
     row = await _row(agent_id)
-    assert (row.llm_provider, row.llm_model) == (
-        agent_defaults.LOCKED_LLM_PROVIDER, agent_defaults.LOCKED_LLM_MODEL)
+    # The rest of the request landed...
+    assert row.agent_name == "Front Desk"
+    # ...the unverifiable model did not, and the working one was left alone.
+    assert row.llm_model == agent_defaults.DEFAULT_LLM_MODEL
+
+
+@pytest.mark.asyncio
+async def test_the_locked_provider_alone_is_still_silently_ignored(app_client):
+    """The provider half on its own does not fail the save. The editor auto-saves on
+    a debounce and an older in-flight build sends llm_provider on every keystroke;
+    422ing that would break saving mid-deploy for anyone on the old bundle."""
+    _, agent_id = await _make_agent()
+
+    r = await app_client.patch(
+        f"/agents/{agent_id}", headers=_super(), json={"llm_provider": "gemini"},
+    )
+    assert r.status_code == 200, r.text
+    assert (await _row(agent_id)).llm_provider == agent_defaults.LOCKED_LLM_PROVIDER
 
 
 @pytest.mark.asyncio
