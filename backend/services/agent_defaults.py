@@ -303,8 +303,19 @@ def models_for(category: str, provider: str) -> list[str]:
 
         return list(SARVAM_TTS_MODELS)
     if category == "stt" and provider == "sarvam":
-        # saaras:v3 first: it serves 23 languages to saarika's 11.
-        return ["saaras:v3", "saarika:v2.5", "saaras:v2.5"]
+        # saaras:v3 FIRST and deliberately: valid[0] is both the picker's default
+        # and the repair value for an unrecognised stored model, so reordering this
+        # would silently move every agent onto a different STT engine.
+        #
+        # saaras:v4 is Sarvam's newer transcribe model (their playground's default),
+        # offered as a CHOICE rather than forced. It is wire-identical to v3 on this
+        # endpoint — same params, same response keys, verbatim-correct Malayalam on
+        # a live A/B — and pipecat needs a shim to build it at all; both are
+        # documented at backend/agent/pipeline.py::_register_sarvam_v4_with_pipecat.
+        #
+        # saaras:v4-multispk / saaras:v3-realtime are absent on purpose: Sarvam's
+        # request validator names them but the transcribe endpoint rejects them.
+        return ["saaras:v3", "saaras:v4", "saarika:v2.5", "saaras:v2.5"]
     if category == "stt" and provider == "deepgram":
         from backend.routers.platform import DEEPGRAM_STT_MODELS
 

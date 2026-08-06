@@ -243,7 +243,22 @@ async def build_llm(provider: str, api_key: str, model: str, system_prompt: str,
     (set via the AI Platform dashboard's "Add Custom Provider").
     """
     temperature = float(agent_config.get("llm_temperature", 0.3))
-    max_tokens = int(agent_config.get("max_response_tokens", 120))
+
+    # Language-aware, because a token is not a fixed amount of speech. The
+    # configured value is an ENGLISH-EQUIVALENT budget; Malayalam and Kannada cost
+    # ~7.6x and ~9x more tokens for the same sentence under Llama's tokenizer, so
+    # the flat cap that suits Hindi cut their replies off mid-word. Measurements and
+    # reasoning: backend/services/token_budget.py.
+    #
+    # Applied HERE deliberately — this is the single point where max_tokens reaches
+    # every provider, so Gemini, OpenAI and DeepSeek get the same treatment as Groq.
+    # (That also answers "is this Groq-specific?": the cap was ours, not Groq's.)
+    from backend.services.token_budget import response_token_budget
+
+    max_tokens = response_token_budget(
+        agent_config.get("max_response_tokens"),
+        agent_config.get("language") or agent_config.get("tts_language"),
+    )
 
     # model is passed via Settings (not the deprecated `model=` kwarg) so the
     # newer pipecat services don't emit a DeprecationWarning and settings win.

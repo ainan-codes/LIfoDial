@@ -2786,7 +2786,17 @@ async def generate_llm_response(
     # Admin-configured response length cap (AgentDetail.tsx "Max Tokens" field).
     # Was previously ignored here — every provider call hardcoded 150 regardless
     # of this setting, so the UI field had no effect on the in-browser tester.
-    max_tokens = int(agent.max_response_tokens or 150)
+    #
+    # Scaled by language for the same reason the voice path is: the configured
+    # number is an English-equivalent budget, and Malayalam/Kannada cost ~7.6x/9x
+    # more tokens for the same sentence, so a flat cap truncated them mid-word here
+    # too. See backend/services/token_budget.py for the measurements.
+    from backend.services.token_budget import response_token_budget
+
+    max_tokens = response_token_budget(
+        agent.max_response_tokens,
+        getattr(agent, "language", None) or getattr(agent, "tts_language", None),
+    )
 
     try:
         if llm_provider in ("gemini", "openai", "anthropic", "groq", "deepseek"):

@@ -10,6 +10,20 @@ interface VoiceLibraryProps {
   isPickerModal?: boolean;
   onSelectVoice?: (voice: any) => void;
   readOnly?: boolean;
+  /**
+   * Language to pre-select in the filter, as a BCP-47 code (e.g. 'ml-IN').
+   *
+   * Matters more than it looks. Sarvam ties NO speaker to a language — all 37
+   * bulbul:v3 voices speak all 11 GA languages, verified live (37/37 return
+   * Malayalam audio) — but each card carries one DISPLAY tag, which for most
+   * voices is hi-IN. So opening this picker for a Malayalam agent with no filter
+   * showed 37 voices all labelled "Hindi", which reads as "there are no Malayalam
+   * voices" even though every one of them is one.
+   *
+   * With the agent's language pre-selected, effectiveLanguage() re-tags each card
+   * to ml-IN and previews synthesize Malayalam — so the list says what it does.
+   */
+  initialLanguage?: string;
 }
 
 // Display metadata for every TTS provider. The library is driven by whichever
@@ -39,11 +53,11 @@ const BASE_LANGUAGE_OPTIONS: { code: string; label: string }[] = [
   { code: 'ar-SA', label: 'Arabic (ar-SA)' },
 ];
 
-export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, readOnly = false }: VoiceLibraryProps) {
+export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, readOnly = false, initialLanguage }: VoiceLibraryProps) {
   const [search, setSearch] = useState('');
   const [provider, setProvider] = useState('');
   const [gender, setGender] = useState('');
-  const [language, setLanguage] = useState('');
+  const [language, setLanguage] = useState(initialLanguage || '');
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [loadingAudioId, setLoadingAudioId] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);

@@ -56,6 +56,8 @@ from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import (
     SpeechTimeoutUserTurnStopStrategy,
 )
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from dataclasses import replace
+
 from pipecat.services.sarvam.stt import SarvamSTTService
 from pipecat.services.sarvam.tts import SarvamTTSModel, SarvamTTSService
 from pipecat.services.openai.stt import OpenAISTTService
@@ -158,8 +160,64 @@ from backend.services import agent_defaults, stt_catalog
 
 
 # ── Sarvam STT model selection ────────────────────────────────────────────────
-#: Models pipecat's SarvamSTTService knows how to build (its MODEL_CONFIGS keys).
-SARVAM_STT_MODELS = frozenset({"saarika:v2.5", "saaras:v2.5", "saaras:v3"})
+
+def _register_sarvam_v4_with_pipecat() -> bool:
+    """Teach pipecat 1.5.0 how to build ``saaras:v4``. Returns True if registered.
+
+    pipecat 1.5.0 ships MODEL_CONFIGS with exactly three keys — saarika:v2.5,
+    saaras:v2.5, saaras:v3 — and its constructor does:
+
+        if resolved_model not in MODEL_CONFIGS:
+            raise ValueError(f"Unsupported model '{resolved_model}'...")
+
+    So simply offering saaras:v4 in the dashboard would not degrade gracefully; it
+    would raise at pipeline build time and the caller would hear dead air. It has
+    to be registered here or not offered at all.
+
+    Registering it is safe because v4 is wire-identical to v3 on the endpoint we
+    use. Verified live on 2026-08-06 by transcribing the SAME Malayalam WAV with
+    both models:
+
+        saaras:v3  200  keys=['language_code','request_id','transcript']
+        saaras:v4  200  keys=['language_code','request_id','transcript']
+        both returned 'നാളെ രാവിലെ പത്തരയ്ക്ക് ഡോക്ടറെ കാണാൻ സമയം വേണം.' verbatim
+
+    and both accept the same parameters (``language_code``, optional
+    ``mode=transcribe``, optional ``sample_rate=16000``). The config below is
+    therefore v3's, copied field for field — it is a statement that v4 has the same
+    capabilities, which is what the probe showed.
+
+    Deliberately NOT registered: ``saaras:v4-multispk`` and ``saaras:v3-realtime``.
+    Sarvam's request validator lists them, but the transcribe endpoint itself
+    answers "Invalid model 'saaras:v4-multispk'. Supported models: 'saarika:v2.5',
+    'saaras:v3', 'saaras:v4'." Offering a model the endpoint rejects is how an
+    agent gets saved into a configuration that cannot take a call.
+
+    Remove this shim once pipecat ships a MODEL_CONFIGS entry of its own — the
+    ``setdefault`` below means pipecat's version wins the moment it exists.
+    """
+    try:
+        from pipecat.services.sarvam.stt import MODEL_CONFIGS
+
+        v3 = MODEL_CONFIGS.get("saaras:v3")
+        if v3 is None:  # pipecat restructured; do not guess
+            return False
+        MODEL_CONFIGS.setdefault("saaras:v4", replace(v3))
+        return "saaras:v4" in MODEL_CONFIGS
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Could not register saaras:v4 with pipecat: %s", e)
+        return False
+
+
+_SARVAM_V4_AVAILABLE = _register_sarvam_v4_with_pipecat()
+
+#: Models pipecat's SarvamSTTService knows how to build (its MODEL_CONFIGS keys),
+#: including saaras:v4 once the shim above has registered it. If registration ever
+#: fails, v4 drops out of this set and resolve_sarvam_stt_model falls back to the
+#: default rather than raising inside the constructor.
+SARVAM_STT_MODELS = frozenset(
+    {"saarika:v2.5", "saaras:v2.5", "saaras:v3"} | ({"saaras:v4"} if _SARVAM_V4_AVAILABLE else set())
+)
 
 #: Retired model ids the dashboard may still have stored. Sarvam answers HTTP 400
 #: for these ("Model 'saarika:v2' has been deprecated"), so they are upgraded

@@ -65,8 +65,18 @@ STT_MODELS = [
         "languages": _stt_langs("saarika:v2.5"), "recommended": False,
     },
     {
+        # `recommended` stays on v3: it is the default every existing agent runs,
+        # and moving the recommendation is a product decision, not a consequence of
+        # v4 existing. v4 is offered so it can be chosen and compared.
         "id": "saaras:v3", "name": "Saaras v3", "provider": "sarvam",
         "languages": _stt_langs("saaras:v3"), "recommended": True,
+    },
+    {
+        # Sarvam's newer transcribe model (the default in their own playground).
+        # Same 23 languages as v3 — _stt_langs keys off the "saaras" prefix, and the
+        # live API confirms v4 accepts the same language codes.
+        "id": "saaras:v4", "name": "Saaras v4 (new)", "provider": "sarvam",
+        "languages": _stt_langs("saaras:v4"), "recommended": False,
     },
 ]
 

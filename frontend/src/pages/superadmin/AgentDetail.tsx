@@ -1701,8 +1701,15 @@ export default function AgentDetail() {
                  <X size={16} />
               </button>
               <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
-                 <VoiceLibrary 
-                   isPickerModal 
+                 <VoiceLibrary
+                   isPickerModal
+                   // Open on the AGENT's language, not unfiltered. Every Sarvam
+                   // voice speaks every language, but each card shows one display
+                   // tag — mostly hi-IN — so an unfiltered picker made a Malayalam
+                   // agent look as though it had no Malayalam voices to choose
+                   // from. Pre-filtering re-tags the cards to ml-IN and makes the
+                   // previews speak Malayalam.
+                   initialLanguage={agent?.language || agent?.tts_language || ''}
                    onSelectVoice={(voice) => {
                      const newVoiceId = voice.voice_id || voice.id || voice.name;
                      // ONLY the voice changes. This used to also write

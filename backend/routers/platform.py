@@ -176,8 +176,10 @@ PROVIDERS = {
          "key_label": "Base URL (no key)", "key_url": "https://ollama.com",                       "icon": "Ol"},
     ],
     "stt": [
+        # saaras:v3 stays first — models[0] is what the dashboard offers as the
+        # default. saaras:v4 is additive (see agent_defaults.models_for).
         {"id": "sarvam",     "name": "Sarvam AI",      "env_var": "SARVAM_API_KEY",
-         "models": ["saaras:v3", "saarika:v2.5"],
+         "models": ["saaras:v3", "saaras:v4", "saarika:v2.5"],
          "key_label": "SARVAM_API_KEY",    "key_url": "https://dashboard.sarvam.ai",         "icon": "S"},
         {"id": "elevenlabs", "name": "ElevenLabs",     "env_var": "ELEVENLABS_API_KEY",
          "models": ["scribe_v2_realtime", "scribe_v2"],
@@ -280,7 +282,17 @@ ANTHROPIC_MODELS = [
 # ── Static authoritative model lists for providers without a list API ──────────
 # Sarvam has no public model enumeration endpoint
 SARVAM_TTS_MODELS = ["bulbul:v3", "bulbul:v2", "bulbul:v1"]
-SARVAM_STT_MODELS = ["saarika:v2.5", "saarika:v2", "saaras:v3", "saaras:v2"]
+
+# Sarvam's speech-to-text endpoint, asked directly on 2026-08-06, answers:
+#   "Invalid model 'x'. Supported models: 'saarika:v2.5', 'saaras:v3', 'saaras:v4'."
+# so those three plus saaras:v2.5 (the translate model, which the endpoint also
+# accepts) are the real set. saaras:v3 leads because it is the default; saaras:v4 is
+# Sarvam's newer transcribe model, added as a choice.
+#
+# 'saarika:v2' and 'saaras:v2' were previously listed here and are NOT valid — the
+# API 400s on both. They stay in pipeline._SARVAM_STT_ALIASES so a row still holding
+# one heals to a working model on its next save, but they are no longer OFFERED.
+SARVAM_STT_MODELS = ["saaras:v3", "saaras:v4", "saarika:v2.5", "saaras:v2.5"]
 
 # ElevenLabs STT (Scribe) — listed here as fallback; also fetched live via /v1/models
 ELEVENLABS_STT_MODELS = ["scribe_v2_realtime", "scribe_v2"]
