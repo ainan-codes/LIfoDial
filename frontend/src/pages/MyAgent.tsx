@@ -212,26 +212,29 @@ export default function MyAgent() {
     setLoading(true);
     setError('');
     try {
-      const email = localStorage.getItem('lifodial-email') || '';
       const tenantId = localStorage.getItem('lifodial-tenant-id') || '';
       let myAgent: AgentInfo | null = null;
 
-      if (tenantId) {
-        try {
-          const agents = await fetchWithAuth('/agents');
-          myAgent = agents.find((a: any) => a.tenant_id === tenantId) || null;
-        } catch {}
-      }
-      if (!myAgent && email) {
-        try {
-          myAgent = await fetchWithAuth(`/agents/mine?email=${encodeURIComponent(email)}`);
-        } catch {}
-      }
-      if (!myAgent) {
-        try {
-          const agents = await fetchWithAuth('/agents');
-          if (agents.length > 0) myAgent = agents[0];
-        } catch {}
+      // ── Resolve the agent from the SESSION, by clinic — never by email ──────
+      //
+      // This used to try three things in order: GET /agents (superadmin-only, so
+      // it 403'd for every clinic session and was swallowed), then
+      // /agents/mine?email=<localStorage email>, then /agents[0]. For an
+      // impersonated session the stored email was still the superadmin's, so the
+      // middle step asked for the clinic whose admin_email is admin@lifodial.com —
+      // nothing — and the last step 403'd too. Hence "No Agent Found" for a clinic
+      // whose agent superadmin could see perfectly.
+      //
+      // A clinic session (real login or impersonation) now asks for its own agent
+      // and the backend answers from the token's clinic_id.
+      if (showInternals) {
+        // Superadmin viewing this page has no clinic of their own; keep the
+        // platform-wide list, narrowed to a stored clinic if there is one.
+        const agents = await fetchWithAuth('/agents');
+        myAgent = (tenantId ? agents.find((a: any) => a.tenant_id === tenantId) : null)
+          ?? agents[0] ?? null;
+      } else {
+        myAgent = await fetchWithAuth('/agents/mine');
       }
 
       if (myAgent) {
@@ -258,7 +261,9 @@ export default function MyAgent() {
           setCallLogs([]);
         }
       } else {
-        setError(email ? `No agent configured for ${email}` : 'No agent found for your clinic.');
+        // Naming an email here was actively misleading — it pointed the reader at
+        // an identity that has nothing to do with which agent belongs to whom.
+        setError('No agent is configured for this clinic yet.');
       }
     } catch (e: any) {
       setError(e.message);

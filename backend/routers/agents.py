@@ -404,34 +404,78 @@ async def list_agents(user: SuperAdmin = None) -> list[dict]:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── GET /agents/mine — clinic admin self-lookup by email ─────────────────────
-# Called by MyAgent.tsx after login. Returns the single agent for the clinic
-# whose admin_email matches the logged-in user.
+# ── GET /agents/mine — the caller's own clinic's agent ───────────────────────
+#
+# Resolves from the VERIFIED TOKEN's tenant_id. It used to resolve from a
+# client-supplied ?email= matched against Tenant.admin_email, which is why kmct's
+# clinic dashboard showed "No agent configured for admin@lifodial.com" while
+# superadmin showed the agent perfectly: the session's clinic_id was never
+# consulted at all. The identity that reached this endpoint was whatever
+# `localStorage['lifodial-email']` happened to hold, and for an impersonated
+# session that was the SUPERADMIN's own email — a clinic that does not exist, so
+# 404. kmct's data was never wrong (verified directly against the live database:
+# agent f367e0e2 -> tenant c311a10c, correct FK, no stray admin@lifodial.com row).
+#
+# For a clinic caller the email/tenant_id params are now IGNORED outright rather
+# than validated. An endpoint that accepts a caller-supplied identity and then
+# checks it is one refactor away from trusting it; there is nothing to check when
+# the only accepted source is the token.
 
 @router.get("/agents/mine")
-async def get_my_agent(email: str, user: CurrentUser = None) -> dict:
+async def get_my_agent(
+    email: str | None = None,
+    tenant_id: str | None = None,
+    user: CurrentUser = None,
+) -> dict:
     """
-    Clinic-admin endpoint: given an email, return that clinic's agent.
-    Requires a valid session token; the resolved tenant must match the
-    caller's own tenant (superadmin may look up any clinic).
-    Returns 404 if no clinic/agent found for that email.
+    Return the agent for the caller's own clinic.
+
+    Clinic session (a real login OR a superadmin impersonation — both carry
+    role="clinic" and the clinic's id as `sub`): resolved from the token. Any
+    email/tenant_id query params are ignored.
+
+    Superadmin session: has no clinic of its own, so it must name one via
+    ?tenant_id= (preferred) or ?email= — otherwise 400. This is the only path on
+    which a query param may steer the lookup.
     """
-    if not email:
-        raise HTTPException(status_code=400, detail="email query param required")
+    target_tenant_id: str | None = None
+
+    if not user.is_superadmin:
+        # The token IS the identity. Nothing the client sends can redirect this.
+        target_tenant_id = user.tenant_id
+        if not target_tenant_id:
+            raise HTTPException(status_code=401, detail="Session carries no clinic")
+    elif tenant_id:
+        target_tenant_id = tenant_id.strip()
+    elif not email:
+        raise HTTPException(
+            status_code=400,
+            detail="A superadmin token has no clinic of its own — pass ?tenant_id= or ?email=",
+        )
+
     try:
         async with async_session() as session:
-            result = await session.execute(
+            stmt = (
                 select(AgentConfig, Tenant.clinic_name)
                 .join(Tenant, AgentConfig.tenant_id == Tenant.id)
-                .where(Tenant.admin_email == email.strip().lower())
+                # Deterministic pick if a clinic has several agents; previously
+                # unordered, so which one "My Agent" showed was up to the planner.
+                .order_by(AgentConfig.created_at.asc())
             )
-            row = result.first()
+            if target_tenant_id:
+                stmt = stmt.where(AgentConfig.tenant_id == target_tenant_id)
+            else:
+                stmt = stmt.where(Tenant.admin_email == (email or "").strip().lower())
+
+            row = (await session.execute(stmt)).first()
             if not row:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"No agent found for email: {email}"
+                    detail="No agent is configured for this clinic yet.",
                 )
             agent, clinic_name = row
+            # Defence in depth: with target_tenant_id taken from the token this is
+            # already guaranteed, and it stays correct if a future param is added.
             user.require_owns(str(agent.tenant_id))
             data = _agent_to_dict(agent, clinic_name)
             data["system_prompt"] = agent.system_prompt
@@ -443,7 +487,9 @@ async def get_my_agent(email: str, user: CurrentUser = None) -> dict:
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Error fetching agent for email %s: %s", email, e)
+        logger.exception(
+            "Error fetching agent for tenant %s: %s", target_tenant_id or email, e
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -160,12 +160,18 @@ function ClinicProfileTab() {
     retry: false,
   });
 
-  // The agent carries working hours; resolved by the clinic admin's own email.
-  const email = localStorage.getItem('lifodial-email') || '';
+  // The agent carries working hours. Resolved by CLINIC, from the session token —
+  // it used to be looked up by localStorage's email, which is not a reliable
+  // pointer to a clinic (see agents.py::get_my_agent and MyAgent.tsx). A
+  // superadmin has no clinic of their own, so they must name one.
   const { data: agent } = useQuery<any>({
-    queryKey: ['my-agent', email],
-    queryFn: () => fetchWithAuth(`/agents/mine?email=${encodeURIComponent(email)}`),
-    enabled: !!email,
+    queryKey: ['my-agent', tenantId ?? 'none'],
+    queryFn: () => fetchWithAuth(
+      isSuperAdmin() && tenantId
+        ? `/agents/mine?tenant_id=${encodeURIComponent(tenantId)}`
+        : '/agents/mine',
+    ),
+    enabled: !!tenantId,
     retry: false,
   });
 
@@ -237,7 +243,8 @@ function ClinicProfileTab() {
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
       queryClient.invalidateQueries({ queryKey: ['tenant', tenantId] });
-      queryClient.invalidateQueries({ queryKey: ['my-agent', email] });
+      // Must match the query's key above — it is keyed by clinic now, not by email.
+      queryClient.invalidateQueries({ queryKey: ['my-agent', tenantId ?? 'none'] });
     } catch (e) {
       setSaveError((e as Error).message || 'Could not save changes');
     } finally {

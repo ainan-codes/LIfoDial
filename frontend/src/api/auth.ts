@@ -31,9 +31,19 @@ export interface Session {
 export function setSession(s: Session): void {
   localStorage.setItem(TOKEN_KEY, s.token);
   localStorage.setItem(ROLE_KEY, s.role);
-  if (s.tenantId) localStorage.setItem(TENANT_KEY, s.tenantId);
-  if (s.email) localStorage.setItem(EMAIL_KEY, s.email);
-  if (s.clinicName) localStorage.setItem(CLINIC_KEY, s.clinicName);
+  // Identity fields are REPLACED, not merged. These used to be written only when
+  // present, so anything the new session lacked was inherited from the previous
+  // one — and starting an impersonation passes no email, so the SUPERADMIN's
+  // admin@lifodial.com survived into the clinic session and became the key
+  // My Agent looked the agent up by. That is the "No agent configured for
+  // admin@lifodial.com" bug: a session half-belonging to two identities.
+  const replace = (key: string, value?: string) => {
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
+  };
+  replace(TENANT_KEY, s.tenantId);
+  replace(EMAIL_KEY, s.email);
+  replace(CLINIC_KEY, s.clinicName);
 }
 
 export function clearSession(): void {
