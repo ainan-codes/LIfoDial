@@ -952,14 +952,26 @@ function SystemStatusTab() {
 // voice pipeline. None of that belongs to a clinic. The behavioural settings a
 // clinic legitimately controls (greeting, prompt, languages, voice choice) live
 // on the agent itself, not here.
+// A clinic admin sees four tabs: Clinic Profile, Doctors, Appearance, System
+// Status. The rest are `superadminOnly`:
+//
+//   * AI Number — provisioning and call-forwarding for a number the platform
+//     owns and assigns. A clinic cannot change which number it was given.
+//   * Integrations — webhook/Sheets plumbing wired during onboarding; editing it
+//     silently breaks the clinic's own booking exports.
+//   * Notifications — alerting config for the platform team, not the clinic.
+//
+// `superadminOnly` is not decoration: it drops the entry from the tab bar AND
+// gates the render branch below, so the panel cannot be reached by forcing tab
+// state either. There is no URL to guard — tabs are component state, not routes.
 const TABS = [
   { id: 'clinic',        label: 'Clinic Profile', icon: Building2  },
-  { id: 'ai-number',     label: 'AI Number',      icon: Phone      },
+  { id: 'ai-number',     label: 'AI Number',      icon: Phone,     superadminOnly: true },
   { id: 'ai-config',     label: 'AI Config',      icon: Zap,       superadminOnly: true },
-  { id: 'integrations',  label: 'Integrations',   icon: Webhook    },
+  { id: 'integrations',  label: 'Integrations',   icon: Webhook,   superadminOnly: true },
   { id: 'doctors',       label: 'Doctors',        icon: Users      },
   { id: 'appearance',   label: 'Appearance',     icon: Sun        },
-  { id: 'notifications', label: 'Notifications',  icon: Bell       },
+  { id: 'notifications', label: 'Notifications',  icon: Bell,      superadminOnly: true },
   { id: 'system',        label: 'System Status',  icon: Shield     },
 ] as const;
 
@@ -972,6 +984,11 @@ export default function Settings() {
   const visibleTabs = TABS.filter(
     t => !('superadminOnly' in t && t.superadminOnly) || showSuperadminOnly
   );
+  // Belt and braces: if `activeTab` ever ends up on a tab this role cannot see,
+  // fall back to the first visible one rather than rendering a blank panel.
+  const currentTab: TabId = visibleTabs.some(t => t.id === activeTab)
+    ? activeTab
+    : visibleTabs[0].id;
 
   return (
     <div data-testid="settings-page" className="h-full flex flex-col">
@@ -995,7 +1012,7 @@ export default function Settings() {
       >
         {visibleTabs.map(tab => {
           const Icon = tab.icon;
-          const isActive = activeTab === tab.id;
+          const isActive = currentTab === tab.id;
           return (
             <button
               key={tab.id}
@@ -1026,16 +1043,17 @@ export default function Settings() {
       {/* Tab content */}
       <div className="flex-1 overflow-y-auto" style={{ backgroundColor: 'var(--bg-page)' }}>
         <div style={{ maxWidth: '680px', margin: '0 auto', padding: '32px 24px' }}>
-          {activeTab === 'clinic'        && <ClinicProfileTab />}
-          {activeTab === 'ai-number'     && <AiNumberTab />}
-          {/* Guarded as well as hidden — the tab id could otherwise still be
-              reached through stale state. */}
-          {activeTab === 'ai-config'     && showSuperadminOnly && <AIConfig />}
-          {activeTab === 'integrations'  && <Integrations />}
-          {activeTab === 'doctors'       && <DoctorsTab />}
-          {activeTab === 'appearance'    && <AppearanceTab />}
-          {activeTab === 'notifications' && <NotificationsTab />}
-          {activeTab === 'system'        && (showSuperadminOnly ? <SystemStatusTab /> : <ClinicStatusTab />)}
+          {/* Every superadmin-only panel is gated HERE as well as excluded from the
+              tab bar above. Hiding the button alone would leave the panel one
+              stale `activeTab` away from rendering for a clinic admin. */}
+          {currentTab === 'clinic'        && <ClinicProfileTab />}
+          {currentTab === 'ai-number'     && showSuperadminOnly && <AiNumberTab />}
+          {currentTab === 'ai-config'     && showSuperadminOnly && <AIConfig />}
+          {currentTab === 'integrations'  && showSuperadminOnly && <Integrations />}
+          {currentTab === 'doctors'       && <DoctorsTab />}
+          {currentTab === 'appearance'    && <AppearanceTab />}
+          {currentTab === 'notifications' && showSuperadminOnly && <NotificationsTab />}
+          {currentTab === 'system'        && (showSuperadminOnly ? <SystemStatusTab /> : <ClinicStatusTab />)}
         </div>
       </div>
     </div>

@@ -10,7 +10,6 @@ const Login = lazy(() => import('./pages/Login'));
 const Onboarding = lazy(() => import('./pages/Onboarding'));
 
 // Protected pages
-const Analytics = lazy(() => import('./pages/Analytics'));
 const Appointments = lazy(() => import('./pages/Appointments'));
 const CallLogs = lazy(() => import('./pages/CallLogs'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
@@ -95,12 +94,11 @@ function App() {
               <Route index element={<Doctors />} />
             </Route>
 
-            <Route
-              path="/analytics"
-              element={<RequireAuth><Layout /></RequireAuth>}
-            >
-              <Route index element={<Analytics />} />
-            </Route>
+            {/* Analytics was merged INTO Dashboard: the two pages had overlapping
+                purpose and three same-named metrics computed over different windows
+                (see pages/Dashboard.tsx). Kept as a redirect rather than deleted so
+                existing bookmarks and any in-app link still land somewhere useful. */}
+            <Route path="/analytics" element={<Navigate to="/dashboard" replace />} />
 
             {/* Voice Clone — platform tooling, superadmin only (clinic admins
                 must not be able to retrain the clinic's TTS voice). */}

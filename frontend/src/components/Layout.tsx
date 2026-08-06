@@ -1,5 +1,4 @@
 import {
-    BarChart2,
     Bot,
     CalendarCheck,
     Headphones,
@@ -34,7 +33,8 @@ const nav = [
   { label: 'Call Logs',    icon: PhoneCall,        to: '/calls',        hidden: false },
   { label: 'Appointments', icon: CalendarCheck,    to: '/appointments', hidden: false },
   { label: 'Doctors',      icon: Users,            to: '/doctors',      hidden: false },
-  { label: 'Analytics',    icon: BarChart2,        to: '/analytics',    hidden: false },
+  // Analytics is gone as a separate destination — it is now the "Recent history"
+  // section of Dashboard. /analytics redirects there (see App.tsx).
   { label: 'Voice Clone',  icon: Mic,              to: '/recorder',     hidden: false, superadminOnly: true },
   { label: 'Voice Library',icon: Music,            to: '/voice-library',hidden: false, superadminOnly: true },
   { label: 'Settings',     icon: Settings,         to: '/settings',     hidden: false },
@@ -45,7 +45,9 @@ const bottomNav = [
   { label: 'Dashboard', icon: LayoutDashboard, to: '/dashboard' },
   { label: 'My Agent',  icon: Bot,             to: '/my-agent' },
   { label: 'Calls',     icon: PhoneCall,        to: '/calls' },
-  { label: 'Analytics', icon: BarChart2,        to: '/analytics' },
+  // Analytics removed here too — the mobile bar is the easy one to forget, which
+  // would have left a live link to a page that now only redirects.
+  { label: 'Appointments', icon: CalendarCheck, to: '/appointments' },
   { label: 'Settings',  icon: Settings,         to: '/settings' },
 ];
 

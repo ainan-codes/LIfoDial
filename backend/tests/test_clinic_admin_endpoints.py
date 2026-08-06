@@ -215,6 +215,10 @@ async def test_clinic_cannot_edit_another_clinic(app_client):
 
 @pytest.mark.asyncio
 async def test_patch_agent_accepts_clinic_info_object(app_client):
+    """clinic_info stays writable by a clinic — it is the clinic's own operational
+    truth (working hours) and Settings → Clinic Profile saves it through this
+    endpoint. It is the one exception to the read-only rule asserted below; see
+    agents.py::_CLINIC_WRITABLE_AGENT_FIELDS."""
     tenant_id, agent_id = await _make_clinic()
     r = await app_client.patch(f"/agents/{agent_id}", headers=_clinic_token(tenant_id),
                                json={"clinic_info": {"working_hours": "10:00 AM - 6:00 PM"}})
@@ -263,8 +267,21 @@ async def test_clinic_admin_cannot_write_platform_credentials(app_client):
 
 
 @pytest.mark.asyncio
-async def test_clinic_admin_can_still_edit_agent_behaviour(app_client):
-    """The restriction must not block legitimate edits."""
+async def test_clinic_admin_cannot_edit_agent_behaviour(app_client):
+    """REVERSED DELIBERATELY — this test used to assert the opposite.
+
+    It was `test_clinic_admin_can_still_edit_agent_behaviour`, and it passed: a
+    clinic token could PATCH first_message / system_prompt / tts_voice /
+    llm_temperature. When the credential deny-list was added, "the restriction must
+    not block legitimate edits" meant only "must not block anything that is not a
+    platform secret".
+
+    The product rule changed: My Agent is a read-only view for clinic admins, and
+    the fields below are precisely the ones that decide whether calls work at all
+    (a voice that does not exist, or a prompt that breaks booking, is a broken
+    receptionist the clinic cannot fix). They are edited by the platform team in
+    Superadmin → Agents. `clinic_info` remains writable — see the test above.
+    """
     tenant_id, agent_id = await _make_clinic(email="b@clinic.com")
     r = await app_client.patch(f"/agents/{agent_id}", headers=_clinic_token(tenant_id), json={
         "first_message": "Namaste, Test Clinic!",
@@ -272,9 +289,33 @@ async def test_clinic_admin_can_still_edit_agent_behaviour(app_client):
         "tts_voice": "meera",
         "llm_temperature": 0.4,
     })
-    assert r.status_code == 200, r.text
+    assert r.status_code == 403, r.text
+    # The 403 names what it refused rather than being opaque.
+    detail = r.json()["detail"]
+    assert "read-only" in detail.lower() and "tts_voice" in detail
 
     async with db_module.AsyncSessionLocal() as s:
         a = (await s.execute(select(AgentConfig).where(AgentConfig.id == agent_id))).scalar_one()
-    assert a.first_message == "Namaste, Test Clinic!"
-    assert a.tts_voice == "meera"
+    assert a.first_message != "Namaste, Test Clinic!"
+    assert a.tts_voice != "meera"
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_patch_is_refused_whole(app_client):
+    """clinic_info being allowed must not become a carrier for the rest.
+
+    A payload that pairs the permitted field with a config field is refused
+    entirely — no partial application, so nothing lands from a rejected request.
+    """
+    tenant_id, agent_id = await _make_clinic(email="mixed@clinic.com")
+    r = await app_client.patch(f"/agents/{agent_id}", headers=_clinic_token(tenant_id), json={
+        "clinic_info": {"working_hours": "9:00 AM - 5:00 PM"},
+        "tts_voice": "meera",
+    })
+    assert r.status_code == 403, r.text
+
+    async with db_module.AsyncSessionLocal() as s:
+        a = (await s.execute(select(AgentConfig).where(AgentConfig.id == agent_id))).scalar_one()
+    info = a.clinic_info if isinstance(a.clinic_info, dict) else {}
+    assert info.get("working_hours") != "9:00 AM - 5:00 PM", "the allowed half of a refused patch was applied"
+    assert a.tts_voice != "meera"

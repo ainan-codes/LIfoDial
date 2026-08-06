@@ -1,282 +1,121 @@
-import React, { useState, useEffect } from 'react';
-
-import {
-  Phone, Clock, IndianRupee, Activity, Mic, Volume2, Brain,
-  AlertCircle, CheckCircle2, FileText, Wrench, BarChart2, Settings,
-  ChevronDown, ChevronUp, Download, Zap, Shield, RefreshCw,
-  PhoneMissed, PlayCircle, Globe, Lock, Bell, Sliders,
-} from 'lucide-react';
+import { AlertCircle, Headphones } from 'lucide-react';
+import { Suspense, lazy, useEffect, useState } from 'react';
 import fetchWithAuth from '../api/client';
-import { isSuperAdmin } from '../api/auth';
-import ConfigureTab from './myagent/ConfigureTab';
+import { AgentCard, PhoneCallModal } from '../components/AgentCard';
+import { FixtureAgent } from '../fixtures/data';
+
+// Lazy: pulls in the LiveKit/WebRTC client stack (~526kB, the largest chunk in
+// the app) — only needed once the test modal actually opens.
+const TestAgentModal = lazy(() => import('./../components/TestAgentModal'));
 
 /**
- * MyAgent — Vapi-style tabbed agent dashboard.
- * Tabs: Assistant | Logs | Tools | Analysis | Advanced
- * ALL existing content preserved, zero removals.
- */
-
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-interface AgentInfo {
-  id: string;
-  agent_name: string;
-  clinic_name: string;
-  status: string;
-  tts_voice: string;
-  language: string;
-  tts_model: string;
-  stt_model: string;
-  llm_model: string;
-  first_message: string;
-  system_prompt?: string;
-  llm_temperature?: number;
-  // Behaviour fields the Configure tab edits. Optional because /agents/mine fills
-  // defaults for some of them and a clinic payload has platform credentials
-  // stripped (backend/routers/agents.py::redact_agent_for_clinic).
-  tts_provider?: string;
-  max_response_tokens?: number;
-  silence_timeout_seconds?: number;
-  max_duration_seconds?: number;
-  end_call_message?: string;
-  can_book_appointments?: boolean;
-  can_cancel_appointments?: boolean;
-  can_check_availability?: boolean;
-  can_transfer_emergency?: boolean;
-  emergency_transfer_number?: string;
-}
-
-interface CreditInfo {
-  balance: number;
-  rate_per_minute: number;
-  total_added: number;
-  total_deducted: number;
-  is_low: boolean;
-  recent_transactions: Array<{
-    id: string;
-    type: string;
-    amount: number;
-    balance_after: number;
-    description: string;
-    created_at: string;
-  }>;
-}
-
-interface CallRecord {
-  id: string;
-  call_type: string;
-  started_at: string;
-  duration_seconds: number;
-  status: string;
-  outcome: string;
-  sentiment: string;
-}
-
-/** A row from GET /api/call_logs (backend/main.py::_call_record_to_row). */
-interface CallLogRow {
-  id: string;
-  phone: string;
-  date: string;
-  duration: string;
-  intent: string;
-  status: string;
-  language: string;
-  transcript: { role: string; text: string; time?: string }[];
-}
-
-const LANG_MAP: Record<string, string> = {
-  'hi-IN': '🇮🇳 Hindi', 'en-IN': '🇮🇳 English', 'ta-IN': '🇮🇳 Tamil',
-  'ml-IN': '🇮🇳 Malayalam', 'te-IN': '🇮🇳 Telugu', 'kn-IN': '🇮🇳 Kannada',
-  'bn-IN': '🇮🇳 Bengali', 'ar-SA': '🇦🇪 Arabic', 'mr-IN': '🇮🇳 Marathi',
-};
-
-/** "meera" → "Meera" — voice ids are lowercase internally. */
-const titleCase = (s?: string | null) =>
-  s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
-
-/** Flag for a BCP-47 code. The real /api/call_logs rows carry no `flag` field
- *  (only the deleted fixtures did), so derive it — mirrors CallLogs.tsx. */
-const LANGUAGE_FLAGS: Record<string, string> = {
-  'hi-IN': '🇮🇳', 'en-IN': '🇮🇳', 'en-US': '🇺🇸', 'en-GB': '🇬🇧', 'ta-IN': '🇮🇳',
-  'te-IN': '🇮🇳', 'kn-IN': '🇮🇳', 'ml-IN': '🇮🇳', 'mr-IN': '🇮🇳', 'bn-IN': '🇮🇳',
-  'pa-IN': '🇮🇳', 'gu-IN': '🇮🇳', 'ar-AE': '🇦🇪', 'ar-SA': '🇸🇦',
-};
-const languageFlag = (code: string) => LANGUAGE_FLAGS[code] ?? '🌐';
-
-/** "2:18" → 138 seconds. Backend sends "M:SS", or "—" when unknown. */
-function parseDurationSeconds(d: string): number | null {
-  const m = /^(\d+):(\d{2})$/.exec((d || '').trim());
-  if (!m) return null;
-  return Number(m[1]) * 60 + Number(m[2]);
-}
-
-/** 138 → "2:18" */
-function formatDurationSeconds(secs: number): string {
-  const m = Math.floor(secs / 60);
-  const s = Math.round(secs % 60);
-  return `${m}:${String(s).padStart(2, '0')}`;
-}
-
-/**
- * Real analytics from real call rows. Everything degrades to a clean zero-state
- * rather than a fabricated one: no calls means 0 / "—" / an empty 7-day chart.
+ * My Agent — the clinic's read-only view of its own receptionist.
  *
- * `date` arrives pre-formatted as "%d %b %Y, %H:%M" (backend/main.py
- * ::_call_record_to_row), so it is parsed back rather than assumed to be ISO.
+ * WHAT THIS PAGE IS
+ *   The same agent card Superadmin → Agents shows (components/AgentCard.tsx),
+ *   scoped to the one agent belonging to the current session's clinic, with the
+ *   editing removed and the two test buttons kept. A clinic admin sees exactly
+ *   what the platform team sees for their agent — status, greeting, language,
+ *   voice/model, Calls today / Bookings / Avg latency / Resolution — and cannot
+ *   change any of it.
+ *
+ * WHAT IT USED TO BE, AND WHY THAT WAS WRONG
+ *   A five-tab editable dashboard (Assistant/Logs/Tools/Analysis/Advanced) with a
+ *   Credit Balance card, a Recent Calls table and an editable Voice Configuration
+ *   section. Two problems:
+ *
+ *     * Shape. It let a clinic edit live voice/model config — the settings that
+ *       decide whether calls work at all — and duplicated call history that
+ *       already has its own pages (Call Logs, Dashboard).
+ *     * Speed. loadData() awaited FIVE requests in sequence: GET /agents
+ *       (superadmin-only, so it 403'd for every clinic session and was swallowed),
+ *       /agents/mine, /credits/my-balance, /agents/{id}/call-logs and
+ *       /api/call_logs?limit=50. Serial round trips to Railway+Supabase, each one
+ *       also paying the impersonation session check under a "view as" session.
+ *       That was the long "Loading your agent..." spinner — not slow rendering.
+ *
+ *   Removing the heavy dashboard removed four of those five calls. What is left is
+ *   /agents/mine, then /agents/{id}/health for the stats (which needs the id, so
+ *   it cannot be parallelised) — and the card renders as soon as the first
+ *   resolves, with stats filling in after, exactly as Superadmin → Agents does.
+ *
+ * READ-ONLY IS ENFORCED ON THE SERVER TOO
+ *   `readOnly` here only removes affordances. PATCH /agents/{id} refuses every
+ *   config field for a clinic-role token (`_authorize_agent_patch`), and the
+ *   prompt/greeting/avatar writes refuse it outright (`_require_agent_write_access`)
+ *   — see backend/tests/test_agent_config_readonly_for_clinics.py. The one field a
+ *   clinic may still write is `clinic_info` (working hours), which Settings →
+ *   Clinic Profile saves; nothing on THIS page writes anything.
  */
-function callLogsToStats(logs: CallLogRow[]) {
-  const totalCalls = logs.length;
-  const booked = logs.filter(l => l.status === 'Booked').length;
-  const resolved = logs.filter(l => l.status === 'Booked' || l.status === 'Resolved').length;
 
-  const durations = logs
-    .map(l => parseDurationSeconds(l.duration))
-    .filter((n): n is number => n !== null);
-  const avgHandleTime = durations.length
-    ? formatDurationSeconds(durations.reduce((a, b) => a + b, 0) / durations.length)
-    : '—';
-
-  const tally = (key: keyof CallLogRow) =>
-    logs.reduce((acc, l) => {
-      const v = String(l[key] ?? '').trim();
-      if (v && v !== '—') acc[v] = (acc[v] ?? 0) + 1;
-      return acc;
-    }, {} as Record<string, number>);
-
-  // Trailing 7 days, oldest → newest, counted from each call's real timestamp.
-  const dayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const buckets: { day: string; value: number }[] = [];
-  for (let i = 6; i >= 0; i--) {
-    const d = new Date(today);
-    d.setDate(d.getDate() - i);
-    buckets.push({ day: dayLabels[d.getDay()], value: 0 });
-  }
-  for (const l of logs) {
-    const parsed = new Date((l.date || '').replace(',', ''));
-    if (Number.isNaN(parsed.getTime())) continue;
-    parsed.setHours(0, 0, 0, 0);
-    const daysAgo = Math.round((today.getTime() - parsed.getTime()) / 86_400_000);
-    if (daysAgo >= 0 && daysAgo <= 6) buckets[6 - daysAgo].value += 1;
-  }
-
+/** Map a GET /agents/mine payload onto the card's shape (same mapping SAAgents uses). */
+function toCardAgent(a: any): FixtureAgent {
   return {
-    totalCalls,
-    booked,
-    resolutionPct: totalCalls ? `${Math.round((resolved / totalCalls) * 100)}%` : '—',
-    avgHandleTime,
-    intentCounts: tally('intent'),
-    langCounts: tally('language'),
-    days: buckets,
-  };
+    ...a,
+    name: a.agent_name || a.name || 'AI Receptionist',
+    languages: a.language ? [a.language.split('-')[0].toUpperCase()] : ['EN'],
+    // Filled in by the /health call below; '—' until then.
+    calls_today: 0,
+    bookings_today: 0,
+    avg_latency_ms: 0,
+    resolution_rate: 0,
+  } as FixtureAgent;
 }
-
-type Tab = 'assistant' | 'configure' | 'logs' | 'tools' | 'analysis' | 'advanced';
-
-// My Agent is VIEW-ONLY for clinic admins. They can see what their receptionist
-// does and how it is performing, but the agent itself is configured by the
-// Lifodial team — so `Configure` is superadminOnly, exactly like the raw model
-// IDs and the Latency/Security sections in the Advanced tab.
-const TABS: { id: Tab; label: string; icon: React.ElementType; superadminOnly?: boolean }[] = [
-  { id: 'assistant', label: 'Assistant',  icon: Mic },
-  { id: 'configure', label: 'Configure',  icon: Sliders, superadminOnly: true },
-  { id: 'logs',      label: 'Logs',       icon: FileText },
-  { id: 'tools',     label: 'Tools',      icon: Wrench },
-  { id: 'analysis',  label: 'Analysis',   icon: BarChart2 },
-  { id: 'advanced',  label: 'Advanced',   icon: Settings },
-];
-
-// ── Main Component ─────────────────────────────────────────────────────────────
 
 export default function MyAgent() {
-  const [activeTab, setActiveTab] = useState<Tab>('assistant');
-  const [agent, setAgent] = useState<AgentInfo | null>(null);
-  const [credits, setCredits] = useState<CreditInfo | null>(null);
-  const [calls, setCalls] = useState<CallRecord[]>([]);
-  const [callLogs, setCallLogs] = useState<CallLogRow[]>([]);
+  const [agent, setAgent] = useState<FixtureAgent | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [testTarget, setTestTarget] = useState<FixtureAgent | null>(null);
+  const [phoneTarget, setPhoneTarget] = useState<FixtureAgent | null>(null);
 
-  // Gate for platform internals: raw provider/model IDs, latency-tuning values,
-  // and the security/infrastructure breakdown. A clinic admin sees what their
-  // receptionist does; only superadmins see which vendors and settings deliver it.
-  // (The backend also strips the actual LiveKit/SIP credentials from the API
-  // response for non-superadmins — see agents.py::redact_agent_for_clinic — so
-  // this flag controls presentation, not secrecy of the keys themselves.)
-  const showInternals = isSuperAdmin();
+  useEffect(() => {
+    let cancelled = false;
 
-  useEffect(() => { loadData(); }, []);
+    (async () => {
+      try {
+        // One request, resolved from the session's clinic_id server-side. No
+        // email, no tenant id, no superadmin-only endpoint in the way.
+        const data = await fetchWithAuth('/agents/mine');
+        if (cancelled) return;
+        const mapped = toCardAgent(data);
+        setAgent(mapped);
+        setLoading(false);
 
-  const loadData = async () => {
-    setLoading(true);
-    setError('');
-    try {
-      const tenantId = localStorage.getItem('lifodial-tenant-id') || '';
-      let myAgent: AgentInfo | null = null;
-
-      // ── Resolve the agent from the SESSION, by clinic — never by email ──────
-      //
-      // This used to try three things in order: GET /agents (superadmin-only, so
-      // it 403'd for every clinic session and was swallowed), then
-      // /agents/mine?email=<localStorage email>, then /agents[0]. For an
-      // impersonated session the stored email was still the superadmin's, so the
-      // middle step asked for the clinic whose admin_email is admin@lifodial.com —
-      // nothing — and the last step 403'd too. Hence "No Agent Found" for a clinic
-      // whose agent superadmin could see perfectly.
-      //
-      // A clinic session (real login or impersonation) now asks for its own agent
-      // and the backend answers from the token's clinic_id.
-      if (showInternals) {
-        // Superadmin viewing this page has no clinic of their own; keep the
-        // platform-wide list, narrowed to a stored clinic if there is one.
-        const agents = await fetchWithAuth('/agents');
-        myAgent = (tenantId ? agents.find((a: any) => a.tenant_id === tenantId) : null)
-          ?? agents[0] ?? null;
-      } else {
-        myAgent = await fetchWithAuth('/agents/mine');
+        // Stats after the card is already on screen — a slow or failing health
+        // check must not hold up the page or blank it.
+        try {
+          const h = await fetchWithAuth(`/agents/${mapped.id}/health`);
+          if (cancelled) return;
+          setAgent(prev => prev ? {
+            ...prev,
+            calls_today: h.last_24h?.total_calls ?? 0,
+            avg_latency_ms: h.latency?.avg_ms ?? 0,
+          } : prev);
+        } catch { /* stats stay '—' */ }
+      } catch (e) {
+        if (cancelled) return;
+        setError((e as Error).message || 'Could not load your agent.');
+        setLoading(false);
       }
+    })();
 
-      if (myAgent) {
-        setAgent(myAgent);
-        try {
-          const tid = (myAgent as any).tenant_id || tenantId;
-          if (tid) {
-            setCredits(await fetchWithAuth(`/credits/my-balance?tenant_id=${tid}`));
-          }
-        } catch {}
-        try {
-          setCalls(await fetchWithAuth(`/agents/${myAgent.id}/call-logs?limit=10`));
-        } catch {}
-        // Richer, tenant-scoped rows (phone / date / duration / intent /
-        // language / transcript) for the Logs and Analysis tabs. Those tabs used
-        // to render FIXTURE_CALL_LOGS — five invented calls with fake Hindi and
-        // Tamil transcripts — shown identically to every clinic, which is why a
-        // clinic that had never taken a call still saw call history and
-        // analytics. Same endpoint the Call Logs page uses.
-        try {
-          const logsResp = await fetchWithAuth('/api/call_logs?limit=50');
-          setCallLogs(logsResp?.items ?? []);
-        } catch {
-          setCallLogs([]);
-        }
-      } else {
-        // Naming an email here was actively misleading — it pointed the reader at
-        // an identity that has nothing to do with which agent belongs to whom.
-        setError('No agent is configured for this clinic yet.');
-      }
-    } catch (e: any) {
-      setError(e.message);
-    }
-    setLoading(false);
-  };
+    return () => { cancelled = true; };
+  }, []);
 
   if (loading) {
     return (
-      <div style={styles.page}>
-        <div style={styles.loadingContainer}>
-          <div style={styles.spinner} />
-          <p style={{ color: '#888', marginTop: 16 }}>Loading your agent...</p>
+      <div style={{ padding: '32px', maxWidth: '560px', margin: '0 auto' }}>
+        <div style={{
+          background: '#1A1A1A', border: '1px solid #2E2E2E', borderRadius: '14px',
+          padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px',
+        }}>
+          {/* Skeleton in the card's own shape, so the layout does not jump when
+              the real card replaces it. */}
+          <div className="skeleton" style={{ height: 18, width: 90, borderRadius: 20 }} />
+          <div className="skeleton" style={{ height: 44, width: '70%', borderRadius: 8 }} />
+          <div className="skeleton" style={{ height: 52, width: '100%', borderRadius: 8 }} />
+          <div className="skeleton" style={{ height: 60, width: '100%', borderRadius: 8 }} />
         </div>
       </div>
     );
@@ -284,831 +123,53 @@ export default function MyAgent() {
 
   if (error || !agent) {
     return (
-      <div style={styles.page}>
-        <div style={styles.errorCard}>
-          <AlertCircle size={40} color="#ef4444" />
-          <h2 style={{ color: '#fff', marginTop: 16 }}>No Agent Found</h2>
-          <p style={{ color: '#888' }}>{error || 'No agent is configured for your clinic yet.'}</p>
-          <p style={{ color: '#666', fontSize: 13 }}>Please contact the Lifodial team to set up your AI receptionist.</p>
+      <div style={{ padding: '32px', maxWidth: '560px', margin: '0 auto' }}>
+        <div style={{
+          background: '#1A1A1A', border: '1px solid #2E2E2E', borderRadius: '14px',
+          padding: '40px 32px', textAlign: 'center',
+        }}>
+          <AlertCircle size={36} color="#ef4444" />
+          <h2 style={{ color: '#fff', fontSize: 18, margin: '14px 0 6px' }}>No agent found</h2>
+          <p style={{ color: '#888', fontSize: 13, margin: 0 }}>
+            {error || 'No agent is configured for this clinic yet.'}
+          </p>
+          <p style={{ color: '#666', fontSize: 12, marginTop: 10 }}>
+            Please contact the Lifodial team to set up your AI receptionist.
+          </p>
         </div>
       </div>
     );
   }
 
-  const totalCalls     = calls.length;
-  const completedCalls = calls.filter(c => c.status === 'completed').length;
-  const totalMinutes   = Math.ceil(calls.reduce((s, c) => s + (c.duration_seconds || 0), 0) / 60);
-
   return (
-    <div style={{ minHeight: '100vh', background: '#0A0A0A', fontFamily: "'Inter', 'Segoe UI', sans-serif" }}>
-
-      {/* ── Vapi-style Header ─────────────────────────────────────────── */}
-      <div style={{
-        borderBottom: '1px solid #1A1A1A',
-        background: '#0D0D0D',
-        padding: '0 32px',
-      }}>
-        {/* Agent identity row */}
-        <div style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          paddingTop: 20,
-          paddingBottom: 14,
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-            {/* Agent avatar */}
-            <div style={{
-              width: 40, height: 40, borderRadius: 10,
-              background: 'linear-gradient(135deg, #3ECF8E22, #3ECF8E44)',
-              border: '1px solid #3ECF8E44',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-            }}>
-              <Mic size={18} color="#3ECF8E" />
-            </div>
-            <div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <h1 style={{ fontSize: 18, fontWeight: 700, color: '#fff', margin: 0, letterSpacing: '-0.02em' }}>
-                  {agent.agent_name}
-                </h1>
-                {/* Status badge */}
-                <span style={{
-                  display: 'inline-flex', alignItems: 'center', gap: 5,
-                  padding: '2px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600,
-                  backgroundColor: agent.status === 'ACTIVE' ? 'rgba(62,207,142,0.1)' : 'rgba(245,158,11,0.1)',
-                  color: agent.status === 'ACTIVE' ? '#3ECF8E' : '#F59E0B',
-                  border: `1px solid ${agent.status === 'ACTIVE' ? 'rgba(62,207,142,0.3)' : 'rgba(245,158,11,0.3)'}`,
-                }}>
-                  {agent.status === 'ACTIVE' ? <CheckCircle2 size={10} /> : <AlertCircle size={10} />}
-                  {agent.status === 'ACTIVE' ? 'Published' : agent.status}
-                </span>
-              </div>
-              <p style={{ fontSize: 12, color: '#555', margin: '2px 0 0' }}>{agent.clinic_name}</p>
-            </div>
-          </div>
-
-          {/* Right: Quick stats */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
-            <QuickStat label="Balance" value={`₹${(credits?.balance ?? 0).toFixed(2)}`} accent={credits?.is_low ? '#ef4444' : '#3ECF8E'} />
-            <QuickStat label="Recent Calls" value={String(totalCalls)} accent="#3B82F6" />
-            <QuickStat label="Minutes Used" value={String(totalMinutes)} accent="#8B5CF6" />
-            <div style={{ width: 1, height: 32, background: '#1A1A1A' }} />
-            <button
-              onClick={loadData}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 6,
-                padding: '7px 14px', borderRadius: 8,
-                background: 'transparent', border: '1px solid #222',
-                color: '#888', fontSize: 12, fontWeight: 500, cursor: 'pointer',
-              }}
-            >
-              <RefreshCw size={13} /> Refresh
-            </button>
-          </div>
-        </div>
-
-        {/* ── Tab bar ─────────────────────────────────────────────────── */}
-        <div style={{ display: 'flex', gap: 4 }}>
-          {TABS.filter(t => !t.superadminOnly || showInternals).map(tab => {
-            const isActive = activeTab === tab.id;
-            const Icon = tab.icon;
-            return (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 7,
-                  padding: '9px 16px',
-                  borderRadius: '8px 8px 0 0',
-                  background: isActive ? '#111' : 'transparent',
-                  border: isActive ? '1px solid #1A1A1A' : '1px solid transparent',
-                  borderBottom: isActive ? '1px solid #111' : '1px solid transparent',
-                  marginBottom: isActive ? -1 : 0,
-                  color: isActive ? '#3ECF8E' : '#555',
-                  fontSize: 13, fontWeight: isActive ? 600 : 500,
-                  cursor: 'pointer',
-                  transition: 'all 0.15s ease',
-                }}
-                onMouseEnter={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = '#aaa'; }}
-                onMouseLeave={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = '#555'; }}
-              >
-                <Icon size={14} />
-                {tab.label}
-              </button>
-            );
-          })}
-        </div>
+    <div style={{ padding: '32px', maxWidth: '560px', margin: '0 auto' }}>
+      <div style={{ marginBottom: '20px' }}>
+        <h1 style={{ fontSize: '22px', fontWeight: 700, color: '#fff', margin: 0, letterSpacing: '-0.02em', display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <Headphones size={20} color="#3ECF8E" /> My Agent
+        </h1>
+        <p style={{ fontSize: '13px', color: '#666', margin: '4px 0 0' }}>
+          Your AI receptionist, as configured by the Lifodial team. Try it with a
+          web or phone call.
+        </p>
       </div>
 
-      {/* ── Tab Content ───────────────────────────────────────────────── */}
-      <div style={{ padding: '28px 32px', maxWidth: 1200, margin: '0 auto' }}>
+      <AgentCard
+        agent={agent}
+        readOnly
+        onTest={() => setTestTarget(agent)}
+        onWebCall={() => setTestTarget(agent)}
+        onPhoneCall={() => setPhoneTarget(agent)}
+      />
 
-        {/* ══ ASSISTANT TAB ═══════════════════════════════════════════════ */}
-        {activeTab === 'assistant' && (
-          <div>
-            {/* Stats Row */}
-            <div style={styles.statsRow}>
-              <StatCard icon={<IndianRupee size={20} />} label="Credit Balance"
-                value={`₹${(credits?.balance ?? 0).toFixed(2)}`}
-                detail={`Rate: ₹${(credits?.rate_per_minute ?? 1.5).toFixed(2)}/min`}
-                accent={credits?.is_low ? '#ef4444' : '#3ECF8E'} warning={credits?.is_low ? 'Low balance!' : undefined} />
-              <StatCard icon={<Phone size={20} />} label="Recent Calls"
-                value={String(totalCalls)} detail={`${completedCalls} completed`} accent="#3B82F6" />
-              <StatCard icon={<Clock size={20} />} label="Total Minutes"
-                value={String(totalMinutes)} detail={`₹${(credits?.total_deducted ?? 0).toFixed(2)} spent`} accent="#8B5CF6" />
-              <StatCard icon={<Activity size={20} />} label="Agent"
-                value={agent.agent_name} detail={LANG_MAP[agent.language] || agent.language} accent="#F59E0B" />
-            </div>
+      {testTarget && (
+        <Suspense fallback={null}>
+          <TestAgentModal agent={testTarget} onClose={() => setTestTarget(null)} />
+        </Suspense>
+      )}
 
-            {/* Two Columns: Voice Config + Recent Calls */}
-            <div style={styles.columns}>
-              {/* Voice Config.
-                  Clinic admins see WHAT their receptionist does, not which vendor
-                  stack runs it. The raw model IDs shown here (saaras:v3, bulbul:v3,
-                  gemini-2.5-flash) name our providers by implication — that's
-                  platform information, so it's superadmin-only. The clinic-facing
-                  view shows the spoken language and voice name instead, which is
-                  what a clinic actually needs to recognise. */}
-              <div style={styles.card}>
-                <h3 style={styles.cardTitle}>Voice Configuration</h3>
-                <p style={styles.cardSubtitle}>
-                  {showInternals
-                    ? 'Platform configuration'
-                    : 'How your receptionist sounds — managed by the Lifodial team'}
-                </p>
-                <div style={styles.configGrid}>
-                  {showInternals ? (
-                    <>
-                      <ConfigRow icon={<Mic size={16} />} label="STT Model" value={agent.stt_model || 'saaras:v3'} />
-                      <ConfigRow icon={<Volume2 size={16} />} label="TTS Voice" value={agent.tts_voice || 'meera'} />
-                      <ConfigRow icon={<Volume2 size={16} />} label="TTS Model" value={agent.tts_model || 'bulbul:v3'} />
-                      <ConfigRow icon={<Brain size={16} />} label="LLM" value={agent.llm_model || 'gemini-2.5-flash'} />
-                    </>
-                  ) : (
-                    <>
-                      <ConfigRow
-                        icon={<Volume2 size={16} />}
-                        label="Voice"
-                        value={titleCase(agent.tts_voice) || '—'}
-                      />
-                      <ConfigRow
-                        icon={<Mic size={16} />}
-                        label="Language"
-                        value={LANG_MAP[agent.language] || agent.language || '—'}
-                      />
-                    </>
-                  )}
-                </div>
-                {agent.first_message && (
-                  <div style={styles.firstMsgBox}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: '#888', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
-                      Greeting Message
-                    </div>
-                    <p style={{ color: '#ccc', fontSize: 13, lineHeight: 1.5, margin: 0 }}>
-                      "{agent.first_message}"
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              {/* Recent Calls */}
-              <div style={styles.card}>
-                <h3 style={styles.cardTitle}>Recent Calls</h3>
-                <p style={styles.cardSubtitle}>Last 10 voice interactions</p>
-                {calls.length === 0 ? (
-                  <div style={{ textAlign: 'center', padding: '40px 0', color: '#555' }}>
-                    <Phone size={32} color="#333" />
-                    <p style={{ marginTop: 12 }}>No calls yet</p>
-                  </div>
-                ) : (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 12 }}>
-                    {calls.slice(0, 10).map(call => (
-                      <div key={call.id} style={styles.callRow}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                          <div style={{
-                            width: 8, height: 8, borderRadius: '50%',
-                            backgroundColor: call.status === 'completed' ? '#3ECF8E' : call.status === 'failed' ? '#ef4444' : '#F59E0B',
-                          }} />
-                          <div>
-                            <div style={{ fontSize: 13, color: '#ddd', fontWeight: 500 }}>
-                              {call.call_type === 'web' ? '🌐 Web Call' : '📞 Phone Call'}
-                            </div>
-                            <div style={{ fontSize: 11, color: '#666' }}>
-                              {call.started_at ? new Date(call.started_at).toLocaleString() : '—'}
-                            </div>
-                          </div>
-                        </div>
-                        <div style={{ textAlign: 'right' }}>
-                          <div style={{ fontSize: 13, color: '#aaa', fontWeight: 500 }}>
-                            {call.duration_seconds ? `${Math.floor(call.duration_seconds / 60)}m ${call.duration_seconds % 60}s` : '—'}
-                          </div>
-                          <div style={{ fontSize: 11, color: '#555', textTransform: 'capitalize' }}>{call.status}</div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* Credit Transactions */}
-            {credits && credits.recent_transactions.length > 0 && (
-              <div style={{ ...styles.card, marginTop: 20 }}>
-                <h3 style={styles.cardTitle}>Credit History</h3>
-                <p style={styles.cardSubtitle}>Recent balance changes</p>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 12 }}>
-                  {credits.recent_transactions.map(txn => (
-                    <div key={txn.id} style={styles.txnRow}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                        <div style={{
-                          width: 28, height: 28, borderRadius: 6,
-                          display: 'flex', alignItems: 'center', justifyContent: 'center',
-                          backgroundColor: txn.amount > 0 ? 'rgba(62,207,142,0.1)' : 'rgba(239,68,68,0.1)',
-                          color: txn.amount > 0 ? '#3ECF8E' : '#ef4444', fontSize: 14,
-                        }}>
-                          {txn.amount > 0 ? '+' : '−'}
-                        </div>
-                        <div>
-                          <div style={{ fontSize: 13, color: '#ddd' }}>{txn.description || txn.type}</div>
-                          <div style={{ fontSize: 11, color: '#555' }}>
-                            {txn.created_at ? new Date(txn.created_at).toLocaleString() : '—'}
-                          </div>
-                        </div>
-                      </div>
-                      <div style={{ fontSize: 14, fontWeight: 600, color: txn.amount > 0 ? '#3ECF8E' : '#ef4444' }}>
-                        {txn.amount > 0 ? '+' : ''}₹{Math.abs(txn.amount).toFixed(2)}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ══ CONFIGURE TAB (superadmin only) ═════════════════════════════ */}
-        {/* Guarded as well as hidden from the tab bar: My Agent is read-only for
-            clinic admins, and stale `activeTab` state must not reach an editor. */}
-        {activeTab === 'configure' && showInternals && (
-          <ConfigureTab agent={agent} onSaved={loadData} />
-        )}
-
-        {/* ══ LOGS TAB ════════════════════════════════════════════════════ */}
-        {activeTab === 'logs' && <LogsTab logs={callLogs} />}
-
-        {/* ══ TOOLS TAB ═══════════════════════════════════════════════════ */}
-        {activeTab === 'tools' && <ToolsTab agent={agent} />}
-
-        {/* ══ ANALYSIS TAB ════════════════════════════════════════════════ */}
-        {activeTab === 'analysis' && <AnalysisTab logs={callLogs} />}
-
-        {/* ══ ADVANCED TAB ════════════════════════════════════════════════ */}
-        {activeTab === 'advanced' && <AdvancedTab agent={agent} credits={credits} showInternals={showInternals} />}
-
-      </div>
+      {phoneTarget && (
+        <PhoneCallModal agent={phoneTarget} onClose={() => setPhoneTarget(null)} />
+      )}
     </div>
   );
 }
-
-
-// ── LOGS TAB ──────────────────────────────────────────────────────────────────
-
-function LogsTab({ logs }: { logs: CallLogRow[] }) {
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [filterStatus, setFilterStatus] = useState('ALL');
-
-  const filtered = logs.filter(l => filterStatus === 'ALL' || l.status === filterStatus);
-  const toggle = (id: string) => setExpandedId(prev => prev === id ? null : id);
-
-  const handleExport = () => {
-    const headers = ['ID', 'Phone', 'Date', 'Duration', 'Intent', 'Language', 'Status'];
-    const rows = logs.map(l => [l.id, l.phone, l.date, l.duration, l.intent, l.language, l.status].join(','));
-    const csv = [headers.join(','), ...rows].join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'call_logs.csv'; a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const selectStyle: React.CSSProperties = {
-    padding: '7px 11px', borderRadius: 8, fontSize: 13,
-    backgroundColor: '#111', border: '1px solid #1A1A1A',
-    color: '#aaa', outline: 'none', cursor: 'pointer',
-  };
-
-  const STATUS_COLORS: Record<string, { color: string; bg: string }> = {
-    Booked:      { color: '#3ECF8E', bg: 'rgba(62,207,142,0.1)' },
-    Transferred: { color: '#8B5CF6', bg: 'rgba(139,92,246,0.1)' },
-    Resolved:    { color: '#888',    bg: '#1A1A1A' },
-    Failed:      { color: '#ef4444', bg: 'rgba(239,68,68,0.1)' },
-    Pending:     { color: '#F59E0B', bg: 'rgba(245,158,11,0.1)' },
-  };
-
-  return (
-    <div>
-      {/* Filter bar */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
-        <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} style={selectStyle}>
-          <option value="ALL">All Statuses</option>
-          {['Booked', 'Resolved', 'Transferred', 'Failed', 'Pending'].map(s => (
-            <option key={s} value={s}>{s}</option>
-          ))}
-        </select>
-        {filterStatus !== 'ALL' && (
-          <button onClick={() => setFilterStatus('ALL')} style={{ fontSize: 12, color: '#3ECF8E', background: 'none', border: 'none', cursor: 'pointer' }}>
-            Clear
-          </button>
-        )}
-        <span style={{ marginLeft: 'auto', fontSize: 12, color: '#555' }}>{filtered.length} call{filtered.length !== 1 ? 's' : ''}</span>
-        <button onClick={handleExport} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 14px', borderRadius: 8, fontSize: 12, fontWeight: 500, color: '#888', backgroundColor: 'transparent', border: '1px solid #1A1A1A', cursor: 'pointer' }}>
-          <Download size={13} /> Export CSV
-        </button>
-      </div>
-
-      <div style={{ background: '#111', borderRadius: 14, border: '1px solid #1A1A1A', overflow: 'hidden' }}>
-        {filtered.length === 0 ? (
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '60px 0', color: '#333' }}>
-            <PhoneMissed size={32} />
-            <p style={{ marginTop: 12, color: '#555' }}>No calls match filters</p>
-          </div>
-        ) : (
-          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-            <thead>
-              <tr style={{ backgroundColor: '#0D0D0D' }}>
-                {['Caller', 'Date & Time', 'Duration', 'Intent', 'Language', 'Status', 'Transcript'].map(h => (
-                  <th key={h} style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#444', borderBottom: '1px solid #1A1A1A', fontWeight: 500 }}>
-                    {h}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.map((call, i) => {
-                const isOpen = expandedId === call.id;
-                const sc = STATUS_COLORS[call.status] ?? { color: '#888', bg: '#1A1A1A' };
-                return (
-                  <React.Fragment key={call.id}>
-                    <tr
-                      onClick={() => toggle(call.id)}
-                      style={{ borderBottom: !isOpen && i < filtered.length - 1 ? '1px solid #161616' : 'none', cursor: 'pointer', backgroundColor: isOpen ? '#141414' : 'transparent' }}
-                      onMouseEnter={e => { if (!isOpen) (e.currentTarget as HTMLElement).style.backgroundColor = '#131313'; }}
-                      onMouseLeave={e => { if (!isOpen) (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent'; }}
-                    >
-                      <td style={{ padding: '12px 16px', fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: '#ddd' }}>{call.phone}</td>
-                      <td style={{ padding: '12px 16px', fontSize: 12, color: '#888' }}>{call.date}</td>
-                      <td style={{ padding: '12px 16px', fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: '#888' }}>{call.duration}</td>
-                      <td style={{ padding: '12px 16px' }}>
-                        <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 9999, color: '#3ECF8E', backgroundColor: 'rgba(62,207,142,0.1)' }}>{call.intent}</span>
-                      </td>
-                      <td style={{ padding: '12px 16px', fontSize: 12, color: '#888' }}>{languageFlag(call.language)} {call.language}</td>
-                      <td style={{ padding: '12px 16px' }}>
-                        <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 9999, color: sc.color, backgroundColor: sc.bg }}>{call.status}</span>
-                      </td>
-                      <td style={{ padding: '12px 16px' }}>
-                        <button
-                          onClick={e => { e.stopPropagation(); toggle(call.id); }}
-                          style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px', borderRadius: 6, fontSize: 12, fontWeight: 500, backgroundColor: isOpen ? 'rgba(62,207,142,0.1)' : 'transparent', border: `1px solid ${isOpen ? 'rgba(62,207,142,0.3)' : '#1A1A1A'}`, color: isOpen ? '#3ECF8E' : '#555', cursor: 'pointer' }}
-                        >
-                          {isOpen ? <><ChevronUp size={11} />Hide</> : <><ChevronDown size={11} />View</>}
-                        </button>
-                      </td>
-                    </tr>
-                    {isOpen && (
-                      <tr>
-                        <td colSpan={7} style={{ padding: 0 }}>
-                          <div style={{ padding: '16px 24px', backgroundColor: '#0D0D0D', borderBottom: '1px solid #1A1A1A' }}>
-                            <p style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: '#444', marginBottom: 12 }}>Call Transcript</p>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 640 }}>
-                              {call.transcript.map((msg, idx) => (
-                                <div key={idx} style={{ display: 'flex', justifyContent: msg.role === 'ai' ? 'flex-end' : 'flex-start' }}>
-                                  <div style={{ maxWidth: '70%', padding: '8px 12px', borderRadius: msg.role === 'ai' ? '12px 12px 2px 12px' : '12px 12px 12px 2px', backgroundColor: msg.role === 'ai' ? 'rgba(62,207,142,0.08)' : '#131313', border: `1px solid ${msg.role === 'ai' ? 'rgba(62,207,142,0.2)' : '#1A1A1A'}` }}>
-                                    <p style={{ fontSize: 13, margin: 0, color: msg.role === 'ai' ? '#3ECF8E' : '#ccc' }}>{msg.text}</p>
-                                    <p style={{ fontSize: 10, color: '#444', marginTop: 4, textAlign: msg.role === 'ai' ? 'right' : 'left' }}>
-                                      {msg.role === 'ai' ? 'Agent' : 'Patient'} · {msg.time}
-                                    </p>
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        </td>
-                      </tr>
-                    )}
-                  </React.Fragment>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
-    </div>
-  );
-}
-
-
-// ── TOOLS TAB ─────────────────────────────────────────────────────────────────
-
-function ToolsTab({ agent }: { agent: AgentInfo }) {
-  const tools = [
-    {
-      id: 'appointment_booking',
-      name: 'Book Appointment',
-      icon: '📅',
-      status: 'active',
-      description: 'Automatically saves confirmed appointments to PostgreSQL database and fires Google Sheets sync.',
-      trigger: 'Patient confirms booking slot',
-      latency: '0ms (background task)',
-    },
-    {
-      id: 'google_sheets',
-      name: 'Google Sheets Sync',
-      icon: '📊',
-      status: 'active',
-      description: 'Sends appointment data to clinic\'s Google Sheet via Apps Script webhook after booking.',
-      trigger: 'After appointment confirmed',
-      latency: 'Async — no call latency',
-    },
-    {
-      id: 'doctor_lookup',
-      name: 'Doctor Lookup',
-      icon: '🩺',
-      status: 'active',
-      description: 'Matches patient\'s specialization request to available doctors from clinic database.',
-      trigger: 'Patient mentions specialty/doctor',
-      latency: 'In-memory cache — ~0ms',
-    },
-    {
-      id: 'emergency_transfer',
-      name: 'Emergency Transfer',
-      icon: '🚨',
-      status: 'active',
-      description: 'Detects emergency keywords and immediately routes call for urgent handling.',
-      trigger: '"chest pain", "emergency", "accident", "unconscious"',
-      latency: 'Immediate',
-    },
-    {
-      id: 'language_detection',
-      name: 'Auto Language Detection',
-      icon: '🌐',
-      status: 'active',
-      description: 'Automatically switches response language to match patient\'s spoken language.',
-      trigger: 'Every patient turn',
-      latency: 'STT-level — ~0ms overhead',
-    },
-    {
-      id: 'credit_deduction',
-      name: 'Call Billing',
-      icon: '₹',
-      status: 'active',
-      description: 'Deducts call credits from clinic balance based on call duration after disconnect.',
-      trigger: 'Room disconnect event',
-      latency: 'Post-call — no impact',
-    },
-  ];
-
-  return (
-    <div>
-      <div style={{ marginBottom: 20 }}>
-        <h2 style={{ fontSize: 16, fontWeight: 600, color: '#fff', margin: 0 }}>Active Tools & Functions</h2>
-        <p style={{ fontSize: 13, color: '#555', marginTop: 4 }}>All capabilities wired into the {agent.agent_name} voice pipeline</p>
-      </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-        {tools.map(tool => (
-          <div key={tool.id} style={{ background: '#111', borderRadius: 12, padding: '18px 20px', border: `1px solid ${tool.status === 'active' ? 'rgba(62,207,142,0.15)' : '#1A1A1A'}` }}>
-            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 10 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <div style={{ width: 36, height: 36, borderRadius: 8, background: '#0D0D0D', border: '1px solid #1A1A1A', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18 }}>
-                  {tool.icon}
-                </div>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 600, color: '#fff' }}>{tool.name}</div>
-                  <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 7px', borderRadius: 9999, backgroundColor: 'rgba(62,207,142,0.1)', color: '#3ECF8E' }}>
-                    {tool.status}
-                  </span>
-                </div>
-              </div>
-              <Zap size={14} color="#3ECF8E" />
-            </div>
-            <p style={{ fontSize: 12, color: '#666', lineHeight: 1.5, margin: '0 0 12px' }}>{tool.description}</p>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span style={{ fontSize: 11, color: '#444' }}>Trigger</span>
-                <span style={{ fontSize: 11, color: '#888', fontStyle: 'italic' }}>{tool.trigger}</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span style={{ fontSize: 11, color: '#444' }}>Latency impact</span>
-                <span style={{ fontSize: 11, color: '#3ECF8E', fontWeight: 600 }}>{tool.latency}</span>
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-
-// ── ANALYSIS TAB ──────────────────────────────────────────────────────────────
-
-// Every number here is derived from the clinic's REAL calls. This tab used to
-// compute all of it from FIXTURE_CALL_LOGS / FIXTURE_APPOINTMENTS — including a
-// hardcoded "2:18" average handle time and a literal Mon–Sun bar array — so a
-// clinic with zero calls still saw a populated dashboard. See callLogsToStats().
-function AnalysisTab({ logs }: { logs: CallLogRow[] }) {
-  const stats = callLogsToStats(logs);
-  const { totalCalls, booked, resolutionPct, avgHandleTime, intentCounts, langCounts, days } = stats;
-  const maxDay = Math.max(1, ...days.map(d => d.value));
-
-  const kpiCards = [
-    { label: 'Total Calls',      value: totalCalls,     icon: Phone,       accent: '#3B82F6' },
-    { label: 'Apts Booked',      value: booked,         icon: CheckCircle2, accent: '#3ECF8E' },
-    { label: 'Resolution Rate',  value: resolutionPct,  icon: Activity,    accent: '#8B5CF6' },
-    { label: 'Avg Handle Time',  value: avgHandleTime,  icon: Clock,       accent: '#F59E0B' },
-  ];
-
-  const INTENT_COLORS: Record<string, string> = {
-    Appointment: '#3ECF8E', Emergency: '#ef4444', 'General Query': '#8B5CF6', Cancellation: '#F59E0B',
-  };
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-      {/* KPI row */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16 }}>
-        {kpiCards.map(k => (
-          <div key={k.label} style={{ background: '#111', borderRadius: 12, padding: '18px 20px', border: '1px solid #1A1A1A' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-              <span style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.08em', color: '#555', fontWeight: 500 }}>{k.label}</span>
-              <k.icon size={16} color={k.accent} />
-            </div>
-            <div style={{ fontSize: 30, fontWeight: 700, color: k.accent, letterSpacing: '-0.02em' }}>{k.value}</div>
-          </div>
-        ))}
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-        {/* Call Volume Chart */}
-        <div style={{ background: '#111', borderRadius: 12, border: '1px solid #1A1A1A' }}>
-          <div style={{ padding: '16px 20px', borderBottom: '1px solid #1A1A1A' }}>
-            <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600, color: '#fff' }}>Call Volume — Last 7 Days</h3>
-          </div>
-          <div style={{ padding: '20px', display: 'flex', alignItems: 'flex-end', gap: 8, height: 140 }}>
-            {days.map(d => {
-              const pct = maxDay > 0 ? Math.round((d.value / maxDay) * 100) : 0;
-              return (
-                <div key={d.day} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
-                  <span style={{ fontSize: 11, color: '#555', fontWeight: 500 }}>{d.value || ''}</span>
-                  <div style={{ width: '100%', height: 80, position: 'relative', borderRadius: 4, backgroundColor: '#1A1A1A' }}>
-                    <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: `${pct}%`, borderRadius: 4, backgroundColor: '#3ECF8E', minHeight: d.value > 0 ? 4 : 0, transition: 'height 0.6s ease' }} />
-                  </div>
-                  <span style={{ fontSize: 11, color: '#444' }}>{d.day}</span>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* Intent Breakdown */}
-        <div style={{ background: '#111', borderRadius: 12, border: '1px solid #1A1A1A' }}>
-          <div style={{ padding: '16px 20px', borderBottom: '1px solid #1A1A1A' }}>
-            <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600, color: '#fff' }}>Intent Breakdown</h3>
-          </div>
-          <div style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: 14 }}>
-            {Object.entries(intentCounts).map(([intent, count]) => {
-              const pct = Math.round((count / totalCalls) * 100);
-              const clr = INTENT_COLORS[intent] ?? '#888';
-              return (
-                <div key={intent}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <span style={{ fontSize: 13, color: '#aaa', fontWeight: 500 }}>{intent}</span>
-                    <span style={{ fontSize: 12, color: '#555', fontFamily: "'JetBrains Mono', monospace" }}>{count} · {pct}%</span>
-                  </div>
-                  <div style={{ height: 6, borderRadius: 3, backgroundColor: '#1A1A1A', overflow: 'hidden' }}>
-                    <div style={{ height: '100%', width: `${pct}%`, borderRadius: 3, backgroundColor: clr, transition: 'width 0.5s ease' }} />
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* Language distribution */}
-        <div style={{ background: '#111', borderRadius: 12, border: '1px solid #1A1A1A' }}>
-          <div style={{ padding: '16px 20px', borderBottom: '1px solid #1A1A1A' }}>
-            <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600, color: '#fff' }}>Language Distribution</h3>
-          </div>
-          <div style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: 14 }}>
-            {Object.entries(langCounts).map(([lang, count]) => {
-              const pct = Math.round((count / totalCalls) * 100);
-              const flags: Record<string, string> = { Hindi: '🇮🇳', English: '🇬🇧', Tamil: '🇮🇳' };
-              return (
-                <div key={lang}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <span style={{ fontSize: 13, color: '#aaa', fontWeight: 500 }}>{flags[lang] ?? ''} {lang}</span>
-                    <span style={{ fontSize: 12, color: '#555', fontFamily: "'JetBrains Mono', monospace" }}>{count} · {pct}%</span>
-                  </div>
-                  <div style={{ height: 6, borderRadius: 3, backgroundColor: '#1A1A1A', overflow: 'hidden' }}>
-                    <div style={{ height: '100%', width: `${pct}%`, borderRadius: 3, backgroundColor: '#3ECF8E', transition: 'width 0.5s ease' }} />
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* AI Impact Card */}
-        <div style={{ background: 'rgba(62,207,142,0.04)', borderRadius: 12, border: '1px solid rgba(62,207,142,0.15)' }}>
-          <div style={{ padding: '16px 20px', borderBottom: '1px solid rgba(62,207,142,0.15)' }}>
-            <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600, color: '#3ECF8E' }}>Receptionist Impact</h3>
-          </div>
-          <div style={{ padding: '20px', display: 'flex', flexDirection: 'column', gap: 14 }}>
-            {[
-              { label: 'Calls fully resolved by AI', value: resolutionPct },
-              { label: 'Languages handled',           value: `${Object.keys(langCounts).length}` },
-              { label: 'Appointments booked (no staff)', value: `${booked}` },
-              { label: 'Avg response time',           value: '< 3 sec' },
-            ].map(item => (
-              <div key={item.label} style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span style={{ fontSize: 13, color: 'rgba(62,207,142,0.7)' }}>{item.label}</span>
-                <span style={{ fontSize: 13, fontWeight: 700, color: '#3ECF8E', fontFamily: "'JetBrains Mono', monospace" }}>{item.value}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-
-// ── ADVANCED TAB ──────────────────────────────────────────────────────────────
-
-function AdvancedTab({
-  agent, credits, showInternals,
-}: { agent: AgentInfo; credits: CreditInfo | null; showInternals: boolean }) {
-  // Platform-internal sections. These name our vendors (Sarvam bulbul/saaras,
-  // Gemini, LiveKit), expose latency-tuning values that are our own engineering
-  // work, and describe the auth/encryption architecture. Superadmin only.
-  const internalSections = [
-    {
-      title: 'Model Configuration',
-      icon: Brain,
-      rows: [
-        { label: 'LLM Model',         value: agent.llm_model || 'gemini-2.0-flash' },
-        { label: 'Temperature',       value: String(agent.llm_temperature ?? 0.3) },
-        { label: 'Max Output Tokens', value: '120 (voice-optimised)' },
-        { label: 'STT Model',         value: agent.stt_model || 'saaras:v2' },
-        { label: 'TTS Model',         value: agent.tts_model || 'bulbul:v3' },
-        { label: 'TTS Voice',         value: agent.tts_voice || 'priya' },
-      ],
-    },
-    {
-      title: 'Latency & Performance',
-      icon: Activity,
-      rows: [
-        { label: 'HTTP Client',       value: 'Persistent HTTP/2 (shared)' },
-        { label: 'VAD Silence',       value: '250ms (optimised)' },
-        { label: 'Prefix Padding',    value: '100ms' },
-        { label: 'TTS Preprocessing', value: 'Disabled (speed)' },
-        { label: 'TTS Pace',          value: '1.05× (faster speech)' },
-        { label: 'Sheets Sync',       value: 'asyncio.create_task (0ms block)' },
-      ],
-    },
-    {
-      title: 'Security & Access',
-      icon: Shield,
-      rows: [
-        { label: 'Authentication',  value: 'JWT Bearer Token' },
-        { label: 'Data Isolation',  value: 'Per-tenant DB rows' },
-        { label: 'Phone Masking',   value: 'Last 4 digits visible' },
-        { label: 'Call Encryption', value: 'LiveKit DTLS/SRTP' },
-      ],
-    },
-  ];
-
-  // Sections every clinic admin legitimately needs: their own money, their own
-  // alerts, their own languages.
-  const clinicSections = [
-    {
-      title: 'Billing & Credits',
-      icon: IndianRupee,
-      rows: [
-        { label: 'Rate',          value: `₹${(credits?.rate_per_minute ?? 1.5).toFixed(2)}/min` },
-        { label: 'Total Added',   value: `₹${(credits?.total_added ?? 0).toFixed(2)}` },
-        { label: 'Total Spent',   value: `₹${(credits?.total_deducted ?? 0).toFixed(2)}` },
-        { label: 'Current Balance', value: `₹${(credits?.balance ?? 0).toFixed(2)}` },
-        { label: 'Status',        value: credits?.is_low ? '⚠️ Low balance' : '✅ Sufficient' },
-      ],
-    },
-    {
-      title: 'Notification Settings',
-      icon: Bell,
-      rows: [
-        { label: 'Low Balance Alert', value: 'Enabled' },
-        { label: 'Booking Alert',     value: 'Google Sheets Webhook' },
-        { label: 'Emergency Alert',   value: 'Transfer to forwarding number' },
-      ],
-    },
-    {
-      title: 'Supported Languages',
-      icon: Globe,
-      rows: [
-        { label: 'Primary',     value: LANG_MAP[agent.language] || agent.language },
-        { label: 'Auto-detect', value: 'Hindi, English, Tamil, Malayalam, Telugu, Kannada, Bengali, Arabic, Marathi' },
-        { label: 'Barge-in',    value: 'Enabled (patient can interrupt AI)' },
-      ],
-    },
-  ];
-
-  const sections = showInternals ? [...internalSections, ...clinicSections] : clinicSections;
-
-  return (
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-      {sections.map(sec => (
-        <div key={sec.title} style={{ background: '#111', borderRadius: 12, border: '1px solid #1A1A1A', overflow: 'hidden' }}>
-          <div style={{ padding: '14px 20px', borderBottom: '1px solid #1A1A1A', display: 'flex', alignItems: 'center', gap: 8 }}>
-            <sec.icon size={15} color="#555" />
-            <h3 style={{ margin: 0, fontSize: 13, fontWeight: 600, color: '#fff' }}>{sec.title}</h3>
-            <Lock size={11} color="#333" style={{ marginLeft: 'auto' }} />
-          </div>
-          <div style={{ padding: '12px 0' }}>
-            {sec.rows.map(row => (
-              <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 20px' }}>
-                <span style={{ fontSize: 12, color: '#555' }}>{row.label}</span>
-                <span style={{ fontSize: 12, color: '#aaa', fontWeight: 500, textAlign: 'right', maxWidth: '55%' }}>{row.value}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-
-// ── Shared Sub-components ─────────────────────────────────────────────────────
-
-function QuickStat({ label, value, accent }: { label: string; value: string; accent: string }) {
-  return (
-    <div style={{ textAlign: 'center' }}>
-      <div style={{ fontSize: 16, fontWeight: 700, color: accent, letterSpacing: '-0.02em' }}>{value}</div>
-      <div style={{ fontSize: 10, color: '#444', marginTop: 1 }}>{label}</div>
-    </div>
-  );
-}
-
-function StatCard({ icon, label, value, detail, accent, warning }: {
-  icon: React.ReactNode; label: string; value: string; detail: string; accent: string; warning?: string;
-}) {
-  return (
-    <div style={{ ...styles.statCard, borderColor: warning ? 'rgba(239,68,68,0.3)' : '#1A1A1A' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-        <div style={{ color: accent, opacity: 0.8 }}>{icon}</div>
-        {warning && (
-          <span style={{ fontSize: 10, color: '#ef4444', fontWeight: 600, background: 'rgba(239,68,68,0.1)', padding: '2px 8px', borderRadius: 4 }}>
-            {warning}
-          </span>
-        )}
-      </div>
-      <div style={{ fontSize: 24, fontWeight: 700, color: '#fff', letterSpacing: '-0.02em' }}>{value}</div>
-      <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>{label}</div>
-      <div style={{ fontSize: 11, color: '#555', marginTop: 2 }}>{detail}</div>
-    </div>
-  );
-}
-
-function ConfigRow({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
-  return (
-    <div style={styles.configRow}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#888' }}>
-        {icon}
-        <span style={{ fontSize: 13 }}>{label}</span>
-      </div>
-      <span style={{ fontSize: 13, color: '#ddd', fontWeight: 500 }}>{value}</span>
-    </div>
-  );
-}
-
-
-// ── Styles ────────────────────────────────────────────────────────────────────
-
-const styles: Record<string, React.CSSProperties> = {
-  page: {
-    padding: '28px 32px', minHeight: '100vh', background: '#0A0A0A',
-    fontFamily: "'Inter', 'Segoe UI', sans-serif", maxWidth: 1200, margin: '0 auto',
-  },
-  loadingContainer: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '50vh' },
-  spinner: { width: 40, height: 40, border: '3px solid #1A1A1A', borderTop: '3px solid #3ECF8E', borderRadius: '50%', animation: 'spin 0.8s linear infinite' },
-  errorCard: { textAlign: 'center', padding: 60, background: '#111', borderRadius: 16, border: '1px solid #1A1A1A', maxWidth: 500, margin: '80px auto' },
-  statsRow: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 },
-  statCard: { background: '#111', borderRadius: 12, padding: '18px 20px', border: '1px solid #1A1A1A' },
-  columns: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 },
-  card: { background: '#111', borderRadius: 14, padding: '22px 24px', border: '1px solid #1A1A1A' },
-  cardTitle: { fontSize: 16, fontWeight: 600, color: '#fff', margin: 0 },
-  cardSubtitle: { fontSize: 12, color: '#555', margin: '4px 0 0' },
-  configGrid: { display: 'flex', flexDirection: 'column', gap: 8, marginTop: 16 },
-  configRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 14px', background: '#0D0D0D', borderRadius: 8, border: '1px solid #1A1A1A' },
-  firstMsgBox: { marginTop: 16, padding: '14px 16px', background: '#0D0D0D', borderRadius: 8, border: '1px solid #1A1A1A' },
-  callRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 14px', background: '#0D0D0D', borderRadius: 8, border: '1px solid #1A1A1A' },
-  txnRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 14px', background: '#0D0D0D', borderRadius: 8, border: '1px solid #1A1A1A' },
-};

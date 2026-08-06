@@ -318,6 +318,68 @@ _CONFIDENTIAL_AGENT_FIELDS = frozenset({
 })
 
 
+#: The ONLY agent fields a clinic-role token may write. Everything that decides how
+#: the receptionist sounds or behaves — provider, model, voice, language, prompt,
+#: greeting, latency knobs — is deliberately absent.
+#:
+#: `clinic_info` is the clinic's own operational truth (working hours), not agent
+#: configuration. It is stored on AgentConfig because the prompt builder reads it
+#: from there, and Settings → Clinic Profile — a tab clinic admins keep — saves it
+#: via PATCH /agents/{id}. Blocking the whole endpoint would have silently broken
+#: that save, which is why this is an allow-list rather than a flat refusal.
+_CLINIC_WRITABLE_AGENT_FIELDS = frozenset({"clinic_info"})
+
+
+def _authorize_agent_patch(user, fields: set[str]) -> None:
+    """Gate PATCH /agents/{id} by ROLE and by which fields were actually sent.
+
+    Superadmin: anything. Clinic: only _CLINIC_WRITABLE_AGENT_FIELDS, and the 403
+    names what was refused so the caller is not left guessing.
+    """
+    if user is not None and getattr(user, "is_superadmin", False):
+        return
+
+    refused = sorted(f for f in fields if f not in _CLINIC_WRITABLE_AGENT_FIELDS)
+    if not refused:
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "Agent configuration is managed by the Lifodial team and is read-only "
+            f"for clinic accounts (refused: {', '.join(refused)})."
+        ),
+    )
+
+
+def _require_agent_write_access(user) -> None:
+    """Agent CONFIGURATION is superadmin-only. Clinic-role callers get 403.
+
+    A clinic admin's view of its agent (My Agent) is read-only by design: the
+    voice, model, language, prompt and greeting decide whether calls work at all,
+    and they are set up for the clinic by the platform team. Until now that was
+    only true of the UI — every write below took ``CurrentUser`` and merely checked
+    ``require_owns``, so a clinic token could PATCH its own agent's provider/model
+    straight through the API and break its own live receptionist. Removing the Edit
+    button is not a permission.
+
+    Applies to config writes ONLY. Deliberately NOT applied to the endpoints a
+    clinic legitimately drives: the web-call token, the outbound test call, and the
+    text/chat test path. Those are the "view and test" capability the clinic keeps.
+
+    403 (not 404) on purpose: the agent is genuinely theirs and they can read it,
+    so hiding its existence would be nonsense. What is denied is the mutation.
+    """
+    if user is None or not getattr(user, "is_superadmin", False):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Agent configuration is managed by the Lifodial team and is "
+                "read-only for clinic accounts."
+            ),
+        )
+
+
 def redact_agent_for_clinic(data: dict) -> dict:
     """Strip platform credentials from an agent payload bound for a clinic admin.
 
@@ -1009,6 +1071,8 @@ def _generation_stream_response(provider, model, key, meta_prompt, fallback_used
 
 @router.post("/agents/{agent_id}/generate-system-prompt")
 async def generate_system_prompt(agent_id: str, user: CurrentUser = None):
+    # Rewrites the agent's system prompt — configuration, so superadmin-only.
+    _require_agent_write_access(user)
     async with async_session() as session:
         result = await session.execute(
             select(AgentConfig, Tenant.clinic_name)
@@ -1050,6 +1114,8 @@ async def generate_system_prompt(agent_id: str, user: CurrentUser = None):
 async def generate_first_message(agent_id: str, user: CurrentUser = None):
     """Compose with AI — generate a warm, clinic-specific first greeting using the
     agent's OWN selected LLM provider/model."""
+    # Rewrites the agent's greeting — configuration, so superadmin-only.
+    _require_agent_write_access(user)
     async with async_session() as session:
         result = await session.execute(
             select(AgentConfig, Tenant.clinic_name)
@@ -1330,6 +1396,14 @@ async def create_agent(payload: AgentCreatePayload, user: SuperAdmin = None) -> 
 
 @router.patch("/agents/{agent_id}")
 async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentUser = None) -> dict:
+    # Checked BEFORE the agent is loaded, so a clinic token attempting a config
+    # write gets the same 403 whether or not the agent exists — this cannot be used
+    # to probe for other clinics' agent ids.
+    #
+    # `model_fields_set` is what was EXPLICITLY sent, which is the right boundary:
+    # AgentPatchPayload declares every field as optional, so the unset ones are not
+    # an attempt to write anything.
+    _authorize_agent_patch(user, set(payload.model_fields_set))
     try:
         async with async_session() as session:
             result = await session.execute(
@@ -1619,6 +1693,8 @@ async def get_prompt_history(agent_id: str, field: str, user: CurrentUser = None
 
 @router.post("/agents/{agent_id}/prompt-history/{history_id}/revert")
 async def revert_prompt_history(agent_id: str, history_id: str, user: CurrentUser = None) -> dict:
+    # Restores a previous prompt/greeting onto the agent — a config write.
+    _require_agent_write_access(user)
     try:
         async with async_session() as session:
             agent = (await session.execute(
@@ -1665,6 +1741,8 @@ async def upload_agent_avatar(agent_id: str, file: UploadFile = File(...), user:
     original is kept, but the widget is served an optimized 256×256 WebP so a
     large source upload never slows the embed script. PNG/JPG/WebP, ≤8MB.
     """
+    _require_agent_write_access(user)
+
     from backend.services import storage
 
     ext = storage.AVATAR_MIME_EXT.get((file.content_type or "").lower())
@@ -1718,6 +1796,7 @@ async def upload_agent_avatar(agent_id: str, file: UploadFile = File(...), user:
 @router.delete("/agents/{agent_id}/avatar")
 async def delete_agent_avatar(agent_id: str, user: CurrentUser = None) -> dict:
     """Clear the agent's avatar (widget reverts to the default icon)."""
+    _require_agent_write_access(user)
     try:
         async with async_session() as session:
             agent = (await session.execute(
