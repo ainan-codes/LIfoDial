@@ -410,6 +410,23 @@ function TestCallUI({
             style={{
               background: '#3ECF8E', color: '#051b11', padding: '8px 20px',
               borderRadius: 20, fontWeight: 700, border: 'none', cursor: 'pointer', fontSize: 13,
+              // ── These four are load-bearing, not styling ──────────────────
+              // @livekit/components-styles (imported globally at the top of this
+              // file) ships:
+              //     .lk-start-audio-button { position: fixed; top: 50%;
+              //                              left: 50%; transform: translate(-50%,-50%) }
+              // StartAudio renders exactly that class, so without these overrides
+              // the button leaves this panel entirely and pins itself to the
+              // CENTRE OF THE VIEWPORT — a fixed element floating over the page
+              // content, eating clicks wherever it lands, for as long as audio
+              // stays locked. Inline styles beat a class rule only for the
+              // properties they declare, and the component's own style prop does
+              // not touch position, so all four have to be named here.
+              //
+              // Easy to miss when testing: Chrome launched with
+              // --autoplay-policy=no-user-gesture-required unlocks audio
+              // immediately and this button never renders at all.
+              position: 'relative', top: 'auto', left: 'auto', transform: 'none',
             }}
           />
         </div>
@@ -734,6 +751,32 @@ export default function TestVoiceCallLK({
     setToken('');
     setWsUrl('');
     setPhase((p) => (p === 'error' || p === 'demo' ? p : 'ended'));
+  }, []);
+
+  // ── Navigating away mid-call ENDS the call. Decided, not incidental. ────────
+  //
+  // Leaving the page unmounts this component and with it <LiveKitRoom>, which
+  // disconnects the room and stops the local mic track — so the call ends cleanly
+  // and the browser's recording indicator goes out. There is deliberately no
+  // persistent mini-player:
+  //
+  //   * This is a TEST call against the clinic's own agent, started from one
+  //     button on one page. A call that followed the operator around the app would
+  //     need a global room provider, and would keep a live mic open on pages that
+  //     give no indication a call is running.
+  //   * A mini-player is also what created the reported bug's shape — a floating
+  //     widget over the app chrome. The panel now stays inside the page that owns
+  //     it, and the chrome outranks it either way.
+  //
+  // Not blocked, and not silent: the panel is visibly gone, and the room's
+  // Disconnected event finalises the call record server-side as it would for a
+  // hang-up. React Router's useBlocker (to warn first) needs a data router; this
+  // app mounts a plain BrowserRouter, so there is no confirm step to hook into.
+  useEffect(() => () => {
+    // Explicit teardown so the intent is in the code and not only in LiveKitRoom's
+    // unmount behaviour. Safe to run when no call is up.
+    setToken('');
+    setWsUrl('');
   }, []);
 
   // Back out to the pre-call screen, keeping the panel open. Used by the error and

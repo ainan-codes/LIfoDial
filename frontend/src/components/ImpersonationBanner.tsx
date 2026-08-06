@@ -2,6 +2,7 @@ import { Eye, LogOut } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import fetchWithAuth from '../api/client';
 import { endImpersonation, getImpersonation, type Impersonation } from '../api/auth';
+import { CHROME_Z, IMPERSONATION_BANNER_HEIGHT as BANNER_H } from './chromeStacking';
 
 /**
  * The "you are viewing someone else's dashboard" banner.
@@ -23,8 +24,10 @@ import { endImpersonation, getImpersonation, type Impersonation } from '../api/a
  * tears down the client session second.
  */
 
-/** Height in px. Layout.tsx offsets the mobile sidebar by exactly this. */
-export const IMPERSONATION_BANNER_HEIGHT = 44;
+// Height + stacking order live in components/chromeStacking.ts, shared with the
+// shell. Re-exported here because Layout and others already import it from this
+// module. Layout offsets the mobile sidebar by exactly this height.
+export { IMPERSONATION_BANNER_HEIGHT } from './chromeStacking';
 
 const AMBER = '#f59e0b';
 
@@ -97,7 +100,7 @@ function Banner({ imp }: { imp: Impersonation }) {
     <div
       role="alert"
       style={{
-        height: IMPERSONATION_BANNER_HEIGHT,
+        height: BANNER_H,
         flexShrink: 0,
         display: 'flex',
         alignItems: 'center',
@@ -108,10 +111,10 @@ function Banner({ imp }: { imp: Impersonation }) {
         color: AMBER,
         fontSize: '13px',
         fontWeight: 600,
-        // Positioned so it paints above the mobile sidebar (z 50) and its
-        // backdrop (z 40) — a drawer must not be able to cover the banner.
+        // Positioned so it paints above page-level panels; the drawer and its
+        // backdrop share the chrome tier, so neither can cover the way out.
         position: 'relative',
-        zIndex: 60,
+        zIndex: CHROME_Z,
       }}
     >
       <Eye size={15} style={{ flexShrink: 0 }} />

@@ -11,10 +11,11 @@ import {
     Users,
     X
 } from 'lucide-react';
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { clearSession, isImpersonating, isSuperAdmin } from '../api/auth';
-import ImpersonationBanner, { IMPERSONATION_BANNER_HEIGHT, exitImpersonation } from './ImpersonationBanner';
+import ImpersonationBanner, { exitImpersonation } from './ImpersonationBanner';
+import { CHROME_BACKDROP_Z, CHROME_Z, IMPERSONATION_BANNER_HEIGHT } from './chromeStacking';
 
 // Agent setup pending — will be enabled later
 // To show the Agents nav item, set CLINIC_AGENT_NAV_ENABLED = true
@@ -40,6 +41,12 @@ const nav = [
   { label: 'Settings',     icon: Settings,         to: '/settings',     hidden: false },
 ];
 
+// Chrome (banner / sidebar / bottom nav) always outranks a page's overlays — the
+// rule and the numbers live in components/chromeStacking.ts. Note that chrome has
+// to be POSITIONED for z-index to apply at all: the desktop sidebar used to be
+// `position: static`, so its z-index of 50 did nothing and any fixed panel painted
+// straight over it.
+
 // Bottom nav items shown on mobile (most important ones)
 const bottomNav = [
   { label: 'Dashboard', icon: LayoutDashboard, to: '/dashboard' },
@@ -63,6 +70,24 @@ export default function Layout() {
   // clinic's own dashboard, not a hybrid of both.
   const impersonating = isImpersonating();
 
+  // The mobile bottom nav's real height, published as --lfd-chrome-bottom so a
+  // viewport-anchored panel can stop above it. MEASURED, not assumed: hardcoding
+  // "56px" left the panel overlapping the bar by 2px, and the bar's height moves
+  // with font size and the device's safe-area inset. 0 on desktop, where the bar
+  // is display:none and reports no height.
+  const bottomNavRef = useRef<HTMLElement | null>(null);
+  const [chromeBottom, setChromeBottom] = useState(0);
+  useEffect(() => {
+    const el = bottomNavRef.current;
+    if (!el) return;
+    const measure = () => setChromeBottom(el.getBoundingClientRect().height);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    window.addEventListener('resize', measure);
+    return () => { ro.disconnect(); window.removeEventListener('resize', measure); };
+  }, []);
+
   // Drop hidden/superadmin-only entries outright rather than rendering them with
   // display:none — a CSS-hidden NavLink is still in the DOM and still a live link.
   const showSuperadminOnly = isSuperAdmin();
@@ -85,6 +110,12 @@ export default function Layout() {
         height: '100vh',
         overflow: 'hidden',
         backgroundColor: 'var(--bg-page)',
+        // How much chrome a viewport-anchored panel must keep clear of. Panels
+        // inside this shell inherit these (CSS vars cross `position: fixed`), so
+        // they can size themselves to the app rather than to the raw viewport —
+        // see TestAgentModal.
+        ['--lfd-chrome-top' as any]: impersonating ? `${IMPERSONATION_BANNER_HEIGHT}px` : '0px',
+        ['--lfd-chrome-bottom' as any]: `${chromeBottom}px`,
       }}
     >
       {/* Static row above the app, not an overlay inside it — it cannot be
@@ -104,7 +135,7 @@ export default function Layout() {
             position: 'fixed', inset: 0,
             background: 'rgba(0,0,0,0.6)',
             backdropFilter: 'blur(4px)',
-            zIndex: 40,
+            zIndex: CHROME_BACKDROP_Z,
           }}
         />
       )}
@@ -123,7 +154,7 @@ export default function Layout() {
           top: 0,
           left: 0,
           height: '100%',
-          zIndex: 50,
+          zIndex: CHROME_Z,
           transform: sidebarOpen ? 'translateX(0)' : 'translateX(-100%)',
           transition: 'transform 0.28s cubic-bezier(0.4,0,0.2,1)',
         }}
@@ -288,6 +319,7 @@ export default function Layout() {
 
         {/* ── Mobile bottom navigation ── */}
         <nav
+          ref={bottomNavRef}
           className="layout-bottom-nav"
           style={{
             display: 'flex',
@@ -295,6 +327,11 @@ export default function Layout() {
             borderTop: '1px solid var(--border)',
             flexShrink: 0,
             paddingBottom: 'env(safe-area-inset-bottom, 0px)',
+            // Same rule as the sidebar: chrome outranks page overlays. On mobile
+            // this bar IS the navigation, and a full-width panel would otherwise
+            // cover it completely.
+            position: 'relative',
+            zIndex: CHROME_Z,
           }}
         >
           {bottomNav.map(({ label, icon: Icon, to }) => (
@@ -330,9 +367,13 @@ export default function Layout() {
         /* ── Desktop: sidebar is always visible, static ── */
         @media (min-width: 768px) {
           .layout-sidebar {
-            position: static !important;
+            /* relative, NOT static: z-index does nothing on a static element, so
+               while this sidebar was static it had no stacking order at all and
+               any fixed panel painted (and clicked) straight over it. */
+            position: relative !important;
             transform: none !important;
             flex-shrink: 0;
+            z-index: ${CHROME_Z};
           }
           .sidebar-close-btn {
             display: none !important;

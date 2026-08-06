@@ -306,6 +306,24 @@ img.logo-img, img.logo-navbar, img.logo {
   padding: 16px 20px; border-top: 1px solid var(--border); background: var(--bg-surface-2);
 }
 .lk-agent-control-bar { background: transparent !important; border: none !important; padding: 0 !important; }
+
+/* @livekit/components-styles ships
+ *     .lk-start-audio-button { position: fixed; top: 50%; left: 50%;
+ *                              transform: translate(-50%, -50%) }
+ * which tears the "Tap to Enable Audio" button out of whatever panel rendered it
+ * and pins it to the centre of the VIEWPORT — a floating element over the page
+ * that eats clicks wherever it lands, for as long as audio stays locked (always,
+ * on iOS Safari and any browser blocking autoplay).
+ *
+ * Overridden here rather than only inline because it must hold for every future
+ * <StartAudio> too, and because a component's style prop can only beat a class
+ * rule for the properties it happens to declare. See TestVoiceCallLK.tsx. */
+.lk-start-audio-button {
+  position: relative !important;
+  top: auto !important;
+  left: auto !important;
+  transform: none !important;
+}
 .mic-hint { text-align: center; font-size: 12px; color: var(--text-muted); padding: 8px 20px 16px; }
 .connecting-state {
   padding: 40px 24px; display: flex; flex-direction: column;

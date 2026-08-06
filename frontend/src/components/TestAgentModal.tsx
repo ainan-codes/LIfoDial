@@ -1349,14 +1349,26 @@ export default function TestAgentModal({ agent, agentId: directId, agentName: di
           overflow: 'hidden',
           border: '1px solid rgba(255,255,255,0.08)'
         } : {
+          // Anchored to the viewport, but INSET BY THE APP'S CHROME rather than
+          // covering it. --lfd-chrome-top is the impersonation banner's height (0
+          // when not impersonating) and --lfd-chrome-bottom is the mobile bottom
+          // nav's (0 on desktop); both are published by components/Layout.tsx and
+          // inherit down here even though this element is fixed. Defaults of 0px
+          // keep this correct on the superadmin pages, which have no such chrome.
+          //
+          // It previously used top: 0 + height: 100dvh, which covered the
+          // impersonation banner's Exit button and, on a phone, the entire bottom
+          // navigation bar. Chrome also now outranks this panel in z-order
+          // (Layout.CHROME_Z), so even a future sizing mistake cannot make the
+          // navigation unclickable.
           position: 'fixed',
           right: 0,
-          top: 0,
+          top: 'var(--lfd-chrome-top, 0px)',
+          bottom: 'var(--lfd-chrome-bottom, 0px)',
           width: 'min(420px, 100vw)',
-          height: '100dvh',
           background: '#0f0f0f',
           borderLeft: '1px solid rgba(255,255,255,0.08)',
-          zIndex: 50,
+          zIndex: 45,
           display: 'flex',
           flexDirection: 'column',
           transform: isOpen ? 'translateX(0)' : 'translateX(100%)',
