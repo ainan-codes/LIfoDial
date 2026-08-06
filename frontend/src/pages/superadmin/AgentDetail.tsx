@@ -355,6 +355,9 @@ export default function AgentDetail() {
   const [showTest, setShowTest] = useState(false);
   const timerRef = useRef<any>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  // Monotonic id for agent GETs, so an out-of-order response cannot repaint the
+  // editor with superseded data. See loadAgent.
+  const loadSeqRef = useRef(0);
 
   // Publish this agent's name so the breadcrumb shows it instead of the raw
   // UUID taken from the URL (audit P5).
@@ -464,9 +467,28 @@ export default function AgentDetail() {
   // ElevenLabs, Whisper, PlayHT and Azure alongside the two that work.
   const [cfgOptions, setCfgOptions] = useState<any>(null);
 
-  const loadAgent = useCallback(async () => {
-    setLoading(true);
+  // `quiet` re-reads the agent WITHOUT touching the page-level `loading` flag.
+  //
+  // That flag gates the whole page on a full-screen "Loading agent..." (see the
+  // early return below), so calling this the normal way after a provider change
+  // tore the entire editor down and rebuilt it — the "full page reload / blank
+  // flash" on every Voice Provider switch. There was never a location.reload()
+  // or a key={provider}; it was this refetch flipping the page gate.
+  //
+  // A quiet load also must not clear `agent` on failure: the PATCH that
+  // triggered it already succeeded, so blanking the editor to "Agent not found"
+  // over a transient GET would throw away a working screen and the operator's
+  // scroll position. It keeps what is on screen and leaves the save status to
+  // report the problem.
+  const loadAgent = useCallback(async (opts?: { quiet?: boolean }) => {
+    const quiet = opts?.quiet === true;
+    if (!quiet) setLoading(true);
     setLoadError(null);
+
+    // Only the newest load may write to state. Switching provider twice quickly
+    // fires two PATCH+refetch pairs, and without this the SLOWER response could
+    // land last and repaint the editor with the superseded provider.
+    const seq = ++loadSeqRef.current;
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 12000);
@@ -477,14 +499,20 @@ export default function AgentDetail() {
         throw new Error('Invalid agent payload');
       }
 
-      setAgent(data);
+      if (seq === loadSeqRef.current) setAgent(data);
     } catch (e: any) {
       console.error('Agent detail load failed:', e);
-      setAgent(null);
-      setLoadError('Unable to load this agent. Please try again.');
+      if (!quiet && seq === loadSeqRef.current) {
+        setAgent(null);
+        setLoadError('Unable to load this agent. Please try again.');
+      }
     } finally {
       clearTimeout(timeout);
-      setLoading(false);
+      // NOT seq-gated: a loud load must always clear the flag it set, even when a
+      // newer quiet refetch has superseded it. Gating this on seq leaves `loading`
+      // stuck true forever (the quiet load never clears it) and the page frozen on
+      // "Loading agent...".
+      if (!quiet) setLoading(false);
     }
   }, [agentId]);
 
@@ -639,14 +667,19 @@ export default function AgentDetail() {
         method: 'PATCH',
         body: JSON.stringify(updates),
       });
-      await loadAgent();
+      // quiet: the optimistic setAgent above already put the new provider on
+      // screen. This refetch exists to pick up what the SERVER derived (a reset
+      // tts_model, a repaired voice, the language mirrors) and must not blank the
+      // page to do it.
+      await loadAgent({ quiet: true });
       setSaveStatus('saved');
       setTimeout(() => setSaveStatus(null), 3000);
     } catch {
       setSaveStatus('error');
       // Re-read so a rejected change (e.g. a language the new provider cannot
-      // speak) does not linger in the UI as if it had been accepted.
-      loadAgent();
+      // speak) does not linger in the UI as if it had been accepted. Also quiet —
+      // the error is already reported through saveStatus.
+      loadAgent({ quiet: true });
     }
   }, [agentId, loadAgent]);
 
@@ -1084,7 +1117,9 @@ export default function AgentDetail() {
             Back
           </button>
           <button
-            onClick={loadAgent}
+            // Wrapped, not passed directly: React would hand loadAgent the click
+            // event as its `opts` argument.
+            onClick={() => loadAgent()}
             style={{ padding: '8px 14px', borderRadius: '8px', background: ACCENT, border: 'none', color: '#000', fontWeight: 600, cursor: 'pointer' }}
           >
             Retry

@@ -15,7 +15,7 @@ import {
   Stethoscope,
   X
 } from 'lucide-react';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import VoiceLibrary from './VoiceLibrary';
 import { useProviders } from '../../hooks/useProviders';
@@ -507,20 +507,50 @@ function Step3({ state, onChange, onChangeMany }: {
   const [playingVoice, setPlayingVoice] = useState<string>("")
   const [audioCache, setAudioCache] = useState<Record<string, string>>({})
 
+  // The element currently playing. Without this, nothing here ever stopped audio:
+  // the "already playing" branch only cleared the LABEL while the sound played on,
+  // and picking a second voice constructed another Audio so both played at once.
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+
+  const stopVoice = () => {
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current.onended = null
+      audioRef.current.src = ''
+      audioRef.current = null
+    }
+    setPlayingVoice("")
+  }
+
+  // Stop on unmount too — leaving the wizard mid-preview used to keep playing.
+  useEffect(() => stopVoice, [])
+
+  const start = (src: string, voiceId: string) => {
+    stopVoice()
+    const audio = new Audio(src)
+    audioRef.current = audio
+    setPlayingVoice(voiceId)
+    audio.onended = () => {
+      if (audioRef.current === audio) audioRef.current = null
+      setPlayingVoice("")
+    }
+    audio.play().catch(() => stopVoice())
+  }
+
   const playVoice = async (voiceId: string) => {
     if (playingVoice === voiceId) {
-      setPlayingVoice("")
+      stopVoice()
       return
     }
-    
+
+    // Any other preview stops before this one starts.
+    stopVoice()
+
     if (audioCache[voiceId]) {
-      const audio = new Audio(audioCache[voiceId])
-      setPlayingVoice(voiceId)
-      audio.onended = () => setPlayingVoice("")
-      audio.play()
+      start(audioCache[voiceId], voiceId)
       return
     }
-    
+
     setPlayingVoice(`loading-${voiceId}`)
     try {
       // No `text`: the backend resolves the sentence from `language`, using the
@@ -538,14 +568,10 @@ function Step3({ state, onChange, onChangeMany }: {
       })
 
       const audioUrl = `data:audio/wav;base64,${data.audio_base64}`
-      
+
       setAudioCache(prev => ({...prev, [voiceId]: audioUrl}))
-      
-      const audio = new Audio(audioUrl)
-      setPlayingVoice(voiceId)
-      audio.onended = () => setPlayingVoice("")
-      audio.play()
-      
+      start(audioUrl, voiceId)
+
     } catch {
       setPlayingVoice("")
     }

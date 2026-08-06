@@ -47,7 +47,10 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [loadingAudioId, setLoadingAudioId] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
-  const [providerStatus, setProviderStatus] = useState<Record<string, { connected: boolean; voice_count: number }>>({});
+  // `error` is set when the provider IS configured but its voice list call failed —
+  // a different state from `connected: false` (no API key), and one the page must
+  // show rather than rendering a silently short list.
+  const [providerStatus, setProviderStatus] = useState<Record<string, { connected: boolean; voice_count: number; error?: string }>>({});
   // Configured TTS providers (ids) in the order they should appear.
   const [ttsProviders, setTtsProviders] = useState<string[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -56,6 +59,8 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
   const [providerLanguages, setProviderLanguages] = useState<{ code: string; name: string }[]>([]);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  // The object URL `audioRef` is currently playing, so stopAudio can revoke it.
+  const audioUrlRef = useRef<string | null>(null);
 
   const [localVoices, setLocalVoices] = useState<any[]>([]);
 
@@ -105,10 +110,24 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
           const mapped = voices.map(v => normalize(providerId, v));
           setLocalVoices(prev => [...prev.filter(p => p.provider !== providerId), ...mapped]);
         }
-      } catch (err) {
-        // A single provider's list API being down must not clear the others.
+      } catch (err: any) {
+        // A single provider's list API being down must not clear the others — but
+        // it must not be SILENT either. This used to console.error and then record
+        // `connected: true`, so a provider whose voice list had just failed was
+        // shown with a green "Connected" dot, "0 voices", and no error anywhere:
+        // indistinguishable from a provider that genuinely has no voices.
         console.error(`Failed to fetch voices for ${providerId}:`, err);
-        setProviderStatus(prev => ({ ...prev, [providerId]: { connected: true, voice_count: prev[providerId]?.voice_count || 0 } }));
+        setProviderStatus(prev => ({
+          ...prev,
+          [providerId]: {
+            connected: true,
+            voice_count: prev[providerId]?.voice_count || 0,
+            // Distinct from `connected: false`, which means "no API key" and
+            // renders an "Add API key to unlock" prompt — the wrong instruction
+            // for a provider that is configured but whose list call failed.
+            error: err?.message ? String(err.message).slice(0, 160) : 'Request failed',
+          },
+        }));
       }
     };
 
@@ -143,7 +162,20 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
   const stopAudio = () => {
     if (audioRef.current) {
       audioRef.current.pause();
+      // Drop the handlers before releasing the element: onerror in particular
+      // alert()s, and a revoked src can fire it on an element we no longer own.
+      audioRef.current.onended = null;
+      audioRef.current.onerror = null;
+      audioRef.current.src = '';
       audioRef.current = null;
+    }
+    // Revoke the blob the preview was playing from. onended/onerror revoke it on
+    // the paths that reach them, but a preview that is STOPPED — stop button, a
+    // different voice clicked, the picker modal closing, unmount — never fires
+    // either, so each of those leaked a ~120KB object URL for the page's lifetime.
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current);
+      audioUrlRef.current = null;
     }
     setPlayingId(null);
   };
@@ -222,17 +254,26 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
 
       const audio = new Audio(audioUrl);
       audioRef.current = audio;
+      audioUrlRef.current = audioUrl;
       setPlayingId(voice.id);
       setLoadingAudioId(null);
-      
+
+      const release = () => {
+        URL.revokeObjectURL(audioUrl);
+        // Only clear the shared refs if this preview is still the current one — a
+        // newer preview may already own them.
+        if (audioUrlRef.current === audioUrl) audioUrlRef.current = null;
+        if (audioRef.current === audio) audioRef.current = null;
+      };
+
       audio.onended = () => {
         setPlayingId(null);
-        URL.revokeObjectURL(audioUrl);
+        release();
       };
-      
+
       audio.onerror = (_err) => {
         setPlayingId(null);
-        URL.revokeObjectURL(audioUrl);
+        release();
         alert('Browser error: Audio loaded but could not be played. Try Chrome or Edge.');
       };
 
@@ -281,6 +322,11 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
       || (Array.isArray(voice.languages) && voice.languages.includes(language));
     return matchSearch && matchProvider && matchGender && matchLang;
   });
+
+  // Providers that ARE configured but whose voice list call failed, as [id, message].
+  const failedProviders = Object.entries(providerStatus)
+    .filter(([, s]) => s?.error)
+    .map(([id, s]) => [id, s.error as string] as [string, string]);
 
   const grouped = filtered.reduce((acc, voice) => {
     if (!acc[voice.provider]) acc[voice.provider] = [];
@@ -427,11 +473,34 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
         </div>
       )}
 
+      {/* A provider whose voice list failed is reported HERE as well as on its
+          section header, because a provider that returned nothing has no section
+          to attach a message to — it is absent from `grouped` entirely. Without
+          this, a Sarvam outage rendered as an empty library with no explanation. */}
+      {failedProviders.length > 0 && (
+        <div style={{ fontSize: '13px', color: '#ff6b6b', background: 'rgba(255,107,107,0.08)', border: '1px solid rgba(255,107,107,0.25)', borderRadius: '8px', padding: '10px 14px', marginBottom: '16px' }}>
+          {failedProviders.map(([id, msg]) => (
+            <div key={id}>
+              Couldn't load {TTS_PROVIDER_META[id]?.name || id} voices — {msg}
+            </div>
+          ))}
+        </div>
+      )}
+
       {filtered.length === 0 ? (
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, color: 'var(--text-muted)', gap: '12px' }}>
           <SearchX size={32} opacity={0.5}/>
-          <div style={{ fontSize: '14px', fontWeight: 500 }}>No voices match your filters</div>
-          <div style={{ fontSize: '12px' }}>Try adjusting the search or filters above</div>
+          {/* "No voices match your filters" is the wrong diagnosis when a fetch
+              failed — it tells the operator to fix filters that are not the
+              problem. Say which it is. */}
+          <div style={{ fontSize: '14px', fontWeight: 500 }}>
+            {failedProviders.length > 0 ? 'Voices could not be loaded' : 'No voices match your filters'}
+          </div>
+          <div style={{ fontSize: '12px' }}>
+            {failedProviders.length > 0
+              ? 'The provider above returned an error. Retry once it recovers.'
+              : 'Try adjusting the search or filters above'}
+          </div>
           <button 
              onClick={() => { setSearch(''); setProvider(''); setGender(''); setLanguage(''); }}
              style={{ marginTop: '8px', background: 'transparent', border: '1px solid var(--border)', borderRadius: '6px', padding: '6px 12px', color: 'var(--text-primary)', cursor: 'pointer', fontSize: '12px' }}
@@ -448,7 +517,8 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
              if (voices.length === 0 && provider !== '') return null;
 
              const isConnected = providerStatus[p]?.connected;
-             
+             const fetchError = providerStatus[p]?.error;
+
              // In "All Providers", show section headers.
              return (
                <div key={p} style={{ marginBottom: '16px' }}>
@@ -463,12 +533,14 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                          <span>{info?.icon} {info?.name}</span>
                          <span style={{ textTransform: 'none', color: 'var(--text-muted)', fontWeight: 400, opacity: 0.7 }}>{providerStatus[p]?.voice_count} voices</span>
-                         <Circle fill={isConnected ? 'var(--accent)' : 'gray'} stroke="none" size={8} style={{ marginLeft: '12px' }}/>
-                         <span style={{ textTransform: 'none', color: isConnected ? 'var(--accent)' : 'var(--text-muted)', fontWeight: 500 }}>
-                            {isConnected ? 'Connected' : 'Not connected'}
+                         <Circle fill={fetchError ? '#ff6b6b' : isConnected ? 'var(--accent)' : 'gray'} stroke="none" size={8} style={{ marginLeft: '12px' }}/>
+                         <span style={{ textTransform: 'none', color: fetchError ? '#ff6b6b' : isConnected ? 'var(--accent)' : 'var(--text-muted)', fontWeight: 500 }}>
+                            {fetchError ? "Couldn't load voices" : isConnected ? 'Connected' : 'Not connected'}
                          </span>
                        </div>
-                       {!isConnected && <span style={{ cursor: 'pointer', color: 'var(--accent)', textTransform: 'none', fontWeight: 500 }}>Add API key to unlock →</span>}
+                       {fetchError
+                         ? <span style={{ textTransform: 'none', color: '#ff6b6b', fontWeight: 400, opacity: 0.9 }}>{fetchError}</span>
+                         : !isConnected && <span style={{ cursor: 'pointer', color: 'var(--accent)', textTransform: 'none', fontWeight: 500 }}>Add API key to unlock →</span>}
                      </div>
                    </>
                  )}
@@ -525,12 +597,17 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
                            </div>
 
                            {/* RIGHT: Play */}
-                           <button 
+                           <button
                              onClick={(e) => playVoice(voice, e)}
                              style={{
                                width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center',
                                background: 'none', border: 'none', cursor: 'pointer',
-                               color: isPlaying ? 'var(--accent)' : 'var(--text-muted)', transition: 'transform 0.15s, color 0.15s'
+                               color: isPlaying ? 'var(--accent)' : 'var(--text-muted)', transition: 'transform 0.15s, color 0.15s',
+                               // Stacked above the picker overlay's scrim so it stays
+                               // VISIBLE on hover, not just clickable. Without this the
+                               // dark backdrop hides it and preview looks unavailable in
+                               // the modal even though the click now works.
+                               position: 'relative', zIndex: 2
                              }}
                              className="play-hover-btn"
                            >
@@ -546,12 +623,23 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
                            {/* Dropdown Extra stuff (Hover State handled by CSS class typically, but implemented here nicely) */}
                            {/* Add explicit full hover capability if requested. Here we handle the static click state */}
                            {isPickerModal && (
+                             // `inset: 0` means this covers the whole card, INCLUDING the
+                             // play button. opacity:0 hides it but does NOT stop it
+                             // hit-testing, so in picker mode it silently swallowed every
+                             // play click — the reason preview worked in the standalone
+                             // library and did nothing in the agent's voice modal.
+                             //
+                             // pointerEvents:'none' lets clicks fall through to the play
+                             // button underneath; the "Use" button re-enables them for
+                             // itself. The reveal moved to the CARD's :hover (see the
+                             // <style> block) because an element with pointer-events:none
+                             // can never satisfy its own :hover.
                              <div className="voice-picker-overlay" style={{
-                               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(2px)', 
+                               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(2px)',
                                borderRadius: '12px', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                               opacity: 0, transition: 'opacity 0.2s'
+                               opacity: 0, transition: 'opacity 0.2s', pointerEvents: 'none'
                              }}>
-                               <button 
+                               <button
                                  onClick={(e) => {
                                    e.stopPropagation();
                                    // Hand back the language the card is shown as, so
@@ -560,7 +648,9 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
                                    // primary display tag.
                                    if (onSelectVoice) onSelectVoice({ ...voice, language: effectiveLanguage(voice) });
                                  }}
-                                 style={{ padding: '8px 16px', borderRadius: '8px', background: 'var(--accent)', color: '#000', border: 'none', fontWeight: 600, fontSize: '13px', cursor: 'pointer' }}>
+                                 /* pointerEvents re-enabled for this button alone: its parent
+                                    overlay is 'none' so play clicks reach the card. */
+                                 style={{ padding: '8px 16px', borderRadius: '8px', background: 'var(--accent)', color: '#000', border: 'none', fontWeight: 600, fontSize: '13px', cursor: 'pointer', pointerEvents: 'auto' }}>
                                  Use {voice.name}
                                </button>
                              </div>
@@ -581,7 +671,12 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
           background-color: var(--bg-surface-2) !important;
           border-color: var(--border-strong) !important;
         }
-        .voice-picker-overlay:hover {
+        /* Revealed by hovering the CARD, not the overlay itself. The overlay is
+           pointer-events:none so that play clicks reach the button beneath it,
+           and an element that does not receive pointer events can never match
+           its own :hover — which would have left the overlay permanently
+           invisible and the "Use <voice>" button unreachable. */
+        .voice-card-hover:hover .voice-picker-overlay {
           opacity: 1 !important;
         }
         .play-hover-btn:hover {

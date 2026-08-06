@@ -57,6 +57,71 @@ interface TranscriptEntry {
   ts: number;
 }
 
+// ─── Transcript panel ────────────────────────────────────────────────────────
+// Extracted so the live call and the post-call review screen render the SAME
+// transcript markup. Two copies would drift, and the ended view is the one an
+// evaluating clinic actually reads.
+//
+// Deliberately takes no LiveKit context: it must render after the room is gone.
+function TranscriptPanel({
+  transcript,
+  agentName,
+  title,
+  dotColor,
+  emptyText,
+}: {
+  transcript: TranscriptEntry[];
+  agentName?: string;
+  title: string;
+  dotColor: string;
+  emptyText: string;
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll to the newest line while the call is live. Harmless once ended:
+  // the transcript stops changing, so this stops firing.
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [transcript]);
+
+  return (
+    <div style={{
+      flex: 1, minHeight: 0,
+      background: '#0d0d0d', border: '1px solid #1f1f1f',
+      borderRadius: 10, overflow: 'hidden',
+      display: 'flex', flexDirection: 'column',
+    }}>
+      <div style={{
+        padding: '8px 12px', borderBottom: '1px solid #1a1a1a',
+        fontSize: 11, color: '#444', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6,
+      }}>
+        <div style={{ width: 6, height: 6, borderRadius: '50%', background: dotColor }} />
+        {title}
+      </div>
+
+      <div
+        ref={scrollRef}
+        style={{
+          flex: 1, overflowY: 'auto', padding: '10px 12px',
+          display: 'flex', flexDirection: 'column', gap: 8,
+        }}
+      >
+        {transcript.length === 0 ? (
+          <div style={{ fontSize: 12, color: '#333', textAlign: 'center', marginTop: 16 }}>
+            {emptyText}
+          </div>
+        ) : (
+          transcript.map((entry) => (
+            <TranscriptBubble key={entry.id} entry={entry} agentName={agentName} />
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Inner component — must be inside <LiveKitRoom> ─────────────────────────
 
 function TestCallUI({
@@ -64,11 +129,18 @@ function TestCallUI({
   avatarUrl,
   onDisconnect,
   onRetry,
+  transcript,
+  setTranscript,
 }: {
   agentName?: string;
   avatarUrl?: string;
   onDisconnect: () => void;
   onRetry?: () => void;
+  // Owned by the PARENT, not by this component. This subtree unmounts when the
+  // room closes, so transcript state held here died with the call — which is why
+  // ending a call used to wipe the transcript.
+  transcript: TranscriptEntry[];
+  setTranscript: React.Dispatch<React.SetStateAction<TranscriptEntry[]>>;
 }) {
   // NOTE: mic state is read from the room itself (below) rather than taken from
   // the parent's `micAvailable` pre-flight — the pre-flight only proves
@@ -77,7 +149,6 @@ function TestCallUI({
   const room = useRoomContext();
   const connState = useConnectionState();
   const remoteParticipants = useRemoteParticipants();
-  const transcriptRef = useRef<HTMLDivElement>(null);
 
   // ── Audio unlock ──────────────────────────────────────────────────────────
   const [audioUnlocked, setAudioUnlocked] = useState(false);
@@ -141,7 +212,8 @@ function TestCallUI({
   }, [room, agentParticipant]);
 
   // ── Live transcript ────────────────────────────────────────────────────────
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  // `transcript` / `setTranscript` now arrive as props from TestVoiceCallLK so the
+  // lines survive this subtree unmounting when the call ends.
   const pendingAgentRef = useRef<Map<string, string>>(new Map());
   // Newest user-transcript seq seen, for discarding out-of-order publishes.
   const lastUserSeqRef = useRef(0);
@@ -261,12 +333,7 @@ function TestCallUI({
     return () => { room.off(RoomEvent.DataReceived, handler); };
   }, [room]);
 
-  // Auto-scroll transcript to bottom
-  useEffect(() => {
-    if (transcriptRef.current) {
-      transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
-    }
-  }, [transcript]);
+  // (Auto-scroll now lives in TranscriptPanel, which owns the scroll container.)
 
   // ── Mic publication state ─────────────────────────────────────────────────
   // Without this the widget had NO signal that the caller's mic was dead: if
@@ -455,42 +522,16 @@ function TestCallUI({
         )}
       </div>
 
-      {/* Live transcript panel */}
-      <div style={{
-        flex: 1, minHeight: 0,
-        background: '#0d0d0d', border: '1px solid #1f1f1f',
-        borderRadius: 10, overflow: 'hidden',
-        display: 'flex', flexDirection: 'column',
-      }}>
-        <div style={{
-          padding: '8px 12px', borderBottom: '1px solid #1a1a1a',
-          fontSize: 11, color: '#444', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6,
-        }}>
-          <div style={{ width: 6, height: 6, borderRadius: '50%', background: agentReady ? '#3ECF8E' : '#F59E0B' }} />
-          Live Transcript
-        </div>
-
-        <div
-          ref={transcriptRef}
-          style={{
-            flex: 1, overflowY: 'auto', padding: '10px 12px',
-            display: 'flex', flexDirection: 'column', gap: 8,
-          }}
-        >
-          {transcript.length === 0 ? (
-            <div style={{ fontSize: 12, color: '#333', textAlign: 'center', marginTop: 16 }}>
-              {agentReady
-                ? 'Speak naturally — transcript will appear here'
-                : 'Waiting for the agent to join the call…'
-              }
-            </div>
-          ) : (
-            transcript.map((entry) => (
-              <TranscriptBubble key={entry.id} entry={entry} agentName={agentName} />
-            ))
-          )}
-        </div>
-      </div>
+      {/* Live transcript panel — same component the post-call review screen uses. */}
+      <TranscriptPanel
+        transcript={transcript}
+        agentName={agentName}
+        title="Live Transcript"
+        dotColor={agentReady ? '#3ECF8E' : '#F59E0B'}
+        emptyText={agentReady
+          ? 'Speak naturally — transcript will appear here'
+          : 'Waiting for the agent to join the call…'}
+      />
 
       {/* Debug info (dev) */}
       {import.meta.env.DEV && remoteParticipants.length > 0 && (
@@ -600,8 +641,16 @@ export default function TestVoiceCallLK({
 }) {
   const [token, setToken] = useState('');
   const [wsUrl, setWsUrl] = useState('');
-  const [phase, setPhase] = useState<'idle' | 'connecting' | 'live' | 'error' | 'demo'>('idle');
+  // 'ended' is the post-call review state: the room is torn down and the audio
+  // stopped, but the transcript and controls stay on screen. Ending a call is NOT
+  // the same event as closing this panel, and conflating the two is what made the
+  // transcript unreadable the instant the call finished.
+  const [phase, setPhase] = useState<'idle' | 'connecting' | 'live' | 'ended' | 'error' | 'demo'>('idle');
   const [error, setError] = useState('');
+  // Owned here, not in TestCallUI: that component lives inside <LiveKitRoom> and
+  // unmounts with it, so a transcript held there was destroyed by the disconnect
+  // that produced it.
+  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [micAvailable, setMicAvailable] = useState(true);
   const [slow, setSlow] = useState(false);
 
@@ -635,6 +684,9 @@ export default function TestVoiceCallLK({
     setPhase('connecting');
     setError('');
     setSlow(false);
+    // Clear the PREVIOUS call's transcript here, at the start of a new one, rather
+    // than when a call ends — that is what lets the ended screen still show it.
+    setTranscript([]);
 
     const slowTimer = setTimeout(() => setSlow(true), SLOW_MS);
     const hardTimer = setTimeout(() => {
@@ -669,10 +721,36 @@ export default function TestVoiceCallLK({
     }
   }, [agentId]);
 
-  const handleDisconnect = useCallback(() => {
+  // The call finished — hang up, KEEP the panel. Clearing token/wsUrl unmounts
+  // <LiveKitRoom>, which disconnects the room and stops all audio; the transcript
+  // is untouched because it lives on this component, not in that subtree.
+  //
+  // This is what RoomEvent.Disconnected and the "End Call" button both run. It
+  // deliberately does NOT call onClose: a disconnect is never a request to close
+  // the panel. That includes disconnects we did not initiate (network drop, the
+  // agent worker dying), where wiping the transcript destroys the only evidence
+  // of what went wrong.
+  const handleCallEnded = useCallback(() => {
     setToken('');
     setWsUrl('');
+    setPhase((p) => (p === 'error' || p === 'demo' ? p : 'ended'));
+  }, []);
+
+  // Back out to the pre-call screen, keeping the panel open. Used by the error and
+  // "not configured" screens, where "Back" means "let me try again", not "close".
+  const handleBackToIdle = useCallback(() => {
+    setToken('');
+    setWsUrl('');
+    setError('');
+    setTranscript([]);
     setPhase('idle');
+  }, []);
+
+  // The ONLY path that closes the panel: an explicit user click. Nothing about
+  // call status reaches this.
+  const handleClose = useCallback(() => {
+    setToken('');
+    setWsUrl('');
     onClose?.();
   }, [onClose]);
 
@@ -857,7 +935,7 @@ export default function TestVoiceCallLK({
             <RotateCcw size={14} /> Retry
           </button>
           <button
-            onClick={handleDisconnect}
+            onClick={handleBackToIdle}
             style={{ padding: '8px 20px', borderRadius: 8, border: '1px solid #2e2e2e', background: 'none', color: '#aaa', cursor: 'pointer' }}
           >
             Back
@@ -875,10 +953,60 @@ export default function TestVoiceCallLK({
         <div style={{ fontSize: 12, color: '#666', maxWidth: 300 }}>
           Set <code>LIVEKIT_URL</code>, <code>LIVEKIT_API_KEY</code>, <code>LIVEKIT_API_SECRET</code> in <code>.env</code>.
         </div>
-        <button onClick={handleDisconnect} style={{ padding: '8px 20px', borderRadius: 8, border: '1px solid #2e2e2e', background: 'none', color: '#aaa', cursor: 'pointer', marginTop: 12 }}>
+        <button onClick={handleBackToIdle} style={{ padding: '8px 20px', borderRadius: 8, border: '1px solid #2e2e2e', background: 'none', color: '#aaa', cursor: 'pointer', marginTop: 12 }}>
           Back
         </button>
       </>
+    );
+  }
+
+  // ── phase === 'ended' — post-call review ───────────────────────────────────
+  // The room is already gone (token/wsUrl cleared), so there is no LiveKit context
+  // and no audio here. The transcript survives because it is this component's
+  // state. Nothing on this screen closes the panel except the explicit Close
+  // button; the parent modal's X still works too.
+  if (phase === 'ended') {
+    return (
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, gap: 12, padding: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#aaa', fontSize: 13, fontWeight: 600 }}>
+          <PhoneOff size={14} />
+          Call ended
+          <span style={{ color: '#555', fontWeight: 500, fontSize: 12 }}>
+            · {transcript.length} {transcript.length === 1 ? 'line' : 'lines'} transcribed
+          </span>
+        </div>
+
+        <TranscriptPanel
+          transcript={transcript}
+          agentName={agentName}
+          title="Transcript"
+          dotColor="#555"
+          emptyText="No speech was transcribed during this call."
+        />
+
+        <div style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
+          <button
+            onClick={startCall}
+            style={{
+              padding: '9px 22px', borderRadius: 40, border: '1px solid #3ECF8E',
+              background: 'rgba(62,207,142,0.08)', color: '#3ECF8E',
+              fontWeight: 600, fontSize: 13, cursor: 'pointer',
+              display: 'flex', alignItems: 'center', gap: 6,
+            }}
+          >
+            <RotateCcw size={14} /> Call again
+          </button>
+          <button
+            onClick={handleClose}
+            style={{
+              padding: '9px 22px', borderRadius: 40, border: '1px solid #2e2e2e',
+              background: 'none', color: '#aaa', fontWeight: 600, fontSize: 13, cursor: 'pointer',
+            }}
+          >
+            Close
+          </button>
+        </div>
+      </div>
     );
   }
 
@@ -891,7 +1019,7 @@ export default function TestVoiceCallLK({
         connect={true}
         audio={micAvailable}
         video={false}
-        onDisconnected={handleDisconnect}
+        onDisconnected={handleCallEnded}
         style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}
       >
         {/*
@@ -903,8 +1031,10 @@ export default function TestVoiceCallLK({
         <TestCallUI
           agentName={agentName}
           avatarUrl={avatarUrl}
-          onDisconnect={handleDisconnect}
-          onRetry={() => { handleDisconnect(); setTimeout(startCall, 300); }}
+          onDisconnect={handleCallEnded}
+          onRetry={() => { handleCallEnded(); setTimeout(startCall, 300); }}
+          transcript={transcript}
+          setTranscript={setTranscript}
         />
       </LiveKitRoom>
     </div>
