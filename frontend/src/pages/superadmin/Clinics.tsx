@@ -1,8 +1,9 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { useSAStore, Clinic, PlanTier } from '../../store/saStore';
 import { PlanBadge, StatusBadge, Modal, SpinBtn, EmptyState } from '../../components/superadmin/SAShared';
-import { Search, Power, Zap, X, ChevronRight, Building2, Plus, Copy, Check, Mail, Trash2, ChevronRight as ChevronR } from 'lucide-react';
+import { Search, Power, Zap, X, ChevronRight, Building2, Plus, Copy, Check, Mail, Trash2, ChevronRight as ChevronR, LogIn } from 'lucide-react';
 import fetchWithAuth from '../../api/client';
+import { startImpersonation } from '../../api/auth';
 
 // ── Agent status pill — mirrors the vocabulary AgentConfig.status actually uses
 // (ACTIVE/CONFIGURED/ERROR/INACTIVE), which differs from StatusBadge's clinic vocabulary.
@@ -198,6 +199,7 @@ function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose:
   const { toggleSuspend } = useSAStore();
   const [suspending, setSuspending] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [impersonating, setImpersonating] = useState(false);
 
   // ── Agents for this clinic — refetched every time the drawer opens for a
   // clinic so suspended/deleted/newly-created agents never show a stale entry.
@@ -263,6 +265,43 @@ function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose:
       goToAgent(agents[0].id);
     } else {
       setShowAgentPicker(true);
+    }
+  };
+
+  // ── "Go to Clinic Admin Dashboard" — impersonate this clinic ────────────────
+  //
+  // Opens the clinic's OWN admin dashboard (the same /dashboard the clinic logs
+  // into), scoped to this clinic, with no login form and without anyone needing
+  // the clinic's password — the backend mints a short-lived token for this one
+  // tenant_id. See backend/services/impersonation.py.
+  //
+  // The token arrives in the POST response body and is stored client-side; it is
+  // never placed in the URL, so there is no link to copy, bookmark or forward.
+  const handleImpersonate = async () => {
+    setImpersonating(true);
+    try {
+      const data = await fetchWithAuth(`/admin/clinics/${clinic.id}/impersonate`, { method: 'POST' });
+      startImpersonation(
+        {
+          token: data.access_token,
+          role: 'clinic',
+          tenantId: data.tenant_id,
+          clinicName: data.clinic_name,
+        },
+        {
+          sessionId: data.impersonation_id,
+          tenantId: data.tenant_id,
+          clinicName: data.clinic_name,
+          expiresAt: Date.parse(data.expires_at),
+        },
+      );
+      // Full page load rather than navigate(): every react-query cache and store
+      // in this tab currently holds superadmin-fetched data, and the clinic
+      // dashboard must be built from the impersonation token alone.
+      window.location.href = '/dashboard';
+    } catch (e) {
+      alert(`Could not open ${clinic.name}'s dashboard: ${(e as Error).message}`);
+      setImpersonating(false);
     }
   };
 
@@ -402,6 +441,23 @@ function ClinicDrawer({ clinic, onClose, onDeleted }: { clinic: Clinic; onClose:
             style={{ width: '100%', padding: '10px', backgroundColor: '#3ECF8E', color: '#000', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
           >
             <Zap size={14} /> Configure AI Receptionist
+          </button>
+          {/* Plain button, not SpinBtn: SpinBtn spreads its variant colours AFTER
+              the style prop, so the amber below would be repainted green. Amber
+              deliberately matches the impersonation banner this leads to. */}
+          <button
+            disabled={impersonating}
+            onClick={handleImpersonate}
+            title={`Open ${clinic.name}'s own admin dashboard as superadmin — no password needed, and every session is logged`}
+            style={{
+              width: '100%', padding: '9px', backgroundColor: 'rgba(245,158,11,0.12)',
+              color: '#f59e0b', border: '1px solid rgba(245,158,11,0.35)',
+              borderRadius: '8px', cursor: impersonating ? 'wait' : 'pointer',
+              fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              gap: '8px', opacity: impersonating ? 0.6 : 1,
+            }}
+          >
+            <LogIn size={14} /> {impersonating ? 'Opening…' : 'Go to Clinic Admin Dashboard'}
           </button>
           <SpinBtn onClick={handleSuspend} loading={suspending} variant="danger" style={{ width: '100%', padding: '9px' }}>
             <Power size={14} /> {clinic.status === 'Suspended' ? 'Activate Clinic' : 'Suspend Clinic'}

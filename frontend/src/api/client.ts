@@ -3,7 +3,7 @@
  * All frontend files MUST import API_URL / WS_URL from here.
  * For Vercel: set VITE_API_URL in your Vercel env vars (e.g. https://your-ngrok-url.ngrok.io)
  */
-import { getToken, clearSession } from './auth';
+import { getToken, clearSession, isImpersonating, endImpersonation } from './auth';
 
 const getDynamicApiUrl = () => {
   if (typeof window !== 'undefined') {
@@ -49,6 +49,16 @@ export async function fetchWithAuth(endpoint: string, options: RequestInit = {})
 
   // Session expired / rejected — clear and bounce to login.
   if (response.status === 401) {
+    // An impersonation session that has been exited or has run past its TTL 401s
+    // here (the backend rechecks the session row on every request). That is a
+    // superadmin sitting in someone else's dashboard, not a clinic whose login
+    // lapsed: restore their own session and return them to the panel instead of
+    // dumping them on the clinic login page with their superadmin session wiped.
+    if (isImpersonating()) {
+      const restored = endImpersonation();
+      window.location.href = restored ? '/superadmin/clinics' : '/superadmin/login';
+      throw new Error('Impersonation session has ended.');
+    }
     clearSession();
     if (!window.location.pathname.includes('/login')) {
       window.location.href = '/login';

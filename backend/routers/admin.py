@@ -3,7 +3,7 @@ import string
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func, case
-from backend.auth import SuperAdmin
+from backend.auth import CurrentUser, SuperAdmin
 from backend.db import AsyncSessionLocal
 from backend.models.tenant import Tenant
 from backend.models.doctor import Doctor
@@ -299,6 +299,178 @@ async def update_clinic_status(tenant_id: str, data: StatusUpdate, user: SuperAd
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Superadmin impersonation: "Go to Clinic Admin Dashboard" ──────────────────
+#
+# Support/debugging shortcut: open a clinic's OWN admin dashboard scoped to that
+# clinic, without knowing or using the clinic's password. Nothing here reads,
+# writes, or returns Tenant.admin_password — the only thing minted is a
+# short-lived token whose subject is one tenant_id.
+#
+# The scoping, the revocation and the "not a general-purpose bypass" reasoning all
+# live in backend/services/impersonation.py; read that module before changing any
+# of this. The two rules this router is responsible for:
+#
+#   1. SuperAdmin dependency = the role check is server-side. The frontend button
+#      is convenience only; a clinic token calling this gets 403 from the
+#      dependency before the handler runs.
+#   2. The session row and its audit entry are committed TOGETHER, before the
+#      token is returned. If either write fails, no token is issued — there is no
+#      path that produces an untraceable impersonation session.
+
+class ImpersonateResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    # Deliberately "clinic": the token carries clinic authority over one tenant,
+    # not superadmin authority (see impersonation.py).
+    role: str = "clinic"
+    tenant_id: str
+    clinic_name: str
+    impersonation_id: str
+    expires_at: datetime
+    expires_in: int
+
+
+@router.post("/clinics/{tenant_id}/impersonate", response_model=ImpersonateResponse)
+async def impersonate_clinic(
+    tenant_id: str, user: SuperAdmin = None, db: AsyncSession = Depends(get_db)
+):
+    """Mint a short-lived, single-clinic session for the calling superadmin.
+
+    Suspended clinics are impersonatable on purpose — "why is this clinic
+    broken" is one of the main reasons to use this at all.
+    """
+    from backend.services.audit import audit_entry
+    from backend.services.impersonation import build_session
+
+    tenant = (
+        await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+    ).scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Clinic not found")
+
+    actor = getattr(user, "subject", None) or "superadmin"
+    session_row, token = build_session(actor, tenant.id)
+
+    db.add(session_row)
+    db.add(audit_entry(
+        actor,
+        "impersonation.start",
+        target=tenant.id,
+        detail=(
+            f"Opened clinic admin dashboard as '{tenant.clinic_name}' "
+            f"(session {session_row.id}, expires {session_row.expires_at.isoformat()})"
+        ),
+    ))
+    try:
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        import logging
+        logging.getLogger(__name__).error("impersonation start failed for %s: %s", tenant_id, e)
+        # No row, no audit entry, and therefore no token.
+        raise HTTPException(status_code=500, detail="Could not start impersonation session")
+
+    expires_at = session_row.expires_at
+    return ImpersonateResponse(
+        access_token=token,
+        tenant_id=tenant.id,
+        clinic_name=tenant.clinic_name,
+        impersonation_id=session_row.id,
+        expires_at=expires_at,
+        expires_in=int((expires_at - datetime.now(timezone.utc)).total_seconds()),
+    )
+
+
+@router.post("/impersonation/end")
+async def end_impersonation(user: CurrentUser = None, db: AsyncSession = Depends(get_db)):
+    """End the caller's own impersonation session, immediately and permanently.
+
+    Authenticated with the IMPERSONATION token itself, not a superadmin token:
+    the session to end is the one the caller is holding, identified by the token's
+    `jti`. That is why this cannot be used to end anyone else's session, and why
+    exiting still works after the superadmin token has been swapped out client-side.
+
+    A normal clinic login calling this gets 400 — there is no session to end, and
+    this must never become a way to invalidate a real clinic's token.
+    """
+    from backend.services.audit import audit_entry
+    from backend.services import impersonation
+
+    if not user.is_impersonating:
+        raise HTTPException(status_code=400, detail="Not an impersonation session")
+
+    row = await impersonation.end(db, user.impersonation_id, reason="exit")
+    actor = user.impersonator or "superadmin"
+    db.add(audit_entry(
+        actor,
+        "impersonation.end",
+        target=user.tenant_id or "",
+        detail=f"Exited impersonation (session {user.impersonation_id}, reason=exit)",
+    ))
+    try:
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        import logging
+        logging.getLogger(__name__).error("impersonation end failed: %s", e)
+        # The caller MUST be told, so it can keep showing the banner rather than
+        # dropping a session that is in fact still live.
+        raise HTTPException(status_code=500, detail="Could not end impersonation session")
+
+    return {
+        "status": "ended",
+        "impersonation_id": user.impersonation_id,
+        "tenant_id": user.tenant_id,
+        "ended_at": (row.ended_at.isoformat() if row is not None and row.ended_at else None),
+    }
+
+
+@router.get("/impersonation/sessions")
+async def list_impersonation_sessions(
+    clinic_id: Optional[str] = None,
+    limit: int = 50,
+    user: SuperAdmin = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """The trail: who opened which clinic's dashboard, when, and when it ended.
+
+    AuditLog holds the same start/end events in the platform-wide feed; this view
+    is the per-clinic one, which is the question actually asked afterwards.
+    """
+    from backend.models.impersonation_session import ImpersonationSession
+    from backend.services.impersonation import expire_stale
+
+    # Abandoned sessions are already unusable (auth.py rejects them on expiry);
+    # stamping them keeps "when did it end" answerable for every row.
+    if await expire_stale(db):
+        await db.commit()
+
+    stmt = (
+        select(ImpersonationSession, Tenant.clinic_name)
+        .outerjoin(Tenant, ImpersonationSession.tenant_id == Tenant.id)
+        .order_by(ImpersonationSession.started_at.desc())
+        .limit(min(max(limit, 1), 200))
+    )
+    if clinic_id:
+        stmt = stmt.where(ImpersonationSession.tenant_id == clinic_id)
+
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "id": s.id,
+            "actor": s.actor,
+            "tenant_id": s.tenant_id,
+            "clinic_name": clinic_name,
+            "started_at": s.started_at.isoformat() if s.started_at else None,
+            "expires_at": s.expires_at.isoformat() if s.expires_at else None,
+            "ended_at": s.ended_at.isoformat() if s.ended_at else None,
+            "ended_reason": s.ended_reason,
+            "active": s.ended_at is None,
+        }
+        for s, clinic_name in rows
+    ]
 
 
 @router.delete("/clinics/{tenant_id}", status_code=204)

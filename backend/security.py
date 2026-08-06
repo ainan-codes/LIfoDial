@@ -86,6 +86,12 @@ def needs_rehash(stored: str | None) -> bool:
 _JWT_ALG = "HS256"
 ACCESS_TOKEN_TTL = timedelta(hours=12)
 
+#: Claim marking a token as a superadmin "view as this clinic" token.
+#: Lives here — with the rest of the claim vocabulary — because both the minting
+#: side (backend/services/impersonation.py) and the enforcing side
+#: (backend/auth.py) need the same string, and neither may import the other.
+IMPERSONATION_CLAIM = "imp"
+
 
 def create_access_token(
     subject: str,

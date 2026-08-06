@@ -10,6 +10,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import select, func
 from backend.redis_client import get_session
 from backend.security import decode_access_token
+from backend.services.impersonation import claims_still_active
 from backend.services.sarvam_streaming import create_streaming_stt
 from backend.db import AsyncSessionLocal
 from backend.models.call_record import CallRecord
@@ -112,6 +113,12 @@ async def live_calls_ws(websocket: WebSocket, tenant_id: str, token: str | None 
     if role != "superadmin" and claims.get("sub") != tenant_id:
         await websocket.close(code=1008)
         return
+    # A revoked/expired superadmin impersonation token must not open a socket that
+    # outlives its session (see services/impersonation.py::claims_still_active).
+    # No-op for ordinary clinic/superadmin tokens.
+    if not await claims_still_active(claims):
+        await websocket.close(code=1008)
+        return
 
     await websocket.accept()
     logger.info(f"WebSocket connected for tenant_id: {tenant_id}")
@@ -186,6 +193,12 @@ async def streaming_stt_ws(websocket: WebSocket, tenant_id: str, agent_id: str, 
         return
     role = claims.get("role", "clinic")
     if role != "superadmin" and claims.get("sub") != tenant_id:
+        await websocket.close(code=1008)
+        return
+    # A revoked/expired superadmin impersonation token must not open a socket that
+    # outlives its session (see services/impersonation.py::claims_still_active).
+    # No-op for ordinary clinic/superadmin tokens.
+    if not await claims_still_active(claims):
         await websocket.close(code=1008)
         return
 

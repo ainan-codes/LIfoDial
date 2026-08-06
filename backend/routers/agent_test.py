@@ -27,6 +27,7 @@ from backend.models.agent_config import AgentConfig
 from backend.models.api_key_config import ApiKeyConfig
 from backend.config import settings
 from backend.security import decode_access_token
+from backend.services.impersonation import claims_still_active
 from backend import redis_client
 from backend.agent.booking_rules import (
     BOOKING_RULES_BLOCK,
@@ -288,6 +289,12 @@ async def voice_websocket(websocket: WebSocket, agent_id: str, token: str | None
     """
     claims = decode_access_token(token) if token else None
     if not claims:
+        await websocket.close(code=1008)
+        return
+    # An exited/expired superadmin impersonation token is dead here too, not just
+    # on the HTTP API (services/impersonation.py::claims_still_active). No-op for
+    # ordinary clinic/superadmin tokens.
+    if not await claims_still_active(claims):
         await websocket.close(code=1008)
         return
 
@@ -642,6 +649,12 @@ async def tts_streaming_websocket(websocket: WebSocket, agent_id: str, token: st
     """
     claims = decode_access_token(token) if token else None
     if not claims:
+        await websocket.close(code=1008)
+        return
+    # An exited/expired superadmin impersonation token is dead here too, not just
+    # on the HTTP API (services/impersonation.py::claims_still_active). No-op for
+    # ordinary clinic/superadmin tokens.
+    if not await claims_still_active(claims):
         await websocket.close(code=1008)
         return
 

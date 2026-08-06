@@ -293,6 +293,11 @@ def _import_all_models():
         "backend.models.api_key_config",
         "backend.models.agent_prompt_history",
         "backend.models.audit_log",
+        # Superadmin "view as this clinic" sessions. MUST be listed here: this is
+        # what create_all() below actually uses, and the table is the revocation
+        # list every impersonated request is checked against — an unimported model
+        # means no table, which means impersonation 401s everywhere.
+        "backend.models.impersonation_session",
     ]
 
     for module_path in optional:

@@ -14,7 +14,8 @@ import {
 } from 'lucide-react';
 import React, { useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
-import { clearSession, isSuperAdmin } from '../api/auth';
+import { clearSession, isImpersonating, isSuperAdmin } from '../api/auth';
+import ImpersonationBanner, { IMPERSONATION_BANNER_HEIGHT, exitImpersonation } from './ImpersonationBanner';
 
 // Agent setup pending — will be enabled later
 // To show the Agents nav item, set CLINIC_AGENT_NAV_ENABLED = true
@@ -52,6 +53,14 @@ export default function Layout() {
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
+  // Superadmin impersonation ("Go to Clinic Admin Dashboard"). The banner lives
+  // in THIS component because Layout is the shell for every clinic route, so
+  // there is no clinic page that can render without it. During impersonation the
+  // stored role is 'clinic', so isSuperAdmin() below is false and the
+  // platform-only nav entries correctly stay hidden — the operator sees the
+  // clinic's own dashboard, not a hybrid of both.
+  const impersonating = isImpersonating();
+
   // Drop hidden/superadmin-only entries outright rather than rendering them with
   // display:none — a CSS-hidden NavLink is still in the DOM and still a live link.
   const showSuperadminOnly = isSuperAdmin();
@@ -67,9 +76,24 @@ export default function Layout() {
 
   return (
     <div
-      className="flex h-screen overflow-hidden"
-      style={{ backgroundColor: 'var(--bg-page)' }}
+      className={`layout-shell${impersonating ? ' impersonating' : ''}`}
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        height: '100vh',
+        overflow: 'hidden',
+        backgroundColor: 'var(--bg-page)',
+      }}
     >
+      {/* Static row above the app, not an overlay inside it — it cannot be
+          scrolled past, and the shell below simply gets shorter. Renders null
+          when not impersonating, so the normal clinic layout is unchanged. */}
+      <ImpersonationBanner />
+
+      <div
+        className="flex"
+        style={{ flex: 1, minHeight: 0, overflow: 'hidden', backgroundColor: 'var(--bg-page)' }}
+      >
       {/* ── Mobile overlay backdrop ── */}
       {sidebarOpen && (
         <div
@@ -195,6 +219,13 @@ export default function Layout() {
           </div>
           <button
             onClick={() => {
+              // Signing out of an impersonated session must END that session, not
+              // just forget the token locally — otherwise it stays live (and reads
+              // as active in the audit trail) until its TTL expires.
+              if (impersonating) {
+                void exitImpersonation();
+                return;
+              }
               clearSession();
               navigate('/');
             }}
@@ -291,6 +322,7 @@ export default function Layout() {
           ))}
         </nav>
       </div>
+      </div>
 
       <style>{`
         /* ── Desktop: sidebar is always visible, static ── */
@@ -321,6 +353,13 @@ export default function Layout() {
         @media (max-width: 767px) {
           .layout-sidebar {
             width: 260px !important;
+          }
+          /* The mobile sidebar is position:fixed from the viewport top, so while
+             the impersonation banner is up the drawer would slide over it and
+             hide the only way out. Push it down by exactly the banner's height. */
+          .layout-shell.impersonating .layout-sidebar {
+            top: ${IMPERSONATION_BANNER_HEIGHT}px !important;
+            height: calc(100% - ${IMPERSONATION_BANNER_HEIGHT}px) !important;
           }
           .layout-page-content {
             /* Add bottom padding for the bottom nav */

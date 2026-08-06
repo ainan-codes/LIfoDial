@@ -123,6 +123,20 @@ async def delete_tenant_cascade(session: AsyncSession, tenant: Tenant) -> dict[s
     except Exception as e:  # pragma: no cover - defensive
         log.warning("Could not delete embed_events for tenant %s: %s", tenant_id, e)
 
+    # 2b. Superadmin impersonation sessions for this clinic. These are auth state,
+    # not history — the clinic is going away, so nothing may still be holding a
+    # usable session for it. The audit trail of who viewed this clinic survives in
+    # audit_logs, which is deliberately not tenant-scoped and not deleted here.
+    # Defensive like the two blocks around it: a stale session row must never be
+    # what blocks removing a clinic (and the rows are already unusable once the
+    # tenant is gone — every handler they could reach 404s without the tenant).
+    try:
+        from backend.models.impersonation_session import ImpersonationSession
+
+        await _wipe(ImpersonationSession, "impersonation_sessions")
+    except Exception as e:  # pragma: no cover - defensive
+        log.warning("Could not delete impersonation_sessions for tenant %s: %s", tenant_id, e)
+
     # 3. agent_prompt_history hangs off agent_id, not tenant_id. The live FK is
     # ON DELETE CASCADE so today it would go automatically, but that is
     # undocumented luck given migrations never run — be explicit.

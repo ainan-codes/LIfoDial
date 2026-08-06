@@ -13,6 +13,7 @@ from backend.models.call_record import CallRecord
 from backend.models.embed_analytics import EmbedEvent
 from backend.models.bulk_call import BulkCallCampaign
 from backend.models.clinic_credits import ClinicCredits, CreditTransaction
+from backend.models.impersonation_session import ImpersonationSession
 
 __all__ = [
     "Tenant",
@@ -30,4 +31,5 @@ __all__ = [
     "BulkCallCampaign",
     "ClinicCredits",
     "CreditTransaction",
+    "ImpersonationSession",
 ]
