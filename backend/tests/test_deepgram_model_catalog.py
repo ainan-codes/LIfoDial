@@ -53,6 +53,46 @@ def test_authoritative_list_also_leads_with_nova_3():
     assert DEEPGRAM_STT_MODELS[0] == "nova-3"
 
 
+def test_only_nova_3_is_selectable():
+    """Production runs nova-3 only, so nothing else may be offered or saved.
+
+    Not a style preference. nova-2 answers HTTP 400 for ta/te/kn/ml/mr/bn/pa/gu and
+    pipecat retries a 400 forever without transcribing — a silently deaf agent — and
+    no pre-nova-3 tier has a "multi" model, so none can follow a caller who
+    code-switches Hindi/English. Both are the normal case for this product.
+    """
+    assert DEEPGRAM_STT_MODELS == ["nova-3"]
+    assert _catalog_models("stt", "deepgram") == ["nova-3"]
+
+
+def test_the_factual_catalogue_is_kept_but_not_selectable():
+    """The full Deepgram list stays documented, and stays out of every dropdown.
+
+    Two lists wired to selection paths is the exact drift that silently rewrote
+    agents from nova-3 to nova-2. DEEPGRAM_STT_MODELS_ALL is a record; only
+    DEEPGRAM_STT_MODELS may reach a dropdown or a save.
+    """
+    from backend.routers.platform import DEEPGRAM_STT_MODELS_ALL
+
+    # Still a real record of what Deepgram offers...
+    assert {"nova-2", "enhanced", "base"} <= set(DEEPGRAM_STT_MODELS_ALL)
+    # ...and nova-3 is genuinely one of Deepgram's models, not something we coined.
+    assert set(DEEPGRAM_STT_MODELS) <= set(DEEPGRAM_STT_MODELS_ALL)
+
+
+def test_a_legacy_nova2_row_is_repaired_rather_than_left_deaf():
+    """An agent already stored on nova-2 must be healed on its next save.
+
+    Trimming the dropdown does not by itself fix rows already in the database, and
+    those are the ones actively failing on Indic languages.
+    """
+    from backend.services.agent_defaults import normalize_provider_choice
+
+    provider, model = normalize_provider_choice("stt", "deepgram", "nova-2")
+    assert provider == "deepgram"
+    assert model == "nova-3", "a stored nova-2 must not survive a save"
+
+
 @pytest.mark.parametrize("category,provider", [
     ("stt", "sarvam"), ("stt", "deepgram"), ("stt", "assemblyai"),
     ("tts", "sarvam"), ("tts", "elevenlabs"), ("tts", "openai_tts"),

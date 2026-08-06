@@ -67,6 +67,46 @@ def test_malayalam_and_kannada_are_offered():
     assert "kn-IN" in SARVAM_TTS_LANGUAGE_CODES
 
 
+def test_every_v3_speaker_can_be_asked_for_malayalam():
+    """EVERY bulbul:v3 voice is a Malayalam voice — there is no ml-IN-only subset.
+
+    Sarvam ties no speaker to a language (module docstring; re-confirmed live on
+    2026-08-06 by synthesizing ml-IN with `priya`, tagged hi-IN, HTTP 200). So the
+    correct Malayalam coverage is all 37 speakers, and the language is a request
+    parameter rather than a property of the voice.
+
+    This test guards against "adding Malayalam voices" by giving speakers a
+    narrowing per-voice language list: the `language` field is a DISPLAY TAG only,
+    and if a `languages` key ever appears on a catalogue entry it would override
+    what the API serves and silently hide most voices from the ml-IN filter.
+    """
+    assert len(BULBUL_V3_VOICES) == 37
+    for v in BULBUL_V3_VOICES:
+        assert "languages" not in v, (
+            f"{v['id']} carries a per-voice language list; that narrows what the "
+            "voices endpoint serves and would hide voices from the ml-IN filter"
+        )
+
+
+def test_the_voices_endpoint_serves_every_language_on_every_voice():
+    """The wiring that makes all 37 discoverable under the Malayalam filter.
+
+    /platform/tts/voices sends `languages` (what a voice CAN speak) alongside
+    `language` (its display tag). The Voice Library and the agent's voice modal are
+    the same component and both filter on `languages`, so this one field is what
+    makes Malayalam coverage identical on both surfaces.
+    """
+    import inspect
+
+    from backend.routers import platform as platform_router
+
+    src = inspect.getsource(platform_router.sarvam_voices)
+    assert '"languages": list(SARVAM_TTS_LANGUAGE_CODES)' in src, (
+        "the per-voice `languages` field must stay the full GA list; narrowing it "
+        "to the display tag is what made Malayalam unreachable before"
+    )
+
+
 def test_beta_gated_languages_are_never_offered_as_available():
     """Fabricating these is the failure mode the task called out explicitly:
     they validate against the schema but 400 on every real request."""

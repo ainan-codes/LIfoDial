@@ -115,13 +115,13 @@ def _invalidate_configured_cache() -> None:
 
 
 # ── Audit log (Phase D) — records who/what/when, NEVER the key value ──────────
+# Thin alias kept for the many call sites below. The row-building and the
+# commit-and-swallow semantics live in backend/services/audit.py so that this and
+# the impersonation trail cannot drift apart on truncation or column limits.
 async def _audit(db: AsyncSession, actor: str, action: str, target: str = "", detail: str = "") -> None:
-    from backend.models.audit_log import AuditLog
-    try:
-        db.add(AuditLog(actor=actor or "unknown", action=action, target=target[:120], detail=detail[:500]))
-        await db.commit()
-    except Exception as e:
-        logger.warning("audit log write failed (%s/%s): %s", action, target, e)
+    from backend.services.audit import record_audit
+
+    await record_audit(db, actor, action, target=target, detail=detail)
 
 
 # ── Rate limiting for key-management endpoints (Phase D) ──────────────────────
@@ -201,12 +201,13 @@ PROVIDERS = {
         # nova-3 + "multi" handles Hindi/English in one socket. It is the right
         # default for this product and must be what models[0] hands the dashboard.
         #
-        # Superset lives in DEEPGRAM_STT_MODELS below (defined after this dict, so
-        # it cannot be referenced here); test_deepgram_model_catalog.py asserts the
-        # two agree.
+        # So this is nova-3 ONLY. The full factual catalogue of what Deepgram
+        # offers is DEEPGRAM_STT_MODELS_ALL below, kept as a record and wired to
+        # nothing; DEEPGRAM_STT_MODELS is the selectable list. Both are defined
+        # after this dict, so the value is repeated literally here rather than
+        # referenced — test_deepgram_model_catalog.py asserts the two agree.
         {"id": "deepgram",   "name": "Deepgram",       "env_var": "DEEPGRAM_API_KEY",
-         "models": ["nova-3", "nova-3-general", "nova-3-medical",
-                    "nova-2", "nova-2-phonecall", "nova-2-medical"],
+         "models": ["nova-3"],
          "key_label": "DEEPGRAM_API_KEY",  "key_url": "https://console.deepgram.com",        "icon": "D"},
         {"id": "whisper",    "name": "OpenAI Whisper", "env_var": "OPENAI_API_KEY",
          "models": ["whisper-1"],
@@ -286,12 +287,16 @@ ELEVENLABS_STT_MODELS = ["scribe_v2_realtime", "scribe_v2"]
 
 # Deepgram STT models. Streaming-capable only — Deepgram's whisper-* models are
 # batch-only and would leave a live call deaf, so they are deliberately absent.
-DEEPGRAM_STT_MODELS = [
+# Every Deepgram STT model that really exists on our account. FACTUAL RECORD ONLY —
+# this is deliberately NOT wired to any dropdown or validation path. It documents
+# what Deepgram offers and why almost none of it is appropriate here.
+#
+# Verified live against GET /v1/models 2026-08-03.
+DEEPGRAM_STT_MODELS_ALL = [
     # nova-3 — the ONLY Indic-capable family (hi ta te kn mr bn gu ur), plus
-    # "multi" for code-switching. Verified live against GET /v1/models 2026-08-03.
+    # "multi" for code-switching.
     "nova-3", "nova-3-general", "nova-3-medical",
     # nova-2 — NOT Indic-capable beyond Hindi: it 400s on ta/te/kn/ml/mr/bn/pa/gu.
-    # Kept because it is real and domain-tuned, not because it is a good default.
     "nova-2", "nova-2-general", "nova-2-meeting", "nova-2-phonecall",
     "nova-2-finance", "nova-2-conversationalai", "nova-2-voicemail",
     "nova-2-video", "nova-2-medical", "nova-2-drivethru", "nova-2-automotive",
@@ -303,6 +308,22 @@ DEEPGRAM_STT_MODELS = [
     "base", "base-general", "base-meeting", "base-phonecall", "base-finance",
     "base-conversationalai", "base-voicemail", "base-video",
 ]
+
+#: What a dropdown may offer and what a save may keep: nova-3 alone.
+#:
+#: Production runs on nova-3 only, and every other tier is actively harmful here
+#: rather than merely redundant. nova-2 answers HTTP 400 for ta/te/kn/ml/mr/bn/pa/gu
+#: — pipecat retries a 400 forever without transcribing, so the agent is silently
+#: deaf, not degraded — and no pre-nova-3 tier has a "multi" model, so none can
+#: follow a caller who code-switches Hindi/English mid-sentence. Both are the
+#: normal case for this product, not edge cases.
+#:
+#: This is ONE list feeding every selection path (the models endpoints, the
+#: PROVIDERS catalogue below, and agent_defaults' selectable-model check). Keeping
+#: a second, longer list wired to any of those is precisely how the dashboard came
+#: to silently rewrite an agent's nova-3 back to nova-2 on every provider change —
+#: see backend/tests/test_deepgram_model_catalog.py for that incident.
+DEEPGRAM_STT_MODELS = ["nova-3"]
 
 # AssemblyAI models
 ASSEMBLYAI_STT_MODELS = ["best", "nano"]
