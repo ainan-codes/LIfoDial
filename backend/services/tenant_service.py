@@ -68,11 +68,16 @@ async def delete_tenant_cascade(session: AsyncSession, tenant: Tenant) -> dict[s
     Returns {table_name: rows_deleted} for logging/auditing.
 
     Why the cascade is spelled out here instead of relying on the database:
-    this project's Alembic migrations are never actually applied at deploy time
-    (init_db() only performs additive ADD COLUMN changes), so the live schema's
-    real FK constraints cannot be trusted to match the model files. Several
-    tenant_id FKs are ON DELETE NO ACTION in the live database even though the
-    model declares CASCADE, and `embed_events.tenant_id` has no FK at all.
+    the live schema's real FK constraints cannot be trusted to match the model
+    files. Several tenant_id FKs are ON DELETE NO ACTION in the live database even
+    though the model declares CASCADE, and `embed_events.tenant_id` has no FK at
+    all — those tables predate migrations being applied.
+
+    (This used to say migrations "are never actually applied at deploy time".
+    That is no longer true: `alembic upgrade` runs on Railway deploys — confirmed
+    2026-08-06 in the log for 51f1601. It does not change the conclusion, because
+    the drift it describes is in tables created BEFORE that, and no migration has
+    gone back to repair those constraints.)
 
     ORDER MATTERS — children before the rows they point at:
       * appointments MUST precede doctors. appointments.doctor_id is declared

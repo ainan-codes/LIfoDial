@@ -9,12 +9,18 @@ The row is both the per-clinic audit trail and the revocation list that
 backend/auth.py checks on every impersonated request — see
 backend/models/impersonation_session.py.
 
-Note this table is ALSO created by init_db()'s create_all() at startup (the model
-is registered in db.py::_import_all_models), which is what actually provisions it
-on deploys, since this project's migrations are not run automatically. This
-revision exists so the schema is reproducible from Alembic alone, and so the
-Postgres-only bits create_all() would miss — the RLS default-deny applied to
-audit_logs, and ON DELETE CASCADE on tenant_id — are recorded somewhere.
+Two paths provision this table, and on 2026-08-06 BOTH ran on Railway:
+
+  1. This revision, applied by `alembic upgrade` at deploy time — confirmed in the
+     deploy log for 51f1601 ("Running upgrade c7d1e9f2a3b4 -> b8e4c2f7d1a9"). This
+     is the path that gets the Postgres-only bits: ON DELETE CASCADE on tenant_id
+     and the RLS default-deny (a client that could read this table could enumerate
+     live session ids).
+  2. init_db()'s create_all() at startup, since the model is registered in
+     db.py::_import_all_models. It found the table already present and no-op'd.
+
+Keep the model in that list anyway: create_all is the only path on SQLite (tests,
+local dev), where `alembic upgrade` is not part of the run.
 """
 from typing import Sequence, Union
 
