@@ -317,23 +317,90 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
     setSyncing(false);
   };
 
-  // Which language this card is currently being shown AS. With no filter that
-  // is the voice's own primary tag (so the unfiltered library looks exactly as
-  // it always has); with a filter active it is the language the user asked for,
-  // which is what gets synthesized and what gets saved onto the agent.
-  const effectiveLanguage = (voice: any): string =>
-    language && Array.isArray(voice.languages) && voice.languages.includes(language)
-      ? language
-      : voice.language;
+  // Existing options first and unchanged, then whatever the providers reported.
+  // Declared here rather than next to the <select> because the search box now
+  // resolves queries against this same list (below).
+  const languageOptions = [
+    ...BASE_LANGUAGE_OPTIONS,
+    ...providerLanguages
+      .filter(l => !BASE_LANGUAGE_OPTIONS.some(b => b.code === l.code))
+      .map(l => ({ code: l.code, label: `${l.name} (${l.code})` })),
+  ];
+
+  // ── Searching by LANGUAGE, not just by speaker name ───────────────────────
+  //
+  // The search box used to match `voice.name` and nothing else. That is why
+  // typing "ML" in the standalone library returned zero results: no speaker is
+  // called "ML", no card is TAGGED ml-IN (every Sarvam card's display tag is its
+  // primary language, mostly hi-IN), and yet all 37 of them speak Malayalam.
+  // "there are no Malayalam voices" was the only reading available.
+  //
+  // So a query is now also read as a language when it names one: "ml", "ml-IN",
+  // "mala" and "malayalam" all resolve to ml-IN. Resolution runs against
+  // `languageOptions` — the same list the dropdown is built from, which the
+  // providers themselves report — so it can never offer a language the voices
+  // cannot actually be asked to speak.
+  const resolveSearchLanguage = (q: string): string => {
+    const t = q.trim().toLowerCase();
+    // One letter is too ambiguous to re-tag a whole page on.
+    if (t.length < 2) return '';
+    // AMBIGUITY GOES TO THE NAME. Several language codes and names are also
+    // fragments of speaker names: "ta" is Tamil's code but sits inside Tanya,
+    // Tarun, Ratan and Kavitha; "ka" starts Kannada but also Kavya, Kavitha and
+    // Kabir; "hi" starts Hindi but also sits inside Mohit and Ishita. Reading
+    // those as languages re-tagged every card and changed what each preview
+    // spoke — so someone looking up "Tanya" got a card reading TA-IN that
+    // previewed in Tamil, for a voice this page has always called Hindi.
+    //
+    // So a query that any speaker's name contains is a name search and nothing
+    // else. This costs nothing in reach: the unambiguous ways to ask for those
+    // languages — the full name ("tamil", "kannada"), the full code ("ta-IN"),
+    // or the dropdown — match no speaker name and still resolve. And "ml" is
+    // unaffected, which is the case that started this: no speaker is called
+    // anything containing "ml", so Malayalam still resolves from two letters.
+    if (localVoices.some(v => String(v.name || '').toLowerCase().includes(t))) return '';
+    const hit = languageOptions.find(l => {
+      const code = l.code.toLowerCase();                              // 'ml-in'
+      const primary = code.split('-')[0];                             // 'ml'
+      const name = l.label.toLowerCase().replace(/\s*\([^)]*\)\s*$/, ''); // 'malayalam'
+      return t === primary || code.startsWith(t) || name.startsWith(t);
+    });
+    return hit ? hit.code : '';
+  };
+  const searchLanguage = resolveSearchLanguage(search);
+  // The language the page is currently speaking in, whichever control chose it.
+  const activeLanguage = language || searchLanguage;
+  const languageLabel = (code: string) =>
+    languageOptions.find(l => l.code === code)?.label || code;
+
+  /** Can this voice actually be asked to speak `code`? */
+  const speaks = (voice: any, code: string): boolean =>
+    !!code && (voice.language === code
+      || (Array.isArray(voice.languages) && voice.languages.includes(code)));
+
+  // Which language this card is currently being shown AS. With no filter and no
+  // language-ish search that is the voice's own primary tag (so the unfiltered
+  // library looks exactly as it always has); otherwise it is the language the
+  // user asked for, which is what gets synthesized, what the chip reads, and
+  // what gets saved onto the agent. The dropdown wins over the search box —
+  // it is the more deliberate of the two.
+  const effectiveLanguage = (voice: any): string => {
+    if (speaks(voice, language)) return language;
+    if (speaks(voice, searchLanguage)) return searchLanguage;
+    return voice.language;
+  };
 
   const filtered = localVoices.filter(voice => {
-    const matchSearch = voice.name.toLowerCase().includes(search.toLowerCase());
+    // A voice matches the query by NAME, or by being able to speak the language
+    // the query names. Union, not intersection: searching "ta" still finds
+    // Tanya, and now also finds every voice that can speak Tamil.
+    const matchSearch = !search
+      || voice.name.toLowerCase().includes(search.toLowerCase())
+      || speaks(voice, searchLanguage);
     const matchProvider = !provider || voice.provider === provider;
     const matchGender = !gender || voice.gender === gender;
     // A voice matches a language if it is tagged with it OR can speak it.
-    const matchLang = !language
-      || voice.language === language
-      || (Array.isArray(voice.languages) && voice.languages.includes(language));
+    const matchLang = !language || speaks(voice, language);
     return matchSearch && matchProvider && matchGender && matchLang;
   });
 
@@ -356,14 +423,6 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
   // Provider order for display + filter: configured providers first, then any
   // provider that actually returned voices (defensive), de-duplicated.
   const displayProviders = Array.from(new Set([...ttsProviders, ...Object.keys(grouped)]));
-
-  // Existing options first and unchanged, then whatever the providers reported.
-  const languageOptions = [
-    ...BASE_LANGUAGE_OPTIONS,
-    ...providerLanguages
-      .filter(l => !BASE_LANGUAGE_OPTIONS.some(b => b.code === l.code))
-      .map(l => ({ code: l.code, label: `${l.name} (${l.code})` })),
-  ];
 
   const wrapContent = (content: React.ReactNode) => {
      if (isPickerModal) {
@@ -480,6 +539,23 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
         Showing {filtered.length} of {localVoices.length} voices
         {ttsProviders.length > 0 && ` · ${ttsProviders.length} provider${ttsProviders.length > 1 ? 's' : ''} configured`}
       </div>
+
+      {/* Say WHY a name search returned voices whose names do not contain the
+          query. Without this, typing "ml" and getting 37 cards that all now read
+          ML-IN looks like a bug rather than the answer to the question asked. */}
+      {activeLanguage && (
+        <div style={{ fontSize: '12px', color: 'var(--accent)', marginTop: '-16px', marginBottom: '20px' }}>
+          Showing voices that can speak {languageLabel(activeLanguage)} — previews and the
+          tag on each card are in that language.
+          {' '}
+          <button
+            onClick={() => { setLanguage(''); setSearch(''); }}
+            style={{ background: 'none', border: 'none', padding: 0, color: 'var(--text-muted)', cursor: 'pointer', font: 'inherit', textDecoration: 'underline' }}
+          >
+            Clear
+          </button>
+        </div>
+      )}
 
       {loadError && (
         <div style={{ fontSize: '13px', color: '#ff6b6b', background: 'rgba(255,107,107,0.08)', border: '1px solid rgba(255,107,107,0.25)', borderRadius: '8px', padding: '10px 14px', marginBottom: '16px' }}>
@@ -600,13 +676,32 @@ export default function VoiceLibrary({ isPickerModal = false, onSelectVoice, rea
                                  }}>
                                    {voice.gender}
                                  </span>
-                                 <span style={{ 
-                                   background: 'var(--bg-surface-3)', color: 'var(--text-muted)', 
-                                   fontSize: '10px', fontWeight: 600, textTransform: 'uppercase', 
-                                   letterSpacing: '0.05em', padding: '2px 6px', borderRadius: '4px' 
+                                 <span style={{
+                                   background: 'var(--bg-surface-3)', color: 'var(--text-muted)',
+                                   fontSize: '10px', fontWeight: 600, textTransform: 'uppercase',
+                                   letterSpacing: '0.05em', padding: '2px 6px', borderRadius: '4px'
                                  }}>
                                    {String(effectiveLanguage(voice) || voice.accent).substring(0, 5)}
                                  </span>
+                                 {/* The tag above is ONE language; Sarvam's speakers each render
+                                     eleven. Without this the library asserted that its whole
+                                     catalogue was Hindi, so the languages nobody had a card for
+                                     — Malayalam above all — looked unsupported. Only shown when
+                                     no language is active, since then the tag IS the answer. */}
+                                 {!activeLanguage && Array.isArray(voice.languages) && voice.languages.length > 1 && (
+                                   <span
+                                     title={`Also speaks ${voice.languages.filter((c: string) => c !== voice.language).map(languageLabel).join(', ')}`}
+                                     style={{
+                                       background: 'transparent', color: 'var(--text-muted)',
+                                       border: '1px solid var(--border)',
+                                       fontSize: '10px', fontWeight: 600,
+                                       letterSpacing: '0.05em', padding: '2px 6px', borderRadius: '4px',
+                                       cursor: 'help',
+                                     }}
+                                   >
+                                     +{voice.languages.length - 1}
+                                   </span>
+                                 )}
                               </div>
                            </div>
 

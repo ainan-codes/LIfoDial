@@ -569,6 +569,9 @@ function TestCallUI({
         onClick={onDisconnect}
         style={{
           alignSelf: 'center',
+          // Same reason as the ended screen's button row: the only way to hang up
+          // must never be what a short viewport shrinks.
+          flexShrink: 0,
           padding: '9px 24px', borderRadius: 40, border: '1px solid #ef4444',
           background: 'rgba(239,68,68,0.08)', color: '#ef4444',
           fontWeight: 600, fontSize: 13, cursor: 'pointer',
@@ -1027,7 +1030,11 @@ export default function TestVoiceCallLK({
           emptyText="No speech was transcribed during this call."
         />
 
-        <div style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
+        {/* flexShrink:0 — on a short phone viewport the flex column would
+            otherwise be free to squeeze this row, and losing "Call again" /
+            "Close" is exactly the failure this screen exists to prevent. The
+            transcript above it is the part that should absorb the space. */}
+        <div style={{ display: 'flex', gap: 10, justifyContent: 'center', flexShrink: 0 }}>
           <button
             onClick={startCall}
             style={{

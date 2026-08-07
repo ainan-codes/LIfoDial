@@ -107,7 +107,9 @@ export default function Layout() {
       style={{
         display: 'flex',
         flexDirection: 'column',
-        height: '100vh',
+        // Height is set in CSS below, not here: it needs the 100vh -> 100dvh
+        // fallback pair, and an inline style can only hold one value per
+        // property (it would also outrank the class rule).
         overflow: 'hidden',
         backgroundColor: 'var(--bg-page)',
         // How much chrome a viewport-anchored panel must keep clear of. Panels
@@ -364,6 +366,22 @@ export default function Layout() {
       </div>
 
       <style>{`
+        /* The app shell is exactly as tall as what the user can SEE.
+         *
+         * 100vh on a phone is the viewport with the browser's toolbars HIDDEN,
+         * which is taller than the visible area whenever they are showing. The
+         * shell is overflow:hidden and its last row is the bottom navigation, so
+         * that difference pushed the bar — and anything measuring itself against
+         * it, i.e. --lfd-chrome-bottom and the test-call panel anchored to it —
+         * below the fold. 100dvh tracks the toolbars as they come and go.
+         *
+         * The 100vh line stays first as the fallback for browsers without dvh;
+         * on desktop the two are identical, so nothing there changes. */
+        .layout-shell {
+          height: 100vh;
+          height: 100dvh;
+        }
+
         /* ── Desktop: sidebar is always visible, static ── */
         @media (min-width: 768px) {
           .layout-sidebar {
