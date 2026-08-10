@@ -264,6 +264,30 @@ async def _apply_lightweight_migrations():
         except Exception as e:
             logger.warning("Lightweight migration %s.%s skipped: %s", table, column, str(e)[:120])
 
+    # create_all() only creates missing TABLES too — on any DB where
+    # 'doctors'/'appointments' already existed before this change, the new
+    # partial unique indexes (doctor dedup guard, appointment conflict guard)
+    # need the same idempotent treatment. Valid identical syntax on both
+    # Postgres and SQLite, so no dialect branch needed here. If real
+    # duplicates/conflicts still exist in this DB, this logs a warning and
+    # boots anyway (same graceful-degradation policy as the column adds
+    # above) — backend/scripts/find_duplicate_doctors.py and
+    # find_appointment_slot_conflicts.py are the real prerequisite check.
+    index_migrations = [
+        ("uq_doctors_tenant_his_id",
+         "CREATE UNIQUE INDEX IF NOT EXISTS uq_doctors_tenant_his_id "
+         "ON doctors (tenant_id, his_doctor_id) WHERE his_doctor_id IS NOT NULL"),
+        ("uq_appointments_doctor_slot_active",
+         "CREATE UNIQUE INDEX IF NOT EXISTS uq_appointments_doctor_slot_active "
+         "ON appointments (doctor_id, slot_time) WHERE status <> 'cancelled'"),
+    ]
+    for name, ddl in index_migrations:
+        try:
+            async with engine.begin() as conn:
+                await conn.exec_driver_sql(ddl)
+        except Exception as e:
+            logger.warning("Lightweight index migration %s skipped: %s", name, str(e)[:200])
+
 
 def _import_all_models():
     """
@@ -298,6 +322,7 @@ def _import_all_models():
         # list every impersonated request is checked against — an unimported model
         # means no table, which means impersonation 401s everywhere.
         "backend.models.impersonation_session",
+        "backend.models.doctor_availability",
     ]
 
     for module_path in optional:

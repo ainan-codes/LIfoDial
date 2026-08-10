@@ -26,6 +26,13 @@ is what stops the two implementations from diverging again.
 BOOKING_RESULT_TRUE = "[BOOKING_RESULT success=true]"
 BOOKING_RESULT_FALSE = "[BOOKING_RESULT success=false]"
 
+# Emitted only by the voice path (BookingProcessor._build_availability_note)
+# when a caller-requested slot isn't actually open — lists the doctor's REAL
+# slots for that day so the LLM offers real alternatives instead of
+# inventing a nearby time. Per-request (depends on the day asked about),
+# unlike the static per-call doctor roster in pipeline.py.
+AVAILABILITY_NOTE = "[AVAILABILITY_NOTE]"
+
 BOOKING_RULES_BLOCK = (
     "\n\n--- APPOINTMENT BOOKING RULES (STRICT) ---\n"
     "1. When the user wants a NEW appointment, ask which doctor and what day/time "
@@ -41,5 +48,7 @@ BOOKING_RULES_BLOCK = (
     "the name it was booked under. For a reschedule, also ask what new day/time they "
     "want. Repeat those details back and ask them to confirm before you proceed — "
     "never assume you already know them.\n"
+    "6. If a system message starting with [AVAILABILITY_NOTE] appears, only offer the "
+    "specific times it lists — never invent a nearby time.\n"
     "--- END BOOKING RULES ---"
 )

@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import DateTime, ForeignKey, String, text
+from sqlalchemy import DateTime, ForeignKey, Index, String, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from backend.db import Base
 
@@ -9,6 +9,19 @@ def _now() -> datetime:
 
 class Appointment(Base):
     __tablename__ = "appointments"
+    __table_args__ = (
+        # A doctor can only have one ACTIVE (non-cancelled) appointment per
+        # slot_time. This is the actual race-safety mechanism for concurrent
+        # bookings: two simultaneous inserts for the same doctor+slot both
+        # attempt the write, and the loser gets a clean IntegrityError instead
+        # of silently creating a double-booking (see his.py::create_appointment).
+        Index(
+            "uq_appointments_doctor_slot_active", "doctor_id", "slot_time",
+            unique=True,
+            postgresql_where=text("status <> 'cancelled'"),
+            sqlite_where=text("status <> 'cancelled'"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36),

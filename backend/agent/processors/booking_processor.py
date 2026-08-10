@@ -104,6 +104,8 @@ class BookingProcessor(FrameProcessor):
             "pending_doctor_id":   None,   # UUID string of matched doctor
             "pending_doctor_name": None,   # Human-readable name
             "pending_slot":        None,   # Slot the CALLER asked for (never fabricated)
+            "pending_slot_day_str":  None,  # Day component, before combining into pending_slot
+            "pending_slot_time_str": None,  # Time component, before combining into pending_slot
             "awaiting_confirm":    False,  # True once doctor + caller-given slot exist
             "patient_phone":       call_meta.get("caller_phone", "unknown"),
             "patient_name":        None,   # Extracted from conversation
@@ -127,6 +129,14 @@ class BookingProcessor(FrameProcessor):
         # appointment's cancel/reschedule commit (separate flag so a NEW
         # booking in progress can never be confused with one).
         self._action_commit_pending: bool = False
+
+        # A one-shot system message queued for the NEXT LLMContextFrame — used
+        # for the [AVAILABILITY_NOTE] the arm-check (_handle_transcription
+        # step 3) queues when a caller-requested slot isn't actually open, so
+        # the LLM learns the real alternatives instead of inventing one.
+        # Parallels _commit_pending's injection mechanism but for an
+        # informational note rather than a booking outcome.
+        self._info_message: Optional[str] = None
 
         logger.info(
             "BookingProcessor initialised | tenant=%s caller=%s",
@@ -159,6 +169,15 @@ class BookingProcessor(FrameProcessor):
 
         if isinstance(frame, LLMContextFrame) and self._action_commit_pending:
             await self._commit_and_inject_action_result(frame)
+
+        if isinstance(frame, LLMContextFrame) and self._info_message:
+            context = getattr(frame, "context", None)
+            if context is not None:
+                try:
+                    context.add_message({"role": "system", "content": self._info_message})
+                except Exception as exc:
+                    logger.error("Failed to inject availability note into LLM context: %s", exc)
+            self._info_message = None
 
         # Always push the frame downstream — never block the voice pipeline
         await self.push_frame(frame, direction)
@@ -214,18 +233,47 @@ class BookingProcessor(FrameProcessor):
         #    (audit FIX 4: the old code offered a hardcoded "11:00 AM").
         if self.booking_state["pending_doctor_id"]:
             self._try_extract_slot(text)
-            # Doctor + a caller-given time = ready to ask for a yes/no.
+            # Doctor + a caller-given time = ready to ask for a yes/no — but
+            # only once verified against the doctor's REAL schedule + existing
+            # bookings (availability.is_doctor_open_at), not just because the
+            # caller said a time. check_availability_allowed() gates this
+            # PROACTIVE check only — the final pre-commit check in
+            # _commit_and_inject_result and the DB unique index always run
+            # regardless of this toggle, since those are data-integrity, not
+            # a feature switch.
             if (
                 self.booking_state["pending_slot"]
                 and not self.booking_state["awaiting_confirm"]
                 and self.check_availability_allowed()
             ):
-                self.booking_state["awaiting_confirm"] = True
-                logger.info(
-                    "Booking: doctor '%s' + caller-requested slot '%s' — awaiting confirm.",
-                    self.booking_state["pending_doctor_name"],
-                    self.booking_state["pending_slot"],
+                from backend.services.availability import is_doctor_open_at
+
+                slot_utc = self._parse_pending_slot_utc()
+                is_open, reason = await is_doctor_open_at(
+                    self._tenant.get("id"), self.booking_state["pending_doctor_id"], slot_utc,
                 )
+                if is_open:
+                    self.booking_state["awaiting_confirm"] = True
+                    logger.info(
+                        "Booking: doctor '%s' + caller-requested slot '%s' — awaiting confirm.",
+                        self.booking_state["pending_doctor_name"],
+                        self.booking_state["pending_slot"],
+                    )
+                else:
+                    logger.info(
+                        "Booking: requested slot '%s' not open (reason=%s) — not arming confirmation.",
+                        self.booking_state["pending_slot"], reason,
+                    )
+                    self.booking_state["pending_slot"] = None
+                    self.booking_state["pending_slot_day_str"] = None
+                    self.booking_state["pending_slot_time_str"] = None
+                    self._info_message = await _build_availability_note(
+                        tenant_id=self._tenant.get("id"),
+                        doctor_id=self.booking_state["pending_doctor_id"],
+                        doctor_name=self.booking_state["pending_doctor_name"],
+                        slot_utc=slot_utc,
+                        reason=reason,
+                    )
 
         # 4. Detect cancellation
         if self.booking_state["awaiting_confirm"]:
@@ -352,14 +400,38 @@ class BookingProcessor(FrameProcessor):
         match = _SLOT_PATTERN.search(text)
         if not match:
             return
-        slot = match.group(0).strip()
+        time_part = match.group(0).strip()
 
         day_match = _DAY_PATTERN.search(text)
-        if day_match:
-            slot = f"{day_match.group(0).strip().capitalize()} {slot}"
+        day_part = day_match.group(0).strip().capitalize() if day_match else None
+        slot = f"{day_part} {time_part}" if day_part else time_part
 
         self.booking_state["pending_slot"] = slot
+        # Kept separately (not just parsed back out of `slot`) so
+        # _parse_pending_slot_utc can hand them straight to
+        # his.parse_slot_datetime(day, time) without re-splitting the
+        # display string — and so they always reflect the caller's most
+        # recently stated time, including a change made after arming.
+        self.booking_state["pending_slot_time_str"] = time_part
+        self.booking_state["pending_slot_day_str"] = day_part
         logger.info("Slot captured from caller utterance: '%s'", slot)
+
+    def _parse_pending_slot_utc(self):
+        """Parse the CURRENT pending_slot_day_str/time_str into a UTC instant.
+
+        Deliberately re-derived on every call rather than cached: a caller
+        can change their requested time while awaiting_confirm is already
+        True (_try_extract_slot updates these fields every turn a doctor is
+        pending, per its own docstring), but the arm-check below only runs on
+        the FIRST transition into awaiting_confirm. Re-parsing fresh here
+        means the final pre-commit check always validates whatever time is
+        actually active, not a stale value from when the flow first armed.
+        """
+        time_str = self.booking_state.get("pending_slot_time_str")
+        if not time_str:
+            return None
+        from backend.services.his import parse_slot_datetime  # Lazy import — avoids circular deps
+        return parse_slot_datetime(self.booking_state.get("pending_slot_day_str"), time_str)
 
     async def _commit_and_inject_result(self, frame: LLMContextFrame) -> None:
         """AWAIT the appointment DB write, then inject the REAL outcome into the
@@ -384,6 +456,45 @@ class BookingProcessor(FrameProcessor):
             )
             return
 
+        # Final pre-commit re-check — closes the race window as tightly as
+        # possible given this file's async structure: the slot could have
+        # gone stale (booked by someone else, or the doctor went on leave)
+        # between arming and this confirm. Always runs, regardless of
+        # check_availability_allowed() — this is data-integrity, not the
+        # proactive-check feature toggle. The DB unique index +
+        # IntegrityError catch in his.create_appointment is what closes the
+        # window completely for a genuinely concurrent second caller; this
+        # just avoids a doomed DB round-trip and gives a faster, cleaner
+        # message in the common (non-race) case.
+        from backend.services.availability import is_doctor_open_at
+
+        recheck_slot_utc = self._parse_pending_slot_utc()
+        is_open, recheck_reason = await is_doctor_open_at(str(tenant_id), str(doctor_id), recheck_slot_utc)
+        if not is_open:
+            logger.info(
+                "Booking: pre-commit re-check found slot '%s' no longer open (reason=%s) — not committing.",
+                slot_time, recheck_reason,
+            )
+            self.booking_state["confirmed"] = False
+            self.booking_state["awaiting_confirm"] = False
+            self.booking_state["pending_slot"] = None
+            self.booking_state["pending_slot_day_str"] = None
+            self.booking_state["pending_slot_time_str"] = None
+            context = getattr(frame, "context", None)
+            if context is not None:
+                try:
+                    context.add_message({
+                        "role": "system",
+                        "content": (
+                            "[BOOKING_RESULT success=false] That time is no longer available "
+                            f"(reason: {recheck_reason}). Do NOT say it is booked. Apologize briefly "
+                            "and ask the caller for a different time."
+                        ),
+                    })
+                except Exception as exc:
+                    logger.error("Failed to inject pre-commit availability result into LLM context: %s", exc)
+            return
+
         ok, result = await _commit_booking_to_db(
             tenant_id=str(tenant_id),
             doctor_id=str(doctor_id),
@@ -405,12 +516,25 @@ class BookingProcessor(FrameProcessor):
             )
         else:
             # Re-arm so another "yes" retries — idempotency key prevents dupes.
+            # (Not appropriate for slot_taken: the SAME slot would just fail
+            # again — clear the stale slot so the caller is asked for a new one.)
             self.booking_state["confirmed"] = False
-            self.booking_state["awaiting_confirm"] = True
-            msg = (
-                "[BOOKING_RESULT success=false] The appointment could NOT be saved due to a system error. "
-                "Do NOT say it is booked. Apologize briefly and ask if they'd like you to try again."
-            )
+            if result.get("reason") == "slot_taken":
+                self.booking_state["awaiting_confirm"] = False
+                self.booking_state["pending_slot"] = None
+                self.booking_state["pending_slot_day_str"] = None
+                self.booking_state["pending_slot_time_str"] = None
+                msg = (
+                    "[BOOKING_RESULT success=false] That exact time was just booked by someone else "
+                    "before this could be confirmed. Do NOT say it is booked. Apologize briefly and ask "
+                    "the caller for a different time."
+                )
+            else:
+                self.booking_state["awaiting_confirm"] = True
+                msg = (
+                    "[BOOKING_RESULT success=false] The appointment could NOT be saved due to a system error. "
+                    "Do NOT say it is booked. Apologize briefly and ask if they'd like you to try again."
+                )
 
         if context is not None:
             try:
@@ -586,6 +710,40 @@ class BookingProcessor(FrameProcessor):
         logger.info("%s commit result injected: ok=%s", mode, ok)
 
 
+async def _build_availability_note(
+    tenant_id: Optional[str],
+    doctor_id: Optional[str],
+    doctor_name: Optional[str],
+    slot_utc,
+    reason: str,
+) -> str:
+    """Build an [AVAILABILITY_NOTE] system message listing the doctor's REAL
+    open slots for the day the caller asked about, so the LLM offers actual
+    alternatives instead of inventing a nearby time (see booking_rules.py
+    rule 6). Unlike the static per-call doctor roster in
+    pipeline.py::_clinic_facts_block, this is computed per-request since it
+    depends on the specific day the caller asked about.
+    """
+    from backend.services.availability import compute_available_slots
+    from backend.services.timeutil import format_ist_clock, ist_now, to_ist
+
+    name = doctor_name or "that doctor"
+    target_date = to_ist(slot_utc).date() if slot_utc is not None else ist_now().date()
+    slots = await compute_available_slots(tenant_id, doctor_id, target_date) if (tenant_id and doctor_id) else []
+
+    if not slots:
+        return (
+            f"[AVAILABILITY_NOTE] {name} has no open slots on that day (reason: {reason}). "
+            "Ask the caller for a different day."
+        )
+
+    times = ", ".join(format_ist_clock(to_ist(s)) for s in slots[:5])
+    return (
+        f"[AVAILABILITY_NOTE] {name} is only actually open at these times that day: {times}. "
+        "Only offer these specific times to the caller — never invent a nearby time."
+    )
+
+
 # ── Standalone DB commit function ─────────────────────────────────────────────
 
 async def _commit_booking_to_db(
@@ -623,7 +781,7 @@ async def _commit_booking_to_db(
         )
         if not result or not result.get("appointment_id"):
             logger.error("[BookingProcessor] create_appointment returned no appointment_id: %r", result)
-            return False, {}
+            return False, (result or {})
         logger.info(
             "[BookingProcessor] Appointment saved: id=%s doctor=%s slot=%s",
             result.get("appointment_id"),

@@ -30,6 +30,7 @@ from backend.models.phone_number import PhoneNumber             # noqa: F401
 from backend.models.call_record import CallRecord               # noqa: F401
 from backend.models.embed_analytics import EmbedEvent           # noqa: F401
 from backend.models.bulk_call import BulkCallCampaign           # noqa: F401
+from backend.models.doctor_availability import DoctorAvailability  # noqa: F401
 
 config = context.config
 

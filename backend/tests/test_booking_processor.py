@@ -12,7 +12,7 @@ Covers:
 Run: python -m pytest backend/tests/test_booking_processor.py -v
 """
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -31,6 +31,19 @@ TENANT = {
         {"id": "doc-2", "name": "Dr Iyer", "specialization": "Dermatologist"},
     ],
 }
+
+
+@pytest.fixture(autouse=True)
+def _default_availability_open():
+    """BookingProcessor now calls availability.is_doctor_open_at at both the
+    arm-check (_handle_transcription step 3) and the pre-commit re-check
+    (_commit_and_inject_result) — a real DB-backed call. Default it to "open"
+    for every test in this file so the pre-existing tests (which predate real
+    availability checking and use no DB) keep passing unchanged; tests that
+    need to exercise a NOT-open path override this within their own
+    `with patch(...)` block."""
+    with patch("backend.services.availability.is_doctor_open_at", AsyncMock(return_value=(True, "ok"))):
+        yield
 
 
 def _make_processor(**config_overrides) -> BookingProcessor:

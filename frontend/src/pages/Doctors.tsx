@@ -1,8 +1,9 @@
-import { Edit2, Plus, Trash2, UserCheck, X } from 'lucide-react';
+import { Clock, Edit2, Plus, Trash2, UserCheck, X } from 'lucide-react';
 import React, { useEffect, useState } from 'react';
 import { SPECIALIZATIONS, type Doctor as BaseDoctor } from '../fixtures/data';
 import fetchWithAuth from '../api/client';
 import { getTenantId } from '../api/auth';
+import DoctorAvailabilityModal from '../components/DoctorAvailabilityModal';
 
 // Widened locally with leave_reason — the shared fixture Doctor type doesn't
 // have it (nothing else that imports it needs it).
@@ -289,9 +290,10 @@ interface DoctorCardProps {
   onEdit: () => void;
   onDelete: () => void;
   onToggle: () => void;
+  onSetHours: () => void;
 }
 
-function DoctorCard({ doctor, onEdit, onDelete, onToggle }: DoctorCardProps) {
+function DoctorCard({ doctor, onEdit, onDelete, onToggle, onSetHours }: DoctorCardProps) {
   return (
     <div
       className="rounded-xl p-5 flex flex-col gap-4 transition-all"
@@ -331,6 +333,22 @@ function DoctorCard({ doctor, onEdit, onDelete, onToggle }: DoctorCardProps) {
         </div>
         {/* Action buttons */}
         <div className="flex items-center gap-1">
+          <button
+            onClick={onSetHours}
+            title="Set weekly hours"
+            style={{
+              padding: '6px',
+              borderRadius: '6px',
+              backgroundColor: 'transparent',
+              border: 'none',
+              cursor: 'pointer',
+              color: 'var(--text-muted)',
+            }}
+            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.backgroundColor = 'var(--bg-surface-2)'; (e.currentTarget as HTMLElement).style.color = 'var(--text-secondary)'; }}
+            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent'; (e.currentTarget as HTMLElement).style.color = 'var(--text-muted)'; }}
+          >
+            <Clock size={14} />
+          </button>
           <button
             onClick={onEdit}
             title="Edit"
@@ -438,6 +456,12 @@ export default function Doctors() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<Doctor | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  const [availabilityTarget, setAvailabilityTarget] = useState<Doctor | null>(null);
+  // Set when handleAdd finds a same-name doctor already in the loaded list —
+  // shows a confirm dialog instead of silently creating a duplicate (the
+  // actual "Dr. Salman x3" bug). Holds the submitted form data so "Add
+  // anyway" can resubmit it with allow_duplicate_name: true.
+  const [pendingDuplicate, setPendingDuplicate] = useState<Omit<Doctor, 'id'> | null>(null);
 
   useEffect(() => {
     if (!tenantId) return;
@@ -454,7 +478,7 @@ export default function Doctors() {
     return () => { cancelled = true; };
   }, [tenantId]);
 
-  const handleAdd = async (data: Omit<Doctor, 'id'>) => {
+  const submitAdd = async (data: Omit<Doctor, 'id'>, allowDuplicateName: boolean) => {
     if (!tenantId) return;
     try {
       const created: BackendDoctor = await fetchWithAuth(`/tenants/${tenantId}/doctors`, {
@@ -462,13 +486,29 @@ export default function Doctors() {
         body: JSON.stringify({
           name: data.name, specialization: data.specialization,
           his_doctor_id: data.his_doctor_id || null, is_available: data.available,
+          allow_duplicate_name: allowDuplicateName,
         }),
       });
       setDoctors(prev => [...prev, fromBackend(created)]);
       setModalOpen(false);
+      setPendingDuplicate(null);
     } catch (e) {
       setError((e as Error).message || 'Failed to add doctor');
     }
+  };
+
+  const handleAdd = async (data: Omit<Doctor, 'id'>) => {
+    const nameMatch = doctors.some(d => d.name.trim().toLowerCase() === data.name.trim().toLowerCase());
+    if (nameMatch) {
+      // Ask before creating a second row for what looks like the same
+      // doctor — this is the client-side half of the duplicate-name guard;
+      // the backend 409 (checked server-side too) is the backstop for a race.
+      // Close the Add modal so only the confirm dialog is on screen.
+      setModalOpen(false);
+      setPendingDuplicate(data);
+      return;
+    }
+    await submitAdd(data, false);
   };
 
   const handleEdit = async (data: Omit<Doctor, 'id'>) => {
@@ -607,6 +647,7 @@ export default function Doctors() {
                 onEdit={() => { setEditTarget(doc); setModalOpen(true); }}
                 onDelete={() => setDeleteConfirm(doc.id)}
                 onToggle={() => handleToggle(doc.id)}
+                onSetHours={() => setAvailabilityTarget(doc)}
               />
             ))}
           </div>
@@ -620,6 +661,57 @@ export default function Doctors() {
           onSave={editTarget ? handleEdit : handleAdd}
           onClose={() => { setModalOpen(false); setEditTarget(null); }}
         />
+      )}
+
+      {/* Weekly availability modal */}
+      {availabilityTarget && tenantId && (
+        <DoctorAvailabilityModal
+          tenantId={tenantId}
+          doctorId={availabilityTarget.id}
+          doctorName={availabilityTarget.name}
+          onClose={() => setAvailabilityTarget(null)}
+        />
+      )}
+
+      {/* Duplicate-name confirm dialog */}
+      {pendingDuplicate && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center"
+          style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}
+        >
+          <div
+            className="rounded-xl p-6"
+            style={{
+              width: '380px',
+              backgroundColor: 'var(--bg-surface)',
+              border: '1px solid var(--border)',
+              boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
+              margin: '0 16px',
+            }}
+          >
+            <h3 style={{ fontSize: '16px', fontWeight: 600, color: 'var(--text-primary)', margin: '0 0 8px' }}>
+              Doctor already exists
+            </h3>
+            <p style={{ fontSize: '14px', color: 'var(--text-secondary)', marginBottom: '20px' }}>
+              A doctor named "{pendingDuplicate.name}" is already in your list. Add another one with the
+              same name, or did you mean to edit the existing entry instead?
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setPendingDuplicate(null)}
+                style={{ flex: 1, padding: '9px', borderRadius: '8px', fontSize: '14px', fontWeight: 500, backgroundColor: 'transparent', border: '1px solid var(--border)', color: 'var(--text-secondary)', cursor: 'pointer' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => submitAdd(pendingDuplicate, true)}
+                style={{ flex: 1, padding: '9px', borderRadius: '8px', fontSize: '14px', fontWeight: 600, backgroundColor: 'var(--accent)', border: 'none', color: '#000', cursor: 'pointer' }}
+              >
+                Add anyway
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Delete confirm dialog */}

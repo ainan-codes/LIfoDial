@@ -2,6 +2,7 @@ import logging
 import re
 from typing import List, Dict, Any, Optional
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from datetime import datetime, timedelta, timezone
 import json
 
@@ -9,6 +10,7 @@ from backend.config import settings
 from backend.db import AsyncSessionLocal
 from backend.models.doctor import Doctor
 from backend.models.appointment import Appointment
+from backend.services.timeutil import IST, ist_now
 
 logger = logging.getLogger(__name__)
 
@@ -18,14 +20,22 @@ _DATE_FORMATS = ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d %b %Y", "%d
 
 
 def parse_slot_datetime(date_str: str | None, time_str: str | None) -> datetime:
-    """Best-effort parse of a requested appointment slot into a tz-aware datetime.
+    """Best-effort parse of a requested appointment slot into a tz-aware UTC datetime.
 
     Accepts times like "11:00 AM", "2 PM", "14:30" and dates like "2026-07-06",
     "today", "tomorrow". Falls back to the next occurrence of the given time
     (or now) if a field is missing/unparseable — and logs when it does so the
     mis-parse is observable rather than silent.
+
+    Every clinic is IST (confirmed with the user — no per-tenant timezone
+    field exists). The caller's day/time strings are wall-clock IST, so
+    parsing is rooted in ist_now() and every intermediate value carries
+    tzinfo=IST; the single .astimezone(timezone.utc) conversion happens only
+    at the return statements. (Previously this rooted parsing in
+    datetime.now(timezone.utc) directly — i.e. treated IST wall-clock as if
+    it already were UTC, mislabeling every stored slot by ~5.5 hours.)
     """
-    now = datetime.now(timezone.utc)
+    now = ist_now()
 
     # ── Date ──
     day: datetime | None = None
@@ -37,7 +47,7 @@ def parse_slot_datetime(date_str: str | None, time_str: str | None) -> datetime:
     else:
         for fmt in _DATE_FORMATS:
             try:
-                day = datetime.strptime(date_str.strip(), fmt).replace(tzinfo=timezone.utc)
+                day = datetime.strptime(date_str.strip(), fmt).replace(tzinfo=IST)
                 break
             except (ValueError, AttributeError):
                 continue
@@ -60,7 +70,7 @@ def parse_slot_datetime(date_str: str | None, time_str: str | None) -> datetime:
             logger.warning("Could not parse appointment time %r; defaulting to now", time_str)
 
     if parsed_time is None:
-        return day.replace(second=0, microsecond=0)
+        return day.replace(second=0, microsecond=0).astimezone(timezone.utc)
 
     combined = day.replace(
         hour=parsed_time.hour, minute=parsed_time.minute, second=0, microsecond=0
@@ -68,7 +78,7 @@ def parse_slot_datetime(date_str: str | None, time_str: str | None) -> datetime:
     # If only a time was given and it already passed today, roll to tomorrow.
     if not ds and combined < now:
         combined += timedelta(days=1)
-    return combined
+    return combined.astimezone(timezone.utc)
 
 
 # Simple in-memory cache for doctors (no Redis dependency)
@@ -140,10 +150,34 @@ async def get_doctors(tenant_id: str, specialization: str = None) -> List[dict]:
     return doctors
 
 
-async def get_slots(doctor_id: str, date: str = None) -> List[str]:
-    # Never cache slots!
-    # Mock slots for upcoming days depending on doctor schedule
-    return ["9:00 AM", "11:00 AM", "2:00 PM", "4:30 PM"]
+async def get_slots(doctor_id: str, date: str = None, tenant_id: str | None = None) -> List[str]:
+    """Real bookable 30-min slots for doctor_id on `date` (YYYY-MM-DD, IST
+    calendar day; defaults to today), formatted as IST display strings.
+
+    Never cache slots! Legacy-compatible wrapper — the FSM
+    (booking_processor.py) and the admin "available-slots" endpoint call
+    availability.compute_available_slots directly for the UTC instants;
+    this exists for any older/simpler caller that just wants display
+    strings. `tenant_id` is an optional trailing kwarg (added last) so no
+    existing caller that only passed doctor_id/date breaks.
+    """
+    if not tenant_id:
+        logger.warning("get_slots called without tenant_id — cannot compute real availability, returning [].")
+        return []
+
+    from backend.services.availability import compute_available_slots
+
+    if date:
+        try:
+            target_date = datetime.strptime(date.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            target_date = ist_now().date()
+    else:
+        target_date = ist_now().date()
+
+    slots_utc = await compute_available_slots(tenant_id, doctor_id, target_date)
+    from backend.services.timeutil import format_ist_clock, to_ist
+    return [format_ist_clock(to_ist(s)) for s in slots_utc]
 
 
 from backend.models.tenant import Tenant
@@ -254,9 +288,20 @@ async def create_appointment(
             call_id=call_id,
         )
         session.add(appointment)
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError:
+            # Race-safety backstop: uq_appointments_doctor_slot_active caught a
+            # concurrent booking for this exact doctor+slot that won the race.
+            # is_doctor_open_at already checks before this is ever reached, so
+            # this only fires for a genuinely simultaneous second caller.
+            await session.rollback()
+            logger.warning(
+                "create_appointment: slot conflict doctor=%s slot=%s", doctor_id, appointment.slot_time,
+            )
+            return {"appointment_id": None, "reason": "slot_taken"}
         await session.refresh(appointment)
-        
+
         appointment_data = {
             "appointment_id": str(appointment.id),
             "tenant_id": tenant_id,
@@ -308,11 +353,22 @@ async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: s
                     appt.status = "cancelled"
                 elif action == "RESCHEDULE":
                     appt.slot_time = parse_slot_datetime(date_str, time_str)
-                
+
                 if notes_clean:
                     appt.notes = notes_clean
-                    
-                await session.commit()
+
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    # Only reachable for RESCHEDULE (CANCEL never changes
+                    # slot_time) — the new slot collided with another active
+                    # booking for the same doctor.
+                    await session.rollback()
+                    logger.warning(
+                        "sync_appointment_to_db: %s slot conflict appt=%s new_slot=%s",
+                        action, appt.id, appt.slot_time,
+                    )
+                    return {"appointment_id": None, "reason": "slot_taken"}
                 await session.refresh(appt)
                 return {
                     "appointment_id": str(appt.id),
@@ -348,7 +404,15 @@ async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: s
                     notes=notes_clean
                 )
                 session.add(new_appt)
-                await session.commit()
+                try:
+                    await session.commit()
+                except IntegrityError:
+                    await session.rollback()
+                    logger.warning(
+                        "sync_appointment_to_db: BOOK slot conflict doctor=%s slot=%s",
+                        doctor.id, new_appt.slot_time,
+                    )
+                    return {"appointment_id": None, "reason": "slot_taken"}
                 await session.refresh(new_appt)
                 return {
                     "appointment_id": str(new_appt.id),
@@ -480,7 +544,7 @@ async def execute_booking_action(
             logger.error("execute_booking_action BOOK failed: %s", e, exc_info=True)
             result = None
         if not result or not result.get("appointment_id"):
-            base["reason"] = "db_error"
+            base["reason"] = (result or {}).get("reason") or "db_error"
             base["doctor_name"] = doctor.name
             return base
         return {
@@ -500,7 +564,7 @@ async def execute_booking_action(
             logger.error("execute_booking_action %s failed: %s", act, e, exc_info=True)
             result = None
         if not result or not result.get("appointment_id"):
-            base["reason"] = "not_found"
+            base["reason"] = (result or {}).get("reason") or "not_found"
             return base
         return {
             "success": True, "reason": "", "appointment_id": result["appointment_id"],
