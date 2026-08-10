@@ -267,6 +267,161 @@ async def test_chat_still_books_with_a_real_time(seeded_db):
     assert "confirmed" in reply.lower()
 
 
+# ── Never end a turn on a promise of a message that can never arrive ───────────
+#
+# The 2026-08-10 production hang: this path is request/response, so any reply
+# that tells the patient to wait strands them permanently. Three ways it
+# happened live, all covered below.
+
+def test_promises_followup_detector():
+    from backend.routers.agent_test import _promises_followup
+    # The two exact strings from the production transcript.
+    assert _promises_followup("please hold on for a moment while I complete your booking") is True
+    assert _promises_followup("I've sent the request, please wait for a moment to confirm") is True
+    assert _promises_followup("Let me check the availability for you") is True
+    # Resolved replies must NOT trip it.
+    assert _promises_followup("Your appointment with Dr Sharma is confirmed for 3 PM.") is False
+    assert _promises_followup("Which doctor would you like to see?") is False
+
+
+def test_scrub_reply_strips_malformed_action_tags():
+    from backend.routers.agent_test import _scrub_reply
+    # Production 2026-08-10: this malformed tag leaked to the patient verbatim
+    # because the strict _ACTION_RE could not parse it.
+    assert "[ACTION" not in _scrub_reply("What time would you like? [ACTION: None]")
+    assert "[ACTION" not in _scrub_reply("Sure. [ACTION: BOOK|a|b|c|d|e|f]")
+    assert _scrub_reply("What time would you like? [ACTION: None]") == "What time would you like?"
+
+
+@pytest.mark.asyncio
+async def test_no_tag_but_promised_followup_is_repaired_into_a_real_booking(seeded_db):
+    """The exact production repro: the model says 'hold on while I complete
+    your booking' and emits NO tag. Before the fix the turn ended there and the
+    patient waited forever. Now it is repaired into the real booking."""
+    calls = {"n": 0}
+
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        calls["n"] += 1
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt and "did NOT" in system_prompt:
+            # The repair pass — model now emits the tag it forgot.
+            return ("Booking that now.\n"
+                    f"[ACTION: BOOK|Ramesh Kumar|9845012345|23/07/2026|2 PM|{REAL_DOCTOR_NAME}|N/A]")
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
+            return f"Your appointment with {REAL_DOCTOR_NAME} is confirmed."
+        # Phase 1: the broken promise, verbatim from production.
+        return "I've got your details, please hold on for a moment while I complete your booking"
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            reply = await chat_mod.generate_llm_response(
+                agent, "Yes, Ramesh Kumar, 9845012345.", db,
+                session_id="s-repair", user_language="en-IN",
+            )
+
+    # The booking the patient was promised actually happened...
+    appts = await _appointments()
+    assert len(appts) == 1, "the repair pass should have completed the real booking"
+    # ...and the patient was TOLD, rather than left waiting.
+    assert "confirmed" in reply.lower()
+    assert not chat_mod._promises_followup(reply), f"turn still ends on a promise: {reply!r}"
+
+
+@pytest.mark.asyncio
+async def test_successful_write_never_replies_with_please_wait(seeded_db):
+    """The nastiest production variant: the row WAS written, but the model's
+    regenerated reply still said 'please wait to confirm', so the patient never
+    learned their appointment existed. The reply must be replaced with a real
+    confirmation."""
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
+            # Model ignores the injected success and hedges anyway.
+            return "I've sent the request, please wait for a moment to confirm"
+        return ("Okay.\n"
+                f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026|3 PM|{REAL_DOCTOR_NAME}|N/A]")
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            reply = await chat_mod.generate_llm_response(
+                agent, "Book it please.", db, session_id="s-hedge", user_language="en-IN",
+            )
+
+    assert len(await _appointments()) == 1
+    assert not chat_mod._promises_followup(reply), f"patient told to wait after a REAL booking: {reply!r}"
+    assert "confirmed" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_no_tag_and_repair_fails_still_resolves_the_turn(seeded_db):
+    """If even the repair pass keeps promising, fall back to a question. The
+    turn must never end on 'please wait'."""
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        return "please hold on for a moment while I complete your booking"
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            reply = await chat_mod.generate_llm_response(
+                agent, "Book me in.", db, session_id="s-norepair", user_language="en-IN",
+            )
+
+    assert await _appointments() == []
+    assert not chat_mod._promises_followup(reply), f"turn ended on a promise: {reply!r}"
+    assert "?" in reply, "should ask for the missing details instead of promising"
+
+
+@pytest.mark.asyncio
+async def test_double_booking_reports_conflict_with_real_alternatives(seeded_db):
+    """A conflict used to fall through to the generic 'system error… try
+    again?' message — wrong, and an infinite retry loop, since retrying the
+    same slot can never succeed."""
+    from datetime import time as time_cls
+    from backend.models.doctor_availability import DoctorAvailability
+    from backend.services.timeutil import ist_now
+
+    # Give the doctor real hours today so alternatives can be computed.
+    today = ist_now().date()
+    async with AsyncSessionLocal() as s:
+        s.add(DoctorAvailability(tenant_id=TENANT_ID, doctor_id=REAL_DOCTOR_ID,
+                                 day_of_week=today.weekday(),
+                                 start_time=time_cls(0, 0), end_time=time_cls(23, 30)))
+        await s.commit()
+
+    date_str = today.strftime("%d/%m/%Y")
+    captured = {}
+
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
+            captured["regen_system"] = system_prompt
+            return "Sorry, that time is taken."
+        return ("Okay.\n"
+                f"[ACTION: BOOK|John Doe|+919812345678|{date_str}|11:30 PM|{REAL_DOCTOR_NAME}|N/A]")
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            # First booking claims the slot.
+            await chat_mod.generate_llm_response(
+                agent, "Book 11:30 PM.", db, session_id="s-first", user_language="en-IN")
+            assert len(await _appointments()) == 1
+            # Second booking hits the same doctor+slot.
+            reply = await chat_mod.generate_llm_response(
+                agent, "Book 11:30 PM.", db, session_id="s-second", user_language="en-IN")
+
+    # No double-booking, and the conflict was reported AS a conflict.
+    assert len(await _appointments()) == 1
+    update = captured["regen_system"].split("SYSTEM UPDATE (AUTHORITATIVE", 1)[1]
+    update = update.split("--- APPOINTMENT BOOKING RULES", 1)[0]
+    assert "ALREADY BOOKED" in update
+    assert "do NOT offer to retry the SAME time" in update.lower() or "retry the same time" in update.lower()
+    assert not chat_mod._promises_followup(reply)
+
+
 # ── Unit-level guards on the shared service ─────────────────────────────────────
 
 @pytest.mark.asyncio

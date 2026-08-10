@@ -508,6 +508,25 @@ async def find_doctor_for_booking(
     return None, names
 
 
+async def alternative_slots_for(
+    tenant_id: str, doctor_id: str, date_str: str, time_str: str, limit: int = 4,
+) -> List[str]:
+    """Real open times (IST display strings) for the doctor on the day the
+    caller asked about — used to answer a "that slot is taken" with actual
+    alternatives instead of a dead end. Returns [] if the doctor has no
+    schedule configured or nothing is left that day."""
+    try:
+        from backend.services.availability import compute_available_slots
+        from backend.services.timeutil import format_ist_clock, to_ist
+
+        requested = parse_slot_datetime(date_str, time_str)
+        slots = await compute_available_slots(tenant_id, doctor_id, to_ist(requested).date())
+        return [format_ist_clock(to_ist(s)) for s in slots[:limit]]
+    except Exception as e:
+        logger.error("Could not compute alternative slots: %s", e, exc_info=True)
+        return []
+
+
 async def execute_booking_action(
     *,
     action: str,
@@ -546,7 +565,7 @@ async def execute_booking_action(
     ).strip()
     base = {
         "success": False, "reason": "unknown_action", "appointment_id": None,
-        "doctor_name": None, "available_doctors": [], "slot": slot,
+        "doctor_name": None, "available_doctors": [], "alternatives": [], "slot": slot,
     }
 
     if act == "BOOK":
@@ -572,6 +591,12 @@ async def execute_booking_action(
         if not result or not result.get("appointment_id"):
             base["reason"] = (result or {}).get("reason") or "db_error"
             base["doctor_name"] = doctor.name
+            if base["reason"] == "slot_taken":
+                # A conflict is the one failure where we can be genuinely
+                # useful: say what IS free rather than just "no".
+                base["alternatives"] = await alternative_slots_for(
+                    tenant_id, str(doctor.id), date_str, time_str,
+                )
             return base
         return {
             "success": True, "reason": "", "appointment_id": result["appointment_id"],

@@ -7,6 +7,10 @@ import asyncio
 import json
 import logging
 import time
+# sync_and_log_appointment() takes a parameter literally named `time`, which
+# shadows the module inside that function — this alias is how its timing log
+# reaches the real clock.
+import time as time_mod
 import uuid
 import base64
 import os
@@ -2323,6 +2327,12 @@ async def openai_transcribe(api_key: str, audio_bytes: bytes) -> tuple[str, str]
         return "", ""
 
 
+# Retained refs for the fire-and-forget Sheets writes below — a bare
+# create_task can be collected before it runs (audit R3, same as
+# web_calls.py::_dispatch_watchers).
+_sheets_tasks: set = set()
+
+
 async def sync_and_log_appointment(action: str, name: str, phone: str, date: str, time: str, doctor: str, notes: str, tenant_id: str, webhook_url: str | None, websocket: WebSocket = None, call_id: str | None = None) -> dict:
     """AWAIT a Book/Reschedule/Cancel, then log only REAL successes to Sheets.
 
@@ -2350,6 +2360,7 @@ async def sync_and_log_appointment(action: str, name: str, phone: str, date: str
         except Exception:
             pass
 
+    _t0 = time_mod.perf_counter()
     try:
         res = await execute_booking_action(
             action=action, tenant_id=tenant_id, name=name, phone=phone,
@@ -2360,6 +2371,13 @@ async def sync_and_log_appointment(action: str, name: str, phone: str, date: str
         logger.error(f"Error in sync_and_log_appointment DB step: {e}", exc_info=True)
         res = {"success": False, "reason": "db_error", "appointment_id": None,
                "doctor_name": None, "available_doctors": [], "slot": ""}
+    # The patient is sitting in a "please hold" state for exactly this window,
+    # so it is worth being able to see it in the logs rather than inferring it
+    # from total request time (which also includes two LLM calls).
+    logger.info(
+        "Booking commit %s finished in %.2fs (success=%s reason=%s)",
+        action, time_mod.perf_counter() - _t0, res.get("success"), res.get("reason") or "-",
+    )
 
     appointment_id = res.get("appointment_id") or "N/A"
     status = ("cancelled" if (action or "").upper() == "CANCEL" else "confirmed") if res["success"] else "failed"
@@ -2368,14 +2386,24 @@ async def sync_and_log_appointment(action: str, name: str, phone: str, date: str
     # fabricated booking would recreate the exact inconsistency this fix removes.
     sheets_success = False
     if res["success"]:
+        # Fire-and-forget. This is an external HTTP call with a 10s timeout and
+        # it used to be AWAITED inside the patient's request — up to 10 extra
+        # seconds of "please hold on" before they were told their booking had
+        # succeeded, for a mirror-write that is not the source of truth (the
+        # appointment row already exists at this point). The reference is
+        # retained because a bare create_task can be garbage-collected
+        # mid-flight (same audit R3 hazard documented in web_calls.py).
         try:
-            sheets_success = await log_booking_to_sheets(
+            _task = asyncio.create_task(log_booking_to_sheets(
                 action=action, name=name, phone=phone, date=date, time=time,
                 doctor=res.get("doctor_name") or doctor, appointment_id=appointment_id,
                 status=status, notes=notes, webhook_url=webhook_url,
-            )
+            ))
+            _sheets_tasks.add(_task)
+            _task.add_done_callback(_sheets_tasks.discard)
+            sheets_success = True  # queued, not yet confirmed — see payload below
         except Exception as e:
-            logger.error(f"Sheets log failed: {e}", exc_info=True)
+            logger.error(f"Sheets log could not be queued: {e}", exc_info=True)
 
     if websocket:
         try:
@@ -2388,7 +2416,10 @@ async def sync_and_log_appointment(action: str, name: str, phone: str, date: str
                 "result": {"appointment_id": appointment_id, "status": status,
                            "reason": res.get("reason", ""),
                            "db_sync": "success" if res["success"] else "failed",
-                           "sheets_sync": "success" if sheets_success else "skipped"},
+                           # "queued": the Sheets mirror-write is no longer
+                           # awaited (it blocked the patient's confirmation),
+                           # so its real outcome isn't known at this point.
+                           "sheets_sync": "queued" if sheets_success else "skipped"},
             })
         except Exception:
             pass
@@ -2405,6 +2436,60 @@ _conversation_history: dict[str, list] = {}
 _ACTION_RE = re.compile(
     r'\[ACTION:\s*(BOOK|RESCHEDULE|CANCEL)\|(.*?)\|(.*?)\|(.*?)\|(.*?)\|(.*?)(?:\|(.*?))?\]'
 )
+
+# ANY [ACTION: ...]-shaped fragment, including malformed ones _ACTION_RE cannot
+# parse. Observed in production 2026-08-10: the model emitted a bare
+# "[ACTION: None]", which the strict regex ignored and which therefore leaked
+# into the patient's chat verbatim. Every user-facing reply is scrubbed with
+# this, not just the ones where a valid tag was found.
+_LOOSE_ACTION_RE = re.compile(r'\[ACTION:[^\]]*\]', re.IGNORECASE)
+
+# Phrases that promise a LATER message ("hold on", "I'll confirm shortly").
+#
+# This path is strictly request/response: one patient message in, one reply
+# out. There is no queue, no callback, no polling — nothing that can ever
+# deliver a promised follow-up. So a reply ending on one of these strands the
+# patient in a permanent "waiting to be confirmed" state.
+#
+# That is the exact 2026-08-10 production bug: the agent said "please hold on
+# for a moment while I complete your booking" / "I've sent the request, please
+# wait for a moment to confirm" and then went silent forever — in one case
+# even though the appointment row HAD been written successfully.
+_FOLLOWUP_PROMISE_PATTERNS = (
+    "hold on", "please hold", "one moment", "a moment", "a minute",
+    "bear with me", "please wait", "kindly wait", "shortly", "momentarily",
+    "i'll confirm", "i will confirm", "let me confirm", "let me check",
+    "i'm checking", "i am checking", "checking availability", "checking the availability",
+    "sent the request", "processing your", "working on it", "get back to you",
+    "इंतज़ार", "इंतजार", "प्रतीक्षा", "थोड़ा रुक", "एक मिनट",
+)
+
+
+def _promises_followup(text: str) -> bool:
+    """True if the reply tells the patient to wait for something that will
+    never arrive. False positives are safe here: the caller's response is to
+    substitute a deterministic, outcome-accurate reply, which is correct
+    either way."""
+    low = (text or "").lower()
+    return any(p in low for p in _FOLLOWUP_PROMISE_PATTERNS)
+
+
+def _scrub_reply(text: str) -> str:
+    """Strip machine tags (valid or malformed) out of anything shown to a patient."""
+    text = _LOOSE_ACTION_RE.sub("", text or "")
+    text = re.sub(r'\[BOOKING_RESULT[^\]]*\]', "", text)
+    return re.sub(r'[ \t]{2,}', ' ', text).strip()
+
+
+# Used when the model promised a follow-up, could not be repaired into either a
+# real action tag or a real question, and would otherwise leave the patient
+# waiting on silence. Asks for what is needed instead of promising anything.
+_NEEDS_DETAILS_REPLY = {
+    "en-IN": ("Sorry — could you confirm the doctor, and the date and time you'd like? "
+              "I'll book it as soon as you tell me."),
+    "hi-IN": ("क्षमा करें — कृपया बताइए किस डॉक्टर के साथ, और कौन सी तारीख़ और समय चाहिए? "
+              "बताते ही मैं बुक कर दूँगा।"),
+}
 
 
 async def _dispatch_llm(provider: str, api_key: str, system_prompt: str,
@@ -2477,6 +2562,13 @@ def _booking_result_message(action: str, res: dict) -> str:
         return (f"{BOOKING_RESULT_FALSE} No valid appointment TIME was given, so nothing was booked or "
                 "changed — never assume or invent a time. Do NOT say it was done. Ask the patient to state "
                 "the time again, e.g. '3 PM' or '11:30 AM'.")
+    if reason == "slot_taken":
+        alts = ", ".join(res.get("alternatives") or [])
+        offer = (f" That doctor IS still free at: {alts}. Offer those exact times and nothing else."
+                 if alts else " Ask the patient for a different day or time.")
+        return (f"{BOOKING_RESULT_FALSE} That exact time is ALREADY BOOKED for that doctor, so nothing was "
+                f"booked and the patient still has no appointment. Do NOT say it was done, and do NOT offer "
+                f"to retry the SAME time — it will fail again.{offer}")
     return (f"{BOOKING_RESULT_FALSE} The {verb} could NOT be saved due to a system error. Do NOT say it was "
             "done. Apologize briefly and offer to try again.")
 
@@ -2510,6 +2602,11 @@ def _deterministic_booking_reply(action: str, res: dict, user_language: str) -> 
                 "changed. Could you re-check those details?")
     if res.get("reason") == "invalid_time":
         return "I'm sorry, I didn't catch a clear time for that. Could you say it again, like '3 PM' or '11:30 AM'?"
+    if res.get("reason") == "slot_taken":
+        alts = ", ".join(res.get("alternatives") or [])
+        if alts:
+            return f"Sorry, that time was just taken. That doctor is still free at: {alts}. Which would you like?"
+        return "Sorry, that time is already booked. Could you pick a different day or time?"
     if res.get("reason") == "disabled":
         return "I'm sorry, I'm not able to do that here. Let me connect you with the clinic's staff."
     return "I'm sorry, I couldn't complete that just now, so nothing was changed. Would you like me to try again?"
@@ -2527,10 +2624,37 @@ async def _handle_booking_action(
     This is the chat/embed analogue of BookingProcessor: the premature phase-1
     text is discarded, so the patient only ever sees a reply produced AFTER the
     booking outcome is known.
+
+    Whatever happens, this returns a reply that RESOLVES the turn — success,
+    failure, or a question. It never returns a promise of a later message,
+    because this path is request/response and no later message can exist.
     """
     m = _ACTION_RE.search(response or "")
+
     if not m:
-        return response
+        # No parseable tag. If the model nonetheless told the patient to wait
+        # while it "completes the booking", the patient is about to be stranded
+        # on silence (the 2026-08-10 bug). Give the model exactly one strict
+        # chance to either emit the tag now or ask for what is missing.
+        if not _promises_followup(response):
+            return _scrub_reply(response)
+
+        logger.warning(
+            "Booking reply promised a follow-up with NO action tag — repairing "
+            "(the turn would otherwise end in permanent silence): %r", (response or "")[:160],
+        )
+        repaired = await _repair_missing_action_tag(
+            provider=provider, api_key=api_key, model=model, max_tokens=max_tokens,
+            base_system_prompt=base_system_prompt, history=history,
+        )
+        m = _ACTION_RE.search(repaired or "")
+        if not m:
+            cleaned = _scrub_reply(repaired or "")
+            # Only accept the repair if it actually stopped promising.
+            if cleaned and not _promises_followup(cleaned):
+                return cleaned
+            lang = (user_language or "en-IN").strip() or "en-IN"
+            return _NEEDS_DETAILS_REPLY.get(lang, _NEEDS_DETAILS_REPLY["en-IN"])
 
     g = m.groups()
     b_action = (g[0] or "").strip().upper()
@@ -2586,14 +2710,59 @@ async def _handle_booking_action(
     )
     try:
         final = await _dispatch_llm(provider, api_key, regen_system, history, model, max_tokens)
-        final = _ACTION_RE.sub("", final or "")
-        final = re.sub(r'\[BOOKING_RESULT[^\]]*\]', "", final).strip()
-        if final:
+        final = _scrub_reply(final)
+        # The reply must RESOLVE the outcome, not defer it. A model that
+        # ignores the injected [BOOKING_RESULT ...] and hedges ("I've sent the
+        # request, please wait to confirm") strands the patient exactly as if
+        # nothing had happened — and on 2026-08-10 it did that on a booking
+        # whose row had ALREADY been written successfully. The deterministic
+        # reply below is always outcome-accurate, so substituting it is strictly
+        # safer than trusting the model here.
+        if final and not _promises_followup(final):
             return final
+        if final:
+            logger.warning(
+                "Regenerated booking reply still promised a follow-up (success=%s) — "
+                "substituting the deterministic reply: %r",
+                res.get("success"), final[:160],
+            )
     except Exception as e:
         logger.error("Honest booking regeneration failed (%s) — using deterministic reply: %s", provider, e)
 
     return _deterministic_booking_reply(b_action, res, user_language)
+
+
+async def _repair_missing_action_tag(
+    *, provider: str, api_key: str, model: str, max_tokens: int,
+    base_system_prompt: str, history: list,
+) -> str:
+    """One strict re-prompt after the model promised to complete a booking but
+    emitted no [ACTION:] tag. Returns the model's second attempt (or "" on
+    error) — the caller decides whether it produced a usable tag.
+
+    This is a repair, not a retry loop: it runs at most once per turn, and only
+    on the path that would otherwise end in permanent silence.
+    """
+    repair_system = (
+        base_system_prompt
+        + "\n\n--- SYSTEM UPDATE (AUTHORITATIVE — obey exactly) ---\n"
+        "Your previous reply told the patient to wait while you completed their request, but you did NOT "
+        "emit an [ACTION: ...] tag — so NOTHING happened. This system can only reply to the patient's own "
+        "messages: there is no way to send them a follow-up later. A promise to confirm 'shortly' is a "
+        "promise that will never be kept.\n"
+        "Reply once more, choosing EXACTLY ONE of:\n"
+        "  (a) If you already have Name, Phone, Date (DD/MM/YYYY), Time and Doctor — output the correct "
+        "[ACTION: ...] tag NOW, at the end of one short neutral sentence.\n"
+        "  (b) If any of those details is missing — ask for the missing detail in ONE short question.\n"
+        "NEVER say 'hold on', 'please wait', 'one moment', 'I'll confirm shortly' or anything else implying "
+        "a later message.\n"
+        + BOOKING_RULES_BLOCK
+    )
+    try:
+        return await _dispatch_llm(provider, api_key, repair_system, history, model, max_tokens) or ""
+    except Exception as e:
+        logger.error("ACTION-tag repair pass failed (%s): %s", provider, e)
+        return ""
 
 
 async def generate_llm_response(
@@ -2744,7 +2913,12 @@ async def generate_llm_response(
         "   - [ACTION: BOOK|Name|Phone|Date|Time|Doctor|Notes]\n"
         "   - [ACTION: RESCHEDULE|Name|Phone|Date|Time|Doctor|Notes]\n"
         "   - [ACTION: CANCEL|Name|Phone|Date|Time|Doctor|Notes]\n"
-        "   (Use 'N/A' for fields that are not being changed.) The text before the tag must ask the patient to hold on for a moment while you complete it — it must NOT claim the action is already done.\n"
+        "   (Use 'N/A' for fields that are not being changed.) The text before the tag must NOT claim the action is already done.\n"
+        "   CRITICAL — the tag must be in the SAME message as that text. You cannot send the patient a "
+        "message later: this system only ever replies to a message they send. If you say 'hold on', "
+        "'please wait', 'one moment' or 'I'll confirm shortly' WITHOUT the tag, the patient is left waiting "
+        "on a reply that will never come. So: either emit the tag now, or ask for the detail you are still "
+        "missing — never promise to follow up.\n"
         "--- END MANDATORY INSTRUCTIONS ---\n"
     )
 

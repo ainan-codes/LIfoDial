@@ -19,7 +19,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-availability-tests")
 os.environ.setdefault("ENVIRONMENT", "development")
 
-from datetime import timedelta, time as time_cls
+from datetime import date as date_cls, datetime, timedelta, time as time_cls
 
 import pytest
 import pytest_asyncio
@@ -30,7 +30,13 @@ from backend.models.doctor import Doctor
 from backend.models.doctor_availability import DoctorAvailability
 from backend.models.appointment import Appointment
 from backend.services.availability import compute_available_slots, is_doctor_open_at
-from backend.services.timeutil import ist_now
+from backend.services.timeutil import ist_now, ist_wall_clock_to_utc
+
+
+# Tests that only care about slot ARITHMETIC use a fixed future date, so they
+# never depend on what time of day the suite happens to run. Only the
+# past-slot-filtering test below deliberately uses "today".
+FUTURE_DATE = date_cls.today() + timedelta(days=3)
 
 
 @pytest_asyncio.fixture
@@ -70,37 +76,37 @@ async def test_no_schedule_configured_returns_no_slots(db):
 @pytest.mark.asyncio
 async def test_slot_boundaries_within_a_window(db):
     tenant_id, doctor_id = await _make_tenant_and_doctor(db)
-    now = ist_now()
-    # A window that spans the rest of today, well clear of "now".
-    start = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0).time()
-    end = (now + timedelta(hours=3)).replace(minute=0, second=0, microsecond=0).time()
-    await _add_window(db, tenant_id, doctor_id, now.weekday(), start, end)
+    # A fixed window on a FUTURE date. Deliberately not "now + N hours": that
+    # rolls past midnight when the suite runs late in the IST evening, turning
+    # the window into a past one and silently yielding zero slots.
+    target = FUTURE_DATE
+    await _add_window(db, tenant_id, doctor_id, target.weekday(), time_cls(9, 0), time_cls(11, 0))
 
-    slots = await compute_available_slots(tenant_id, doctor_id, now.date())
-    # A 2-hour window in 30-min increments gives exactly 4 slots, and the
-    # last slot must END at (not start at) the window's end time.
+    slots = await compute_available_slots(tenant_id, doctor_id, target)
+    # A 2-hour window in 30-min increments gives exactly 4 slots: 9:00, 9:30,
+    # 10:00, 10:30 — the window's end time is never itself offered as a start.
     assert len(slots) == 4
     from backend.services.timeutil import to_ist
-    last_start_ist = to_ist(slots[-1])
-    assert (last_start_ist.hour, last_start_ist.minute) != (end.hour, end.minute), \
-        "the window's end time itself must never be offered as a slot START"
+    starts = [(to_ist(s).hour, to_ist(s).minute) for s in slots]
+    assert starts == [(9, 0), (9, 30), (10, 0), (10, 30)]
+    assert (11, 0) not in starts, "the window's end time must never be offered as a slot START"
 
 
 @pytest.mark.asyncio
 async def test_booked_slot_is_excluded_and_cancelled_slot_reopens(db):
     tenant_id, doctor_id = await _make_tenant_and_doctor(db)
-    now = ist_now()
-    await _add_window(db, tenant_id, doctor_id, now.weekday(), time_cls(0, 0), time_cls(23, 59))
+    target_date = FUTURE_DATE
+    await _add_window(db, tenant_id, doctor_id, target_date.weekday(), time_cls(9, 0), time_cls(17, 0))
 
-    slots = await compute_available_slots(tenant_id, doctor_id, now.date())
-    assert slots, "expected at least one future slot today"
+    slots = await compute_available_slots(tenant_id, doctor_id, target_date)
+    assert slots, "expected open slots on the target date"
     target = slots[0]
 
     async with db() as s:
         s.add(Appointment(tenant_id=tenant_id, doctor_id=doctor_id, slot_time=target, patient_phone="+911", status="confirmed"))
         await s.commit()
 
-    remaining = await compute_available_slots(tenant_id, doctor_id, now.date())
+    remaining = await compute_available_slots(tenant_id, doctor_id, target_date)
     assert target not in remaining
 
     async with db() as s:
@@ -108,7 +114,7 @@ async def test_booked_slot_is_excluded_and_cancelled_slot_reopens(db):
         appt.status = "cancelled"
         await s.commit()
 
-    reopened = await compute_available_slots(tenant_id, doctor_id, now.date())
+    reopened = await compute_available_slots(tenant_id, doctor_id, target_date)
     assert target in reopened
 
 
@@ -143,24 +149,28 @@ async def test_is_doctor_open_at_reason_vocabulary(db):
     is_open, reason = await is_doctor_open_at(tenant_id, "not-a-real-doctor", ist_now())
     assert (is_open, reason) == (False, "doctor_not_found")
 
-    now = ist_now()
-    is_open, reason = await is_doctor_open_at(tenant_id, doctor_id, now + timedelta(hours=1))
+    # Fixed future date + fixed window, so none of the assertions below depend
+    # on what time of day the suite runs.
+    target_date = FUTURE_DATE
+    at_10 = ist_wall_clock_to_utc(datetime.combine(target_date, time_cls(10, 0)))
+
+    is_open, reason = await is_doctor_open_at(tenant_id, doctor_id, at_10)
     assert (is_open, reason) == (False, "no_schedule_configured")
 
-    start = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0).time()
-    end = (now + timedelta(hours=2)).replace(minute=0, second=0, microsecond=0).time()
-    await _add_window(db, tenant_id, doctor_id, now.weekday(), start, end)
+    await _add_window(db, tenant_id, doctor_id, target_date.weekday(), time_cls(9, 0), time_cls(11, 0))
 
-    slots = await compute_available_slots(tenant_id, doctor_id, now.date())
-    assert slots
-    is_open, reason = await is_doctor_open_at(tenant_id, doctor_id, slots[0])
+    is_open, reason = await is_doctor_open_at(tenant_id, doctor_id, at_10)
     assert (is_open, reason) == (True, "ok")
 
-    # A time later the same day but outside [start, end) — asserted via a
-    # bounded offset rather than a fixed +N hours, since +N could roll past
-    # midnight into a day with no schedule at all (a different, also-valid
-    # "closed" reason) depending on when this test happens to run.
-    outside_same_day = end.hour < 22
-    if outside_same_day:
-        is_open, reason = await is_doctor_open_at(tenant_id, doctor_id, now.replace(hour=23, minute=0, second=0, microsecond=0))
-        assert (is_open, reason) == (False, "slot_taken_or_outside_hours")
+    # Inside the day, outside the configured window.
+    at_20 = ist_wall_clock_to_utc(datetime.combine(target_date, time_cls(20, 0)))
+    is_open, reason = await is_doctor_open_at(tenant_id, doctor_id, at_20)
+    assert (is_open, reason) == (False, "slot_taken_or_outside_hours")
+
+    # Inside the window but already taken.
+    async with db() as s:
+        s.add(Appointment(tenant_id=tenant_id, doctor_id=doctor_id, slot_time=at_10,
+                          patient_phone="+911", status="confirmed"))
+        await s.commit()
+    is_open, reason = await is_doctor_open_at(tenant_id, doctor_id, at_10)
+    assert (is_open, reason) == (False, "slot_taken_or_outside_hours")
