@@ -3180,7 +3180,19 @@ async def generate_llm_response(
                     "gemini": settings.gemini_api_key or os.getenv("GEMINI_API_KEY"),
                 }.get(fb_provider)
 
-                # Prefer DB key if present
+                # Prefer a DB key over the env one — but ONLY if it actually
+                # decrypts. get_key_raw() returns "" for a row stored under a
+                # different SECRET_KEY (decrypt_secret swallows InvalidToken),
+                # and assigning that unconditionally WIPES a perfectly good env
+                # key, so `if not fb_env: continue` below then skips the
+                # provider entirely.
+                #
+                # That is not hypothetical: production's api_key_configs row for
+                # groq decrypts to "" (verified 2026-08-10), which silently
+                # disabled Groq as a fallback target for every provider — and
+                # was why the gpt-oss same-model retry never ran. The primary
+                # key lookup above already has this precedence right; this is
+                # the same rule.
                 try:
                     res_fb = await db.execute(
                         select(ApiKeyConfig).where(
@@ -3190,7 +3202,14 @@ async def generate_llm_response(
                     )
                     fb_cfg = res_fb.scalars().first()
                     if fb_cfg and fb_cfg.api_key_enc:
-                        fb_env = fb_cfg.get_key_raw()
+                        db_key = fb_cfg.get_key_raw()
+                        if db_key:
+                            fb_env = db_key
+                        else:
+                            logger.warning(
+                                "api_key_configs row for %s does not decrypt — falling back to the "
+                                "environment key for this provider.", fb_provider,
+                            )
                 except Exception:
                     pass
 

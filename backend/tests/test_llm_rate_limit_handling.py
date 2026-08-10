@@ -159,6 +159,48 @@ async def test_rate_limit_retries_another_groq_model_before_switching_provider(s
     assert seen["model"] != "llama-3.3-70b-versatile"
 
 
+@pytest.mark.asyncio
+async def test_undecryptable_db_key_does_not_disable_the_fallback(seeded_db):
+    """Production had an api_key_configs row for groq whose ciphertext no
+    longer decrypts (get_key_raw() -> ""). The fallback loop assigned that over
+    the working env key, so `if not fb_env: continue` skipped Groq entirely —
+    silently disabling it as a fallback target for every provider."""
+    from backend.models.api_key_config import ApiKeyConfig
+
+    async with AsyncSessionLocal() as s:
+        row = ApiKeyConfig(provider="groq", category="llm", display_name="Groq", is_active=True)
+        # Must carry the real "fernet:" prefix: decrypt_secret only returns ""
+        # for a ciphertext it recognises but cannot open (a rotated SECRET_KEY).
+        # Anything else falls through its legacy base64 branch and is handed
+        # back verbatim — which is what production's dead row does NOT do.
+        row.api_key_enc = "fernet:this-will-not-decrypt"
+        s.add(row)
+        await s.commit()
+
+    seen = {}
+
+    async def boom(*a, **kw):
+        raise Exception(GROQ_TPD_ERROR)
+
+    async def ok_groq(api_key, system_prompt, history, model, **kw):
+        seen["key"] = api_key
+        seen["model"] = model
+        return "Sure — what time suits you?"
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=boom), \
+         patch.object(chat_mod, "call_groq", side_effect=ok_groq), \
+         patch.dict(os.environ, {"GROQ_API_KEY": "env-key-that-works"}), \
+         patch.object(chat_mod.settings, "groq_api_key", None):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            reply = await chat_mod.generate_llm_response(
+                agent, "9090909090", db, session_id="s-baddbkey", user_language="en-IN")
+
+    assert reply == "Sure — what time suits you?", "the dead DB row must not disable the fallback"
+    assert seen["key"] == "env-key-that-works", "should fall back to the environment key"
+    assert seen["model"] == "openai/gpt-oss-120b"
+
+
 def test_reasoning_models_get_room_to_think():
     """gpt-oss returns EMPTY content at the agents' normal max_tokens, because
     reasoning consumes the whole allowance — so the client must raise it."""
