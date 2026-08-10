@@ -544,10 +544,14 @@ class BookingProcessor(FrameProcessor):
         logger.info("Booking commit result injected: ok=%s slot=%s", ok, slot_time)
 
     def check_availability_allowed(self) -> bool:
-        """Gate for the 'Check Availability' tool toggle — offering a slot to
-        confirm is the live pipeline's only availability-check equivalent
-        (see _set_pending_doctor; real per-doctor scheduling data is not
-        wired here yet, matching the mocked his.get_slots())."""
+        """Gate for the 'Check Availability' tool toggle — it governs the
+        PROACTIVE check only (the arm-check in _handle_transcription step 3).
+
+        The pre-commit checks in _commit_and_inject_result, the reschedule
+        pre-check in _reschedule_slot_is_open, the gate inside
+        his.execute_booking_action and the DB unique index all run regardless:
+        those are data integrity, not a feature switch, and a clinic turning a
+        tool off must never turn into a fabricated or conflicting booking."""
         return self._agent_config.get("can_check_availability", True)
 
     # ── Cancel / reschedule of an EXISTING appointment ────────────────────────
@@ -594,6 +598,14 @@ class BookingProcessor(FrameProcessor):
             ready = bool(state["patient_name"])
 
         if ready and not state["action_awaiting_confirm"]:
+            # A reschedule is only armed once the NEW time is verified against
+            # the doctor's real schedule — the same is_doctor_open_at check the
+            # NEW-booking flow above does before arming. Without it the agent
+            # asked the caller to confirm a time it had never checked, and
+            # (before the pre-commit gate in his.execute_booking_action) would
+            # then have written it regardless. A cancel needs no such check.
+            if state["mode"] == "reschedule" and not await self._reschedule_slot_is_open():
+                return
             state["action_awaiting_confirm"] = True
             logger.info(
                 "Action '%s' ready for confirmation (name=%s, new_slot=%s %s).",
@@ -625,6 +637,68 @@ class BookingProcessor(FrameProcessor):
             state["new_slot_day"] = None
             state["new_slot_time"] = None
             return
+
+    async def _reschedule_slot_is_open(self) -> bool:
+        """True when the caller's requested NEW time is genuinely open on the
+        real schedule of the doctor their existing appointment is with.
+
+        Resolves the appointment first (his.find_active_appointment — the same
+        lookup the write itself uses), because a reschedule rarely names a
+        doctor: the calendar that matters is the one the appointment is already
+        on. On a miss, queues an [AVAILABILITY_NOTE] with that doctor's real
+        open times so the agent offers actual alternatives, and leaves the flow
+        un-armed so no confirmation can be asked for.
+
+        A lookup failure (no such appointment) does NOT block arming: the
+        commit path already reports "not found" honestly, and blocking here
+        would leave the caller with no explanation at all.
+        """
+        state = self.booking_state
+        tenant_id = self._tenant.get("id")
+        if not tenant_id or not state.get("new_slot_time"):
+            return False
+
+        try:
+            from backend.services.availability import is_doctor_open_at
+            from backend.services.his import find_active_appointment, parse_slot_datetime
+
+            existing = await find_active_appointment(
+                str(tenant_id), state.get("patient_name") or "",
+                state.get("patient_phone") or "",
+            )
+            if not existing:
+                logger.info(
+                    "Reschedule: no existing appointment found for '%s' — arming so the "
+                    "commit can report that honestly.", state.get("patient_name"),
+                )
+                return True
+
+            slot_utc = parse_slot_datetime(state.get("new_slot_day"), state.get("new_slot_time"))
+            is_open, reason = await is_doctor_open_at(
+                str(tenant_id), existing["doctor_id"], slot_utc,
+            )
+            if is_open:
+                return True
+
+            logger.info(
+                "Reschedule: requested new slot '%s %s' not open (reason=%s) — not arming confirmation.",
+                state.get("new_slot_day"), state.get("new_slot_time"), reason,
+            )
+            state["new_slot_time"] = None
+            state["new_slot_day"] = None
+            self._info_message = await _build_availability_note(
+                tenant_id=str(tenant_id),
+                doctor_id=existing["doctor_id"],
+                doctor_name=existing.get("doctor_name"),
+                slot_utc=slot_utc,
+                reason=reason,
+            )
+            return False
+        except Exception as exc:
+            # Never let a check failure strand the caller mid-flow: arm, and let
+            # the awaited pre-commit gate be the authority on whether it happens.
+            logger.error("Reschedule availability pre-check failed: %s", exc, exc_info=True)
+            return True
 
     def _extract_day_and_time(self, text: str) -> tuple[Optional[str], Optional[str]]:
         """Same recognizers as _try_extract_slot, but returned separately so a
@@ -672,7 +746,18 @@ class BookingProcessor(FrameProcessor):
         )
 
         context = getattr(frame, "context", None)
-        if ok:
+        reason = (result or {}).get("reason") or ""
+        if ok and reason == "already_at_that_time":
+            # Nothing moved, and nothing is wrong — but "rescheduled" would be a
+            # lie about a change that never happened.
+            state["action_confirmed"] = True
+            state["action_awaiting_confirm"] = False
+            msg = (
+                "[BOOKING_RESULT success=true] The caller's appointment was ALREADY at exactly that time "
+                f"(appointment id {result.get('appointment_id')}), so nothing needed to change. Tell them "
+                "in one short sentence that it is already at that time and still confirmed."
+            )
+        elif ok:
             state["action_confirmed"] = True
             state["action_awaiting_confirm"] = False
             verb = "cancelled" if mode == "cancel" else "rescheduled"
@@ -689,12 +774,36 @@ class BookingProcessor(FrameProcessor):
             # Re-arm so another "yes" retries.
             state["action_confirmed"] = False
             state["action_awaiting_confirm"] = True
-            if (result or {}).get("reason") == "not_found":
+            if reason == "not_found":
                 msg = (
                     f"[BOOKING_RESULT success=false] No appointment was found for that name and phone "
                     f"number, so nothing was changed. Do NOT say the {mode} is done. Ask the caller to "
                     "double-check the name the appointment was booked under, or offer to connect them "
                     "to the clinic's staff."
+                )
+            elif reason in ("slot_taken", "outside_hours", "slot_in_past", "slot_unavailable",
+                            "no_schedule", "doctor_unavailable"):
+                # The requested new time was refused by the availability engine.
+                # Clearing it (and standing the flow down) is what stops a
+                # repeated "yes" from retrying a time that can never succeed.
+                state["action_awaiting_confirm"] = False
+                state["new_slot_time"] = None
+                state["new_slot_day"] = None
+                alts = ", ".join((result or {}).get("alternatives") or [])
+                offer = (f" That doctor IS free at: {alts}. Offer those exact times and nothing else."
+                         if alts else " Ask the caller for a different day or time.")
+                msg = (
+                    f"[BOOKING_RESULT success=false] That time is NOT open on the doctor's real schedule, "
+                    f"so NOTHING changed and the existing appointment still stands at its original time. "
+                    f"Do NOT say the {mode} is done, and do NOT offer that same time again.{offer}"
+                )
+            elif reason == "invalid_time":
+                state["new_slot_time"] = None
+                state["new_slot_day"] = None
+                msg = (
+                    f"[BOOKING_RESULT success=false] No valid new TIME was given, so NOTHING changed and "
+                    f"the existing appointment still stands. Do NOT say the {mode} is done. Ask the caller "
+                    "to state the new time again, e.g. '3 PM' or '11:30 AM'."
                 )
             else:
                 msg = (
@@ -868,10 +977,13 @@ async def _commit_action_to_db(
             logger.warning("[BookingProcessor] %s failed: %s", action, result)
             return False, result
         logger.info(
-            "[BookingProcessor] %s committed: appointment_id=%s",
-            action, result.get("appointment_id"),
+            "[BookingProcessor] %s committed: appointment_id=%s reason=%s",
+            action, result.get("appointment_id"), result.get("reason") or "-",
         )
-        await _mark_call_action(call_record_id, action)
+        # A no-op reschedule succeeded without changing the appointment, so the
+        # call outcome must not be recorded as "rescheduled".
+        if result.get("reason") != "already_at_that_time":
+            await _mark_call_action(call_record_id, action)
         return True, result
     except Exception as exc:
         logger.error(

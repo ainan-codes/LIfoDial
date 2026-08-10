@@ -22,6 +22,8 @@ import os
 os.environ["ENVIRONMENT"] = "development"
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_chat_booking_honesty.db"
 
+from datetime import time as time_cls, timedelta
+
 import pytest
 import pytest_asyncio
 from unittest.mock import patch
@@ -31,15 +33,24 @@ import backend.db as db_mod
 from backend.db import AsyncSessionLocal, engine, Base
 from backend.models.tenant import Tenant
 from backend.models.doctor import Doctor
+from backend.models.doctor_availability import DoctorAvailability
 from backend.models.appointment import Appointment
 from backend.models.agent_config import AgentConfig
 from backend.agent.booking_rules import BOOKING_RESULT_TRUE, BOOKING_RESULT_FALSE
 from backend.routers import agent_test as chat_mod
+from backend.services.timeutil import ist_now
 
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
 AGENT_ID = "22222222-2222-2222-2222-222222222222"
 REAL_DOCTOR_ID = "33333333-3333-3333-3333-333333333333"
 REAL_DOCTOR_NAME = "Dr Anjali Sharma"
+
+# Every booking is now gated on the doctor's REAL schedule (the same
+# availability engine the voice path uses), so a bookable date has to be a
+# future one the seeded doctor actually has hours on — a hardcoded past date
+# is correctly refused now, which is the point of the gate.
+BOOK_DATE = ist_now().date() + timedelta(days=1)
+BOOK_DATE_STR = BOOK_DATE.strftime("%d/%m/%Y")
 
 
 @pytest_asyncio.fixture
@@ -53,6 +64,14 @@ async def seeded_db():
     async with AsyncSessionLocal() as s:
         s.add(Tenant(id=TENANT_ID, clinic_name="ZZZ Audit Clinic", admin_email="zzz_audit@example.com"))
         s.add(Doctor(id=REAL_DOCTOR_ID, tenant_id=TENANT_ID, name=REAL_DOCTOR_NAME, specialization="Cardiologist"))
+        # Real consulting hours, every day — without these the doctor has no
+        # schedule and NOTHING can be booked, which is exactly what the
+        # availability gate is for (see test_book_is_refused_when_the_doctor_
+        # has_no_hours_that_day).
+        for dow in range(7):
+            s.add(DoctorAvailability(tenant_id=TENANT_ID, doctor_id=REAL_DOCTOR_ID,
+                                     day_of_week=dow,
+                                     start_time=time_cls(0, 0), end_time=time_cls(23, 30)))
         s.add(AgentConfig(
             id=AGENT_ID, tenant_id=TENANT_ID, agent_name="Aster Bot",
             llm_provider="gemini", llm_model="gemini-2.5-flash",
@@ -61,6 +80,13 @@ async def seeded_db():
         ))
         await s.commit()
     chat_mod._conversation_history.clear()
+    # The availability digest is cached for 30s in-process; a stale entry
+    # would leak one test's schedule into the next.
+    chat_mod._avail_cache.clear()
+    # The doctor roster is cached in-process for an hour; a stale list would
+    # leak between tests (and into the availability block built for the prompt).
+    from backend.services.his import invalidate_doctor_cache
+    invalidate_doctor_cache(TENANT_ID)
     yield
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
@@ -92,7 +118,7 @@ async def test_chat_refuses_nonexistent_doctor(seeded_db):
                     f"We do have {REAL_DOCTOR_NAME} (Cardiologist). Who would you like to see?")
         # Phase 1 = model follows the ACTION RULE and emits a tag for a fake doctor.
         return ("One moment while I check that for you.\n"
-                "[ACTION: BOOK|John Doe|+919812345678|23/07/2026|3 PM|Dr Strange|N/A]")
+                f"[ACTION: BOOK|John Doe|+919812345678|{BOOK_DATE_STR}|3 PM|Dr Strange|N/A]")
 
     with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
          patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
@@ -129,7 +155,7 @@ async def test_chat_books_real_doctor_after_real_write(seeded_db):
             assert BOOKING_RESULT_TRUE in system_prompt, system_prompt[-400:]
             return f"You're all set — your appointment with {REAL_DOCTOR_NAME} is confirmed."
         return ("One moment while I book that.\n"
-                f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026|3 PM|{REAL_DOCTOR_NAME}|N/A]")
+                f"[ACTION: BOOK|John Doe|+919812345678|{BOOK_DATE_STR}|3 PM|{REAL_DOCTOR_NAME}|N/A]")
 
     with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
          patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
@@ -159,7 +185,7 @@ async def test_chat_respects_disabled_booking_flag(seeded_db):
             assert BOOKING_RESULT_FALSE in system_prompt
             assert "turned off" in system_prompt
             return "I'm sorry, I can't book appointments here. Let me connect you with our staff."
-        return ("Sure.\n[ACTION: BOOK|John Doe|+919812345678|23/07/2026|3 PM|" + REAL_DOCTOR_NAME + "|N/A]")
+        return (f"Sure.\n[ACTION: BOOK|John Doe|+919812345678|{BOOK_DATE_STR}|3 PM|" + REAL_DOCTOR_NAME + "|N/A]")
 
     with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
          patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
@@ -190,7 +216,7 @@ async def test_chat_refuses_booking_with_blank_time(seeded_db):
             return "I'm sorry, I didn't catch the time. Could you say it again?"
         # Correct date, BLANK time — the real production repro.
         return ("One moment while I book that.\n"
-                f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026||{REAL_DOCTOR_NAME}|N/A]")
+                f"[ACTION: BOOK|John Doe|+919812345678|{BOOK_DATE_STR}||{REAL_DOCTOR_NAME}|N/A]")
 
     captured = {}
     with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
@@ -223,7 +249,7 @@ async def test_chat_refuses_booking_with_na_time(seeded_db):
             captured["regen_system"] = system_prompt
             return "I'm sorry, I didn't catch the time. Could you say it again?"
         return ("One moment while I book that.\n"
-                f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026|N/A|{REAL_DOCTOR_NAME}|N/A]")
+                f"[ACTION: BOOK|John Doe|+919812345678|{BOOK_DATE_STR}|N/A|{REAL_DOCTOR_NAME}|N/A]")
 
     captured = {}
     with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
@@ -250,7 +276,7 @@ async def test_chat_still_books_with_a_real_time(seeded_db):
             assert BOOKING_RESULT_TRUE in system_prompt, system_prompt[-400:]
             return f"You're all set — your appointment with {REAL_DOCTOR_NAME} is confirmed."
         return ("One moment while I book that.\n"
-                f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026|3 PM|{REAL_DOCTOR_NAME}|N/A]")
+                f"[ACTION: BOOK|John Doe|+919812345678|{BOOK_DATE_STR}|3 PM|{REAL_DOCTOR_NAME}|N/A]")
 
     with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
          patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
@@ -279,9 +305,17 @@ def test_promises_followup_detector():
     assert _promises_followup("please hold on for a moment while I complete your booking") is True
     assert _promises_followup("I've sent the request, please wait for a moment to confirm") is True
     assert _promises_followup("Let me check the availability for you") is True
+    # The 2026-08-11 reschedule variant: no "wait", but just as stranding.
+    assert _promises_followup("Yes, proceeding with the change.") is True
+    assert _promises_followup("Sure, I'll go ahead and move it.") is True
+    assert _promises_followup("Your reschedule is being processed.") is True
     # Resolved replies must NOT trip it.
     assert _promises_followup("Your appointment with Dr Sharma is confirmed for 3 PM.") is False
     assert _promises_followup("Which doctor would you like to see?") is False
+    # Asking for confirmation is a legitimate, resolving question — the word
+    # "proceed" here must not be mistaken for "proceeding".
+    assert _promises_followup(
+        "Just to confirm, you'd like 3 PM with Dr Sharma? Reply yes to proceed.") is False
 
 
 def test_scrub_reply_strips_malformed_action_tags():
@@ -305,7 +339,7 @@ async def test_no_tag_but_promised_followup_is_repaired_into_a_real_booking(seed
         if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt and "did NOT" in system_prompt:
             # The repair pass — model now emits the tag it forgot.
             return ("Booking that now.\n"
-                    f"[ACTION: BOOK|Ramesh Kumar|9845012345|23/07/2026|2 PM|{REAL_DOCTOR_NAME}|N/A]")
+                    f"[ACTION: BOOK|Ramesh Kumar|9845012345|{BOOK_DATE_STR}|2 PM|{REAL_DOCTOR_NAME}|N/A]")
         if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
             return f"Your appointment with {REAL_DOCTOR_NAME} is confirmed."
         # Phase 1: the broken promise, verbatim from production.
@@ -339,7 +373,7 @@ async def test_successful_write_never_replies_with_please_wait(seeded_db):
             # Model ignores the injected success and hedges anyway.
             return "I've sent the request, please wait for a moment to confirm"
         return ("Okay.\n"
-                f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026|3 PM|{REAL_DOCTOR_NAME}|N/A]")
+                f"[ACTION: BOOK|John Doe|+919812345678|{BOOK_DATE_STR}|3 PM|{REAL_DOCTOR_NAME}|N/A]")
 
     with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
          patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
@@ -365,7 +399,7 @@ async def test_claiming_booked_with_no_tag_is_never_shown_to_the_patient(seeded_
     async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
         if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt and "NOTHING happened" in system_prompt:
             # Repair pass: model now emits the tag it should have emitted.
-            return f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026|3 PM|{REAL_DOCTOR_NAME}|N/A]"
+            return f"[ACTION: BOOK|John Doe|+919812345678|{BOOK_DATE_STR}|3 PM|{REAL_DOCTOR_NAME}|N/A]"
         if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
             return f"Your appointment with {REAL_DOCTOR_NAME} is confirmed."
         # Phase 1: fabricated confirmation, no tag.
@@ -428,19 +462,6 @@ async def test_double_booking_reports_conflict_with_real_alternatives(seeded_db)
     """A conflict used to fall through to the generic 'system error… try
     again?' message — wrong, and an infinite retry loop, since retrying the
     same slot can never succeed."""
-    from datetime import time as time_cls
-    from backend.models.doctor_availability import DoctorAvailability
-    from backend.services.timeutil import ist_now
-
-    # Give the doctor real hours today so alternatives can be computed.
-    today = ist_now().date()
-    async with AsyncSessionLocal() as s:
-        s.add(DoctorAvailability(tenant_id=TENANT_ID, doctor_id=REAL_DOCTOR_ID,
-                                 day_of_week=today.weekday(),
-                                 start_time=time_cls(0, 0), end_time=time_cls(23, 30)))
-        await s.commit()
-
-    date_str = today.strftime("%d/%m/%Y")
     captured = {}
 
     async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
@@ -448,7 +469,7 @@ async def test_double_booking_reports_conflict_with_real_alternatives(seeded_db)
             captured["regen_system"] = system_prompt
             return "Sorry, that time is taken."
         return ("Okay.\n"
-                f"[ACTION: BOOK|John Doe|+919812345678|{date_str}|11:30 PM|{REAL_DOCTOR_NAME}|N/A]")
+                f"[ACTION: BOOK|John Doe|+919812345678|{BOOK_DATE_STR}|11:00 PM|{REAL_DOCTOR_NAME}|N/A]")
 
     with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
          patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
@@ -456,11 +477,11 @@ async def test_double_booking_reports_conflict_with_real_alternatives(seeded_db)
             agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
             # First booking claims the slot.
             await chat_mod.generate_llm_response(
-                agent, "Book 11:30 PM.", db, session_id="s-first", user_language="en-IN")
+                agent, "Book 11 PM.", db, session_id="s-first", user_language="en-IN")
             assert len(await _appointments()) == 1
             # Second booking hits the same doctor+slot.
             reply = await chat_mod.generate_llm_response(
-                agent, "Book 11:30 PM.", db, session_id="s-second", user_language="en-IN")
+                agent, "Book 11 PM.", db, session_id="s-second", user_language="en-IN")
 
     # No double-booking, and the conflict was reported AS a conflict.
     assert len(await _appointments()) == 1
@@ -468,6 +489,50 @@ async def test_double_booking_reports_conflict_with_real_alternatives(seeded_db)
     update = update.split("--- APPOINTMENT BOOKING RULES", 1)[0]
     assert "ALREADY BOOKED" in update
     assert "do NOT offer to retry the SAME time" in update.lower() or "retry the same time" in update.lower()
+    assert not chat_mod._promises_followup(reply)
+
+
+@pytest.mark.asyncio
+async def test_book_is_refused_when_the_doctor_has_no_hours_that_day(seeded_db):
+    """A deliberate behaviour change: the chat path used to write an appointment
+    for any time at all, because it never consulted the doctor's schedule. It is
+    now gated on the same engine as the voice path, so a doctor with no
+    configured hours for that day cannot be booked — and the patient is told
+    why, rather than being handed a confirmation for a slot that does not
+    exist."""
+    from backend.models.doctor_availability import DoctorAvailability
+    from sqlalchemy import delete
+
+    target = ist_now().date() + timedelta(days=2)
+    async with AsyncSessionLocal() as s:
+        await s.execute(delete(DoctorAvailability).where(
+            DoctorAvailability.doctor_id == REAL_DOCTOR_ID,
+            DoctorAvailability.day_of_week == target.weekday(),
+        ))
+        await s.commit()
+    chat_mod._avail_cache.clear()
+
+    captured = {}
+
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
+            captured["regen_system"] = system_prompt
+            return "Sorry, the doctor doesn't consult that day. Could you pick another?"
+        return ("Okay.\n"
+                f"[ACTION: BOOK|John Doe|+919812345678|{target.strftime('%d/%m/%Y')}|3 PM|"
+                f"{REAL_DOCTOR_NAME}|N/A]")
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            reply = await chat_mod.generate_llm_response(
+                agent, "Book 3 PM that day.", db, session_id="s-nohours", user_language="en-IN")
+
+    assert await _appointments() == [], "no schedule means no bookable slot"
+    update = captured["regen_system"]
+    assert BOOKING_RESULT_FALSE in update
+    assert "no consulting hours" in update
     assert not chat_mod._promises_followup(reply)
 
 
@@ -493,7 +558,7 @@ async def test_successful_write_reported_as_a_question_is_replaced(seeded_db):
         if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
             return "To confirm, you are John Doe and you want Dr Sharma at three PM, is that right?"
         return ("Okay.\n"
-                f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026|3 PM|{REAL_DOCTOR_NAME}|N/A]")
+                f"[ACTION: BOOK|John Doe|+919812345678|{BOOK_DATE_STR}|3 PM|{REAL_DOCTOR_NAME}|N/A]")
 
     with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
          patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
@@ -520,7 +585,7 @@ async def test_book_with_placeholder_name_and_phone_is_refused(seeded_db):
             captured["regen_system"] = system_prompt
             return "Could you tell me your name and phone number?"
         return ("Booking that now.\n"
-                f"[ACTION: BOOK|N/A|N/A|23/07/2026|2 PM|{REAL_DOCTOR_NAME}|N/A]")
+                f"[ACTION: BOOK|N/A|N/A|{BOOK_DATE_STR}|2 PM|{REAL_DOCTOR_NAME}|N/A]")
 
     with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
          patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):

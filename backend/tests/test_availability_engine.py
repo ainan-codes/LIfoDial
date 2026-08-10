@@ -162,10 +162,19 @@ async def test_is_doctor_open_at_reason_vocabulary(db):
     is_open, reason = await is_doctor_open_at(tenant_id, doctor_id, at_10)
     assert (is_open, reason) == (True, "ok")
 
-    # Inside the day, outside the configured window.
+    # Inside the day, outside the configured window. Distinct from a slot that
+    # is inside the hours but already taken (below) — the agent says something
+    # completely different for each, so they must not share one reason.
     at_20 = ist_wall_clock_to_utc(datetime.combine(target_date, time_cls(20, 0)))
     is_open, reason = await is_doctor_open_at(tenant_id, doctor_id, at_20)
-    assert (is_open, reason) == (False, "slot_taken_or_outside_hours")
+    assert (is_open, reason) == (False, "outside_hours")
+
+    # A time inside the hours that has already gone by.
+    past_date = ist_now().date() - timedelta(days=1)
+    await _add_window(db, tenant_id, doctor_id, past_date.weekday(), time_cls(9, 0), time_cls(11, 0))
+    yesterday_10 = ist_wall_clock_to_utc(datetime.combine(past_date, time_cls(10, 0)))
+    is_open, reason = await is_doctor_open_at(tenant_id, doctor_id, yesterday_10)
+    assert (is_open, reason) == (False, "in_the_past")
 
     # Inside the window but already taken.
     async with db() as s:
@@ -173,4 +182,4 @@ async def test_is_doctor_open_at_reason_vocabulary(db):
                           patient_phone="+911", status="confirmed"))
         await s.commit()
     is_open, reason = await is_doctor_open_at(tenant_id, doctor_id, at_10)
-    assert (is_open, reason) == (False, "slot_taken_or_outside_hours")
+    assert (is_open, reason) == (False, "slot_taken")

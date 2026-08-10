@@ -2384,8 +2384,10 @@ async def sync_and_log_appointment(action: str, name: str, phone: str, date: str
 
     # Log to Sheets ONLY when the appointment really changed. Logging a failed or
     # fabricated booking would recreate the exact inconsistency this fix removes.
+    # "already_at_that_time" succeeds without changing anything, so it must not
+    # add a row either.
     sheets_success = False
-    if res["success"]:
+    if res["success"] and res.get("reason") != "already_at_that_time":
         # Fire-and-forget. This is an external HTTP call with a 10s timeout and
         # it used to be AWAITED inside the patient's request — up to 10 extra
         # seconds of "please hold on" before they were told their booking had
@@ -2433,8 +2435,18 @@ async def sync_and_log_appointment(action: str, name: str, phone: str, date: str
 _conversation_history: dict[str, list] = {}
 
 # Matches the [ACTION: BOOK|Name|Phone|Date|Time|Doctor|Notes] tag the LLM emits.
+#
+# Whitespace is tolerated everywhere the model actually puts it. Production
+# 2026-08-11 (Indiana Hospital): the model emitted
+#   "[ ACTION: RESCHEDULE|Ainan|9090909090|11/08/2026|03:00 PM|Rajesh|N/A ]"
+# — a space after the opening bracket. The old pattern required "[ACTION"
+# adjacently, so it did not match, NOTHING was executed, and (because the
+# loose scrubber below had the same gap) the raw tag was shown to the patient
+# verbatim. Both are now whitespace- and case-tolerant; the fields themselves
+# are .strip()ed by the caller.
 _ACTION_RE = re.compile(
-    r'\[ACTION:\s*(BOOK|RESCHEDULE|CANCEL)\|(.*?)\|(.*?)\|(.*?)\|(.*?)\|(.*?)(?:\|(.*?))?\]'
+    r'\[\s*ACTION\s*:\s*(BOOK|RESCHEDULE|CANCEL)\s*\|(.*?)\|(.*?)\|(.*?)\|(.*?)\|(.*?)(?:\|(.*?))?\]',
+    re.IGNORECASE,
 )
 
 # ANY [ACTION: ...]-shaped fragment, including malformed ones _ACTION_RE cannot
@@ -2442,7 +2454,16 @@ _ACTION_RE = re.compile(
 # "[ACTION: None]", which the strict regex ignored and which therefore leaked
 # into the patient's chat verbatim. Every user-facing reply is scrubbed with
 # this, not just the ones where a valid tag was found.
-_LOOSE_ACTION_RE = re.compile(r'\[ACTION\b[^\]]*\]', re.IGNORECASE)
+_LOOSE_ACTION_RE = re.compile(r'\[\s*ACTION\b[^\]]*\]', re.IGNORECASE)
+
+# A machine tag whose closing bracket never arrived — the model ran into the
+# max_tokens cap mid-tag, or stopped early. There is no valid patient-facing
+# text that starts "[ACTION"/"[BOOKING_RESULT" and never closes, so the whole
+# tail is dropped rather than spoken.
+_TRUNCATED_TAG_RE = re.compile(
+    r'\[\s*(?:ACTION|BOOKING_RESULT|AVAILABILITY_NOTE)\b[^\]]*$',
+    re.IGNORECASE,
+)
 
 # Phrases that promise a LATER message ("hold on", "I'll confirm shortly").
 #
@@ -2461,6 +2482,16 @@ _FOLLOWUP_PROMISE_PATTERNS = (
     "i'll confirm", "i will confirm", "let me confirm", "let me check",
     "i'm checking", "i am checking", "checking availability", "checking the availability",
     "sent the request", "processing your", "working on it", "get back to you",
+    # "The action is underway" — the same stranding without the word "wait".
+    # Measured live 2026-08-11 on a reschedule: asked "is it done?", the model
+    # replied "Yes, proceeding with the change." and emitted no tag, so nothing
+    # happened and the patient was told it was in progress forever. Note these
+    # must NOT match "please reply yes to proceed", which is a legitimate
+    # question — hence "proceeding", not "proceed".
+    "proceeding", "going ahead", "i'll go ahead", "i will go ahead",
+    "doing that now", "i'll do that now", "i will do that now",
+    "making that change", "making the change", "updating your appointment",
+    "changing your appointment", "in progress", "being processed",
     "इंतज़ार", "इंतजार", "प्रतीक्षा", "थोड़ा रुक", "एक मिनट",
 )
 
@@ -2528,10 +2559,24 @@ def _claims_any_completion(text: str) -> bool:
 
 
 def _scrub_reply(text: str) -> str:
-    """Strip machine tags (valid or malformed) out of anything shown to a patient."""
+    """Strip machine tags (valid, malformed, or truncated) out of anything shown
+    to a patient. Every user-facing string on this path passes through here."""
     text = _LOOSE_ACTION_RE.sub("", text or "")
-    text = re.sub(r'\[BOOKING_RESULT[^\]]*\]', "", text)
+    text = re.sub(r'\[\s*BOOKING_RESULT[^\]]*\]', "", text, flags=re.IGNORECASE)
+    text = re.sub(r'\[\s*AVAILABILITY_NOTE[^\]]*\]', "", text, flags=re.IGNORECASE)
+    text = _TRUNCATED_TAG_RE.sub("", text)
     return re.sub(r'[ \t]{2,}', ' ', text).strip()
+
+
+def _is_only_a_tag(text: str) -> bool:
+    """True if the model's whole reply was machine tag(s) and nothing else.
+
+    Scrubbing such a reply yields "" — and an empty chat bubble tells the
+    patient nothing at all, which is the same dead end as leaking the tag. The
+    2026-08-11 production reply was exactly this: a bare
+    "[ ACTION: RESCHEDULE|…]" with no prose around it.
+    """
+    return bool((text or "").strip()) and not _scrub_reply(text)
 
 
 # Used when the model promised a follow-up, could not be repaired into either a
@@ -2543,6 +2588,199 @@ _NEEDS_DETAILS_REPLY = {
     "hi-IN": ("क्षमा करें — कृपया बताइए किस डॉक्टर के साथ, और कौन सी तारीख़ और समय चाहिए? "
               "बताते ही मैं बुक कर दूँगा।"),
 }
+
+
+# Relative-day words the patient may use, mapped to an offset from today (IST).
+# Weekday names are handled separately (next occurrence of that weekday).
+_RELATIVE_DAYS: dict[str, int] = {
+    "today": 0, "tonight": 0, "aaj": 0,
+    "tomorrow": 1, "tmrw": 1, "kal": 1,
+    "day after tomorrow": 2, "parso": 2,
+}
+_WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday",
+                  "friday", "saturday", "sunday")
+
+# How much real availability data goes into one prompt. Bounded because each
+# extra doctor/day is real DB work inside the patient's reply latency, and a
+# 40-line slot dump also buries the instruction that follows it.
+#
+# The slot cap is deliberately high enough to cover a normal full clinic day
+# (24 × 30 minutes = 12 hours): a truncated list reads to the model as the
+# WHOLE day, and it then tells the patient a genuinely free time is
+# unavailable. Measured live 2026-08-11 with a cap of 8 — Dr Rajesh consults
+# 09:00–17:00 and the agent refused a 3 PM reschedule that was open.
+_AVAIL_MAX_DOCTORS = 3
+_AVAIL_MAX_DAYS = 2
+_AVAIL_MAX_SLOTS_SHOWN = 24
+
+# Short-lived cache of the computed digest, keyed by (tenant, doctors, dates).
+# Every turn of a conversation asks about the same doctor and day, and a DB
+# session costs a full Supabase handshake (~1.7s under NullPool), so without
+# this the block would add that to each reply. 30s is deliberately short: a
+# slot someone else took in the meantime can only ever make the agent OFFER a
+# stale time, never book one — the pre-write gate in
+# his.execute_booking_action is always computed fresh.
+_AVAIL_CACHE_TTL = 30.0
+_avail_cache: dict[tuple, tuple[float, dict]] = {}
+
+
+async def _cached_digest(tenant_id: str, doctor_ids: list[str], dates: list):
+    from backend.services.availability import availability_digest
+
+    key = (tenant_id, tuple(sorted(doctor_ids)), tuple(dates))
+    hit = _avail_cache.get(key)
+    now = time.time()
+    if hit and now - hit[0] < _AVAIL_CACHE_TTL:
+        return hit[1]
+
+    digest = await availability_digest(tenant_id, doctor_ids, dates)
+    _avail_cache[key] = (now, digest)
+    if len(_avail_cache) > 256:
+        for stale in [k for k, (ts, _) in _avail_cache.items()
+                      if now - ts >= _AVAIL_CACHE_TTL]:
+            _avail_cache.pop(stale, None)
+    return digest
+
+
+def _dates_mentioned(text: str):
+    """IST dates the patient's words refer to, in the order found.
+
+    Recognises the same relative-day words and DD/MM/YYYY-style dates the
+    booking tag itself uses, so the availability we look up is for the day
+    actually being discussed rather than always today.
+    """
+    from backend.services.his import _DATE_FORMATS
+    from backend.services.timeutil import ist_now
+    import datetime as _dt
+
+    low = (text or "").lower()
+    today = ist_now().date()
+    found: list = []
+
+    def _add(d):
+        if d not in found:
+            found.append(d)
+
+    # Longest phrases first so "day after tomorrow" is not read as "tomorrow".
+    for word in sorted(_RELATIVE_DAYS, key=len, reverse=True):
+        if word.strip() and word.strip() in low:
+            _add(today + _dt.timedelta(days=_RELATIVE_DAYS[word]))
+
+    for idx, name in enumerate(_WEEKDAY_NAMES):
+        if name in low:
+            ahead = (idx - today.weekday()) % 7 or 7
+            _add(today + _dt.timedelta(days=ahead))
+
+    for token in re.findall(r'\b\d{1,4}[/-]\d{1,2}[/-]\d{2,4}\b', text or ""):
+        for fmt in _DATE_FORMATS:
+            try:
+                _add(_dt.datetime.strptime(token, fmt).date())
+                break
+            except ValueError:
+                continue
+
+    return found
+
+
+async def _real_availability_block(agent: AgentConfig, user_message: str, history: list) -> str:
+    """The clinic's REAL doctor roster and REAL open slots, as a prompt block.
+
+    The chat/embed path had NOTHING like this: its prompt carried the system
+    prompt and the knowledge base only, so when a patient asked "what times
+    are free with Dr Rajesh tomorrow?" the model had no data, stalled ("let me
+    check…", which this path can never follow up on) and then admitted it did
+    not know — while still going on to confirm a specific time. Now the same
+    availability engine new bookings are validated against
+    (services/availability.py) supplies the answer before the model speaks.
+
+    Best-effort: any failure returns "" and the turn proceeds without it. The
+    hard guarantee that an unavailable slot is never booked lives in
+    his.execute_booking_action's pre-write gate, not here.
+    """
+    try:
+        from backend.services.his import get_doctors
+        from backend.services.timeutil import format_ist_clock, ist_now, to_ist
+
+        tenant_id = str(agent.tenant_id)
+        doctors = await get_doctors(tenant_id)
+        if not doctors:
+            return (
+                "\n\n--- DOCTORS AT THIS CLINIC ---\n"
+                "No doctors have been added to this clinic yet, so you CANNOT book, "
+                "reschedule or confirm an appointment with a named doctor. Offer to take "
+                "the patient's details for the clinic to call back, and never invent a "
+                "doctor's name or an available time.\n"
+                "--- END DOCTORS AT THIS CLINIC ---\n"
+            )
+
+        # Which days? Exactly the ones being discussed; today + tomorrow only
+        # when nothing specific was said, so a patient who asks "what's free?"
+        # still gets real numbers. Listing extra days would only spend tokens
+        # and dilute the day that is actually under discussion.
+        recent = " ".join(
+            [user_message or ""]
+            + [str(m.get("content") or "") for m in (history or [])[-3:]]
+        )
+        today = ist_now().date()
+        import datetime as _dt
+        dates = _dates_mentioned(recent)[:_AVAIL_MAX_DAYS] or [
+            today, today + _dt.timedelta(days=1),
+        ]
+
+        # Which doctors? The ones named in the conversation, else the roster.
+        low = recent.lower()
+        def _mentioned(doc: dict) -> bool:
+            words = [w for w in (doc.get("name") or "").lower().split() if len(w) > 2]
+            words += [w for w in (doc.get("specialization") or "").lower().split() if len(w) > 2]
+            return any(w in low for w in words)
+
+        named = [d for d in doctors if _mentioned(d)]
+        chosen = (named or doctors)[:_AVAIL_MAX_DOCTORS]
+        bookable = [d for d in chosen if d.get("is_available", True)]
+
+        digest = await _cached_digest(tenant_id, [d["id"] for d in bookable], dates)
+
+        lines = [f"Today is {today.strftime('%A, %d/%m/%Y')} (IST). All times are IST."]
+        lines.append("Doctors at this clinic:")
+        for d in doctors:
+            label = f"  - {d['name']} ({d.get('specialization') or 'Specialist'})"
+            if not d.get("is_available", True):
+                reason = f" — {d['leave_reason']}" if d.get("leave_reason") else ""
+                label += f" — ON LEAVE{reason}, cannot be booked"
+            lines.append(label)
+
+        lines.append("Real open appointment slots (already excludes booked times):")
+        for d in bookable:
+            for day in dates:
+                slots = digest.get((str(d["id"]), day)) or []
+                when = day.strftime("%A %d/%m/%Y")
+                if not slots:
+                    lines.append(f"  - {d['name']}, {when}: NO open slots — do not offer any time that day.")
+                    continue
+                shown = [format_ist_clock(to_ist(s)) for s in slots[:_AVAIL_MAX_SLOTS_SHOWN]]
+                extra = len(slots) - len(shown)
+                lines.append(
+                    f"  - {d['name']}, {when}: " + ", ".join(shown)
+                    + (f", and {extra} further slots after that (this list was cut short — "
+                       "do NOT tell the patient a later time is unavailable)" if extra > 0 else "")
+                )
+
+        return (
+            "\n\n--- REAL DOCTOR AVAILABILITY (live from this clinic's schedule) ---\n"
+            + "\n".join(lines)
+            + "\n--- END REAL DOCTOR AVAILABILITY ---\n"
+            "This section is the ONLY source of truth for what is free. When the patient asks "
+            "what is available, answer with these exact times immediately — never say you will "
+            "check and get back to them, because you cannot send a later message. Only offer "
+            "times listed above for that doctor and that day, and if they ask for a listed day "
+            "at a time that is NOT listed, say plainly that it is taken and offer the listed "
+            "times instead. For a day not covered above, just ask them to confirm the day — the "
+            "system checks every time against the real schedule before anything is saved, so "
+            "never guess and never invent a time.\n"
+        )
+    except Exception as e:
+        logger.warning("Could not build the real availability block: %s", e, exc_info=True)
+        return ""
 
 
 async def _dispatch_llm(provider: str, api_key: str, system_prompt: str,
@@ -2584,6 +2822,14 @@ def _booking_result_message(action: str, res: dict) -> str:
     action = (action or "").upper()
     verb = {"BOOK": "booking", "RESCHEDULE": "reschedule",
             "CANCEL": "cancellation"}.get(action, "request")
+    # Checked before the generic success branch: the appointment IS at the
+    # requested time (so the patient's goal holds and success is true), but
+    # saying "rescheduled" would imply a change that did not happen.
+    if res.get("reason") == "already_at_that_time":
+        return (f"{BOOKING_RESULT_TRUE} The patient's appointment was ALREADY at exactly that time "
+                f"(appointment id {res.get('appointment_id')}), so nothing needed to change and nothing "
+                "was lost. Tell them in ONE short sentence that their appointment is already at that time "
+                "and is still confirmed.")
     if res.get("success"):
         detail = f" (appointment id {res.get('appointment_id')}"
         if res.get("doctor_name"):
@@ -2617,16 +2863,47 @@ def _booking_result_message(action: str, res: dict) -> str:
                 "the time again, e.g. '3 PM' or '11:30 AM'.")
     if reason == "missing_details":
         need = " and ".join(res.get("missing") or ["the patient's details"])
+        if action in ("RESCHEDULE", "CANCEL"):
+            return (f"{BOOKING_RESULT_FALSE} NOTHING was changed and the existing appointment is untouched: "
+                    f"an appointment can only be found by the patient's name AND phone number, and you have "
+                    f"not collected their {need} yet. Do NOT say it was done, and do NOT tell them no "
+                    f"appointment exists. Ask the patient for their {need} in one short question.")
         return (f"{BOOKING_RESULT_FALSE} NOTHING was booked: you have not collected the patient's {need} "
                 f"yet, and an appointment without it could never be found again to cancel or reschedule. "
                 f"Do NOT say it was done. Ask the patient for their {need} in one short question.")
-    if reason == "slot_taken":
+    # ── Pre-write availability gate (his._availability_gate) ──────────────────
+    # BOOK and RESCHEDULE are both checked against the doctor's real schedule
+    # BEFORE anything is written, so the patient can be told the specific truth
+    # rather than a generic "system error" — or, worse, a confirmation.
+    unchanged = ("nothing was booked and the patient still has no appointment"
+                 if action == "BOOK" else
+                 "NOTHING changed and the existing appointment still stands at its original time")
+    if reason in ("slot_taken", "outside_hours", "slot_in_past", "slot_unavailable"):
         alts = ", ".join(res.get("alternatives") or [])
-        offer = (f" That doctor IS still free at: {alts}. Offer those exact times and nothing else."
+        who = res.get("doctor_name") or "That doctor"
+        offer = (f" {who} IS free at: {alts}. Offer those exact times and nothing else."
                  if alts else " Ask the patient for a different day or time.")
-        return (f"{BOOKING_RESULT_FALSE} That exact time is ALREADY BOOKED for that doctor, so nothing was "
-                f"booked and the patient still has no appointment. Do NOT say it was done, and do NOT offer "
+        if reason == "slot_taken":
+            what = "That exact time is ALREADY BOOKED for that doctor"
+        elif reason == "outside_hours":
+            what = f"{who} does not consult at that time — it is outside their hours that day"
+        elif reason == "slot_in_past":
+            what = "That time has already passed"
+        else:
+            what = "That time is not open on that doctor's real schedule"
+        return (f"{BOOKING_RESULT_FALSE} {what}, so {unchanged}. Do NOT say it was done, and do NOT offer "
                 f"to retry the SAME time — it will fail again.{offer}")
+    if reason == "no_schedule":
+        who = res.get("doctor_name") or "that doctor"
+        return (f"{BOOKING_RESULT_FALSE} {who} has no consulting hours set for that day, so NOTHING was "
+                f"{verb}d and the appointment is UNCHANGED. Do NOT say it was done. Tell the patient that "
+                "doctor does not have hours that day, ask them for a different day, or offer to connect "
+                "them to the clinic's staff.")
+    if reason == "doctor_unavailable":
+        who = res.get("doctor_name") or "That doctor"
+        return (f"{BOOKING_RESULT_FALSE} {who} is currently ON LEAVE, so NOTHING was {verb}d and the "
+                f"appointment is UNCHANGED. Do NOT say it was done. Tell the patient that doctor is not "
+                "available and offer another doctor at this clinic.")
     return (f"{BOOKING_RESULT_FALSE} The {verb} could NOT be saved due to a system error. Do NOT say it was "
             "done. Apologize briefly and offer to try again.")
 
@@ -2647,6 +2924,8 @@ _SUCCESS_FALLBACKS = {
 
 def _deterministic_booking_reply(action: str, res: dict, user_language: str) -> str:
     lang = (user_language or "en-IN").strip() or "en-IN"
+    if res.get("reason") == "already_at_that_time":
+        return "Your appointment is already at that time, and it's still confirmed."
     if res.get("success"):
         table = _SUCCESS_FALLBACKS.get((action or "").upper(), _SUCCESS_FALLBACKS["BOOK"])
         return table.get(lang, table["en-IN"])
@@ -2663,11 +2942,27 @@ def _deterministic_booking_reply(action: str, res: dict, user_language: str) -> 
     if res.get("reason") == "missing_details":
         need = " and ".join(res.get("missing") or ["your details"])
         return f"Before I book that, could you give me your {need}?"
-    if res.get("reason") == "slot_taken":
+    if res.get("reason") in ("slot_taken", "outside_hours", "slot_in_past", "slot_unavailable"):
+        who = res.get("doctor_name") or "that doctor"
         alts = ", ".join(res.get("alternatives") or [])
+        unchanged = "" if (action or "").upper() == "BOOK" else " Your existing appointment is unchanged."
+        what = {
+            "slot_taken": f"that time is already booked with {who}",
+            "outside_hours": f"{who} doesn't consult at that time",
+            "slot_in_past": "that time has already passed",
+        }.get(res.get("reason"), f"{who} isn't free at that time")
         if alts:
-            return f"Sorry, that time was just taken. That doctor is still free at: {alts}. Which would you like?"
-        return "Sorry, that time is already booked. Could you pick a different day or time?"
+            return (f"Sorry, {what}.{unchanged} They are open at: {alts}. Which of those works for you?")
+        return (f"Sorry, {what}, and there's nothing else open that day."
+                f"{unchanged} Could you pick a different day?")
+    if res.get("reason") == "no_schedule":
+        who = res.get("doctor_name") or "that doctor"
+        unchanged = "" if (action or "").upper() == "BOOK" else " Your existing appointment is unchanged."
+        return (f"Sorry, {who} doesn't have consulting hours on that day, so I haven't changed anything."
+                f"{unchanged} Could you pick a different day?")
+    if res.get("reason") == "doctor_unavailable":
+        who = res.get("doctor_name") or "That doctor"
+        return f"Sorry, {who} is on leave at the moment, so I haven't made any changes. Would another doctor work?"
     if res.get("reason") == "disabled":
         return "I'm sorry, I'm not able to do that here. Let me connect you with the clinic's staff."
     return "I'm sorry, I couldn't complete that just now, so nothing was changed. Would you like me to try again?"
@@ -2701,13 +2996,19 @@ async def _handle_booking_action(
         #     booking that does not exist.
         # Either way, give the model one strict chance to emit the tag or ask
         # for what is missing.
+        #   * a reply that was ENTIRELY a machine tag this regex could not
+        #     parse — scrubbing leaves nothing to say, and the patient gets an
+        #     empty bubble (2026-08-11 production: a bare, space-padded
+        #     "[ ACTION: RESCHEDULE|…]" tag that no longer parses as a tag).
         fabricated = _claims_any_completion(response)
-        if not (_promises_followup(response) or fabricated):
+        tag_only = _is_only_a_tag(response)
+        if not (_promises_followup(response) or fabricated or tag_only):
             return _scrub_reply(response)
 
         logger.error(
-            "Booking reply %s with NO action tag — nothing was written. Repairing: %r",
-            "CLAIMED THE ACTION WAS DONE" if fabricated else "promised a follow-up",
+            "Booking reply %s with NO parseable action tag — nothing was written. Repairing: %r",
+            "WAS AN UNPARSEABLE TAG AND NOTHING ELSE" if tag_only
+            else ("CLAIMED THE ACTION WAS DONE" if fabricated else "promised a follow-up"),
             (response or "")[:160],
         )
         repaired = await _repair_missing_action_tag(
@@ -2756,8 +3057,14 @@ async def _handle_booking_action(
     # (his.py::sync_appointment_to_db). Observed live 2026-08-10: the model
     # emitted a BOOK tag with "N/A" for both before it had asked for them, and
     # a real appointment was written for "N/A".
+    #
+    # CANCEL/RESCHEDULE need the same two fields for the opposite reason: the
+    # existing appointment is FOUND by name + phone, so a placeholder there can
+    # only ever produce "no appointment found" — which reads to the patient as
+    # "your appointment doesn't exist" when the truth is "you were never asked
+    # who you are". Ask instead.
     missing = [label for label, val in (("name", b_name), ("phone number", b_phone))
-               if _is_placeholder(val)] if b_action == "BOOK" else []
+               if _is_placeholder(val)] if b_action in ("BOOK", "RESCHEDULE", "CANCEL") else []
 
     if needs_real_time and not is_time_str_parseable(b_time):
         res = {"success": False, "reason": "invalid_time", "appointment_id": None,
@@ -2802,7 +3109,11 @@ async def _handle_booking_action(
         # least not promise a follow-up. Anything else gets replaced with the
         # deterministic, outcome-accurate reply.
         if final:
-            ok = (_asserts_completion(final, b_action) if res.get("success")
+            # A no-op reschedule ("already at that time") is a success that must
+            # NOT assert a change, so it is held to the weaker bar: just don't
+            # strand the patient on a promise.
+            assert_completion = res.get("success") and res.get("reason") != "already_at_that_time"
+            ok = (_asserts_completion(final, b_action) if assert_completion
                   else not _promises_followup(final))
             if ok:
                 return final
@@ -2915,8 +3226,16 @@ async def generate_llm_response(
         return generate_demo_response(agent, user_message, history)
     
     # ── Build System Prompt with Knowledge Base ──────────────────────────────
-    import datetime
-    today = datetime.datetime.now()
+    # IST, not the server's local clock. This is the reference date the model
+    # converts "tomorrow" against, while his.parse_slot_datetime resolves the
+    # resulting slot in IST — so a UTC-hosted backend (Railway) told the model
+    # it was still yesterday between 18:30 and 24:00 UTC, and every relative
+    # date the patient gave in that window was booked one day early. Seen in
+    # the 2026-08-11 transcript: "tomorrow" became 11/08 when IST was already
+    # 11/08.
+    from backend.services.timeutil import ist_now
+
+    today = ist_now()
     current_date_str = today.strftime("%d/%m/%Y")
     current_day_str = today.strftime("%A")
 
@@ -3000,6 +3319,13 @@ async def generate_llm_response(
         "   - [ACTION: RESCHEDULE|Name|Phone|Date|Time|Doctor|Notes]\n"
         "   - [ACTION: CANCEL|Name|Phone|Date|Time|Doctor|Notes]\n"
         "   (Use 'N/A' for fields that are not being changed.) The text before the tag must NOT claim the action is already done.\n"
+        "   NEVER emit a tag when the patient is only ASKING something — 'what times are free?', 'is the "
+        "doctor in tomorrow?', 'how much does it cost?'. A question about availability is answered "
+        "straight from the REAL DOCTOR AVAILABILITY section above, with NO tag. Only emit a tag when the "
+        "patient has actually asked you to book, move or cancel an appointment AND you have every field.\n"
+        "   Date and Time in the tag must be the real values the patient gave (converted to DD/MM/YYYY and "
+        "a clock time). Never write 'N/A' in the Time field of a BOOK or RESCHEDULE — if you do not have a "
+        "time yet, ask for it instead of emitting a tag.\n"
         "   CRITICAL — the tag must be in the SAME message as that text. You cannot send the patient a "
         "message later: this system only ever replies to a message they send. If you say 'hold on', "
         "'please wait', 'one moment' or 'I'll confirm shortly' WITHOUT the tag, the patient is left waiting "
@@ -3008,8 +3334,15 @@ async def generate_llm_response(
         "--- END MANDATORY INSTRUCTIONS ---\n"
     )
 
-    system_prompt = base_prompt + kb_context + guardrail + BOOKING_RULES_BLOCK
-    
+    # Real roster + real open slots, from the same availability engine that
+    # gates the write. Built BEFORE the user message is appended to history so
+    # the day/doctor detection sees this turn's words exactly once.
+    availability_context = await _real_availability_block(agent, user_message, history)
+
+    system_prompt = (
+        base_prompt + kb_context + availability_context + guardrail + BOOKING_RULES_BLOCK
+    )
+
     # Add user message to history
     history.append({"role": "user", "content": user_message})
     

@@ -18,6 +18,8 @@ import os
 os.environ["ENVIRONMENT"] = "development"
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_audio_turn_tts_pipelining.db"
 
+from datetime import time as time_cls, timedelta
+
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, patch
@@ -27,16 +29,23 @@ import backend.db as db_mod
 from backend.db import AsyncSessionLocal, engine, Base
 from backend.models.tenant import Tenant
 from backend.models.doctor import Doctor
+from backend.models.doctor_availability import DoctorAvailability
 from backend.models.appointment import Appointment
 from backend.models.agent_config import AgentConfig
 from backend.agent.booking_rules import BOOKING_RESULT_TRUE
 from backend.routers import agent_test as chat_mod
 from backend import redis_client
+from backend.services.timeutil import ist_now
 
 TENANT_ID = "66666666-6666-6666-6666-666666666666"
 AGENT_ID = "77777777-7777-7777-7777-777777777777"
 REAL_DOCTOR_ID = "88888888-8888-8888-8888-888888888888"
 REAL_DOCTOR_NAME = "Dr Kavita Rao"
+
+# A booking is only written if the slot is really open on the doctor's real
+# schedule (his._availability_gate), so the date used below has to be a future
+# one the seeded doctor actually consults on.
+BOOK_DATE_STR = (ist_now().date() + timedelta(days=1)).strftime("%d/%m/%Y")
 
 
 class FakeWebSocket:
@@ -64,6 +73,10 @@ async def seeded_db():
     async with AsyncSessionLocal() as s:
         s.add(Tenant(id=TENANT_ID, clinic_name="Pipelining Test Clinic", admin_email="pipeline_test@example.com"))
         s.add(Doctor(id=REAL_DOCTOR_ID, tenant_id=TENANT_ID, name=REAL_DOCTOR_NAME, specialization="Dermatologist"))
+        for dow in range(7):
+            s.add(DoctorAvailability(tenant_id=TENANT_ID, doctor_id=REAL_DOCTOR_ID,
+                                     day_of_week=dow,
+                                     start_time=time_cls(0, 0), end_time=time_cls(23, 30)))
         s.add(AgentConfig(
             id=AGENT_ID, tenant_id=TENANT_ID, agent_name="Pipeline Bot",
             llm_provider="gemini", llm_model="gemini-2.5-flash",
@@ -211,7 +224,7 @@ async def test_booking_action_reply_is_never_chunked_before_safety_check(seeded_
             assert BOOKING_RESULT_TRUE in system_prompt, system_prompt[-400:]
             return f"You're all set. Your appointment with {REAL_DOCTOR_NAME} is confirmed."
         return ("One moment while I book that.\n"
-                f"[ACTION: BOOK|Jane Doe|+919812345678|23/07/2026|4 PM|{REAL_DOCTOR_NAME}|N/A]")
+                f"[ACTION: BOOK|Jane Doe|+919812345678|{BOOK_DATE_STR}|4 PM|{REAL_DOCTOR_NAME}|N/A]")
 
     tts_calls: list[str] = []
     ws = FakeWebSocket()

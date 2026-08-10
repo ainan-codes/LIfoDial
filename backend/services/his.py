@@ -341,12 +341,91 @@ async def create_appointment(
 
         return appointment_data
 
-async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: str, time_str: str, doctor_name: str, tenant_id: str, notes: str = None) -> dict | None:
+def normalize_phone(phone: str | None) -> str:
+    """Digits only, with an Indian country code dropped, for MATCHING purposes.
+
+    The stored value is whatever the patient gave when booking, so "+91 98450
+    12345", "098450-12345" and "9845012345" are the same person but three
+    different strings — and CANCEL/RESCHEDULE matched patient_phone EXACTLY,
+    so any difference in punctuation or a +91 prefix made an existing
+    appointment unfindable and the agent honestly (but wrongly) reported "no
+    appointment found".
+
+    Only formatting is normalized: a genuinely different number still does
+    not match, which is the behaviour we want — see the reschedule flow, which
+    must never touch another patient's appointment.
+    """
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) > 10 and digits.startswith("91"):
+        digits = digits[2:]
+    if len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    return digits
+
+
+async def _find_active_appointment_in_session(session, tenant_id: str, name: str, phone: str):
+    """The single lookup that identifies WHICH appointment a cancel/reschedule
+    refers to: tenant + patient name (fuzzy) + phone (format-insensitive),
+    earliest active slot first.
+
+    Shared so the pre-commit availability check and the write itself always
+    resolve the SAME row. Two lookups with different rules would let the agent
+    validate one appointment's new slot and then move another.
+    """
+    name_clean = (name or "").strip()
+    if not name_clean:
+        return None
+    candidates = (
+        await session.execute(
+            select(Appointment).where(
+                Appointment.tenant_id == tenant_id,
+                Appointment.patient_name.ilike(f"%{name_clean}%"),
+                Appointment.status.in_(["pending", "confirmed"]),
+            ).order_by(Appointment.slot_time.asc())
+        )
+    ).scalars().all()
+
+    wanted = normalize_phone(phone)
+    for appt in candidates:
+        if normalize_phone(appt.patient_phone) == wanted:
+            return appt
+    return None
+
+
+async def find_active_appointment(tenant_id: str, name: str, phone: str) -> dict | None:
+    """``_find_active_appointment_in_session`` for callers outside a session.
+
+    Returns a plain dict (not the ORM object, which would be detached once the
+    session closes) with the fields a pre-commit availability check needs.
+    """
+    async with AsyncSessionLocal() as session:
+        appt = await _find_active_appointment_in_session(session, tenant_id, name, phone)
+        if not appt:
+            return None
+        doctor = (
+            await session.execute(select(Doctor).where(Doctor.id == appt.doctor_id))
+        ).scalar_one_or_none()
+        return {
+            "appointment_id": str(appt.id),
+            "doctor_id": str(appt.doctor_id),
+            "doctor_name": doctor.name if doctor else None,
+            "slot_time": appt.slot_time,
+            "status": appt.status,
+        }
+
+
+async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: str, time_str: str, doctor_name: str, tenant_id: str, notes: str = None, new_doctor_id: str | None = None) -> dict | None:
     """
     Intelligently Book, Reschedule, or Cancel an appointment in the local DB.
     `action` is one of: BOOK, RESCHEDULE, CANCEL.
     Returns a dictionary of the updated/created appointment details (id, status, notes) or None on failure.
     Requires matching BOTH name and phone number for CANCEL and RESCHEDULE.
+
+    ``new_doctor_id`` moves a RESCHEDULE to a different doctor. It exists so
+    the availability check in execute_booking_action and this write can never
+    disagree about which doctor's calendar the new slot belongs to: if the
+    caller named a different doctor, the slot was validated against THAT
+    doctor, so the row has to move there too.
     """
     try:
         async with AsyncSessionLocal() as session:
@@ -358,24 +437,20 @@ async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: s
                 notes_clean = None
 
             if action in ["CANCEL", "RESCHEDULE"]:
-                # Match strictly with patient_phone AND patient_name (case insensitive match on name)
-                stmt = select(Appointment).where(
-                    Appointment.tenant_id == tenant_id,
-                    Appointment.patient_phone == phone_clean,
-                    Appointment.patient_name.ilike(f"%{name_clean}%"),
-                    Appointment.status.in_(["pending", "confirmed"])
-                ).order_by(Appointment.slot_time.asc())
-                result = await session.execute(stmt)
-                appt = result.scalars().first()
-                
+                appt = await _find_active_appointment_in_session(
+                    session, tenant_id, name_clean, phone_clean,
+                )
+
                 if not appt:
                     logger.warning(f"No active appointment found matching phone {phone_clean} and name '{name_clean}' to {action}.")
                     return None
-                    
+
                 if action == "CANCEL":
                     appt.status = "cancelled"
                 elif action == "RESCHEDULE":
                     appt.slot_time = parse_slot_datetime(date_str, time_str)
+                    if new_doctor_id and str(new_doctor_id) != str(appt.doctor_id):
+                        appt.doctor_id = new_doctor_id
 
                 if notes_clean:
                     appt.notes = notes_clean
@@ -524,6 +599,71 @@ async def alternative_slots_for(
         return []
 
 
+def _as_utc(dt: datetime) -> datetime:
+    """Label a naive DB-read datetime as UTC (SQLite loses tzinfo; Postgres
+    does not). Every slot_time this app writes is a real UTC instant, so a
+    naive value read back is always safe to label rather than reinterpret —
+    same rule as availability._ensure_utc."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+# is_doctor_open_at's reason vocabulary → the outcome reason callers render a
+# message from. Kept as an explicit mapping so a new engine reason surfaces as
+# an obvious KeyError-free fallback instead of being silently reported as a
+# generic system error.
+_AVAILABILITY_REASONS = {
+    "unparseable_time": "invalid_time",
+    "doctor_not_found": "doctor_not_found",
+    "doctor_unavailable": "doctor_unavailable",
+    "no_schedule_configured": "no_schedule",
+    "outside_hours": "outside_hours",
+    "in_the_past": "slot_in_past",
+    "slot_taken": "slot_taken",
+}
+
+# Failures worth answering with the doctor's REAL remaining times rather than a
+# flat "no" — the patient can act on those immediately.
+_REASONS_WITH_ALTERNATIVES = frozenset({"slot_taken", "outside_hours", "slot_in_past", "slot_unavailable"})
+
+
+async def _availability_gate(
+    tenant_id: str,
+    doctor_id: str,
+    doctor_name: str | None,
+    date_str: str,
+    time_str: str,
+) -> dict | None:
+    """``None`` when the requested slot really is open; otherwise the failure
+    fields to merge into the result dict.
+
+    This is the one place BOOK and RESCHEDULE share their "is this slot
+    actually available" answer, so the two flows cannot drift apart again —
+    the reschedule branch had no such check at all, which is how the agent
+    came to confirm a time it had never verified.
+    """
+    from backend.services.availability import is_doctor_open_at
+
+    requested = parse_slot_datetime(date_str, time_str)
+    is_open, why = await is_doctor_open_at(tenant_id, str(doctor_id), requested)
+    if is_open:
+        return None
+
+    out = {
+        "reason": _AVAILABILITY_REASONS.get(why, "slot_unavailable"),
+        "doctor_name": doctor_name,
+        "availability_reason": why,
+    }
+    if out["reason"] in _REASONS_WITH_ALTERNATIVES:
+        out["alternatives"] = await alternative_slots_for(
+            tenant_id, str(doctor_id), date_str, time_str,
+        )
+    logger.info(
+        "Availability gate refused %s for doctor=%s at %s (engine reason=%s)",
+        out["reason"], doctor_id, requested, why,
+    )
+    return out
+
+
 async def execute_booking_action(
     *,
     action: str,
@@ -546,14 +686,27 @@ async def execute_booking_action(
           "appointment_id": str | None,
           "doctor_name": str | None,
           "available_doctors": list[str],
+          "alternatives": list[str],     # real open times, on a slot failure
           "slot": str,
         }
+
+    ``reason`` is one of: doctor_not_found, doctor_required, doctor_unavailable,
+    no_schedule, invalid_time, slot_unavailable, slot_taken,
+    already_at_that_time, not_found, db_error, unknown_action. A slot failure
+    also carries ``availability_reason`` (the availability engine's own,
+    finer-grained reason) for logging.
 
     BOOK routes through create_appointment() — the same idempotent, awaited
     writer the voice pipeline uses — and only after a real doctor is resolved.
     CANCEL/RESCHEDULE go through sync_appointment_to_db(), which returns None
     when no matching appointment exists; that surfaces here as success=False so
     the caller refuses instead of fabricating a confirmation.
+
+    BOTH BOOK and RESCHEDULE are gated on availability.is_doctor_open_at — the
+    same engine, checked immediately before the write — so no slot can be
+    confirmed to a patient that the doctor's real schedule and existing
+    bookings do not actually have open. RESCHEDULE previously had NO
+    availability check of any kind: it wrote whatever time it was handed.
     """
     act = (action or "").upper().strip()
     slot = " ".join(
@@ -572,6 +725,15 @@ async def execute_booking_action(
             named = (doctor_name or "").strip().lower() not in _NO_DOCTOR_TOKENS
             base["reason"] = "doctor_not_found" if named else "doctor_required"
             return base
+
+        base["doctor_name"] = doctor.name
+        gate = await _availability_gate(
+            tenant_id, str(doctor.id), doctor.name, date_str, time_str,
+        )
+        if gate is not None:
+            base.update(gate)
+            return base
+
         try:
             result = await create_appointment(
                 tenant_id=tenant_id,
@@ -602,21 +764,89 @@ async def execute_booking_action(
         }
 
     if act in ("CANCEL", "RESCHEDULE"):
+        new_doctor_id: str | None = None
+        target_doctor_id: str | None = None
+
+        if act == "RESCHEDULE":
+            # Find the appointment FIRST. Its doctor is whose calendar the new
+            # slot has to be free on — the tag's Doctor field is often "N/A" on
+            # a reschedule, and trusting it would mean checking one doctor's
+            # availability and writing to another's.
+            existing = await find_active_appointment(tenant_id, name, phone)
+            if not existing:
+                base["reason"] = "not_found"
+                return base
+
+            target_doctor_id = existing["doctor_id"]
+            target_doctor_name = existing["doctor_name"]
+            named_doctor, available = await find_doctor_for_booking(tenant_id, doctor_name)
+            base["available_doctors"] = available
+            if named_doctor and str(named_doctor.id) != str(target_doctor_id):
+                # The patient asked to move to a DIFFERENT doctor. Validate and
+                # write against that doctor, or the confirmation would silently
+                # keep the old one.
+                target_doctor_id = str(named_doctor.id)
+                target_doctor_name = named_doctor.name
+                new_doctor_id = str(named_doctor.id)
+
+            base["doctor_name"] = target_doctor_name
+
+            # A reschedule with no real time would silently move the
+            # appointment to midnight (parse_slot_datetime's documented
+            # fallback) — refuse, exactly as the BOOK path does.
+            if not is_time_str_parseable(time_str):
+                base["reason"] = "invalid_time"
+                return base
+
+            from backend.services.availability import floor_to_slot
+
+            requested_utc = parse_slot_datetime(date_str, time_str)
+
+            current = existing.get("slot_time")
+            if (
+                new_doctor_id is None
+                and current is not None
+                and floor_to_slot(_as_utc(current)) == floor_to_slot(requested_utc)
+            ):
+                # The requested end state already holds, so this is a success
+                # (nothing is broken, nothing was lost) — but it is NOT a
+                # change, and the reason keeps callers from saying "rescheduled"
+                # or writing a Sheets row for a move that never happened.
+                # Without this the availability check below would report the
+                # patient's OWN booking as "that slot is taken".
+                base["success"] = True
+                base["reason"] = "already_at_that_time"
+                base["appointment_id"] = existing["appointment_id"]
+                return base
+
+            gate = await _availability_gate(
+                tenant_id, target_doctor_id, target_doctor_name, date_str, time_str,
+            )
+            if gate is not None:
+                base.update(gate)
+                return base
+
         try:
             result = await sync_appointment_to_db(
                 action=act, name=name, phone=phone, date_str=date_str,
                 time_str=time_str, doctor_name=doctor_name, tenant_id=tenant_id,
-                notes=notes,
+                notes=notes, new_doctor_id=new_doctor_id,
             )
         except Exception as e:
             logger.error("execute_booking_action %s failed: %s", act, e, exc_info=True)
             result = None
         if not result or not result.get("appointment_id"):
             base["reason"] = (result or {}).get("reason") or "not_found"
+            if base["reason"] == "slot_taken" and target_doctor_id:
+                # Lost a genuine race between the check above and this write.
+                base["alternatives"] = await alternative_slots_for(
+                    tenant_id, target_doctor_id, date_str, time_str,
+                )
             return base
         return {
             "success": True, "reason": "", "appointment_id": result["appointment_id"],
-            "doctor_name": None, "available_doctors": [], "slot": slot,
+            "doctor_name": base.get("doctor_name"), "available_doctors": [],
+            "alternatives": [], "slot": slot,
         }
 
     return base

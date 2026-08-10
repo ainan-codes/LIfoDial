@@ -81,6 +81,7 @@ from backend.agent.processors.call_logger_processor import (
     UserTranscriptTap,
 )
 from backend.agent.processors.language_switcher import LanguageSwitchProcessor
+from backend.agent.processors.tag_scrub import TagScrubProcessor
 from backend.agent.processors.transcript_publisher import LiveKitTranscriptPublisher
 
 # ── App config ────────────────────────────────────────────────────────────────
@@ -1839,7 +1840,7 @@ async def entrypoint(ctx) -> None:
     # ── Build the Pipeline ─────────────────────────────────────────────────
     # Data flows left to right through each processor:
     #
-    #   audio in → STT → context_in → booking → LLM → context_out → logger → TTS → audio out
+    #   audio in → STT → context_in → booking → LLM → tag scrub → TTS → logger → audio out
     #
     # Mirrors the agent's spoken text into the room as transcriptions so the
     # browser Test widget shows a live transcript (transparent passthrough,
@@ -1867,6 +1868,14 @@ async def entrypoint(ctx) -> None:
     user_transcript_publisher = LiveKitTranscriptPublisher(transport)
     agent_transcript_publisher = LiveKitTranscriptPublisher(transport)
 
+    # Strips [BOOKING_RESULT …] / [AVAILABILITY_NOTE] / [ACTION: …] out of the
+    # LLM's text before TTS can speak it. Those tags are addressed to the model
+    # (BookingProcessor injects them into its context), and a model that has
+    # just been shown one echoes it — which on the voice path would be read out
+    # loud to the caller, since nothing downstream of the LLM inspects the text.
+    # MUST sit between `llm` and `tts`. See processors/tag_scrub.py.
+    tag_scrub = TagScrubProcessor()
+
     pipeline = Pipeline([
         transport.input(),                       # Audio in from LiveKit room
         vad,                                     # Silero VAD → speech start/stop (barge-in + segmentation)
@@ -1877,6 +1886,7 @@ async def entrypoint(ctx) -> None:
         context_aggregator.user(),               # Accumulates user turns into LLMContext
         booking_processor,                       # Booking state machine (transparent)
         llm,                                     # LLMContext → LLMResponseFrame (streaming)
+        tag_scrub,                               # Never speak a machine tag (transparent)
         tts,                                     # LLMResponseFrame → TTSAudioRawFrame
         call_logger,                             # Metrics + call record updates (transparent)
         agent_transcript_publisher,              # Mirror AGENT text → room transcript (transparent)

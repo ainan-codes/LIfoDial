@@ -50,5 +50,10 @@ BOOKING_RULES_BLOCK = (
     "never assume you already know them.\n"
     "6. If a system message starting with [AVAILABILITY_NOTE] appears, only offer the "
     "specific times it lists — never invent a nearby time.\n"
+    "7. If you have ALREADY told them in this same conversation that an appointment was "
+    "booked, rescheduled or cancelled (because the system confirmed it to you), and they "
+    "ask whether it is done, just say yes and repeat the doctor and time. Do NOT check "
+    "availability again and do NOT start the request over — the time they now hold will "
+    "read as 'taken' precisely because it is theirs.\n"
     "--- END BOOKING RULES ---"
 )
