@@ -3117,6 +3117,12 @@ async def generate_llm_response(
             or " 401" in err_msg_pad(error_msg)
             or " 403" in err_msg_pad(error_msg)
             or " 404" in err_msg_pad(error_msg)
+            # A rate limit / exhausted quota is the case where another provider
+            # helps MOST — the current one is refusing to serve at all. This
+            # used to be excluded, so a Groq 429 dead-ended the conversation
+            # (and the booking in progress) even when another key was
+            # configured. Observed in production 2026-08-10.
+            or is_rate_limit_error(error_msg)
         )
 
         if should_fallback:
@@ -3192,12 +3198,11 @@ async def generate_llm_response(
                     )
                     continue
 
-        if "429" in error_msg:
-             return "I'm currently receiving too many requests. Please wait a moment before speaking again."
-        if "safety" in err_low:
-             return "I'm sorry, I cannot respond to that prompt due to safety guidelines. How else can I help?"
-        if "timeout" in err_low or "timed out" in err_low:
-             return "The AI service took too long to respond. Please try again."
+        # Every fallback provider is exhausted or unconfigured by this point, so
+        # tell the patient what actually went wrong (see describe_llm_failure).
+        described = describe_llm_failure(error_msg)
+        if described:
+            return described
 
         return "I'm sorry, I'm having trouble processing that right now. Could you please repeat?"
 
@@ -3205,6 +3210,82 @@ async def generate_llm_response(
 def err_msg_pad(s: str) -> str:
     """Pad error string with spaces so HTTP status code substring matches reliably."""
     return f" {s} "
+
+
+# \b so a token COUNT never reads as a status code. The old check was a bare
+# `"429" in error_msg`, which also matched "Requested 4291 tokens" — i.e. an
+# unrelated failure could be reported to the patient as a rate limit. (Padding
+# alone does not fix this: " 429" is a prefix of " 4291".)
+_HTTP_429_RE = re.compile(r"\b429\b")
+
+# Groq spells the wait as "Please try again in 14m46.464s."
+_RETRY_HINT_RE = re.compile(
+    r"try again in\s+(?:(\d+)\s*h)?(?:(\d+)\s*m)?(?:([\d.]+)\s*s)?", re.IGNORECASE,
+)
+
+# Markers that this is a LONG-HORIZON budget (a daily/monthly allowance), not a
+# short burst limit. "Please wait a moment" is a lie for these — the next
+# message will fail exactly the same way.
+_LONG_QUOTA_MARKERS = (
+    "per day", "tokens per day", "tpd", "daily limit", "per month", "quota exceeded",
+    "insufficient_quota", "billing", "credit balance",
+)
+
+
+def is_rate_limit_error(error_msg: str) -> bool:
+    low = (error_msg or "").lower()
+    return bool(
+        _HTTP_429_RE.search(error_msg or "")
+        or "rate limit" in low
+        or "rate_limit" in low
+        or "too many requests" in low
+        or "quota exceeded" in low
+        or "insufficient_quota" in low
+    )
+
+
+def retry_after_seconds(error_msg: str) -> float | None:
+    """Seconds the provider asked us to wait, if it said so."""
+    m = _RETRY_HINT_RE.search(error_msg or "")
+    if not m or not any(m.groups()):
+        return None
+    h, mins, secs = m.groups()
+    return (int(h or 0) * 3600) + (int(mins or 0) * 60) + float(secs or 0)
+
+
+def describe_llm_failure(error_msg: str) -> str | None:
+    """The patient-facing sentence for a KNOWN failure mode, or None.
+
+    Every branch here has to survive the same test the booking replies do: it
+    must tell the patient something true and leave them with a next step. The
+    old code answered every 429 with "Please wait a moment before speaking
+    again", which on 2026-08-10 was shown for an exhausted tokens-per-DAY
+    budget ("Used 99463 of 100000, try again in 14m46s") — waiting a moment
+    could not possibly help, and the booking simply dead-ended.
+    """
+    if not error_msg:
+        return None
+    low = error_msg.lower()
+
+    if is_rate_limit_error(error_msg):
+        wait = retry_after_seconds(error_msg)
+        long_budget = any(k in low for k in _LONG_QUOTA_MARKERS) or (wait or 0) > 120
+        if long_budget:
+            # Not recoverable inside this conversation — say so, and hand the
+            # patient somewhere that can actually finish the booking.
+            return ("I'm sorry — our AI assistant has reached its usage limit for today, so I can't "
+                    "continue right now. Please call the clinic directly and our staff will finish "
+                    "your booking.")
+        if wait:
+            return (f"I'm handling a lot of requests right now. Please try again in about "
+                    f"{max(1, round(wait))} seconds.")
+        return "I'm handling a lot of requests right now. Please try again in a few seconds."
+
+    if "safety" in low:
+        return "I'm sorry, I cannot respond to that prompt due to safety guidelines. How else can I help?"
+    if "timeout" in low or "timed out" in low:
+        return "The AI service took too long to respond. Please try again."
+    return None
 
 
 async def call_gemini(api_key: str, system_prompt: str,
