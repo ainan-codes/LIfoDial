@@ -19,6 +19,41 @@ _TIME_FORMATS = ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%H.%M")
 _DATE_FORMATS = ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d %b %Y", "%d %B %Y")
 
 
+def _try_parse_time(time_str: str | None) -> datetime | None:
+    """Parse time_str against _TIME_FORMATS, or None if empty/unparseable.
+
+    Factored out of parse_slot_datetime so is_time_str_parseable() below can
+    ask "would this actually parse" without duplicating the format list.
+    """
+    ts = (time_str or "").strip()
+    if not ts:
+        return None
+    norm = ts.upper().replace(".", ":") if ("AM" in ts.upper() or "PM" in ts.upper()) else ts
+    for fmt in _TIME_FORMATS:
+        try:
+            return datetime.strptime(norm.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def is_time_str_parseable(time_str: str | None) -> bool:
+    """True if time_str carries a REAL caller-given time — i.e.
+    parse_slot_datetime(date_str, time_str) would use it, not silently fall
+    back to a default (now/midnight).
+
+    parse_slot_datetime's fallback-on-unparseable behavior is correct for
+    contexts where "just pick something reasonable" is fine (its docstring:
+    "Falls back... if a field is missing/unparseable"), but a caller that
+    needs a REAL requested time — never a fabricated one — must check this
+    FIRST and refuse instead of booking whatever the fallback produces. See
+    booking_processor.py's own "no fabricated slot" rule for the voice
+    equivalent of this same principle, enforced there by construction
+    (BookingProcessor only ever sets a pending time from a real regex match).
+    """
+    return _try_parse_time(time_str) is not None
+
+
 def parse_slot_datetime(date_str: str | None, time_str: str | None) -> datetime:
     """Best-effort parse of a requested appointment slot into a tz-aware UTC datetime.
 
@@ -56,18 +91,9 @@ def parse_slot_datetime(date_str: str | None, time_str: str | None) -> datetime:
             day = now
 
     # ── Time ──
-    ts = (time_str or "").strip()
-    parsed_time = None
-    if ts:
-        norm = ts.upper().replace(".", ":") if ("AM" in ts.upper() or "PM" in ts.upper()) else ts
-        for fmt in _TIME_FORMATS:
-            try:
-                parsed_time = datetime.strptime(norm.strip(), fmt)
-                break
-            except ValueError:
-                continue
-        if parsed_time is None:
-            logger.warning("Could not parse appointment time %r; defaulting to now", time_str)
+    parsed_time = _try_parse_time(time_str)
+    if parsed_time is None and (time_str or "").strip():
+        logger.warning("Could not parse appointment time %r; defaulting to now", time_str)
 
     if parsed_time is None:
         return day.replace(second=0, microsecond=0).astimezone(timezone.utc)

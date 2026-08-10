@@ -2473,6 +2473,10 @@ def _booking_result_message(action: str, res: dict) -> str:
         return (f"{BOOKING_RESULT_FALSE} No matching appointment was found for that name and phone number, "
                 "so nothing was changed. Do NOT say it was done. Ask the patient to re-check their name and "
                 "phone number.")
+    if reason == "invalid_time":
+        return (f"{BOOKING_RESULT_FALSE} No valid appointment TIME was given, so nothing was booked or "
+                "changed — never assume or invent a time. Do NOT say it was done. Ask the patient to state "
+                "the time again, e.g. '3 PM' or '11:30 AM'.")
     return (f"{BOOKING_RESULT_FALSE} The {verb} could NOT be saved due to a system error. Do NOT say it was "
             "done. Apologize briefly and offer to try again.")
 
@@ -2504,6 +2508,8 @@ def _deterministic_booking_reply(action: str, res: dict, user_language: str) -> 
     if res.get("reason") == "not_found":
         return ("I couldn't find a matching appointment for that name and phone number, so nothing was "
                 "changed. Could you re-check those details?")
+    if res.get("reason") == "invalid_time":
+        return "I'm sorry, I didn't catch a clear time for that. Could you say it again, like '3 PM' or '11:30 AM'?"
     if res.get("reason") == "disabled":
         return "I'm sorry, I'm not able to do that here. Let me connect you with the clinic's staff."
     return "I'm sorry, I couldn't complete that just now, so nothing was changed. Would you like me to try again?"
@@ -2543,7 +2549,20 @@ async def _handle_booking_action(
     allowed = can_book if b_action in ("BOOK", "RESCHEDULE") else (
         can_cancel if b_action == "CANCEL" else False)
 
-    if not allowed:
+    # Time gate — BOOK/RESCHEDULE need a REAL caller-given time. The model's
+    # [ACTION:] tag can carry an empty/"N/A" Time field (observed live
+    # 2026-08-10: the tag had a correct Date but a blank Time), and
+    # parse_slot_datetime's fallback-on-unparseable behavior would silently
+    # book midnight instead of refusing — exactly the kind of fabricated slot
+    # audit FIX 4 already bans for the voice path. CANCEL needs no time at
+    # all (matched by name+phone), so it is not gated here.
+    from backend.services.his import is_time_str_parseable
+    needs_real_time = b_action in ("BOOK", "RESCHEDULE")
+
+    if needs_real_time and not is_time_str_parseable(b_time):
+        res = {"success": False, "reason": "invalid_time", "appointment_id": None,
+               "doctor_name": None, "available_doctors": [], "slot": ""}
+    elif not allowed:
         res = {"success": False, "reason": "disabled", "appointment_id": None,
                "doctor_name": None, "available_doctors": [], "slot": ""}
     else:

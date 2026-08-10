@@ -174,6 +174,99 @@ async def test_chat_respects_disabled_booking_flag(seeded_db):
     assert "can't" in reply.lower() or "cannot" in reply.lower() or "unable" in reply.lower()
 
 
+# ── Time gate: an [ACTION:] tag with no real time must not book midnight ───────
+
+@pytest.mark.asyncio
+async def test_chat_refuses_booking_with_blank_time(seeded_db):
+    """Reproduces a real 2026-08-10 production incident: the model's [ACTION:]
+    tag carried a correct Date but a blank Time field, and
+    parse_slot_datetime's fallback-on-unparseable behavior silently booked
+    midnight instead of refusing. This is exactly the fabricated-slot failure
+    mode audit FIX 4 already bans for the voice path — the chat path must
+    refuse instead of booking whatever the fallback produces."""
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
+            captured["regen_system"] = system_prompt
+            return "I'm sorry, I didn't catch the time. Could you say it again?"
+        # Correct date, BLANK time — the real production repro.
+        return ("One moment while I book that.\n"
+                f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026||{REAL_DOCTOR_NAME}|N/A]")
+
+    captured = {}
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            reply = await chat_mod.generate_llm_response(
+                agent, f"Book me with {REAL_DOCTOR_NAME} tomorrow. I'm John Doe, 9812345678.",
+                db, session_id="s-blanktime", user_language="en-IN",
+            )
+
+    assert "regen_system" in captured, "honest regeneration pass never ran"
+    update = captured["regen_system"].split("SYSTEM UPDATE (AUTHORITATIVE", 1)[1]
+    update = update.split("--- APPOINTMENT BOOKING RULES", 1)[0]
+    assert BOOKING_RESULT_FALSE in update
+    assert BOOKING_RESULT_TRUE not in update
+    assert "no valid appointment time" in update.lower()
+    # NOTHING was written — not even a midnight fallback appointment.
+    assert await _appointments() == []
+    low = reply.lower()
+    assert "booked" not in low and "confirmed" not in low
+
+
+@pytest.mark.asyncio
+async def test_chat_refuses_booking_with_na_time(seeded_db):
+    """Same gate, but the model wrote the literal placeholder 'N/A' instead of
+    leaving the field blank — both must be refused, not just an empty string."""
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
+            captured["regen_system"] = system_prompt
+            return "I'm sorry, I didn't catch the time. Could you say it again?"
+        return ("One moment while I book that.\n"
+                f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026|N/A|{REAL_DOCTOR_NAME}|N/A]")
+
+    captured = {}
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            await chat_mod.generate_llm_response(
+                agent, f"Book me with {REAL_DOCTOR_NAME} tomorrow. I'm John Doe, 9812345678.",
+                db, session_id="s-natime", user_language="en-IN",
+            )
+
+    assert "regen_system" in captured
+    update = captured["regen_system"].split("SYSTEM UPDATE (AUTHORITATIVE", 1)[1]
+    assert BOOKING_RESULT_FALSE in update.split("--- APPOINTMENT BOOKING RULES", 1)[0]
+    assert await _appointments() == []
+
+
+@pytest.mark.asyncio
+async def test_chat_still_books_with_a_real_time(seeded_db):
+    """Regression guard: the time gate must not block a REAL time — only
+    empty/unparseable ones."""
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
+            assert BOOKING_RESULT_TRUE in system_prompt, system_prompt[-400:]
+            return f"You're all set — your appointment with {REAL_DOCTOR_NAME} is confirmed."
+        return ("One moment while I book that.\n"
+                f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026|3 PM|{REAL_DOCTOR_NAME}|N/A]")
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            reply = await chat_mod.generate_llm_response(
+                agent, f"Book {REAL_DOCTOR_NAME} tomorrow 3 PM, I'm John Doe 9812345678.",
+                db, session_id="s-realtime", user_language="en-IN",
+            )
+
+    appts = await _appointments()
+    assert len(appts) == 1
+    assert appts[0].status == "confirmed"
+    assert "confirmed" in reply.lower()
+
+
 # ── Unit-level guards on the shared service ─────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -187,6 +280,18 @@ async def test_execute_booking_action_refuses_unknown_doctor(seeded_db):
     assert res["reason"] == "doctor_not_found"
     assert REAL_DOCTOR_NAME in res["available_doctors"]
     assert await _appointments() == []
+
+
+def test_is_time_str_parseable():
+    from backend.services.his import is_time_str_parseable
+    assert is_time_str_parseable("3 PM") is True
+    assert is_time_str_parseable("11:30 AM") is True
+    assert is_time_str_parseable("18:00") is True
+    assert is_time_str_parseable(None) is False
+    assert is_time_str_parseable("") is False
+    assert is_time_str_parseable("   ") is False
+    assert is_time_str_parseable("N/A") is False
+    assert is_time_str_parseable("whenever is convenient") is False
 
 
 @pytest.mark.asyncio
