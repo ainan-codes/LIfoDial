@@ -416,7 +416,7 @@ def _call_record_to_row(rec, clinic_name: str | None = None) -> dict:
     outcome = (rec.outcome or "").lower()
     status_map = {
         "booked": "Booked", "transferred": "Transferred", "resolved": "Resolved",
-        "cancelled": "CANCELLED", "unresolved": "Failed",
+        "cancelled": "CANCELLED", "unresolved": "Failed", "rescheduled": "Rescheduled",
     }
     if outcome in status_map:
         display_status = status_map[outcome]
@@ -532,7 +532,10 @@ async def clinic_stats(user=Depends(get_current_user)) -> dict:
     outcomes = [(c.outcome or "").lower() for c in todays_calls]
     statuses = [(c.status or "").lower() for c in todays_calls]
 
-    resolved = sum(1 for o in outcomes if o in ("booked", "resolved", "transferred"))
+    resolved = sum(
+        1 for o in outcomes
+        if o in ("booked", "resolved", "transferred", "cancelled", "rescheduled")
+    )
     missed = sum(
         1 for s, o in zip(statuses, outcomes)
         if s in ("failed", "voicemail") or o == "unresolved"

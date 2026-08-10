@@ -36,6 +36,23 @@ _CANCEL_WORDS: frozenset[str] = frozenset({
     "cancel", "nahi", "no", "nope", "mat karo", "band karo",
 })
 
+# Intent phrases that start an EXISTING-appointment cancel/reschedule flow —
+# distinct from _CANCEL_WORDS above, which only aborts a NEW booking that
+# hasn't been confirmed yet.
+_CANCEL_APPOINTMENT_PHRASES: frozenset[str] = frozenset({
+    "cancel my appointment", "cancel the appointment", "cancel my booking",
+    "cancel appointment", "i want to cancel", "i need to cancel",
+    "i'd like to cancel", "appointment cancel karo", "booking cancel karo",
+    "mera appointment cancel karna hai",
+})
+
+_RESCHEDULE_APPOINTMENT_PHRASES: frozenset[str] = frozenset({
+    "reschedule my appointment", "reschedule the appointment", "reschedule my booking",
+    "reschedule appointment", "change my appointment", "move my appointment",
+    "postpone my appointment", "i want to reschedule", "i need to reschedule",
+    "appointment reschedule karo", "appointment change karna hai",
+})
+
 _EMERGENCY_WORDS: frozenset[str] = frozenset({
     "emergency", "heart attack", "accident", "unconscious", "bleeding",
     "bahut dard", "chest pain", "can't breathe", "can not breathe",
@@ -92,6 +109,12 @@ class BookingProcessor(FrameProcessor):
             "patient_name":        None,   # Extracted from conversation
             "confirmed":           False,  # True once booking committed to DB
             "emergency_detected":  False,  # True on emergency keyword
+            # ── Cancel/reschedule state (existing appointment, not a new one) ──
+            "mode":                  None,   # None | "cancel" | "reschedule"
+            "action_awaiting_confirm": False,  # True once the details needed are known
+            "action_confirmed":      False,  # True once the action committed to DB
+            "new_slot_day":          None,   # Reschedule only — caller-given new day
+            "new_slot_time":         None,   # Reschedule only — caller-given new time
         }
 
         # Set when a confirm keyword is heard; consumed on the next
@@ -99,6 +122,11 @@ class BookingProcessor(FrameProcessor):
         # injected into the LLM context BEFORE generation (audit FIX 4 — the
         # agent must never say "booked" unless the row actually exists).
         self._commit_pending: bool = False
+
+        # Same contract as _commit_pending above, but for an EXISTING
+        # appointment's cancel/reschedule commit (separate flag so a NEW
+        # booking in progress can never be confused with one).
+        self._action_commit_pending: bool = False
 
         logger.info(
             "BookingProcessor initialised | tenant=%s caller=%s",
@@ -129,6 +157,9 @@ class BookingProcessor(FrameProcessor):
         if isinstance(frame, LLMContextFrame) and self._commit_pending:
             await self._commit_and_inject_result(frame)
 
+        if isinstance(frame, LLMContextFrame) and self._action_commit_pending:
+            await self._commit_and_inject_action_result(frame)
+
         # Always push the frame downstream — never block the voice pipeline
         await self.push_frame(frame, direction)
 
@@ -147,6 +178,18 @@ class BookingProcessor(FrameProcessor):
                 )
                 await self._handle_emergency()
             return  # Don't process booking after emergency
+
+        # 0.5. Cancel/reschedule of an EXISTING appointment — an independent flow
+        #      from the NEW-booking one below (a caller may cancel one appointment
+        #      in the same call a NEW-booking attempt failed or succeeded in, so
+        #      this must not be gated on booking_state["confirmed"]).
+        if self._agent_config.get("can_cancel_appointments", True):
+            await self._handle_cancel_reschedule(text, text_lower)
+            if self.booking_state["mode"] is not None:
+                # An existing-appointment flow is active — don't let the
+                # NEW-booking keyword matching below (doctor/slot/confirm)
+                # interpret the same utterance a second time.
+                return
 
         # Already confirmed — nothing more to do
         if self.booking_state["confirmed"]:
@@ -346,6 +389,7 @@ class BookingProcessor(FrameProcessor):
             doctor_id=str(doctor_id),
             slot_time=slot_time,
             patient_phone=patient_phone,
+            patient_name=self.booking_state.get("patient_name"),
             call_record_id=self._call_meta.get("call_record_id"),
         )
 
@@ -382,6 +426,165 @@ class BookingProcessor(FrameProcessor):
         wired here yet, matching the mocked his.get_slots())."""
         return self._agent_config.get("can_check_availability", True)
 
+    # ── Cancel / reschedule of an EXISTING appointment ────────────────────────
+
+    async def _handle_cancel_reschedule(self, text: str, text_lower: str) -> None:
+        """Drive the cancel/reschedule state machine for an appointment that
+        (unlike the NEW-booking flow above) already exists in the database.
+
+        The lookup his.sync_appointment_to_db performs is by tenant + phone +
+        name, so this only has to collect a name (the phone is already known
+        from caller ID, via booking_state["patient_phone"]) — and, for a
+        reschedule, the new day/time the caller wants.
+        """
+        state = self.booking_state
+
+        # Already committed this call — nothing further to do.
+        if state["action_confirmed"]:
+            return
+
+        # Arm a flow only when nothing is active yet — a bare "cancel" heard
+        # while a NEW booking is still being collected already means "abort
+        # that", handled entirely by the code above this call site.
+        if state["mode"] is None:
+            if any(p in text_lower for p in _RESCHEDULE_APPOINTMENT_PHRASES):
+                state["mode"] = "reschedule"
+                logger.info("Reschedule-existing-appointment intent detected.")
+            elif any(p in text_lower for p in _CANCEL_APPOINTMENT_PHRASES):
+                state["mode"] = "cancel"
+                logger.info("Cancel-existing-appointment intent detected.")
+            else:
+                return
+
+        # Collect the patient's name (phone is already known from caller ID).
+        self._try_extract_name(text, text_lower)
+
+        if state["mode"] == "reschedule":
+            day, time_part = self._extract_day_and_time(text)
+            if time_part:
+                state["new_slot_time"] = time_part
+                if day:
+                    state["new_slot_day"] = day
+            ready = bool(state["patient_name"]) and bool(state["new_slot_time"])
+        else:
+            ready = bool(state["patient_name"])
+
+        if ready and not state["action_awaiting_confirm"]:
+            state["action_awaiting_confirm"] = True
+            logger.info(
+                "Action '%s' ready for confirmation (name=%s, new_slot=%s %s).",
+                state["mode"], state["patient_name"],
+                state["new_slot_day"], state["new_slot_time"],
+            )
+
+        if not state["action_awaiting_confirm"]:
+            return
+
+        # An explicit affirmative always wins, checked BEFORE the abort words —
+        # "yes, cancel it" contains the literal word "cancel" (an abort word
+        # below), and abort-first would wipe the flow instead of committing it.
+        if any(w in text_lower for w in _CONFIRM_WORDS):
+            self._action_commit_pending = True
+            logger.info("%s confirm keyword heard — commit will be awaited before LLM reply.", state["mode"])
+            return
+
+        # Caller backs out before confirming — drop the whole flow so the
+        # existing appointment is left untouched and normal conversation
+        # (including a fresh NEW booking) can resume. When the action itself
+        # IS "cancel", the bare word "cancel" is excluded from the abort set —
+        # it almost always means "yes, cancel it", not "abort the cancel".
+        abort_words = _CANCEL_WORDS - {"cancel"} if state["mode"] == "cancel" else _CANCEL_WORDS
+        if any(w in text_lower for w in abort_words):
+            logger.info("Patient backed out of pending %s. Resetting action state.", state["mode"])
+            state["mode"] = None
+            state["action_awaiting_confirm"] = False
+            state["new_slot_day"] = None
+            state["new_slot_time"] = None
+            return
+
+    def _extract_day_and_time(self, text: str) -> tuple[Optional[str], Optional[str]]:
+        """Same recognizers as _try_extract_slot, but returned separately so a
+        reschedule's new slot can be passed to his.execute_booking_action as
+        distinct date_str/time_str args instead of one combined string."""
+        match = _SLOT_PATTERN.search(text)
+        if not match:
+            return None, None
+        time_part = match.group(0).strip()
+        day_match = _DAY_PATTERN.search(text)
+        day_part = day_match.group(0).strip().capitalize() if day_match else None
+        return day_part, time_part
+
+    async def _commit_and_inject_action_result(self, frame: LLMContextFrame) -> None:
+        """AWAIT the cancel/reschedule DB write, then inject the REAL outcome
+        into the LLM context — the cancel/reschedule analogue of
+        _commit_and_inject_result above, kept as a separate method (and a
+        separate _action_commit_pending flag) so a NEW booking in progress
+        can never be confused with an existing-appointment action.
+        """
+        self._action_commit_pending = False
+        state = self.booking_state
+
+        tenant_id = self._tenant.get("id")
+        mode = state.get("mode")
+        patient_name = state.get("patient_name")
+        patient_phone = state.get("patient_phone", "unknown")
+
+        if not tenant_id or not patient_name or mode not in ("cancel", "reschedule"):
+            logger.warning(
+                "Confirm heard but %s incomplete (tenant=%s name=%s) — not committing.",
+                mode, tenant_id, patient_name,
+            )
+            return
+
+        action = "CANCEL" if mode == "cancel" else "RESCHEDULE"
+        ok, result = await _commit_action_to_db(
+            action=action,
+            tenant_id=str(tenant_id),
+            patient_name=patient_name,
+            patient_phone=patient_phone,
+            new_slot_day=state.get("new_slot_day"),
+            new_slot_time=state.get("new_slot_time"),
+            call_record_id=self._call_meta.get("call_record_id"),
+        )
+
+        context = getattr(frame, "context", None)
+        if ok:
+            state["action_confirmed"] = True
+            state["action_awaiting_confirm"] = False
+            verb = "cancelled" if mode == "cancel" else "rescheduled"
+            extra = (
+                f" to {state.get('new_slot_day') or ''} {state.get('new_slot_time') or ''}".strip()
+                if mode == "reschedule" else ""
+            )
+            msg = (
+                f"[BOOKING_RESULT success=true] The appointment IS {verb} in the system"
+                f"{(' ' + extra) if extra else ''} (appointment id {result.get('appointment_id')}). "
+                "Confirm this to the caller in one short sentence."
+            )
+        else:
+            # Re-arm so another "yes" retries.
+            state["action_confirmed"] = False
+            state["action_awaiting_confirm"] = True
+            if (result or {}).get("reason") == "not_found":
+                msg = (
+                    f"[BOOKING_RESULT success=false] No appointment was found for that name and phone "
+                    f"number, so nothing was changed. Do NOT say the {mode} is done. Ask the caller to "
+                    "double-check the name the appointment was booked under, or offer to connect them "
+                    "to the clinic's staff."
+                )
+            else:
+                msg = (
+                    f"[BOOKING_RESULT success=false] The {mode} could NOT be saved due to a system error. "
+                    "Do NOT say it is done. Apologize briefly and ask if they'd like you to try again."
+                )
+
+        if context is not None:
+            try:
+                context.add_message({"role": "system", "content": msg})
+            except Exception as exc:
+                logger.error("Failed to inject %s result into LLM context: %s", mode, exc)
+        logger.info("%s commit result injected: ok=%s", mode, ok)
+
 
 # ── Standalone DB commit function ─────────────────────────────────────────────
 
@@ -390,6 +593,7 @@ async def _commit_booking_to_db(
     doctor_id: str,
     slot_time: str,
     patient_phone: str,
+    patient_name: Optional[str] = None,
     call_record_id: Optional[str] = None,
 ) -> tuple[bool, dict]:
     """
@@ -400,6 +604,11 @@ async def _commit_booking_to_db(
     unconfirmed write). Idempotency lives in his.create_appointment — a
     repeated commit for the same call_id returns the existing row instead of
     creating a duplicate.
+
+    ``patient_name`` is passed through (when the caller gave one during the
+    call) so a LATER cancel/reschedule call can find this row again — the
+    lookup in his.sync_appointment_to_db matches on name AND phone, and a
+    NULL name can never match.
     """
     try:
         from backend.services.his import create_appointment  # Lazy import — avoids circular deps
@@ -409,6 +618,7 @@ async def _commit_booking_to_db(
             doctor_id=doctor_id,
             slot_time=slot_time,
             patient_phone=patient_phone,
+            patient_name=patient_name,
             call_id=call_record_id,
         )
         if not result or not result.get("appointment_id"):
@@ -463,3 +673,78 @@ async def _mark_call_booked(call_record_id: Optional[str]) -> None:
         logger.info("[BookingProcessor] Marked call %s outcome=booked", call_record_id)
     except Exception as exc:
         logger.error("[BookingProcessor] Failed to mark call %s booked: %s", call_record_id, exc)
+
+
+async def _commit_action_to_db(
+    action: str,
+    tenant_id: str,
+    patient_name: str,
+    patient_phone: str,
+    new_slot_day: Optional[str] = None,
+    new_slot_time: Optional[str] = None,
+    call_record_id: Optional[str] = None,
+) -> tuple[bool, dict]:
+    """
+    Cancel or reschedule an EXISTING appointment in PostgreSQL/Supabase and
+    return (ok, result). AWAITED by BookingProcessor before the LLM is allowed
+    to speak a confirmation (same audit FIX 4 contract as _commit_booking_to_db).
+
+    Routes through his.execute_booking_action — the SAME function the
+    chat/embed path uses — so voice and chat share one real, doctor/DB-backed
+    implementation instead of drifting into two.
+    """
+    try:
+        from backend.services.his import execute_booking_action  # Lazy import — avoids circular deps
+
+        result = await execute_booking_action(
+            action=action,
+            tenant_id=tenant_id,
+            name=patient_name,
+            phone=patient_phone,
+            date_str=new_slot_day or "",
+            time_str=new_slot_time or "",
+            doctor_name="",
+            call_id=call_record_id,
+        )
+        if not result.get("success"):
+            logger.warning("[BookingProcessor] %s failed: %s", action, result)
+            return False, result
+        logger.info(
+            "[BookingProcessor] %s committed: appointment_id=%s",
+            action, result.get("appointment_id"),
+        )
+        await _mark_call_action(call_record_id, action)
+        return True, result
+    except Exception as exc:
+        logger.error(
+            "[BookingProcessor] Failed to %s appointment: %s",
+            action, exc, exc_info=True,
+        )
+        return False, {}
+
+
+async def _mark_call_action(call_record_id: Optional[str], action: str) -> None:
+    """Flag the call with the real outcome of a cancel/reschedule, mirroring
+    _mark_call_booked's audit-P3 fix so cancelled/rescheduled calls are also
+    reflected in the dashboard's call outcome column instead of reading as
+    unresolved. Best-effort: a failure here never affects the caller's
+    already-successful cancel/reschedule."""
+    if not call_record_id:
+        return
+    outcome = "cancelled" if action == "CANCEL" else "rescheduled"
+    try:
+        from sqlalchemy import update
+
+        from backend.db import AsyncSessionLocal
+        from backend.models.call_record import CallRecord
+
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(CallRecord)
+                .where(CallRecord.id == call_record_id)
+                .values(outcome=outcome, booking_successful=True)
+            )
+            await db.commit()
+        logger.info("[BookingProcessor] Marked call %s outcome=%s", call_record_id, outcome)
+    except Exception as exc:
+        logger.error("[BookingProcessor] Failed to mark call %s %s: %s", call_record_id, outcome, exc)

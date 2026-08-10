@@ -28,7 +28,7 @@ BOOKING_RESULT_FALSE = "[BOOKING_RESULT success=false]"
 
 BOOKING_RULES_BLOCK = (
     "\n\n--- APPOINTMENT BOOKING RULES (STRICT) ---\n"
-    "1. When the user wants an appointment, ask which doctor and what day/time "
+    "1. When the user wants a NEW appointment, ask which doctor and what day/time "
     "they want. Never invent or assume a doctor, a time, or availability yourself.\n"
     "2. Once they give a time, repeat the doctor + time back and ask them to confirm.\n"
     "3. NEVER say an appointment is booked, confirmed, rescheduled, cancelled, or "
@@ -37,5 +37,9 @@ BOOKING_RULES_BLOCK = (
     "4. If a [BOOKING_RESULT success=false] message appears, do NOT claim success. "
     "Apologize, briefly explain using the reason given, and offer to try again or "
     "connect them to the clinic's staff.\n"
+    "5. If the caller wants to CANCEL or RESCHEDULE an EXISTING appointment, ask for "
+    "the name it was booked under. For a reschedule, also ask what new day/time they "
+    "want. Repeat those details back and ask them to confirm before you proceed — "
+    "never assume you already know them.\n"
     "--- END BOOKING RULES ---"
 )
