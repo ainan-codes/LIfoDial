@@ -3,7 +3,7 @@ import logging
 import os
 from dotenv import load_dotenv
 
-from backend.services.net import is_safe_outbound_url
+from backend.services.net import is_safe_outbound_url, post_json_with_safe_redirects
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -70,11 +70,14 @@ async def log_booking_to_sheets(
     }
     
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(final_url, json=payload, follow_redirects=False)
-            response.raise_for_status()
-            logger.info("Successfully logged booking to Google Sheets.")
-            return True
+        # Google Apps Script /exec ALWAYS answers with a 302 to
+        # script.googleusercontent.com, so this must follow redirects — but
+        # only to hosts that still pass the SSRF check, since the URL is
+        # tenant-controlled. See net.post_json_with_safe_redirects.
+        response = await post_json_with_safe_redirects(final_url, payload, timeout=10.0)
+        response.raise_for_status()
+        logger.info("Successfully logged booking to Google Sheets.")
+        return True
     except Exception as e:
         logger.error(f"Failed to log booking to Google Sheets: {e}")
         return False

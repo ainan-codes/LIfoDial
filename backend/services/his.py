@@ -218,24 +218,21 @@ async def send_to_sheets_webhook(webhook_url: str | None, payload: dict):
     if not target_url:
         logger.info("No Google Sheets webhook URL configured. Skipping sheet sync.")
         return
-    from backend.services.net import is_safe_outbound_url
+    from backend.services.net import is_safe_outbound_url, post_json_with_safe_redirects
     if not is_safe_outbound_url(target_url):
         logger.warning("Refusing to POST to unsafe/internal Sheets webhook URL: %s", target_url)
         return
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                target_url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=5.0,
-                follow_redirects=False
-            )
-            if response.status_code == 200:
-                logger.info(f"Successfully pushed appointment {payload.get('appointment_id')} to Google Sheets.")
-            else:
-                logger.error(f"Google Sheets webhook failed with status {response.status_code}: {response.text}")
+        # Google Apps Script /exec always 302s to script.googleusercontent.com,
+        # so refusing redirects outright meant this never actually reached the
+        # sheet. Redirects are followed but re-validated per hop, because the
+        # webhook URL is tenant-controlled (see net.py).
+        response = await post_json_with_safe_redirects(target_url, payload, timeout=5.0)
+        if response.status_code == 200:
+            logger.info(f"Successfully pushed appointment {payload.get('appointment_id')} to Google Sheets.")
+        else:
+            logger.error(f"Google Sheets webhook failed with status {response.status_code}: {response.text}")
     except Exception as e:
         logger.error(f"Error pushing to Google Sheets: {e}", exc_info=True)
 
