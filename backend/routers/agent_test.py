@@ -2515,6 +2515,18 @@ def _asserts_completion(text: str, action: str) -> bool:
     return any(k in low for k in _COMPLETION_MARKERS.get((action or "").upper(), ()))
 
 
+def _claims_any_completion(text: str) -> bool:
+    """True if the reply claims ANY appointment action is done.
+
+    Used where no [ACTION:] tag was emitted — in which case nothing was
+    written, so such a claim is a fabricated confirmation. Measured
+    2026-08-10: llama-3.1-8b-instant produced exactly this ("Your appointment
+    with Dr. Rajesh is booked", no tag) in 2 of 3 runs, and the stronger
+    llama-3.3-70b does it occasionally too.
+    """
+    return any(_asserts_completion(text, action) for action in _COMPLETION_MARKERS)
+
+
 def _scrub_reply(text: str) -> str:
     """Strip machine tags (valid or malformed) out of anything shown to a patient."""
     text = _LOOSE_ACTION_RE.sub("", text or "")
@@ -2681,16 +2693,22 @@ async def _handle_booking_action(
     m = _ACTION_RE.search(response or "")
 
     if not m:
-        # No parseable tag. If the model nonetheless told the patient to wait
-        # while it "completes the booking", the patient is about to be stranded
-        # on silence (the 2026-08-10 bug). Give the model exactly one strict
-        # chance to either emit the tag now or ask for what is missing.
-        if not _promises_followup(response):
+        # No parseable tag means NOTHING was written. Two replies are unsafe to
+        # pass through in that state:
+        #   * a promise to go do it ("hold on…") — the patient waits on silence
+        #     forever, since this path cannot send a follow-up;
+        #   * a claim that it is already done — a fabricated confirmation for a
+        #     booking that does not exist.
+        # Either way, give the model one strict chance to emit the tag or ask
+        # for what is missing.
+        fabricated = _claims_any_completion(response)
+        if not (_promises_followup(response) or fabricated):
             return _scrub_reply(response)
 
-        logger.warning(
-            "Booking reply promised a follow-up with NO action tag — repairing "
-            "(the turn would otherwise end in permanent silence): %r", (response or "")[:160],
+        logger.error(
+            "Booking reply %s with NO action tag — nothing was written. Repairing: %r",
+            "CLAIMED THE ACTION WAS DONE" if fabricated else "promised a follow-up",
+            (response or "")[:160],
         )
         repaired = await _repair_missing_action_tag(
             provider=provider, api_key=api_key, model=model, max_tokens=max_tokens,
@@ -2699,8 +2717,8 @@ async def _handle_booking_action(
         m = _ACTION_RE.search(repaired or "")
         if not m:
             cleaned = _scrub_reply(repaired or "")
-            # Only accept the repair if it actually stopped promising.
-            if cleaned and not _promises_followup(cleaned):
+            # Accept the repair only if it stopped BOTH promising and claiming.
+            if cleaned and not _promises_followup(cleaned) and not _claims_any_completion(cleaned):
                 return cleaned
             lang = (user_language or "en-IN").strip() or "en-IN"
             return _NEEDS_DETAILS_REPLY.get(lang, _NEEDS_DETAILS_REPLY["en-IN"])
@@ -2813,10 +2831,11 @@ async def _repair_missing_action_tag(
     repair_system = (
         base_system_prompt
         + "\n\n--- SYSTEM UPDATE (AUTHORITATIVE — obey exactly) ---\n"
-        "Your previous reply told the patient to wait while you completed their request, but you did NOT "
-        "emit an [ACTION: ...] tag — so NOTHING happened. This system can only reply to the patient's own "
-        "messages: there is no way to send them a follow-up later. A promise to confirm 'shortly' is a "
-        "promise that will never be kept.\n"
+        "Your previous reply either told the patient to wait while you completed their request, or told "
+        "them it was already done — but you did NOT emit an [ACTION: ...] tag, so NOTHING happened. No "
+        "appointment was created, changed or cancelled. This system can only reply to the patient's own "
+        "messages: there is no way to send them a follow-up later, and you must never state that an "
+        "appointment is booked/cancelled/rescheduled unless the system has confirmed it back to you.\n"
         "Reply once more, choosing EXACTLY ONE of:\n"
         "  (a) If you already have Name, Phone, Date (DD/MM/YYYY), Time and Doctor — output the correct "
         "[ACTION: ...] tag NOW, at the end of one short neutral sentence.\n"
@@ -3007,7 +3026,11 @@ async def generate_llm_response(
         "gemini": ["gemini"],
         "openai": ["gpt-", "o1-", "o3-"],
         "anthropic": ["claude"],
-        "groq": ["llama", "mixtral", "gemma", "whisper", "compound", "deepseek-r1", "moonshard"],
+        # "openai/gpt-oss" is Groq-hosted despite the vendor prefix — without it
+        # here, setting a clinic to that model would be silently "auto-corrected"
+        # back to llama-3.3-70b by the check below.
+        "groq": ["llama", "mixtral", "gemma", "whisper", "compound", "deepseek-r1",
+                 "moonshard", "openai/gpt-oss", "qwen"],
         "deepseek": ["deepseek"],
         "mistral": ["mistral"],
     }
@@ -3126,9 +3149,29 @@ async def generate_llm_response(
         )
 
         if should_fallback:
-            fallback_order = [p for p in ("groq", "openai", "anthropic", "deepseek", "gemini")
-                              if p != llm_provider]
-            for fb_provider in fallback_order:
+            # (provider, model_override) candidates, tried in order.
+            #
+            # Groq's free tier meters tokens-per-day PER MODEL, so when the
+            # primary model's daily budget is gone another Groq model still has
+            # its own untouched budget — that is the cheapest possible recovery,
+            # and it needs no extra API key. gpt-oss-120b is used because it
+            # matched llama-3.3-70b on ACTION-tag emission when measured
+            # (3/3 each) at comparable latency; the smaller llama-3.1-8b-instant
+            # did NOT (1/3, and it fabricated a booking confirmation), so it is
+            # deliberately not in this list.
+            #
+            # NOTE: groq/compound* is also NOT a valid escape hatch — it routes
+            # to llama-3.3-70b internally and returns that same exhausted-budget
+            # 429.
+            candidates: list[tuple[str, str | None]] = []
+            if is_rate_limit_error(error_msg):
+                for alt_model in SAME_PROVIDER_RATE_LIMIT_MODELS.get(llm_provider, ()):
+                    if alt_model != agent_model:
+                        candidates.append((llm_provider, alt_model))
+            candidates += [(p, None) for p in ("groq", "openai", "anthropic", "deepseek", "gemini")
+                           if p != llm_provider]
+
+            for fb_provider, fb_model_override in candidates:
                 fb_env = {
                     "groq": settings.groq_api_key or os.getenv("GROQ_API_KEY"),
                     "openai": settings.openai_api_key or os.getenv("OPENAI_API_KEY"),
@@ -3154,11 +3197,11 @@ async def generate_llm_response(
                 if not fb_env:
                     continue
                 fb_key = fb_env.strip()
-                fb_model = PROVIDER_DEFAULTS.get(fb_provider, "")
+                fb_model = fb_model_override or PROVIDER_DEFAULTS.get(fb_provider, "")
                 try:
                     logger.warning(
-                        "Falling back from %s → %s (model=%s) due to error: %s",
-                        llm_provider, fb_provider, fb_model, error_msg[:200],
+                        "Falling back from %s/%s → %s/%s due to error: %s",
+                        llm_provider, agent_model, fb_provider, fb_model, error_msg[:200],
                     )
                     if fb_provider == "gemini":
                         response = await call_gemini(fb_key, system_prompt, history, fb_model)
@@ -3230,6 +3273,26 @@ _LONG_QUOTA_MARKERS = (
     "per day", "tokens per day", "tpd", "daily limit", "per month", "quota exceeded",
     "insufficient_quota", "billing", "credit balance",
 )
+
+
+# Same-provider models to retry when the configured one is rate limited.
+#
+# Groq meters tokens-per-day PER MODEL on the free tier, so a second Groq model
+# is a whole extra daily budget reachable with the SAME api key — the cheapest
+# recovery available, and the first thing tried before switching provider.
+#
+# Chosen empirically (2026-08-10) on this app's hardest task, emitting a
+# well-formed [ACTION: ...] tag from a booking conversation:
+#     llama-3.3-70b-versatile  3/3   (current primary)
+#     openai/gpt-oss-120b      3/3   <- listed here
+#     openai/gpt-oss-20b       3/3
+#     llama-3.1-8b-instant     1/3   <- NOT listed: it also fabricated
+#                                       "your appointment is booked" with no
+#                                       tag, i.e. confirmed a booking that was
+#                                       never written.
+SAME_PROVIDER_RATE_LIMIT_MODELS: dict[str, tuple[str, ...]] = {
+    "groq": ("openai/gpt-oss-120b", "openai/gpt-oss-20b"),
+}
 
 
 def is_rate_limit_error(error_msg: str) -> bool:
@@ -3438,6 +3501,21 @@ async def call_anthropic(api_key: str, system_prompt: str,
             raise Exception(f"Anthropic error: {response.status_code}")
 
 
+# Groq-hosted REASONING models: they spend tokens thinking before they emit a
+# single visible character. Measured 2026-08-10: at the agents' normal
+# max_tokens (150-250) openai/gpt-oss-* returns EMPTY content every time — the
+# whole allowance goes to reasoning. Given room (and effort capped to "low")
+# the same models match llama-3.3-70b on this app's hardest task, emitting a
+# well-formed [ACTION: ...] tag 3/3. So these two knobs are not tuning, they
+# are the difference between "works" and "replies with nothing".
+_GROQ_REASONING_MODEL_MARKERS = ("gpt-oss", "qwen3", "deepseek-r1")
+_GROQ_REASONING_MIN_TOKENS = 800
+
+
+def is_groq_reasoning_model(model: str) -> bool:
+    return any(marker in (model or "").lower() for marker in _GROQ_REASONING_MODEL_MARKERS)
+
+
 async def call_groq(api_key: str, system_prompt: str,
                              history: list, model: str, max_tokens: int = 150) -> str:
     import httpx
@@ -3450,6 +3528,16 @@ async def call_groq(api_key: str, system_prompt: str,
             "content": msg["content"]
         })
 
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.7,
+    }
+    if is_groq_reasoning_model(model):
+        payload["reasoning_effort"] = "low"
+        payload["max_tokens"] = max(max_tokens, _GROQ_REASONING_MIN_TOKENS)
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -3457,17 +3545,17 @@ async def call_groq(api_key: str, system_prompt: str,
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
             },
-            json={
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": 0.7
-            }
+            json=payload,
         )
-        
+
         if response.status_code == 200:
             data = response.json()
-            return data["choices"][0]["message"]["content"]
+            content = (data["choices"][0]["message"].get("content") or "").strip()
+            if not content:
+                # Never hand an empty string back as if it were a reply — raise
+                # so the caller's fallback chain gets a chance to answer.
+                raise Exception(f"Groq returned an empty completion for model {model}")
+            return content
         else:
             logger.error(f"Groq API error: {response.status_code} - {response.text}")
             raise Exception(f"Groq API error: {response.status_code} - {response.text}")

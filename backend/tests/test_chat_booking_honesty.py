@@ -355,6 +355,55 @@ async def test_successful_write_never_replies_with_please_wait(seeded_db):
 
 
 @pytest.mark.asyncio
+async def test_claiming_booked_with_no_tag_is_never_shown_to_the_patient(seeded_db):
+    """The worst failure mode: the model says "your appointment is booked" and
+    emits NO tag, so nothing was written — a fabricated confirmation.
+
+    Measured 2026-08-10 while benchmarking Groq models: llama-3.1-8b-instant
+    did exactly this in 2 of 3 booking runs. The previous guard only caught
+    replies that PROMISED a follow-up, so this sailed straight through."""
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt and "NOTHING happened" in system_prompt:
+            # Repair pass: model now emits the tag it should have emitted.
+            return f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026|3 PM|{REAL_DOCTOR_NAME}|N/A]"
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
+            return f"Your appointment with {REAL_DOCTOR_NAME} is confirmed."
+        # Phase 1: fabricated confirmation, no tag.
+        return f"Your appointment with {REAL_DOCTOR_NAME} is booked for 3 PM on 23/07/2026."
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            reply = await chat_mod.generate_llm_response(
+                agent, "John Doe, 9812345678.", db, session_id="s-fabricated", user_language="en-IN")
+
+    # The claim is only allowed to stand because the repair actually booked it.
+    appts = await _appointments()
+    assert len(appts) == 1, "a 'booked' claim must be backed by a real row"
+    assert "confirmed" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_fabricated_claim_that_cannot_be_repaired_is_replaced(seeded_db):
+    """If the model keeps claiming success without a tag, the patient must NOT
+    be told it is booked."""
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        return f"Your appointment with {REAL_DOCTOR_NAME} is booked."
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            reply = await chat_mod.generate_llm_response(
+                agent, "book it", db, session_id="s-fab-norepair", user_language="en-IN")
+
+    assert await _appointments() == [], "nothing was written"
+    assert not chat_mod._claims_any_completion(reply), \
+        f"must not tell the patient it is booked when it is not: {reply!r}"
+
+
+@pytest.mark.asyncio
 async def test_no_tag_and_repair_fails_still_resolves_the_turn(seeded_db):
     """If even the repair pass keeps promising, fall back to a question. The
     turn must never end on 'please wait'."""

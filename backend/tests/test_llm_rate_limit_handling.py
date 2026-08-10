@@ -115,7 +115,11 @@ async def test_rate_limit_fails_over_to_another_provider(seeded_db):
     async def ok_openai(api_key, system_prompt, history, model, **kw):
         return "Thanks — what time would you like?"
 
+    # call_groq must be stubbed too, or the same-provider retry (gpt-oss) runs
+    # first — and, since settings.groq_api_key is read from .env before the
+    # patched env var, it would fire a REAL request at the live Groq API.
     with patch.object(chat_mod, "_dispatch_llm", side_effect=boom), \
+         patch.object(chat_mod, "call_groq", side_effect=boom), \
          patch.object(chat_mod, "call_openai", side_effect=ok_openai), \
          patch.dict(os.environ, {"GROQ_API_KEY": "gk", "OPENAI_API_KEY": "ok-key"}):
         async with AsyncSessionLocal() as db:
@@ -128,6 +132,90 @@ async def test_rate_limit_fails_over_to_another_provider(seeded_db):
 
 
 @pytest.mark.asyncio
+async def test_rate_limit_retries_another_groq_model_before_switching_provider(seeded_db):
+    """Groq meters tokens-per-day PER MODEL, so a second Groq model is a whole
+    extra daily budget reachable with the same key — try it first."""
+    seen = {}
+
+    async def boom(*a, **kw):
+        raise Exception(GROQ_TPD_ERROR)
+
+    async def ok_groq(api_key, system_prompt, history, model, **kw):
+        seen["model"] = model
+        return "Sure — what time suits you?"
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=boom), \
+         patch.object(chat_mod, "call_groq", side_effect=ok_groq), \
+         patch.dict(os.environ, {"GROQ_API_KEY": "gk"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            reply = await chat_mod.generate_llm_response(
+                agent, "9090909090", db, session_id="s-429-model", user_language="en-IN")
+
+    assert reply == "Sure — what time suits you?"
+    assert seen["model"] == "openai/gpt-oss-120b", \
+        f"should retry on a Groq model with its own budget, used {seen.get('model')!r}"
+    # The model that ran out must never be the one retried.
+    assert seen["model"] != "llama-3.3-70b-versatile"
+
+
+def test_reasoning_models_get_room_to_think():
+    """gpt-oss returns EMPTY content at the agents' normal max_tokens, because
+    reasoning consumes the whole allowance — so the client must raise it."""
+    assert chat_mod.is_groq_reasoning_model("openai/gpt-oss-120b") is True
+    assert chat_mod.is_groq_reasoning_model("llama-3.3-70b-versatile") is False
+
+
+@pytest.mark.asyncio
+async def test_groq_reasoning_model_gets_reasoning_effort_and_more_tokens():
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"choices": [{"message": {"content": "hello"}}]}
+
+    class _Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, headers=None, json=None):
+            captured.update(json or {})
+            return _Resp()
+
+    with patch("httpx.AsyncClient", lambda *a, **kw: _Client()):
+        out = await chat_mod.call_groq("k", "sys", [{"role": "user", "content": "hi"}],
+                                       "openai/gpt-oss-120b", max_tokens=150)
+    assert out == "hello"
+    assert captured["reasoning_effort"] == "low"
+    assert captured["max_tokens"] >= 800, "150 tokens is all reasoning and yields an empty reply"
+
+    captured.clear()
+    with patch("httpx.AsyncClient", lambda *a, **kw: _Client()):
+        await chat_mod.call_groq("k", "sys", [{"role": "user", "content": "hi"}],
+                                 "llama-3.3-70b-versatile", max_tokens=150)
+    assert "reasoning_effort" not in captured, "non-reasoning models must be left alone"
+    assert captured["max_tokens"] == 150
+
+
+@pytest.mark.asyncio
+async def test_empty_completion_raises_rather_than_returning_blank():
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {"choices": [{"message": {"content": "   "}}]}
+
+    class _Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, headers=None, json=None): return _Resp()
+
+    with patch("httpx.AsyncClient", lambda *a, **kw: _Client()):
+        with pytest.raises(Exception, match="empty completion"):
+            await chat_mod.call_groq("k", "sys", [{"role": "user", "content": "hi"}],
+                                     "openai/gpt-oss-120b")
+
+
+@pytest.mark.asyncio
 async def test_rate_limit_with_no_fallback_reports_the_truth(seeded_db):
     """Production's actual situation: Groq is the only configured LLM, so
     there is nothing to fail over to. The patient must still be told something
@@ -135,7 +223,10 @@ async def test_rate_limit_with_no_fallback_reports_the_truth(seeded_db):
     async def boom(*a, **kw):
         raise Exception(GROQ_TPD_ERROR)
 
+    # Stub call_groq as well: the same-provider gpt-oss retry would otherwise
+    # reach the real Groq API via settings.groq_api_key from .env.
     with patch.object(chat_mod, "_dispatch_llm", side_effect=boom), \
+         patch.object(chat_mod, "call_groq", side_effect=boom), \
          patch.dict(os.environ, {"GROQ_API_KEY": "gk"}, clear=False):
         for k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY"):
             os.environ.pop(k, None)
