@@ -2442,7 +2442,7 @@ _ACTION_RE = re.compile(
 # "[ACTION: None]", which the strict regex ignored and which therefore leaked
 # into the patient's chat verbatim. Every user-facing reply is scrubbed with
 # this, not just the ones where a valid tag was found.
-_LOOSE_ACTION_RE = re.compile(r'\[ACTION:[^\]]*\]', re.IGNORECASE)
+_LOOSE_ACTION_RE = re.compile(r'\[ACTION\b[^\]]*\]', re.IGNORECASE)
 
 # Phrases that promise a LATER message ("hold on", "I'll confirm shortly").
 #
@@ -2472,6 +2472,47 @@ def _promises_followup(text: str) -> bool:
     either way."""
     low = (text or "").lower()
     return any(p in low for p in _FOLLOWUP_PROMISE_PATTERNS)
+
+
+# Values a model writes when it does not actually have the detail. The tag
+# instructions themselves say to use 'N/A' for fields that don't apply, so the
+# model readily fills these in for BOOK fields it hasn't collected yet.
+_PLACEHOLDER_VALUES = frozenset({
+    "", "n/a", "na", "n.a.", "none", "null", "-", "--", "unknown", "not provided",
+    "not given", "patient", "customer", "tbd", "xxx",
+})
+
+
+def _is_placeholder(value: str) -> bool:
+    return (value or "").strip().lower() in _PLACEHOLDER_VALUES
+
+
+# Words that make a reply an actual ASSERTION that the action completed. A
+# reply may mention "confirm" and still not confirm anything ("To confirm, you
+# are Ramesh Kumar… is that right?"), so a trailing question mark disqualifies
+# it regardless — see _asserts_completion.
+_COMPLETION_MARKERS = {
+    "BOOK": ("confirmed", "booked", "scheduled", "reserved", "is set", "all set",
+             "कन्फर्म", "बुक", "निश्चित"),
+    "RESCHEDULE": ("rescheduled", "moved", "changed", "updated", "new time",
+                   "रीशेड्यूल", "बदल"),
+    "CANCEL": ("cancelled", "canceled", "called off", "रद्द"),
+}
+
+
+def _asserts_completion(text: str, action: str) -> bool:
+    """True if this reply actually TELLS the patient the action is done.
+
+    Guards the success path: the write really happened, so a reply that merely
+    asks another question ("…is that correct?") leaves the patient believing
+    nothing has been booked — the same stranding as a "please wait", just
+    phrased differently. Observed live 2026-08-10.
+    """
+    t = (text or "").strip()
+    if not t or t.endswith("?"):
+        return False
+    low = t.lower()
+    return any(k in low for k in _COMPLETION_MARKERS.get((action or "").upper(), ()))
 
 
 def _scrub_reply(text: str) -> str:
@@ -2562,6 +2603,11 @@ def _booking_result_message(action: str, res: dict) -> str:
         return (f"{BOOKING_RESULT_FALSE} No valid appointment TIME was given, so nothing was booked or "
                 "changed — never assume or invent a time. Do NOT say it was done. Ask the patient to state "
                 "the time again, e.g. '3 PM' or '11:30 AM'.")
+    if reason == "missing_details":
+        need = " and ".join(res.get("missing") or ["the patient's details"])
+        return (f"{BOOKING_RESULT_FALSE} NOTHING was booked: you have not collected the patient's {need} "
+                f"yet, and an appointment without it could never be found again to cancel or reschedule. "
+                f"Do NOT say it was done. Ask the patient for their {need} in one short question.")
     if reason == "slot_taken":
         alts = ", ".join(res.get("alternatives") or [])
         offer = (f" That doctor IS still free at: {alts}. Offer those exact times and nothing else."
@@ -2602,6 +2648,9 @@ def _deterministic_booking_reply(action: str, res: dict, user_language: str) -> 
                 "changed. Could you re-check those details?")
     if res.get("reason") == "invalid_time":
         return "I'm sorry, I didn't catch a clear time for that. Could you say it again, like '3 PM' or '11:30 AM'?"
+    if res.get("reason") == "missing_details":
+        need = " and ".join(res.get("missing") or ["your details"])
+        return f"Before I book that, could you give me your {need}?"
     if res.get("reason") == "slot_taken":
         alts = ", ".join(res.get("alternatives") or [])
         if alts:
@@ -2683,9 +2732,22 @@ async def _handle_booking_action(
     from backend.services.his import is_time_str_parseable
     needs_real_time = b_action in ("BOOK", "RESCHEDULE")
 
+    # Identity gate — a BOOK with a placeholder Name/Phone creates a row nobody
+    # can be identified from, and which the patient can NEVER cancel or
+    # reschedule, because that lookup matches on name AND phone
+    # (his.py::sync_appointment_to_db). Observed live 2026-08-10: the model
+    # emitted a BOOK tag with "N/A" for both before it had asked for them, and
+    # a real appointment was written for "N/A".
+    missing = [label for label, val in (("name", b_name), ("phone number", b_phone))
+               if _is_placeholder(val)] if b_action == "BOOK" else []
+
     if needs_real_time and not is_time_str_parseable(b_time):
         res = {"success": False, "reason": "invalid_time", "appointment_id": None,
                "doctor_name": None, "available_doctors": [], "slot": ""}
+    elif missing:
+        res = {"success": False, "reason": "missing_details", "appointment_id": None,
+               "doctor_name": None, "available_doctors": [], "slot": "",
+               "missing": missing}
     elif not allowed:
         res = {"success": False, "reason": "disabled", "appointment_id": None,
                "doctor_name": None, "available_doctors": [], "slot": ""}
@@ -2718,11 +2780,16 @@ async def _handle_booking_action(
         # whose row had ALREADY been written successfully. The deterministic
         # reply below is always outcome-accurate, so substituting it is strictly
         # safer than trusting the model here.
-        if final and not _promises_followup(final):
-            return final
+        # On SUCCESS the reply must assert completion; on failure it must at
+        # least not promise a follow-up. Anything else gets replaced with the
+        # deterministic, outcome-accurate reply.
         if final:
+            ok = (_asserts_completion(final, b_action) if res.get("success")
+                  else not _promises_followup(final))
+            if ok:
+                return final
             logger.warning(
-                "Regenerated booking reply still promised a follow-up (success=%s) — "
+                "Regenerated booking reply did not resolve the outcome (success=%s) — "
                 "substituting the deterministic reply: %r",
                 res.get("success"), final[:160],
             )

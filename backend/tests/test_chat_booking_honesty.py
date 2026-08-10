@@ -422,6 +422,71 @@ async def test_double_booking_reports_conflict_with_real_alternatives(seeded_db)
     assert not chat_mod._promises_followup(reply)
 
 
+def test_asserts_completion_rejects_questions_and_hedges():
+    from backend.routers.agent_test import _asserts_completion
+    assert _asserts_completion("Your appointment is confirmed.", "BOOK") is True
+    assert _asserts_completion("You're all set for 3 PM.", "BOOK") is True
+    # The exact live 2026-08-10 reply that followed a SUCCESSFUL write — it
+    # mentions "confirm" but asks rather than tells, so it must be rejected.
+    assert _asserts_completion(
+        "To confirm, you are Ramesh Kumar, and you would like to book with Dr. Rajesh "
+        "for tomorrow at two PM, is that right?", "BOOK") is False
+    assert _asserts_completion("", "BOOK") is False
+    assert _asserts_completion("Okay, noted.", "BOOK") is False
+
+
+@pytest.mark.asyncio
+async def test_successful_write_reported_as_a_question_is_replaced(seeded_db):
+    """A successful booking answered with another question leaves the patient
+    believing nothing happened — same stranding as 'please wait', different
+    wording. Observed live 2026-08-10."""
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
+            return "To confirm, you are John Doe and you want Dr Sharma at three PM, is that right?"
+        return ("Okay.\n"
+                f"[ACTION: BOOK|John Doe|+919812345678|23/07/2026|3 PM|{REAL_DOCTOR_NAME}|N/A]")
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            reply = await chat_mod.generate_llm_response(
+                agent, "Book it.", db, session_id="s-question", user_language="en-IN")
+
+    assert len(await _appointments()) == 1, "the write really happened"
+    assert chat_mod._asserts_completion(reply, "BOOK"), \
+        f"patient must be TOLD the booking exists, got: {reply!r}"
+
+
+@pytest.mark.asyncio
+async def test_book_with_placeholder_name_and_phone_is_refused(seeded_db):
+    """Live 2026-08-10: the model emitted a BOOK tag with N/A name and phone
+    before asking for them, writing a real appointment for patient "N/A" —
+    a row the patient could never cancel, since that lookup matches on
+    name AND phone."""
+    captured = {}
+
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
+            captured["regen_system"] = system_prompt
+            return "Could you tell me your name and phone number?"
+        return ("Booking that now.\n"
+                f"[ACTION: BOOK|N/A|N/A|23/07/2026|2 PM|{REAL_DOCTOR_NAME}|N/A]")
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            reply = await chat_mod.generate_llm_response(
+                agent, "Tomorrow at 2 PM please.", db, session_id="s-noname", user_language="en-IN")
+
+    assert await _appointments() == [], "must not write an unidentifiable appointment"
+    update = captured["regen_system"].split("SYSTEM UPDATE (AUTHORITATIVE", 1)[1]
+    assert BOOKING_RESULT_FALSE in update.split("--- APPOINTMENT BOOKING RULES", 1)[0]
+    assert "name" in update.lower() and "phone" in update.lower()
+    assert not chat_mod._promises_followup(reply)
+
+
 # ── Unit-level guards on the shared service ─────────────────────────────────────
 
 @pytest.mark.asyncio
