@@ -12,6 +12,7 @@ import {
   Pause,
   Phone,
   Play,
+  RefreshCw,
   Settings,
   X
 } from 'lucide-react';
@@ -19,7 +20,7 @@ import React, { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useRef,
 import { useNavigate, useParams } from 'react-router-dom';
 import fetchWithAuth, { API_URL } from '../../api/client';
 import {
-  DEFAULT_LANGUAGE, DEFAULT_STT_MODEL, DEFAULT_STT_PROVIDER,
+  DEFAULT_LANGUAGE, DEFAULT_LLM_MODEL, DEFAULT_STT_MODEL, DEFAULT_STT_PROVIDER,
   DEFAULT_TTS_MODEL, DEFAULT_TTS_PROVIDER,
 } from '../../api/lockedDefaults';
 import { getToken } from '../../api/auth';
@@ -339,11 +340,21 @@ const CollapsibleSection = ({ icon: Icon, title, summary, children }: any) => {
 
 // ── Main Page ────────────────────────────────────────────────────────────────
 
-// getLlmFallbackModels was removed with the LLM Model dropdown. It listed
-// gemini-2.5-flash-8b among Gemini's models, which is also the exact string one
-// live agent had stored against provider 'groq' — Groq answers 404 for it. A
-// per-provider model catalogue on the client is precisely the affordance that let
-// that pair be assembled, so it is not being kept "just in case".
+// There is deliberately NO model catalogue in this file. The Model dropdown is
+// populated from GET /platform/llm/models, which asks Groq itself on every cache
+// miss.
+//
+// The function that used to live here, getLlmFallbackModels, is why: it listed
+// gemini-2.5-flash-8b among Gemini's models, which is also the exact string one live
+// agent had stored against provider 'groq' — Groq answers 404 for it, so that
+// agent's LLM was dead. A per-provider model catalogue on the client is precisely
+// the affordance that let that pair be assembled. The provider half is gone for good
+// (locked to Groq server-side); the model half is a real choice again, but only ever
+// from Groq's live answer.
+
+/** Human-readable context window, e.g. 131072 → "131K context". */
+const contextLabel = (tokens?: number) =>
+  !tokens ? '' : tokens >= 1000 ? `${Math.round(tokens / 1000)}K context` : `${tokens} context`;
 
 export default function AgentDetail() {
   const { agentId } = useParams();
@@ -458,14 +469,91 @@ export default function AgentDetail() {
   // the selectable providers, each provider's real models, the language list, and
   // whether the currently-configured combination genuinely works.
   //
-  // The LLM provider/model dropdowns are NOT here and are not coming back — the
-  // LLM is locked platform-wide (backend/services/agent_defaults.py). STT and TTS
-  // provider/model ARE here: switching provider is the product's fallback story
-  // when a vendor degrades, so the choice stays. What changed is that the option
-  // list is a whitelist of providers that are genuinely configured and buildable,
-  // instead of the aspirational /platform PROVIDERS catalogue that used to offer
-  // ElevenLabs, Whisper, PlayHT and Azure alongside the two that work.
+  // The LLM PROVIDER dropdown is not here and is not coming back — the provider is
+  // locked platform-wide (backend/services/agent_defaults.py). The LLM MODEL has its
+  // own state below, fetched from Groq's live catalogue rather than from this
+  // endpoint. STT and TTS provider/model ARE here: switching provider is the
+  // product's fallback story when a vendor degrades, so the choice stays. What
+  // changed is that the option list is a whitelist of providers that are genuinely
+  // configured and buildable, instead of the aspirational /platform PROVIDERS
+  // catalogue that used to offer ElevenLabs, Whisper, PlayHT and Azure alongside the
+  // two that work.
   const [cfgOptions, setCfgOptions] = useState<any>(null);
+
+  // Groq's live model list for the Model dropdown, and the reason it is missing when
+  // it is missing.
+  //
+  // `llmModelsError` is rendered rather than swallowed on purpose: the backend
+  // answers 503 with Groq's own explanation instead of serving a stale list (see
+  // GET /platform/llm/models). An empty dropdown next to a visible error is
+  // recoverable; a plausible-looking list of models that 404 mid-call is not. The
+  // agent's CURRENT model is always offered regardless, so a fetch failure can never
+  // make the field look unset or silently move an agent off its model.
+  const [llmModels, setLlmModels] = useState<any[] | null>(null);
+  const [llmModelsError, setLlmModelsError] = useState<string | null>(null);
+  const [refreshingModels, setRefreshingModels] = useState(false);
+
+  const loadLlmModels = useCallback(async (opts?: { refresh?: boolean }) => {
+    const refresh = opts?.refresh === true;
+    if (refresh) setRefreshingModels(true);
+    try {
+      const d = await fetchWithAuth(`/platform/llm/models${refresh ? '?refresh=true' : ''}`);
+      setLlmModels(Array.isArray(d?.models) ? d.models : []);
+      setLlmModelsError(null);
+    } catch (e: any) {
+      // fetchWithAuth surfaces the backend's `detail`, which is Groq's own reason
+      // (bad key, unreachable, nothing usable) — far more actionable than "failed".
+      setLlmModels(null);
+      setLlmModelsError(e?.message || 'Could not load the model list from Groq.');
+    } finally {
+      if (refresh) setRefreshingModels(false);
+    }
+  }, []);
+
+  useEffect(() => { loadLlmModels(); }, [loadLlmModels]);
+
+  // The agent's CURRENT model is ALWAYS an option, even when Groq's list could not be
+  // fetched or no longer contains it.
+  //
+  // Two reasons, and the second is the one that matters: a <select> whose value
+  // matches no <option> renders blank — so the field would read as "this agent has no
+  // model" during any Groq hiccup — and the browser reports that blank state as the
+  // first option's value, meaning one stray change event could save a model nobody
+  // chose. Pinning the current value keeps the control honest in both directions.
+  //
+  // When the list DID load and the current model is absent from it, that is labelled
+  // rather than hidden: the agent is sitting on a model Groq no longer serves, which
+  // is a real problem (it is what left one live agent answering 404 on every call).
+  // The backend repairs such a row on its next save — see apply_locked_defaults'
+  // llm_model_ok tri-state.
+  const currentLlmModel = agent?.llm_model || DEFAULT_LLM_MODEL;
+  const selectedLlmModel = (llmModels || []).find((m: any) => m.id === currentLlmModel) || null;
+  const llmModelOptions = React.useMemo(() => {
+    const opts = (llmModels || []).map((m: any) => ({
+      value: m.id,
+      label: [
+        m.id,
+        contextLabel(m.context_window),
+        // The number that actually decides how many calls a day this agent can
+        // serve, and one no Groq response header reports.
+        m.daily_token_budget ? `${Math.round(m.daily_token_budget / 1000)}K tokens/day` : '',
+        m.reasoning ? 'reasoning' : '',
+        m.booking_verified ? '' : 'booking not verified',
+      ].filter(Boolean).join(' · '),
+    }));
+    if (!opts.some((o: any) => o.value === currentLlmModel)) {
+      opts.unshift({
+        value: currentLlmModel,
+        // Nothing is claimed about the model when the list is simply unavailable —
+        // "we could not ask Groq" and "Groq says this does not exist" are different
+        // facts, and the backend keeps them distinct too (groq_catalog.check_model).
+        label: llmModels === null
+          ? currentLlmModel
+          : `${currentLlmModel} · no longer served by Groq`,
+      });
+    }
+    return opts;
+  }, [llmModels, currentLlmModel]);
 
   // `quiet` re-reads the agent WITHOUT touching the page-level `loading` flag.
   //
@@ -1242,18 +1330,87 @@ export default function AgentDetail() {
             {/* ══ ASSISTANT SECTION ════════════════════════════════════════════ */}
             <div ref={el => { sectionRefs.current.assistant = el; }} data-section="assistant">
             {/* 1. MODEL */}
-            {/* LLM Provider + Model dropdowns REMOVED — the platform locks one
-                known-working combination (see backend/services/agent_defaults.py).
-                They were a real source of breakage, not just clutter: one live
-                agent had llm_provider='groq' with llm_model='gemini-2.5-flash-8b',
-                which Groq answers 404 for. Nothing here replaces them; the
-                backend applies the locked pair on every write. */}
-            <CollapsibleSection icon={Brain} title="Model" summary={agent.agent_name || 'Assistant'}>
+            {/* The LLM PROVIDER dropdown stays removed — it is locked to Groq
+                server-side (backend/services/agent_defaults.py) and was a real source
+                of breakage: one live agent had llm_provider='groq' with
+                llm_model='gemini-2.5-flash-8b', which Groq answers 404 for.
+
+                The MODEL dropdown is back, because that pair could only be assembled
+                when BOTH halves were free-form against client-side catalogues. The
+                options here come from Groq's live API, and the backend re-checks the
+                submitted model against Groq before storing it. */}
+            <CollapsibleSection icon={Brain} title="Model" summary={agent.llm_model || DEFAULT_LLM_MODEL}>
               {/* Was a two-column grid: Provider/Model on the left, First Message
-                  on the right. With the left column gone, one column is all that
-                  is left to lay out — kept as a grid so nothing else here moved. */}
+                  on the right. Kept as a single column — the Model dropdown reads
+                  better full-width, since the option labels carry the context window
+                  and the reasoning caveat. */}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '24px' }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <Label>LLM Model</Label>
+                      <button
+                        onClick={() => loadLlmModels({ refresh: true })}
+                        disabled={refreshingModels}
+                        title="Re-ask Groq for the current model list"
+                        style={{
+                          background: 'none', border: `1px solid ${BORDER}`, borderRadius: '12px',
+                          padding: '4px 8px', fontSize: '11px', color: '#fff',
+                          cursor: refreshingModels ? 'not-allowed' : 'pointer',
+                          opacity: refreshingModels ? 0.6 : 1,
+                          display: 'flex', alignItems: 'center', gap: '5px',
+                        }}
+                      >
+                        <RefreshCw size={11} style={refreshingModels ? { animation: 'lifodial-spin 0.8s linear infinite' } : undefined} />
+                        {refreshingModels ? 'Refreshing…' : 'Refresh'}
+                      </button>
+                    </div>
+                    <Select
+                      value={agent.llm_model || DEFAULT_LLM_MODEL}
+                      // Saves immediately and re-reads the row, like the STT/TTS
+                      // pickers: the backend may reject a model Groq no longer
+                      // serves, and optimistic state would leave a value on screen
+                      // that the row does not hold.
+                      onChange={(v: any) => changeProviderOrModel({ llm_model: v })}
+                      options={llmModelOptions}
+                    />
+                    {/* A reasoning model's visible chain-of-thought is spoken to the
+                        caller — nothing in the pipeline strips it — so the caveat
+                        belongs next to the choice, not buried in a doc. */}
+                    {selectedLlmModel?.reasoning && (
+                      <div style={{ marginTop: '6px', fontSize: '12px', color: '#e0a94a', display: 'flex', alignItems: 'flex-start', gap: '6px' }}>
+                        <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: '1px' }} />
+                        This is a reasoning model. Its thinking is not stripped from the
+                        reply, so callers may hear it read aloud.
+                      </div>
+                    )}
+                    {/* "Not measured" rather than "broken" — but worth saying, because
+                        the one model that WAS measured badly failed by telling the
+                        patient their appointment was booked without emitting the tag
+                        that writes it. A silent booking failure is the worst outcome
+                        this product has. */}
+                    {selectedLlmModel && !selectedLlmModel.booking_verified && (
+                      <div style={{ marginTop: '6px', fontSize: '12px', color: '#e0a94a', display: 'flex', alignItems: 'flex-start', gap: '6px' }}>
+                        <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: '1px' }} />
+                        This model has not been verified on appointment booking. Test a
+                        booking end to end before relying on it — an unverified model can
+                        confirm an appointment it never actually saved.
+                      </div>
+                    )}
+                    {llmModelsError ? (
+                      <div style={{ marginTop: '6px', fontSize: '12px', color: '#ff6b6b', display: 'flex', alignItems: 'flex-start', gap: '6px' }}>
+                        <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: '1px' }} />
+                        {llmModelsError} Only this agent's current model is shown until
+                        the list can be fetched — it has not been changed.
+                      </div>
+                    ) : (
+                      <Helper>
+                        Groq is the provider for every agent on the platform. The model is
+                        per-agent, and each one has its own daily token budget — moving an
+                        agent to a different model gives it a separate allowance.
+                      </Helper>
+                    )}
+                  </div>
                   <div>
                     <Label>First Message Mode</Label>
                     <div style={{ display: 'flex', gap: '12px', marginTop: '6px' }}>

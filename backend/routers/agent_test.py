@@ -32,6 +32,7 @@ from backend.models.api_key_config import ApiKeyConfig
 from backend.config import settings
 from backend.security import decode_access_token
 from backend.services.impersonation import claims_still_active
+from backend.services import llm_failover
 from backend import redis_client
 from backend.agent.booking_rules import (
     BOOKING_RULES_BLOCK,
@@ -3224,6 +3225,17 @@ async def generate_llm_response(
         )
         agent_model = new_model
 
+    # Skip a model already KNOWN to be out of budget, instead of rediscovering it.
+    #
+    # Groq's free-tier tokens-per-day is metered per model and, when it is gone, it
+    # is gone for ~15 minutes at a time (the provider says so: "try again in
+    # 14m46.464s"). Without this, every turn in that window spends a request on the
+    # wall before failing over — which still consumes an RPD slot from the 1,000/day
+    # bucket and, in the voice path, costs the caller a turn. A no-op on the happy
+    # path: nothing is benched unless a 429 was actually seen.
+    if llm_provider == "groq":
+        agent_model, _switch_reason = llm_failover.preferred_model(agent_model)
+
     # Admin-configured response length cap (AgentDetail.tsx "Max Tokens" field).
     # Was previously ignored here — every provider call hardcoded 150 regardless
     # of this setting, so the UI field had no effect on the in-browser tester.
@@ -3239,26 +3251,34 @@ async def generate_llm_response(
         getattr(agent, "language", None) or getattr(agent, "tts_language", None),
     )
 
-    try:
-        if llm_provider in ("gemini", "openai", "anthropic", "groq", "deepseek"):
-            response = await _dispatch_llm(llm_provider, api_key, system_prompt,
-                                           history, agent_model, max_tokens)
-        else:
-            response = generate_demo_response(agent, user_message, history)
+    async def _finish(reply: str, *, provider: str, key: str, model: str) -> str:
+        """Everything a successful turn owes the patient, wherever the reply came from.
 
+        Factored out because a turn can now succeed in THREE ways — on the
+        configured model, on a short-backoff retry of that same model, or on a
+        fallback model/provider — and every one of them owes the same two
+        guarantees: an ``[ACTION:]`` tag is turned into a REAL database write
+        before the reply is returned (never a confirmation for a row that does not
+        exist), and the turn reaches the shared history so a follow-up message
+        landing on another uvicorn worker still sees it.
+
+        These steps used to be copy-pasted per path, which put every future
+        recovery path one omission away from confirming a booking that was never
+        written.
+        """
+        nonlocal history
         # Honest booking (audit FIX 4): if the model emitted an [ACTION:] tag,
         # AWAIT the real DB write and regenerate the reply with the true outcome
         # injected. A confirmation is never spoken before the row exists — the
         # same guarantee the voice pipeline's BookingProcessor provides.
-        response = await _handle_booking_action(
-            response, agent=agent, db=db, history=history,
-            provider=llm_provider, api_key=api_key, model=agent_model,
+        reply = await _handle_booking_action(
+            reply, agent=agent, db=db, history=history,
+            provider=provider, api_key=key, model=model,
             max_tokens=max_tokens, base_system_prompt=system_prompt,
             user_language=user_language, websocket=websocket,
         )
 
-        # Add response to history
-        history.append({"role": "assistant", "content": response})
+        history.append({"role": "assistant", "content": reply})
 
         # Keep history to last 10 turns to avoid token overflow
         if len(history) > 20:
@@ -3272,12 +3292,60 @@ async def generate_llm_response(
         if websocket is None:
             await redis_client.save_chat_history(str(session_key), history)
 
-        return response
-        
+        return reply
+
+    try:
+        if llm_provider in ("gemini", "openai", "anthropic", "groq", "deepseek"):
+            response = await _dispatch_llm(llm_provider, api_key, system_prompt,
+                                           history, agent_model, max_tokens)
+        else:
+            response = generate_demo_response(agent, user_message, history)
+
+        return await _finish(response, provider=llm_provider, key=api_key, model=agent_model)
+
     except Exception as e:
         logger.error(f"LLM call failed (Provider: {llm_provider}, Model: {agent_model}): {type(e).__name__}: {e}", exc_info=True)
         error_msg = str(e) or type(e).__name__
         err_low = error_msg.lower()
+
+        # ── A BURST limit is waited out, not failed over ───────────────────────
+        # RPM/TPM refill continuously — measured on the live key, TPM 12,000
+        # refills at 200 tokens/sec, so `x-ratelimit-reset-tokens` on a real
+        # request was 185ms and even a full 1,563-token request is ~8s of refill.
+        # Switching model for that would move the clinic off the model they chose
+        # for a wait shorter than the switch itself, and spend a second model's
+        # daily budget to do it.
+        #
+        # A tokens-per-DAY exhaustion is explicitly excluded (see
+        # llm_failover.is_burst_limit): sleeping through that is the "please wait a
+        # moment" lie the 2026-08-10 incident was reported for. Exactly ONE retry,
+        # with a hard 5s cap, because a patient is waiting on this reply.
+        if is_rate_limit_error(error_msg) and llm_failover.is_burst_limit(error_msg):
+            pause = llm_failover.burst_sleep_seconds(error_msg)
+            logger.warning(
+                "Burst rate limit on %s/%s — waiting %.2fs and retrying the same model.",
+                llm_provider, agent_model, pause,
+            )
+            try:
+                await asyncio.sleep(pause)
+                retried = await _dispatch_llm(llm_provider, api_key, system_prompt,
+                                              history, agent_model, max_tokens)
+                logger.info("Burst retry on %s/%s succeeded.", llm_provider, agent_model)
+                return await _finish(retried, provider=llm_provider, key=api_key, model=agent_model)
+            except Exception as retry_e:
+                # Fall through to model/provider failover on the NEW error — the
+                # retry's own message is the current truth about what is wrong.
+                error_msg = str(retry_e) or type(retry_e).__name__
+                err_low = error_msg.lower()
+                logger.error(
+                    "Burst retry on %s/%s also failed: %s",
+                    llm_provider, agent_model, error_msg[:200],
+                )
+
+        # Bench a model that has told us it is out of budget, so the NEXT turn
+        # starts somewhere with budget instead of rediscovering this wall.
+        if is_rate_limit_error(error_msg) and llm_provider == "groq":
+            llm_failover.mark_rate_limited(agent_model, error_msg)
 
         # ── Auto-fallback to another provider on geo/region/auth/quota errors ──
         # e.g. Gemini returns 400 "User location is not supported for the API use"
@@ -3322,10 +3390,29 @@ async def generate_llm_response(
             # to llama-3.3-70b internally and returns that same exhausted-budget
             # 429.
             candidates: list[tuple[str, str | None]] = []
-            if is_rate_limit_error(error_msg):
-                for alt_model in SAME_PROVIDER_RATE_LIMIT_MODELS.get(llm_provider, ()):
-                    if alt_model != agent_model:
-                        candidates.append((llm_provider, alt_model))
+            # Another model on the SAME key recovers two different failures: an
+            # exhausted per-model budget, and a model Groq will not serve at all.
+            # The second used to fall straight through to "I'm having trouble
+            # processing that" even with four other Groq models reachable on the same
+            # key — which is exactly what a live agent stuck on 'gemini-2.5-flash-8b'
+            # (llm_provider='groq', HTTP 404 every call) got.
+            _same_key_retry = (
+                is_rate_limit_error(error_msg)
+                or llm_failover.is_model_unavailable_error(error_msg)
+            )
+            if _same_key_retry and llm_provider == "groq":
+                # Ordered by llm_failover, and a model already known to be out of
+                # budget is skipped rather than tried and re-failed: each rejected
+                # request still spends one of the 1,000/day RPD slots, and the
+                # patient waits through it for nothing.
+                for alt_model in llm_failover.fallback_models(agent_model):
+                    if llm_failover.is_cooling_down(alt_model):
+                        logger.info(
+                            "Skipping Groq fallback model %s — rate limited for another %.0fs.",
+                            alt_model, llm_failover.cooldown_remaining(alt_model),
+                        )
+                        continue
+                    candidates.append((llm_provider, alt_model))
             candidates += [(p, None) for p in ("groq", "openai", "anthropic", "deepseek", "gemini")
                            if p != llm_provider]
 
@@ -3396,26 +3483,19 @@ async def generate_llm_response(
                     else:
                         continue
 
-                    # Same honest booking handling as the primary path.
-                    response = await _handle_booking_action(
-                        response, agent=agent, db=db, history=history,
-                        provider=fb_provider, api_key=fb_key, model=fb_model,
-                        max_tokens=max_tokens, base_system_prompt=system_prompt,
-                        user_language=user_language, websocket=websocket,
-                    )
-
-                    history.append({"role": "assistant", "content": response})
-                    if len(history) > 20:
-                        history = history[-20:]
-                        _conversation_history[session_key] = history
-                    if websocket is None:
-                        await redis_client.save_chat_history(str(session_key), history)
-                    return response
+                    # Same honest booking handling as the primary path — including
+                    # the [ACTION:] tag becoming a real DB write before this reply
+                    # is returned. The fallback path must not be the cheap one.
+                    return await _finish(response, provider=fb_provider, key=fb_key, model=fb_model)
                 except Exception as fb_e:
+                    fb_err = str(fb_e) or type(fb_e).__name__
                     logger.error(
-                        "Fallback provider %s also failed: %s",
-                        fb_provider, fb_e,
+                        "Fallback %s/%s also failed: %s", fb_provider, fb_model, fb_err[:200],
                     )
+                    # A fallback that 429s is itself out of budget: bench it so the
+                    # next turn does not try it first all over again.
+                    if fb_provider == "groq" and is_rate_limit_error(fb_err):
+                        llm_failover.mark_rate_limited(fb_model, fb_err)
                     continue
 
         # Every fallback provider is exhausted or unconfigured by this point, so
@@ -3432,65 +3512,36 @@ def err_msg_pad(s: str) -> str:
     return f" {s} "
 
 
-# \b so a token COUNT never reads as a status code. The old check was a bare
-# `"429" in error_msg`, which also matched "Requested 4291 tokens" — i.e. an
-# unrelated failure could be reported to the patient as a rate limit. (Padding
-# alone does not fix this: " 429" is a prefix of " 4291".)
-_HTTP_429_RE = re.compile(r"\b429\b")
-
-# Groq spells the wait as "Please try again in 14m46.464s."
-_RETRY_HINT_RE = re.compile(
-    r"try again in\s+(?:(\d+)\s*h)?(?:(\d+)\s*m)?(?:([\d.]+)\s*s)?", re.IGNORECASE,
-)
-
 # Markers that this is a LONG-HORIZON budget (a daily/monthly allowance), not a
 # short burst limit. "Please wait a moment" is a lie for these — the next
 # message will fail exactly the same way.
-_LONG_QUOTA_MARKERS = (
-    "per day", "tokens per day", "tpd", "daily limit", "per month", "quota exceeded",
-    "insufficient_quota", "billing", "credit balance",
-)
+#
+# Shared with the voice path, and NO LONGER containing "billing": every Groq
+# rate-limit message ends with an "Upgrade to Dev Tier today at
+# .../settings/billing" link whatever window was hit, so matching it here told a
+# patient the assistant had "reached its usage limit for today" when the real limit
+# was a two-second requests-per-minute burst. Verified against a real forced 429 on
+# 2026-08-11 — see llm_failover.LONG_QUOTA_MARKERS.
+_LONG_QUOTA_MARKERS = llm_failover.LONG_QUOTA_MARKERS
 
 
 # Same-provider models to retry when the configured one is rate limited.
 #
-# Groq meters tokens-per-day PER MODEL on the free tier, so a second Groq model
-# is a whole extra daily budget reachable with the SAME api key — the cheapest
-# recovery available, and the first thing tried before switching provider.
-#
-# Chosen empirically (2026-08-10) on this app's hardest task, emitting a
-# well-formed [ACTION: ...] tag from a booking conversation:
-#     llama-3.3-70b-versatile  3/3   (current primary)
-#     openai/gpt-oss-120b      3/3   <- listed here
-#     openai/gpt-oss-20b       3/3
-#     llama-3.1-8b-instant     1/3   <- NOT listed: it also fabricated
-#                                       "your appointment is booked" with no
-#                                       tag, i.e. confirmed a booking that was
-#                                       never written.
+# DERIVED from backend/services/llm_failover.py rather than declared here, because
+# the voice path needs the identical answer and two lists would drift. That module
+# also carries the live evidence for the chain: per-model budgets are independent
+# (proven by probing the production key), and llama-3.1-8b-instant is excluded
+# despite the largest budget because it fabricated a booking confirmation.
 SAME_PROVIDER_RATE_LIMIT_MODELS: dict[str, tuple[str, ...]] = {
-    "groq": ("openai/gpt-oss-120b", "openai/gpt-oss-20b"),
+    "groq": tuple(llm_failover.GROQ_MODEL_CHAIN[1:]),
 }
 
 
-def is_rate_limit_error(error_msg: str) -> bool:
-    low = (error_msg or "").lower()
-    return bool(
-        _HTTP_429_RE.search(error_msg or "")
-        or "rate limit" in low
-        or "rate_limit" in low
-        or "too many requests" in low
-        or "quota exceeded" in low
-        or "insufficient_quota" in low
-    )
-
-
-def retry_after_seconds(error_msg: str) -> float | None:
-    """Seconds the provider asked us to wait, if it said so."""
-    m = _RETRY_HINT_RE.search(error_msg or "")
-    if not m or not any(m.groups()):
-        return None
-    h, mins, secs = m.groups()
-    return (int(h or 0) * 3600) + (int(mins or 0) * 60) + float(secs or 0)
+# Classification lives in llm_failover so the Pipecat pipeline reaches the same
+# verdict from the same code. Re-exported under the original names: these are the
+# module's public surface (widget/embed callers and tests both use them).
+is_rate_limit_error = llm_failover.is_rate_limit_error
+retry_after_seconds = llm_failover.retry_after_seconds
 
 
 def describe_llm_failure(error_msg: str) -> str | None:
@@ -3509,7 +3560,14 @@ def describe_llm_failure(error_msg: str) -> str | None:
 
     if is_rate_limit_error(error_msg):
         wait = retry_after_seconds(error_msg)
-        long_budget = any(k in low for k in _LONG_QUOTA_MARKERS) or (wait or 0) > 120
+        # The provider's own wait DECIDES when it is present; the prose is only
+        # consulted when there is no number to read. Groq's rate-limit prose carries
+        # a billing/upgrade link in every case, so keyword-matching it first labelled
+        # short bursts as exhausted daily budgets.
+        long_budget = (
+            wait > 120 if wait is not None
+            else llm_failover.names_a_long_budget(error_msg)
+        )
         if long_budget:
             # Not recoverable inside this conversation — say so, and hand the
             # patient somewhere that can actually finish the booking.

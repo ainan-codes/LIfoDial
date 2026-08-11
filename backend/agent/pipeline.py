@@ -1868,7 +1868,17 @@ async def entrypoint(ctx) -> None:
     # on any LLM/TTS ErrorFrame, speaks a short reassurance phrase in the agent's
     # language instead of leaving dead air. Task is bound after PipelineTask
     # construction below.
-    resilience = ResilienceProcessor(language=tts_language)
+    # The LLM service, provider and model are passed in so a rate limit can be
+    # RECOVERED (switch to a Groq model that still has budget and re-ask this turn)
+    # rather than only apologised for. The setup-time probe above cannot prevent this
+    # case: listing models costs no tokens, so a key with an exhausted daily budget
+    # passes the probe and fails on the caller's first question.
+    resilience = ResilienceProcessor(
+        language=tts_language,
+        llm=llm,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+    )
 
     # Mid-call language switching: watches the caller's final transcripts and
     # retunes TTS (and STT, when the model is language-pinned) the moment they

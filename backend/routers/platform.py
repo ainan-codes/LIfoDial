@@ -1784,7 +1784,7 @@ async def llm_models(
     user: CurrentUser = None,
     db: AsyncSession = Depends(get_db),
 ):
-    from backend.services import agent_defaults, groq_catalog
+    from backend.services import agent_defaults, groq_catalog, llm_failover
 
     raw_key = await _get_raw_key(agent_defaults.LOCKED_LLM_PROVIDER, db, category="llm")
     try:
@@ -1794,10 +1794,36 @@ async def llm_models(
         # so the UI should invite a retry rather than present a broken page.
         raise HTTPException(status_code=503, detail=str(exc))
 
+    # Annotated here rather than in groq_catalog, which deliberately derives every
+    # judgement from a field Groq itself returned. These two are OUR knowledge about
+    # a model, and they are what an operator actually needs to choose well:
+    #
+    #  * booking_verified — the model was measured emitting a well-formed [ACTION:]
+    #    tag from a real booking conversation. This is the capability that matters in
+    #    this product, and it is NOT the same as Groq's `tools` flag: booking here is
+    #    a regex FSM over the reply text (BookingProcessor / the [ACTION:] parser),
+    #    not function calling, so `tools` says nothing about whether bookings work.
+    #    Unverified is not "broken" — it is "nobody has measured it", which matters
+    #    because the one model that WAS measured badly (llama-3.1-8b-instant) failed
+    #    by telling the patient their appointment was booked without emitting a tag,
+    #    i.e. confirming a row that was never written.
+    #  * daily_token_budget — Groq meters its free-tier token budget per model, and
+    #    no response header reports it, so an operator has no other way to see that
+    #    moving an agent to gpt-oss-120b doubles the calls it can serve in a day.
+    verified = set(llm_failover.GROQ_MODEL_CHAIN)
+    annotated = [
+        {
+            **m,
+            "booking_verified": m["id"] in verified,
+            "daily_token_budget": llm_failover.GROQ_FREE_TIER_TPD.get(m["id"]),
+        }
+        for m in models
+    ]
+
     return {
         "provider": agent_defaults.LOCKED_LLM_PROVIDER,
         "source": "live",
-        "models": models,
+        "models": annotated,
         "default": agent_defaults.DEFAULT_LLM_MODEL,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }

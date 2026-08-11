@@ -12,16 +12,47 @@ Two guarantees, split by where the failure happens:
    the caller never hits a dead primary. Probes are cheap HTTP GETs that run once
    at call setup — NOT in the per-turn hot loop.
 
-2. MID-CALL never-silence (`ResilienceProcessor`):
+2. MID-CALL recovery, then never-silence (`ResilienceProcessor`):
    If the chosen provider (LLM or TTS) throws AFTER the call is underway
    (429, timeout, network blip), Pipecat emits an ErrorFrame. This processor
-   catches it and speaks a short reassurance phrase in the agent's language via
-   the same proven TTSSpeakFrame→TTS path the greeting uses — so a failed turn is
-   never dead air. Debounced + capped so a hard-down provider can't loop.
+   catches it and, in order of preference:
 
-Reuses the test path's provider preference order (groq→openai→...); it does not
-re-implement per-turn streaming failover (Pipecat's static pipeline can't swap a
-service mid-stream — documented limitation, tracked for Batch 2).
+   a. On a Groq RATE LIMIT, switches the live LLM service onto the next Groq model
+      that still has budget and re-runs the same turn, so the caller gets a real
+      answer to the question they actually asked.
+   b. Otherwise (or once the models are exhausted) speaks a short reassurance
+      phrase in the agent's language via the same proven TTSSpeakFrame→TTS path the
+      greeting uses — so a failed turn is never dead air. Debounced + capped so a
+      hard-down provider can't loop.
+
+Why (a) exists at all, given the note that used to be here
+----------------------------------------------------------
+This module previously stated that per-turn failover was impossible: "Pipecat's
+static pipeline can't swap a service mid-stream — documented limitation, tracked for
+Batch 2". That is true of REPLACING a service object, and it is the wrong conclusion
+— the model is not the service. Verified against the installed pipecat-ai 1.5.0:
+
+* ``BaseOpenAILLMService`` reads the model from ``self._settings.model`` on every
+  request, and ``LLMUpdateSettingsFrame(delta=Settings(model=...))`` is the
+  supported way to change it (``LLMService.process_frame`` routes it to
+  ``_update_settings``, which reports ``updated settings fields: {'model'}`` and
+  leaves every unset field at NOT_GIVEN).
+* ``LLMUserAggregator`` handles ``LLMRunFrame`` by calling ``push_context_frame()``,
+  which re-runs inference on the context as it already stands — i.e. re-answers the
+  caller's last question, with nothing to rebuild.
+
+So the failed turn can genuinely be retried on another model without touching the
+pipeline. This matters because the SETUP-time probe in (1) cannot catch an exhausted
+token budget: listing models costs no tokens, so ``GET /v1/models`` answers 200 for
+a key whose daily budget is spent. Before this, every voice call started on the
+exhausted model and answered every single question with the apology phrase.
+
+Retrying is restricted to rate limits on purpose. A 429 is rejected BEFORE any
+tokens are generated, so re-running produces one reply rather than a duplicated or
+half-spoken one; a mid-stream network failure has no such guarantee.
+
+The model chain, the per-model cooldowns and the evidence for both live in
+backend/services/llm_failover.py, shared with the chat path so the two cannot drift.
 """
 
 from __future__ import annotations
@@ -32,10 +63,17 @@ from typing import Optional
 
 import httpx
 
-from pipecat.frames.frames import ErrorFrame, Frame, TTSSpeakFrame
+from pipecat.frames.frames import (
+    ErrorFrame,
+    Frame,
+    LLMRunFrame,
+    LLMUpdateSettingsFrame,
+    TTSSpeakFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from backend.config import settings
+from backend.services import llm_failover
 
 log = logging.getLogger(__name__)
 
@@ -153,6 +191,30 @@ def reset_llm_selection_cache() -> None:
     _selection_cache.clear()
 
 
+def _skip_exhausted_model(provider: str, key: str, model: str) -> tuple[str, str, str]:
+    """Swap in a Groq model that still has budget, if this one has none.
+
+    Applied to the selection on the way OUT, after the reachability probe and after
+    the selection cache, because the two answer different questions and only one of
+    them can be cached: "is the key reachable?" is stable for minutes, while "does
+    this model have budget right now?" is exactly what changed. Caching the swap
+    would pin a call to the fallback model for the cache's full TTL after the
+    primary's budget had already refilled.
+
+    This is the setup-time half of the fix. The probe cannot detect an exhausted
+    budget — ``GET /v1/models`` costs no tokens and answers 200 either way — so
+    without this, every new call starts on a model that will 429 on the caller's
+    first question, and the ResilienceProcessor has to recover a turn that never
+    needed to fail.
+    """
+    if provider != "groq":
+        return provider, key, model
+    chosen, reason = llm_failover.preferred_model(model)
+    if reason:
+        log.warning("[RESILIENCE] %s", reason)
+    return provider, key, chosen
+
+
 async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
     """
     Return (provider, api_key, model) for the first reachable provider.
@@ -201,7 +263,7 @@ async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
             "[RESILIENCE] using cached LLM selection provider=%s model=%s (no probe)",
             provider, model,
         )
-        return cached[1]
+        return _skip_exhausted_model(*cached[1])
     # Auto-sanitize decommissioned models
     if configured_model in {"mixtral-8x7b-32768", "llama3-8b-8192", "llama3-70b-8192", "gemma-7b-it"}:
         configured_model = "llama-3.3-70b-versatile"
@@ -223,8 +285,10 @@ async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
                 )
             else:
                 log.info("[RESILIENCE] LLM provider '%s' healthy (model=%s)", provider, model)
+            # The UNSWAPPED selection is what gets cached — see _skip_exhausted_model
+            # for why the budget check must not be cached alongside the probe.
             _selection_cache[cache_key] = (time.monotonic(), (provider, key, model))
-            return provider, key, model
+            return _skip_exhausted_model(provider, key, model)
 
     raise RuntimeError(
         f"No reachable LLM provider among {order}. Checked keys for each; all failed a "
@@ -326,13 +390,29 @@ def fallback_phrase(language: str) -> str:
 class ResilienceProcessor(FrameProcessor):
     """Transparent processor placed at the END of the pipeline. Watches every
     frame flowing downstream; on an ErrorFrame (LLM or TTS provider failure) it
-    speaks a reassurance phrase so the caller never hears silence.
+    first tries to RECOVER the turn on another Groq model, and only if that is
+    impossible speaks a reassurance phrase so the caller never hears silence.
 
     Debounced (min gap between fallback utterances) and capped (max per call) so
     a fully-down provider can't drive an infinite speak→fail→speak loop.
+
+    ``llm``/``llm_provider``/``llm_model`` are what make the model swap possible; pass
+    them from pipeline.py. Omitted (as in the older two-argument call, and in tests
+    that only exercise the spoken fallback), the processor keeps its original
+    speak-only behaviour rather than failing to construct.
     """
 
-    def __init__(self, language: str, min_gap_seconds: float = 8.0, max_fallbacks: int = 4) -> None:
+    def __init__(
+        self,
+        language: str,
+        min_gap_seconds: float = 8.0,
+        max_fallbacks: int = 4,
+        *,
+        llm=None,
+        llm_provider: str = "",
+        llm_model: str = "",
+        max_model_switches: int = 2,
+    ) -> None:
         super().__init__()
         self._phrase = fallback_phrase(language)
         self._task = None                       # set by pipeline.py after PipelineTask creation
@@ -340,9 +420,83 @@ class ResilienceProcessor(FrameProcessor):
         self._min_gap = min_gap_seconds
         self._count = 0
         self._max = max_fallbacks
+        self._llm = llm
+        self._llm_provider = (llm_provider or "").strip().lower()
+        self._llm_model = (llm_model or "").strip()
+        # Bounded so a systematically failing chain cannot walk the caller through
+        # every model on the account. Two switches covers the whole Groq chain.
+        self._switches_left = max_model_switches
 
     def bind_task(self, task) -> None:
         self._task = task
+
+    def _is_llm_rate_limit(self, err: str) -> bool:
+        """Is this ErrorFrame a Groq LLM rate limit, as opposed to a TTS/STT one?
+
+        ErrorFrame carries a message, not its origin, and this pipeline's TTS
+        provider can 429 too. Switching the LLM's model because Sarvam throttled the
+        VOICE would be a change that cannot possibly help, made at the worst moment.
+        So known speech-vendor markers veto the swap, and anything else that reads
+        as a rate limit is attributed to the LLM — which is the only rate-limited
+        component this can actually do something about.
+
+        Being wrong in the cautious direction costs nothing: the spoken fallback
+        below is exactly the old behaviour.
+        """
+        if not llm_failover.is_rate_limit_error(err):
+            return False
+        if self._llm is None or self._llm_provider != "groq":
+            return False
+        low = (err or "").lower()
+        speech_markers = ("sarvam", "deepgram", "elevenlabs", "cartesia", "whisper",
+                          "tts", "stt", "transcri", "speech")
+        return not any(m in low for m in speech_markers)
+
+    async def _try_another_model(self, err: str) -> bool:
+        """Move the live LLM onto a model with budget and re-ask. True if retried."""
+        if self._switches_left <= 0:
+            log.error(
+                "[RESILIENCE] model-switch budget spent this call — not switching again.",
+            )
+            return False
+        if self._task is None:
+            log.error("[RESILIENCE] no task bound — cannot switch model.")
+            return False
+
+        llm_failover.mark_rate_limited(self._llm_model, err)
+        alt = llm_failover.next_available_model(self._llm_model)
+        if alt is None:
+            log.error(
+                "[RESILIENCE] every Groq model in the chain is rate limited — "
+                "falling back to speech.",
+            )
+            return False
+
+        try:
+            # The service's OWN Settings type, so the delta validates against the
+            # same schema it was built with, and `service=` targets this LLM
+            # explicitly rather than relying on it being the only one in the pipeline.
+            delta = type(self._llm._settings)(model=alt)
+            await self._task.queue_frames([
+                LLMUpdateSettingsFrame(delta=delta, service=self._llm),
+                # Re-runs inference on the context as it stands, i.e. re-answers the
+                # question the caller already asked. Safe specifically because a 429
+                # is refused before any tokens are generated, so there is no partial
+                # reply to duplicate.
+                LLMRunFrame(),
+            ])
+        except Exception as e:  # noqa: BLE001
+            log.error("[RESILIENCE] failed to switch model %s → %s: %s", self._llm_model, alt, e)
+            return False
+
+        self._switches_left -= 1
+        log.warning(
+            "[RESILIENCE] LLM rate limited on %s — switched to %s and re-asking this turn "
+            "(%d switch(es) left).",
+            self._llm_model, alt, self._switches_left,
+        )
+        self._llm_model = alt
+        return True
 
     def set_language(self, language: str) -> None:
         """Re-target the fallback phrase after a mid-call language switch.
@@ -356,9 +510,21 @@ class ResilienceProcessor(FrameProcessor):
         # REQUIRED first (pipecat 1.5): handle system frames + mark started.
         await super().process_frame(frame, direction)
         if isinstance(frame, ErrorFrame):
-            await self._speak_fallback(frame)
+            await self._handle_error(frame)
         # Always pass frames through — never block the pipeline.
         await self.push_frame(frame, direction)
+
+    async def _handle_error(self, frame: ErrorFrame) -> None:
+        """Recover the turn if we can; speak rather than go silent if we cannot."""
+        err = str(getattr(frame, "error", None) or frame)
+
+        # Retrying on a model with budget beats apologising: the caller asked a real
+        # question and can still get a real answer. Only when no model is left does
+        # this fall through to the spoken fallback.
+        if self._is_llm_rate_limit(err) and await self._try_another_model(err):
+            return
+
+        await self._speak_fallback(frame)
 
     async def _speak_fallback(self, frame: ErrorFrame) -> None:
         now = time.time()

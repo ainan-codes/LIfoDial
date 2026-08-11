@@ -46,6 +46,22 @@ GROQ_TPD_ERROR = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clean_cooldowns():
+    """Forget benched models between tests.
+
+    A 429 now records a per-model cooldown that lives in the worker process, so
+    without this the first rate-limit test moves every later test's primary model
+    onto the fallback — the tests would be asserting against each other's state
+    rather than the behaviour.
+    """
+    from backend.services import llm_failover
+
+    llm_failover.reset_cooldowns()
+    yield
+    llm_failover.reset_cooldowns()
+
+
 @pytest_asyncio.fixture
 async def seeded_db():
     assert db_mod.IS_SQLITE, "TEST SAFETY: refusing to run against a non-SQLite database"
