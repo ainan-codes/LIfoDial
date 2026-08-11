@@ -2590,197 +2590,16 @@ _NEEDS_DETAILS_REPLY = {
 }
 
 
-# Relative-day words the patient may use, mapped to an offset from today (IST).
-# Weekday names are handled separately (next occurrence of that weekday).
-_RELATIVE_DAYS: dict[str, int] = {
-    "today": 0, "tonight": 0, "aaj": 0,
-    "tomorrow": 1, "tmrw": 1, "kal": 1,
-    "day after tomorrow": 2, "parso": 2,
-}
-_WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday",
-                  "friday", "saturday", "sunday")
-
-# How much real availability data goes into one prompt. Bounded because each
-# extra doctor/day is real DB work inside the patient's reply latency, and a
-# 40-line slot dump also buries the instruction that follows it.
-#
-# The slot cap is deliberately high enough to cover a normal full clinic day
-# (24 × 30 minutes = 12 hours): a truncated list reads to the model as the
-# WHOLE day, and it then tells the patient a genuinely free time is
-# unavailable. Measured live 2026-08-11 with a cap of 8 — Dr Rajesh consults
-# 09:00–17:00 and the agent refused a 3 PM reschedule that was open.
-_AVAIL_MAX_DOCTORS = 3
-_AVAIL_MAX_DAYS = 2
-_AVAIL_MAX_SLOTS_SHOWN = 24
-
-# Short-lived cache of the computed digest, keyed by (tenant, doctors, dates).
-# Every turn of a conversation asks about the same doctor and day, and a DB
-# session costs a full Supabase handshake (~1.7s under NullPool), so without
-# this the block would add that to each reply. 30s is deliberately short: a
-# slot someone else took in the meantime can only ever make the agent OFFER a
-# stale time, never book one — the pre-write gate in
-# his.execute_booking_action is always computed fresh.
-_AVAIL_CACHE_TTL = 30.0
-_avail_cache: dict[tuple, tuple[float, dict]] = {}
-
-
-async def _cached_digest(tenant_id: str, doctor_ids: list[str], dates: list):
-    from backend.services.availability import availability_digest
-
-    key = (tenant_id, tuple(sorted(doctor_ids)), tuple(dates))
-    hit = _avail_cache.get(key)
-    now = time.time()
-    if hit and now - hit[0] < _AVAIL_CACHE_TTL:
-        return hit[1]
-
-    digest = await availability_digest(tenant_id, doctor_ids, dates)
-    _avail_cache[key] = (now, digest)
-    if len(_avail_cache) > 256:
-        for stale in [k for k, (ts, _) in _avail_cache.items()
-                      if now - ts >= _AVAIL_CACHE_TTL]:
-            _avail_cache.pop(stale, None)
-    return digest
-
-
-def _dates_mentioned(text: str):
-    """IST dates the patient's words refer to, in the order found.
-
-    Recognises the same relative-day words and DD/MM/YYYY-style dates the
-    booking tag itself uses, so the availability we look up is for the day
-    actually being discussed rather than always today.
-    """
-    from backend.services.his import _DATE_FORMATS
-    from backend.services.timeutil import ist_now
-    import datetime as _dt
-
-    low = (text or "").lower()
-    today = ist_now().date()
-    found: list = []
-
-    def _add(d):
-        if d not in found:
-            found.append(d)
-
-    # Longest phrases first so "day after tomorrow" is not read as "tomorrow".
-    for word in sorted(_RELATIVE_DAYS, key=len, reverse=True):
-        if word.strip() and word.strip() in low:
-            _add(today + _dt.timedelta(days=_RELATIVE_DAYS[word]))
-
-    for idx, name in enumerate(_WEEKDAY_NAMES):
-        if name in low:
-            ahead = (idx - today.weekday()) % 7 or 7
-            _add(today + _dt.timedelta(days=ahead))
-
-    for token in re.findall(r'\b\d{1,4}[/-]\d{1,2}[/-]\d{2,4}\b', text or ""):
-        for fmt in _DATE_FORMATS:
-            try:
-                _add(_dt.datetime.strptime(token, fmt).date())
-                break
-            except ValueError:
-                continue
-
-    return found
-
-
-async def _real_availability_block(agent: AgentConfig, user_message: str, history: list) -> str:
-    """The clinic's REAL doctor roster and REAL open slots, as a prompt block.
-
-    The chat/embed path had NOTHING like this: its prompt carried the system
-    prompt and the knowledge base only, so when a patient asked "what times
-    are free with Dr Rajesh tomorrow?" the model had no data, stalled ("let me
-    check…", which this path can never follow up on) and then admitted it did
-    not know — while still going on to confirm a specific time. Now the same
-    availability engine new bookings are validated against
-    (services/availability.py) supplies the answer before the model speaks.
-
-    Best-effort: any failure returns "" and the turn proceeds without it. The
-    hard guarantee that an unavailable slot is never booked lives in
-    his.execute_booking_action's pre-write gate, not here.
-    """
-    try:
-        from backend.services.his import get_doctors
-        from backend.services.timeutil import format_ist_clock, ist_now, to_ist
-
-        tenant_id = str(agent.tenant_id)
-        doctors = await get_doctors(tenant_id)
-        if not doctors:
-            return (
-                "\n\n--- DOCTORS AT THIS CLINIC ---\n"
-                "No doctors have been added to this clinic yet, so you CANNOT book, "
-                "reschedule or confirm an appointment with a named doctor. Offer to take "
-                "the patient's details for the clinic to call back, and never invent a "
-                "doctor's name or an available time.\n"
-                "--- END DOCTORS AT THIS CLINIC ---\n"
-            )
-
-        # Which days? Exactly the ones being discussed; today + tomorrow only
-        # when nothing specific was said, so a patient who asks "what's free?"
-        # still gets real numbers. Listing extra days would only spend tokens
-        # and dilute the day that is actually under discussion.
-        recent = " ".join(
-            [user_message or ""]
-            + [str(m.get("content") or "") for m in (history or [])[-3:]]
-        )
-        today = ist_now().date()
-        import datetime as _dt
-        dates = _dates_mentioned(recent)[:_AVAIL_MAX_DAYS] or [
-            today, today + _dt.timedelta(days=1),
-        ]
-
-        # Which doctors? The ones named in the conversation, else the roster.
-        low = recent.lower()
-        def _mentioned(doc: dict) -> bool:
-            words = [w for w in (doc.get("name") or "").lower().split() if len(w) > 2]
-            words += [w for w in (doc.get("specialization") or "").lower().split() if len(w) > 2]
-            return any(w in low for w in words)
-
-        named = [d for d in doctors if _mentioned(d)]
-        chosen = (named or doctors)[:_AVAIL_MAX_DOCTORS]
-        bookable = [d for d in chosen if d.get("is_available", True)]
-
-        digest = await _cached_digest(tenant_id, [d["id"] for d in bookable], dates)
-
-        lines = [f"Today is {today.strftime('%A, %d/%m/%Y')} (IST). All times are IST."]
-        lines.append("Doctors at this clinic:")
-        for d in doctors:
-            label = f"  - {d['name']} ({d.get('specialization') or 'Specialist'})"
-            if not d.get("is_available", True):
-                reason = f" — {d['leave_reason']}" if d.get("leave_reason") else ""
-                label += f" — ON LEAVE{reason}, cannot be booked"
-            lines.append(label)
-
-        lines.append("Real open appointment slots (already excludes booked times):")
-        for d in bookable:
-            for day in dates:
-                slots = digest.get((str(d["id"]), day)) or []
-                when = day.strftime("%A %d/%m/%Y")
-                if not slots:
-                    lines.append(f"  - {d['name']}, {when}: NO open slots — do not offer any time that day.")
-                    continue
-                shown = [format_ist_clock(to_ist(s)) for s in slots[:_AVAIL_MAX_SLOTS_SHOWN]]
-                extra = len(slots) - len(shown)
-                lines.append(
-                    f"  - {d['name']}, {when}: " + ", ".join(shown)
-                    + (f", and {extra} further slots after that (this list was cut short — "
-                       "do NOT tell the patient a later time is unavailable)" if extra > 0 else "")
-                )
-
-        return (
-            "\n\n--- REAL DOCTOR AVAILABILITY (live from this clinic's schedule) ---\n"
-            + "\n".join(lines)
-            + "\n--- END REAL DOCTOR AVAILABILITY ---\n"
-            "This section is the ONLY source of truth for what is free. When the patient asks "
-            "what is available, answer with these exact times immediately — never say you will "
-            "check and get back to them, because you cannot send a later message. Only offer "
-            "times listed above for that doctor and that day, and if they ask for a listed day "
-            "at a time that is NOT listed, say plainly that it is taken and offer the listed "
-            "times instead. For a day not covered above, just ask them to confirm the day — the "
-            "system checks every time against the real schedule before anything is saved, so "
-            "never guess and never invent a time.\n"
-        )
-    except Exception as e:
-        logger.warning("Could not build the real availability block: %s", e, exc_info=True)
-        return ""
+# The clinic's real roster + real open slots, and the day/date parsing it needs,
+# both live in backend/services/availability_prompt.py — ONE implementation,
+# shared with the voice pipeline. They used to live here, private to the
+# chat/embed router, which is precisely how voice came to answer "which doctors
+# do you have?" with "no doctors, no information given to me" for a clinic whose
+# chat channel named a real cardiologist off the same tables.
+from backend.services.availability_prompt import (  # noqa: E402
+    _cache as _avail_cache,
+    real_availability_block as _real_availability_block,
+)
 
 
 async def _dispatch_llm(provider: str, api_key: str, system_prompt: str,
@@ -3337,7 +3156,13 @@ async def generate_llm_response(
     # Real roster + real open slots, from the same availability engine that
     # gates the write. Built BEFORE the user message is appended to history so
     # the day/doctor detection sees this turn's words exactly once.
-    availability_context = await _real_availability_block(agent, user_message, history)
+    availability_context = await _real_availability_block(
+        str(agent.tenant_id),
+        " ".join(
+            [user_message or ""]
+            + [str(m.get("content") or "") for m in (history or [])[-3:]]
+        ),
+    )
 
     system_prompt = (
         base_prompt + kb_context + availability_context + guardrail + BOOKING_RULES_BLOCK

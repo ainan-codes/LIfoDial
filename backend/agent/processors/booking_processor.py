@@ -16,6 +16,7 @@ It only reads TranscriptionFrames and triggers side-effects.
 No added latency to the voice pipeline (all DB writes are fire-and-forget tasks).
 """
 
+import datetime as dt
 import logging
 import re
 from typing import Optional
@@ -25,15 +26,48 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 logger = logging.getLogger(__name__)
 
-# ── Keyword sets (lowercase, stripped) ────────────────────────────────────────
+
+def _said(text: str, phrases) -> bool:
+    """Did the caller say any of ``phrases``, whatever script they said it in?
+
+    Replaces the ``any(w in text_lower for w in WORDS)`` tests this file used
+    everywhere. Those tests were the reason a Hindi caller's "हाँ" never
+    confirmed a booking: the phrase lists are romanised, the transcript is not.
+    services/indic_text.contains_any does a plain substring test first (exact
+    for same-script text) and falls back to a consonant-skeleton comparison.
+    """
+    from backend.services.indic_text import contains_any
+
+    return contains_any(text, phrases)
+
+
+# ── Keyword sets ──────────────────────────────────────────────────────────────
+#
+# These are matched with indic_text.contains_any, NOT a plain `in`, because STT
+# returns an Indic call's words in the caller's own script: a Hindi caller says
+# "हाँ", and no amount of romanised spelling in this set will ever contain it.
+# The romanised entries are still useful (callers do code-switch), and the
+# native-script entries below are the ones that made a Hindi/Malayalam/Kannada
+# booking completable at all. Skeleton matching covers spelling variants, so
+# only genuinely different WORDS need listing.
 _CONFIRM_WORDS: frozenset[str] = frozenset({
+    # Romanised / English
     "yes", "haan", "ha", "okay", "ok", "theek", "theek hai", "book it",
     "confirm", "book karo", "book kar do", "book karein", "done", "sahi hai",
-    "bilkul", "zaroor", "schedule it", "go ahead",
+    "bilkul", "zaroor", "schedule it", "go ahead", "correct", "right",
+    # Hindi / Marathi
+    "हाँ", "हां", "ठीक है", "सही है", "बिल्कुल", "जरूर", "हो", "बरोबर",
+    # Bengali, Gujarati, Punjabi, Odia
+    "হ্যাঁ", "ঠিক আছে", "હા", "બરાબર", "ਹਾਂ", "ਠੀਕ ਹੈ", "ହଁ", "ଠିକ୍ ଅଛି",
+    # Tamil, Telugu, Kannada, Malayalam
+    "ஆம்", "சரி", "అవును", "సరే", "ಹೌದು", "ಸರಿ", "അതെ", "ശരി", "ഉവ്വ്",
 })
 
 _CANCEL_WORDS: frozenset[str] = frozenset({
     "cancel", "nahi", "no", "nope", "mat karo", "band karo",
+    "नहीं", "नको", "मत करो", "ना करो", "नहीं चाहिए",
+    "না", "ના", "ਨਹੀਂ", "ନାହିଁ",
+    "இல்லை", "వద్దు", "కాదు", "ಬೇಡ", "ಇಲ್ಲ", "വേണ്ട", "ഇല്ല",
 })
 
 # Intent phrases that start an EXISTING-appointment cancel/reschedule flow —
@@ -65,15 +99,38 @@ _SLOT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Day words that qualify a requested time ("tomorrow 3 pm", "kal 11 baje")
+# Day words that qualify a requested time ("tomorrow 3 pm", "kal 11 baje",
+# "कल ग्यारह बजे"). The native-script alternatives carry no \b because word
+# boundaries are meaningless against Indic scripts in Python's re.
 _DAY_PATTERN = re.compile(
-    r'\b(today|tomorrow|tonight|aaj|kal|parso|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b',
+    r'\b(today|tomorrow|tonight|aaj|kal|parso|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b'
+    r'|(आज|कल|परसों|আজ|আগামীকাল|આજે|કાલે|ਅੱਜ|ਕੱਲ੍ਹ|ଆଜି|କାଲି'
+    r'|இன்று|நாளை|ఈరోజు|రేపు|ಇಂದು|ನಾಳೆ|ഇന്ന്|നാളെ)',
     re.IGNORECASE,
 )
 
-# Triggers for extracting patient name from transcription
+# Native day words -> the English word his.parse_slot_datetime understands.
+# Without this the captured day_part would be Devanagari text that the parser
+# does not recognise, and the booking would silently fall back to today.
+_DAY_WORD_TO_ENGLISH: dict[str, str] = {
+    "आज": "Today", "कल": "Tomorrow", "परसों": "Parso",
+    "আজ": "Today", "আগামীকাল": "Tomorrow",
+    "આજે": "Today", "કાલે": "Tomorrow",
+    "ਅੱਜ": "Today", "ਕੱਲ੍ਹ": "Tomorrow",
+    "ଆଜି": "Today", "କାଲି": "Tomorrow",
+    "இன்று": "Today", "நாளை": "Tomorrow",
+    "ఈరోజు": "Today", "రేపు": "Tomorrow",
+    "ಇಂದು": "Today", "ನಾಳೆ": "Tomorrow",
+    "ഇന്ന്": "Today", "നാളെ": "Tomorrow",
+}
+
+# Triggers for extracting patient name from transcription. Native-script forms
+# for the same reason as the confirm words above — "मेरा नाम" is what a Hindi
+# transcript actually contains.
 _NAME_TRIGGERS: tuple[str, ...] = (
     "my name is", "i am", "main hoon", "naam hai", "mera naam", "naam",
+    "मेरा नाम", "नाम है", "माझे नाव", "আমার নাম", "મારું નામ", "ਮੇਰਾ ਨਾਮ",
+    "ମୋ ନାମ", "என் பெயர்", "నా పేరు", "ನನ್ನ ಹೆಸರು", "എന്റെ പേര്",
 )
 
 
@@ -138,6 +195,19 @@ class BookingProcessor(FrameProcessor):
         # informational note rather than a booking outcome.
         self._info_message: Optional[str] = None
 
+        # A refreshed copy of the shared REAL DOCTOR AVAILABILITY block, queued
+        # for the next LLMContextFrame. The block in the system prompt was built
+        # at call setup and covers today + tomorrow; when the caller asks about
+        # some other day ("Friday", "15/08/2025") the agent would otherwise have
+        # to answer from nothing. Kept in its own slot rather than sharing
+        # _info_message so a slot-unavailable note and a roster refresh in the
+        # same turn cannot overwrite each other.
+        self._availability_refresh: Optional[str] = None
+
+        # Days the prompt already carries real slots for — so a caller saying
+        # "tomorrow" does not trigger a pointless DB read on the audio path.
+        self._days_in_prompt: set = set()
+
         logger.info(
             "BookingProcessor initialised | tenant=%s caller=%s",
             tenant.get("id"), self.booking_state["patient_phone"],
@@ -170,14 +240,19 @@ class BookingProcessor(FrameProcessor):
         if isinstance(frame, LLMContextFrame) and self._action_commit_pending:
             await self._commit_and_inject_action_result(frame)
 
-        if isinstance(frame, LLMContextFrame) and self._info_message:
+        if isinstance(frame, LLMContextFrame) and (
+            self._info_message or self._availability_refresh
+        ):
             context = getattr(frame, "context", None)
-            if context is not None:
+            for content in (self._availability_refresh, self._info_message):
+                if not content or context is None:
+                    continue
                 try:
-                    context.add_message({"role": "system", "content": self._info_message})
+                    context.add_message({"role": "system", "content": content})
                 except Exception as exc:
                     logger.error("Failed to inject availability note into LLM context: %s", exc)
             self._info_message = None
+            self._availability_refresh = None
 
         # Always push the frame downstream — never block the voice pipeline
         await self.push_frame(frame, direction)
@@ -188,8 +263,15 @@ class BookingProcessor(FrameProcessor):
         """Apply all booking state machine rules to a completed user utterance."""
         text_lower = text.lower().strip()
 
+        # 0.0. Real availability for a day the prompt does not already cover.
+        #       Runs before every early return below (emergency, cancel flow,
+        #       already-confirmed, can_book off) because "what times are free on
+        #       Friday?" is a question the agent must be able to answer whatever
+        #       state the booking FSM happens to be in.
+        await self._maybe_refresh_availability(text)
+
         # 0. Emergency detection — highest priority
-        if any(w in text_lower for w in _EMERGENCY_WORDS):
+        if _said(text, _EMERGENCY_WORDS):
             if not self.booking_state["emergency_detected"]:
                 self.booking_state["emergency_detected"] = True
                 logger.warning(
@@ -225,7 +307,9 @@ class BookingProcessor(FrameProcessor):
 
         # 2. Detect doctor / specialization mention (only when not yet awaiting confirm)
         if not self.booking_state["awaiting_confirm"]:
-            self._try_match_doctor(text_lower)
+            # Raw text, not text_lower: the matcher works on the caller's own
+            # script and lowercases per-word itself.
+            self._try_match_doctor(text)
 
         # 3. Extract the slot the CALLER asks for. Runs whenever a doctor is
         #    pending — before confirm (caller states a time) or during confirm
@@ -277,7 +361,7 @@ class BookingProcessor(FrameProcessor):
 
         # 4. Detect cancellation
         if self.booking_state["awaiting_confirm"]:
-            if any(w in text_lower for w in _CANCEL_WORDS):
+            if _said(text, _CANCEL_WORDS):
                 logger.info("Patient cancelled pending booking. Resetting state.")
                 self.booking_state["awaiting_confirm"] = False
                 self.booking_state["pending_doctor_id"] = None
@@ -288,9 +372,55 @@ class BookingProcessor(FrameProcessor):
         #    awaited on the next LLMContextFrame (see process_frame) so its
         #    real result reaches the LLM before it can speak a confirmation.
         if self.booking_state["awaiting_confirm"] and self.booking_state["pending_slot"]:
-            if any(w in text_lower for w in _CONFIRM_WORDS):
+            if _said(text, _CONFIRM_WORDS):
                 self._commit_pending = True
                 logger.info("Booking confirm keyword heard — commit will be awaited before LLM reply.")
+
+    async def _maybe_refresh_availability(self, text: str) -> None:
+        """Queue a refreshed shared availability block when the caller brings up
+        a day the prompt's copy does not cover.
+
+        Same builder the chat channel calls
+        (services/availability_prompt.real_availability_block) — the point of
+        this method is only WHEN, not WHAT. Cheap by construction: the days
+        already in the prompt are skipped outright, and the builder's own 30s
+        digest cache absorbs repeats within a conversation.
+        """
+        try:
+            from backend.services.availability_prompt import (
+                dates_mentioned,
+                real_availability_block,
+            )
+            from backend.services.timeutil import ist_now
+
+            tenant_id = self._tenant.get("id")
+            if not tenant_id:
+                return
+
+            if not self._days_in_prompt:
+                today = ist_now().date()
+                self._days_in_prompt = {today, today + dt.timedelta(days=1)}
+
+            wanted = [d for d in dates_mentioned(text) if d not in self._days_in_prompt]
+            if not wanted:
+                return
+
+            block = await real_availability_block(str(tenant_id), text)
+            if block:
+                self._availability_refresh = (
+                    "[AVAILABILITY_REFRESH] The real schedule for the day the caller just "
+                    "mentioned. This REPLACES the availability section in your instructions "
+                    "for that day — answer from it and nothing else.\n" + block
+                )
+                self._days_in_prompt.update(wanted)
+                logger.info(
+                    "Availability refreshed mid-call for %s",
+                    ", ".join(d.isoformat() for d in wanted),
+                )
+        except Exception as exc:
+            # Never let this break a turn — the agent simply asks the caller to
+            # confirm the day, which the shared block's own rules instruct.
+            logger.warning("Mid-call availability refresh failed (non-fatal): %s", exc)
 
     async def _handle_emergency(self) -> None:
         """
@@ -345,42 +475,34 @@ class BookingProcessor(FrameProcessor):
                         logger.info("Patient name captured: '%s'", clean_name)
                 break
 
-    def _try_match_doctor(self, text_lower: str) -> None:
-        """Scan utterance for doctor name or specialization keywords.
+    def _try_match_doctor(self, text: str) -> None:
+        """Scan the utterance for a doctor name or specialization.
+
+        Delegates to services/doctor_match.match_doctor — the SAME matcher
+        his.find_doctor_for_booking uses to resolve the doctor named in a chat
+        booking tag. This used to be a private lowercase-ASCII loop, which
+        meant a Hindi caller saying "सलमान" matched nothing and no
+        Indian-language voice call could ever start a booking.
 
         An on-leave doctor is never armed for booking here: the system prompt
         (backend/agent/pipeline.py::_doctor_availability_block) already tells
         the LLM who's unavailable, so the spoken "sorry, on leave" response
         comes from there — this just has to not silently start booking a
-        doctor who isn't seeing patients. A specialization match still tries
-        to fall through to another available doctor with the same
-        specialization before giving up, matching the prompt's own
-        instruction to offer an alternative.
+        doctor who isn't seeing patients.
         """
-        doctors: list[dict] = self._tenant.get("doctors", [])
-        spec_match_unavailable = False
-        for doc in doctors:
-            spec = (doc.get("specialization") or "").lower()
-            name = (doc.get("name") or "").lower()
-            available = doc.get("is_available", True)
+        from backend.services.doctor_match import match_doctor
 
-            # Match by specialization words or doctor name words
-            spec_words = [w for w in spec.split() if len(w) > 2]
-            name_words = [w for w in name.split() if len(w) > 2]
-
-            if spec and (spec in text_lower or any(w in text_lower for w in spec_words)):
-                if available:
-                    self._set_pending_doctor(doc)
-                    return
-                spec_match_unavailable = True
-                continue
-            if name and any(w in text_lower for w in name_words):
-                if available:
-                    self._set_pending_doctor(doc)
-                return  # matched by name (available or not) — stop scanning either way
-
-        if spec_match_unavailable:
-            logger.info("Booking: specialization matched only on-leave doctor(s) — not arming a pending doctor.")
+        doc, how = match_doctor(text, self._tenant.get("doctors", []))
+        if doc is None:
+            return
+        if how in ("name", "specialization"):
+            self._set_pending_doctor(doc)
+            return
+        logger.info(
+            "Booking: %r matched only an unavailable doctor (%s, %s) — not arming a "
+            "pending doctor; the prompt tells the caller they are on leave.",
+            text[:60], doc.get("name"), how,
+        )
 
     def _set_pending_doctor(self, doc: dict) -> None:
         """Record a matched doctor. Confirmation is NOT armed here — it requires
@@ -396,14 +518,31 @@ class BookingProcessor(FrameProcessor):
     def _try_extract_slot(self, text: str) -> None:
         """Extract the requested slot from the caller's own words. Captures an
         explicit clock time plus any nearby day word ("tomorrow 3 pm",
-        "kal 11 baje") so the stored slot reflects what was actually asked."""
-        match = _SLOT_PATTERN.search(text)
+        "kal 11 baje", "कल ग्यारह बजे") so the stored slot reflects what was
+        actually asked.
+
+        The utterance is normalised first: spoken number words and native digit
+        shapes become ASCII digits, and the local "o'clock" word becomes "baje".
+        Without that, _SLOT_PATTERN — which needs \\d — found no time at all in
+        "ग्यारह बजे", so an entire Hindi call could name a time and the FSM
+        would never arm a confirmation.
+        """
+        from backend.services.indic_text import normalise_spoken_numbers
+
+        normalised = normalise_spoken_numbers(text)
+        match = _SLOT_PATTERN.search(normalised)
         if not match:
             return
         time_part = match.group(0).strip()
 
         day_match = _DAY_PATTERN.search(text)
-        day_part = day_match.group(0).strip().capitalize() if day_match else None
+        day_part = None
+        if day_match:
+            raw_day = day_match.group(0).strip()
+            # Native-script day words must be translated, not just capitalised:
+            # his.parse_slot_datetime only knows the English/romanised forms and
+            # silently treats anything else as today.
+            day_part = _DAY_WORD_TO_ENGLISH.get(raw_day, raw_day.capitalize())
         slot = f"{day_part} {time_part}" if day_part else time_part
 
         self.booking_state["pending_slot"] = slot
@@ -575,10 +714,10 @@ class BookingProcessor(FrameProcessor):
         # while a NEW booking is still being collected already means "abort
         # that", handled entirely by the code above this call site.
         if state["mode"] is None:
-            if any(p in text_lower for p in _RESCHEDULE_APPOINTMENT_PHRASES):
+            if _said(text, _RESCHEDULE_APPOINTMENT_PHRASES):
                 state["mode"] = "reschedule"
                 logger.info("Reschedule-existing-appointment intent detected.")
-            elif any(p in text_lower for p in _CANCEL_APPOINTMENT_PHRASES):
+            elif _said(text, _CANCEL_APPOINTMENT_PHRASES):
                 state["mode"] = "cancel"
                 logger.info("Cancel-existing-appointment intent detected.")
             else:
@@ -619,7 +758,7 @@ class BookingProcessor(FrameProcessor):
         # An explicit affirmative always wins, checked BEFORE the abort words —
         # "yes, cancel it" contains the literal word "cancel" (an abort word
         # below), and abort-first would wipe the flow instead of committing it.
-        if any(w in text_lower for w in _CONFIRM_WORDS):
+        if _said(text, _CONFIRM_WORDS):
             self._action_commit_pending = True
             logger.info("%s confirm keyword heard — commit will be awaited before LLM reply.", state["mode"])
             return
@@ -630,7 +769,7 @@ class BookingProcessor(FrameProcessor):
         # IS "cancel", the bare word "cancel" is excluded from the abort set —
         # it almost always means "yes, cancel it", not "abort the cancel".
         abort_words = _CANCEL_WORDS - {"cancel"} if state["mode"] == "cancel" else _CANCEL_WORDS
-        if any(w in text_lower for w in abort_words):
+        if _said(text, abort_words):
             logger.info("Patient backed out of pending %s. Resetting action state.", state["mode"])
             state["mode"] = None
             state["action_awaiting_confirm"] = False

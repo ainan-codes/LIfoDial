@@ -299,9 +299,26 @@ def _clinic_facts_block(tenant: dict) -> str:
     Same reasoning as _doctor_availability_block below, which already had to solve
     this for on-leave doctors. This block carries the positive roster and the
     hours; that one carries the emphatic do-not-book warning for absences.
+
+    The roster half is now redundant with the shared REAL DOCTOR AVAILABILITY
+    block (services/availability_prompt.py), which lists the same names plus
+    real open times — but it is kept, because that block is best-effort and this
+    one is built from data already in memory. What this must NEVER do is assert
+    the roster is empty when the roster could not be READ: see the
+    _facts_unavailable branch.
     """
     hours = (tenant.get("working_hours") or "").strip() or _DEFAULT_WORKING_HOURS
     doctors = tenant.get("doctors") or []
+
+    if tenant.get("_facts_unavailable"):
+        # The clinic's data could not be loaded (see _load_tenant_and_config's
+        # except branch). Saying "working hours are 9-7" and "no doctors have
+        # been added" here would be two confident fabrications in three lines —
+        # and that is the exact prompt that told callers at a three-doctor
+        # clinic that no doctor information existed. Volunteer nothing.
+        from backend.services.availability_prompt import lookup_failed_block
+
+        return lookup_failed_block()
 
     lines = [f"Working hours: {hours}"]
     if tenant.get("address"):
@@ -401,7 +418,9 @@ _NO_FABRICATION_RULE = (
 )
 
 
-def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
+def _build_system_prompt(
+    agent_config: dict, tenant: dict, availability_block: str = "",
+) -> str:
     """
     Build the LLM system prompt from stored config, or render from template,
     then append the clinic knowledge base (if any) and the booking honesty
@@ -411,6 +430,13 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
       1. agent_config['system_prompt'] — custom prompt set by clinic admin
       2. Rendered prompt_templates entry for agent_config['template']
       3. Hardcoded fallback
+
+    ``availability_block`` is the shared real-roster-and-real-slots block from
+    services/availability_prompt.py — the SAME text the chat channel builds for
+    the same clinic. Passed in rather than fetched here because building it is
+    async and does DB work: the caller does it during call setup, off the audio
+    hot path. BookingProcessor refreshes it mid-call when the caller raises a day
+    it does not cover.
     """
     # The LLM is the third consumer of THE one language field (STT and TTS are the
     # other two). Naming the configured language explicitly is what makes the
@@ -467,6 +493,10 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
         # exists and when we're open" and then "who of those is away".
         + _clinic_facts_block(tenant)
         + _doctor_availability_block(tenant)
+        # Real names + real open times, from the shared builder the chat channel
+        # uses. Placed after the roster so the concrete times are the last thing
+        # the model reads about availability.
+        + (availability_block or "")
         + _BOOKING_RULES_BLOCK
         + _NO_FABRICATION_RULE
         + _LANGUAGE_MIRROR_RULE
@@ -503,7 +533,13 @@ def _build_system_prompt(agent_config: dict, tenant: dict) -> str:
             #     never invent a doctor's name." The model was handed both statements
             #     and had to pick.
             #
-            # The honest rendering of an empty roster is that it is empty.
+            # The honest rendering of an empty roster is that it is empty — but
+            # ONLY when we actually know it is empty. A failed read is a
+            # different statement (see _clinic_facts_block's _facts_unavailable
+            # branch, which carries the full instruction).
+            "- (the doctor list could not be loaded right now — say you cannot look "
+            "it up at the moment; do NOT say the clinic has no doctors)"
+            if tenant.get("_facts_unavailable") else
             "- (none yet — no doctors have been added to this clinic, so you cannot "
             "book with a named doctor)"
         )
@@ -686,7 +722,6 @@ async def _load_tenant_and_config(
 
     try:
         from backend.models.agent_config import AgentConfig
-        from backend.models.doctor import Doctor
         from backend.models.tenant import Tenant
         from sqlalchemy import select
 
@@ -790,19 +825,15 @@ async def _load_tenant_and_config(
                     if (_ci.get("address") or "").strip():
                         tenant["address"] = _ci["address"].strip()
 
-                d_result = await db.execute(
-                    select(Doctor).where(Doctor.tenant_id == tenant_id)
-                )
-                tenant["doctors"] = [
-                    {
-                        "id":             str(d.id),
-                        "name":           d.name,
-                        "specialization": d.specialization,
-                        "is_available":   d.is_available,
-                        "leave_reason":   d.leave_reason,
-                    }
-                    for d in d_result.scalars().all()
-                ]
+                # THE doctor lookup — services/his.py::get_doctors, the exact
+                # function the chat/embed channel uses. This used to be a
+                # private Doctor query right here, which is the second half of
+                # why the two channels answered "which doctors do you have?"
+                # differently: even once both could read the DB, only one of
+                # them went through the cached, shared accessor.
+                from backend.services.his import get_doctors
+
+                tenant["doctors"] = await get_doctors(tenant_id)
                 log.info(
                     "Tenant loaded from DB: %s (%d doctors)",
                     tenant["clinic_name"], len(tenant["doctors"]),
@@ -827,9 +858,22 @@ async def _load_tenant_and_config(
                     log.warning("Knowledge base load failed (non-fatal): %s", kb_exc)
 
     except Exception as exc:
-        log.warning(
-            "DB load failed — using metadata defaults. Error: %s", exc
+        # CRITICAL, not warning: reaching here means this call runs with no
+        # clinic data at all — no doctors, no configured working hours, no
+        # knowledge base. It is not a degraded call, it is a blind one.
+        log.critical(
+            "DB load FAILED for tenant=%s agent=%s — this call has NO doctor roster, "
+            "NO configured working hours and NO knowledge base, and the agent will "
+            "have to tell the caller it cannot look their details up. Error: %s: %s",
+            tenant_id, agent_id, type(exc).__name__, exc, exc_info=True,
         )
+        # The prompt builders MUST be able to tell "this clinic has no doctors"
+        # (a real state for a new clinic — say so plainly) apart from "we could
+        # not read the clinic's doctors" (never say anything about the roster).
+        # Without this flag both look like an empty list, and the second one had
+        # the agent confidently informing callers at a clinic with three
+        # cardiologists that no doctor information existed.
+        tenant["_facts_unavailable"] = True
         # The session now belongs to the CALLER (see the `db` arg), and a failed
         # statement leaves SQLAlchemy's transaction needing a rollback — every
         # later statement on it would raise PendingRollbackError. When we owned
@@ -1121,7 +1165,20 @@ async def entrypoint(ctx) -> None:
         tts_model_str = "bulbul:v3"
 
     # ── Build system prompt ────────────────────────────────────────────────
-    system_prompt = _build_system_prompt(agent_config, tenant)
+    # The shared real-roster-and-real-slots block, built HERE (call setup, before
+    # the caller has said anything) rather than per turn: it costs a DB read, and
+    # a voice turn cannot afford a Supabase handshake. Today + tomorrow for every
+    # doctor is what a fresh call needs; BookingProcessor refreshes it mid-call
+    # when the caller raises a different day. Best-effort by construction — on
+    # failure it returns the "could not look it up" block, never an empty string
+    # and never a claim that the clinic has no doctors.
+    availability_block = ""
+    if tenant.get("id") and not tenant.get("_facts_unavailable"):
+        from backend.services.availability_prompt import real_availability_block
+
+        availability_block = await real_availability_block(str(tenant["id"]))
+
+    system_prompt = _build_system_prompt(agent_config, tenant, availability_block)
 
     # ── Build first message ────────────────────────────────────────────────
     first_message: str = (
@@ -2286,12 +2343,20 @@ def prewarm(proc) -> None:
 
     try:
         import backend.db  # noqa: F401  — SQLAlchemy engine + asyncpg import
-        from backend.models.agent_config import AgentConfig  # noqa: F401
-        from backend.models.call_record import CallRecord  # noqa: F401
-        from backend.models.doctor import Doctor  # noqa: F401
-        from backend.models.knowledge_base import KnowledgeBase  # noqa: F401
-        from backend.models.tenant import Tenant  # noqa: F401
         from backend.services import provider_status  # noqa: F401
+
+        # EVERY model, via the one canonical loader — never a hand-picked list.
+        # This used to import five modules by name (AgentConfig, CallRecord,
+        # Doctor, KnowledgeBase, Tenant), which is how the worker lost its
+        # entire database on 2026-08-10: the availability-engine commit gave
+        # Doctor a relationship to DoctorAvailability, that module was not on
+        # the list, and nothing else in the worker imported it. SQLAlchemy
+        # resolves relationship targets by CLASS NAME at mapper-configure time,
+        # so the first ORM query raised "expression 'DoctorAvailability' failed
+        # to locate a name" — and, because a failed configure_mappers() is
+        # cached, EVERY later query in the process raised too. See
+        # _verify_orm_registry_or_die for the guard that now makes this loud.
+        backend.db._import_all_models()
         log.info("Prewarm: DB layer imported (%.2fs)", time.monotonic() - t0)
     except Exception as exc:
         log.warning("Prewarm: DB layer import failed (non-fatal): %s", exc)
@@ -2317,6 +2382,62 @@ def prewarm(proc) -> None:
         log.warning("Prewarm: Silero VAD load failed (non-fatal): %s", exc)
 
     log.info("Agent worker pre-warmed in %.2fs.", time.monotonic() - t0)
+
+
+def _verify_orm_registry_or_die() -> None:
+    """Fail LOUDLY at worker boot if the ORM model registry is incomplete.
+
+    Why this exists, and why it is fatal rather than a warning:
+
+    SQLAlchemy resolves ``relationship("SomeClass")`` targets by class name the
+    first time any mapper is used. If the module defining that class was never
+    imported in THIS process, configure_mappers() raises — and the failure is
+    cached, so every subsequent ORM query in the process raises
+    "One or more mappers failed to initialize" forever. The worker keeps
+    running and keeps answering calls; it simply has no database.
+
+    That is exactly what shipped on 2026-08-10. ``Doctor`` gained
+    ``availability_windows -> DoctorAvailability``; the API process registers
+    every model through ``init_db() -> _import_all_models()``, but the agent
+    worker imported five model modules by name and DoctorAvailability was not
+    one of them. Consequences, all silent:
+
+      * _load_tenant_and_config fell into its except branch, so the agent ran
+        on room metadata only — no doctors, no clinic_info working hours, no
+        knowledge base, no DB provider keys, no credit gate;
+      * the prompt then told every caller "no doctors have been added to this
+        clinic yet", while the chat channel answered the same question with
+        real names off the same tables;
+      * BookingProcessor could not match a doctor, so no voice call could book
+        anything;
+      * CallLoggerProcessor could not write, so transcripts and turn counts
+        stopped persisting (verified in production: every call before
+        2026-08-10 has a transcript, the calls after it have none).
+
+    A worker with no database is strictly worse than a worker that refuses to
+    boot: a dead worker is visible in seconds and fails over, whereas this one
+    quietly told patients their clinic had no doctors. So: die.
+    """
+    try:
+        from sqlalchemy.orm import configure_mappers
+
+        import backend.db as _db
+
+        _db._import_all_models()
+        configure_mappers()
+    except Exception as exc:
+        log.critical(
+            "FATAL: the ORM model registry is incomplete in this process — %s: %s. "
+            "Every database read and write in this worker would fail (SQLAlchemy "
+            "caches a failed mapper configuration), so the agent would answer calls "
+            "with no doctors, no clinic details and no ability to book. This almost "
+            "always means a model gained a relationship to a class whose module is "
+            "not listed in backend/db.py::_import_all_models. Add it there and "
+            "restart.",
+            type(exc).__name__, exc,
+        )
+        raise SystemExit(1)
+    log.info("Preflight OK — ORM model registry complete and all mappers configured.")
 
 
 def _preflight_or_die() -> None:
@@ -2348,6 +2469,10 @@ def _preflight_or_die() -> None:
         )
         raise SystemExit(1)
     log.info("Preflight OK — LiveKit creds present; registering worker as agent_name=%s", AGENT_NAME)
+    # Checked here too, not only in prewarm(): prewarm is best-effort by design
+    # (a warm-up failure must not stop a worker booting), so it can only warn.
+    # An unusable ORM is not a warm-up problem — it is a broken worker.
+    _verify_orm_registry_or_die()
 
 
 if __name__ == "__main__":

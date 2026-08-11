@@ -558,26 +558,26 @@ async def find_doctor_for_booking(
     if q in _NO_DOCTOR_TOKENS:
         return None, names
 
-    # 1. Substring match either direction ("sharma" ~ "Dr. Anjali Sharma").
-    for d in docs:
-        dn = (d.name or "").lower()
-        if dn and (q in dn or dn in q):
-            return d, names
+    # Matching itself lives in services/doctor_match.py — ONE implementation,
+    # shared with the voice booking FSM, and script-independent so a name the
+    # LLM wrote in Devanagari/Malayalam/Kannada still resolves against a roster
+    # stored in Latin. This function keeps only the DB read and the
+    # "(doctor, all names)" contract its callers depend on.
+    from backend.services.doctor_match import match_doctor_name
 
-    # 2. Significant word overlap (ignore short/filler words).
-    q_words = {w for w in re.split(r"\W+", q) if len(w) > 2 and w not in {"doctor"}}
-    if q_words:
-        for d in docs:
-            dn_words = {w for w in re.split(r"\W+", (d.name or "").lower()) if len(w) > 2}
-            if q_words & dn_words:
-                return d, names
-        # 3. Specialization match ("cardiologist" ~ doctor whose spec is Cardiology).
-        for d in docs:
-            spec_words = {w for w in re.split(r"\W+", (d.specialization or "").lower()) if len(w) > 2}
-            if spec_words & q_words:
-                return d, names
-
-    return None, names
+    by_id = {str(d.id): d for d in docs}
+    matched = match_doctor_name(q, [
+        {
+            "id": str(d.id),
+            "name": d.name,
+            "specialization": d.specialization,
+            "is_available": d.is_available,
+        }
+        for d in docs
+    ])
+    if matched is None:
+        return None, names
+    return by_id.get(str(matched["id"])), names
 
 
 async def alternative_slots_for(

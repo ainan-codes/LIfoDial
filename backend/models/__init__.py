@@ -1,6 +1,11 @@
 """backend/models/__init__.py — export all ORM models."""
 from backend.models.tenant import Tenant
 from backend.models.doctor import Doctor
+# MUST be imported alongside Doctor: Doctor.availability_windows names this
+# class as a string, and SQLAlchemy resolves it by name at mapper-configure
+# time. Leaving it out does not fail at import — it fails on the first ORM
+# query, and then on every query after that.
+from backend.models.doctor_availability import DoctorAvailability
 from backend.models.appointment import Appointment
 from backend.models.call_log import CallLog
 from backend.models.agent_config import AgentConfig
@@ -18,6 +23,7 @@ from backend.models.impersonation_session import ImpersonationSession
 __all__ = [
     "Tenant",
     "Doctor",
+    "DoctorAvailability",
     "Appointment",
     "CallLog",
     "AgentConfig",
