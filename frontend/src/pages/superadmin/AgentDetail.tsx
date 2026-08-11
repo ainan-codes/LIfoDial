@@ -538,7 +538,10 @@ export default function AgentDetail() {
         // serve, and one no Groq response header reports.
         m.daily_token_budget ? `${Math.round(m.daily_token_budget / 1000)}K tokens/day` : '',
         m.reasoning ? 'reasoning' : '',
-        m.booking_verified ? '' : 'booking not verified',
+        // `=== false`, not falsy: a backend that has not been redeployed yet does not
+        // send this field at all, and `undefined` must not read as "unverified" —
+        // that would tag every model, including the one every agent actually runs on.
+        m.booking_verified === false ? 'booking not verified' : '',
       ].filter(Boolean).join(' · '),
     }));
     if (!opts.some((o: any) => o.value === currentLlmModel)) {
@@ -1389,7 +1392,7 @@ export default function AgentDetail() {
                         patient their appointment was booked without emitting the tag
                         that writes it. A silent booking failure is the worst outcome
                         this product has. */}
-                    {selectedLlmModel && !selectedLlmModel.booking_verified && (
+                    {selectedLlmModel?.booking_verified === false && (
                       <div style={{ marginTop: '6px', fontSize: '12px', color: '#e0a94a', display: 'flex', alignItems: 'flex-start', gap: '6px' }}>
                         <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: '1px' }} />
                         This model has not been verified on appointment booking. Test a
