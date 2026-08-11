@@ -19,6 +19,7 @@ No added latency to the voice pipeline (all DB writes are fire-and-forget tasks)
 import datetime as dt
 import logging
 import re
+import unicodedata
 from typing import Optional
 
 from pipecat.frames.frames import Frame, LLMContextFrame, TranscriptionFrame, TTSSpeakFrame
@@ -468,8 +469,21 @@ class BookingProcessor(FrameProcessor):
                 remainder = text[idx:].strip()
                 if remainder:
                     raw_name = remainder.split()[0]
-                    # Strip punctuation from name
-                    clean_name = re.sub(r"[^\w]", "", raw_name).capitalize()
+                    # Strip punctuation, KEEPING combining marks. re.sub(r"[^\w]")
+                    # looks Unicode-safe and is not: Python's \w excludes the
+                    # nonspacing-mark category (Mn), which is where every Indic
+                    # vowel sign lives. It silently turned "विनोद" into "वनद" —
+                    # a name the patient does not have, stored on their
+                    # appointment and read back to them.
+                    clean_name = "".join(
+                        ch for ch in raw_name
+                        if ch.isalnum() or unicodedata.category(ch).startswith("M")
+                    )
+                    # .capitalize() is a no-op for scripts without case, and
+                    # lowercases the rest of a romanised name, so only apply it
+                    # where it means something.
+                    if clean_name.isascii():
+                        clean_name = clean_name.capitalize()
                     if clean_name:
                         self.booking_state["patient_name"] = clean_name
                         logger.info("Patient name captured: '%s'", clean_name)
@@ -634,10 +648,21 @@ class BookingProcessor(FrameProcessor):
                     logger.error("Failed to inject pre-commit availability result into LLM context: %s", exc)
             return
 
+        # The DAY and the TIME go through separately — never the combined
+        # display string. This used to pass pending_slot ("Tomorrow 11 baje"),
+        # with no date at all, into create_appointment's slot_time. Downstream,
+        # parse_slot_datetime(None, "Tomorrow 11 baje") could parse neither
+        # field, so it fell back to TODAY at NOW and wrote that: the caller was
+        # told "tomorrow at eleven", the row said this afternoon. The
+        # availability gate above validated the correct instant, which is why
+        # nothing complained. Chat has always passed the two fields separately
+        # (execute_booking_action takes date_str, time_str) — this is the voice
+        # side of that same contract.
         ok, result = await _commit_booking_to_db(
             tenant_id=str(tenant_id),
             doctor_id=str(doctor_id),
-            slot_time=slot_time,
+            slot_time=self.booking_state.get("pending_slot_time_str") or slot_time,
+            slot_date=self.booking_state.get("pending_slot_day_str"),
             patient_phone=patient_phone,
             patient_name=self.booking_state.get("patient_name"),
             call_record_id=self._call_meta.get("call_record_id"),
@@ -999,6 +1024,7 @@ async def _commit_booking_to_db(
     doctor_id: str,
     slot_time: str,
     patient_phone: str,
+    slot_date: Optional[str] = None,
     patient_name: Optional[str] = None,
     call_record_id: Optional[str] = None,
 ) -> tuple[bool, dict]:
@@ -1010,6 +1036,10 @@ async def _commit_booking_to_db(
     unconfirmed write). Idempotency lives in his.create_appointment — a
     repeated commit for the same call_id returns the existing row instead of
     creating a duplicate.
+
+    ``slot_date`` and ``slot_time`` are the caller's day and time as SEPARATE
+    strings ("Tomorrow", "11 baje"), because that is what create_appointment
+    parses. Handing it one combined display string silently lost the day.
 
     ``patient_name`` is passed through (when the caller gave one during the
     call) so a LATER cancel/reschedule call can find this row again — the
@@ -1023,6 +1053,7 @@ async def _commit_booking_to_db(
             tenant_id=tenant_id,
             doctor_id=doctor_id,
             slot_time=slot_time,
+            slot_date=slot_date,
             patient_phone=patient_phone,
             patient_name=patient_name,
             call_id=call_record_id,

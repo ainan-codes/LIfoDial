@@ -116,8 +116,13 @@ async def test_successful_commit_injects_success_before_llm():
     assert proc._commit_pending is True
 
     async def fake_commit(**kwargs):
-        # Must receive the CALLER's slot, not a fabricated one
-        assert kwargs["slot_time"] == "Today 4 pm"
+        # Must receive the CALLER's slot, not a fabricated one — and the day and
+        # the time as SEPARATE fields, which is what create_appointment parses.
+        # This used to assert slot_time == "Today 4 pm", the combined display
+        # string: downstream, parse_slot_datetime(None, "Today 4 pm") could read
+        # neither field and silently wrote today at NOW instead of 4 PM.
+        assert kwargs["slot_time"] == "4 pm"
+        assert kwargs["slot_date"] == "Today"
         return True, {"appointment_id": "appt-42", "doctor_name": "Dr Sharma"}
 
     frame = _ctx_frame()

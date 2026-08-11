@@ -247,7 +247,14 @@ def skeleton_contains(haystack: str, needle: str, loose: bool = False) -> bool:
     pass it for specialization text only.
     """
     n = consonant_skeleton(needle)
-    if len(n) < 2:
+    if len(n) < MIN_SKELETON:
+        # Two consonant classes is not enough to identify anything. Measured
+        # against the live roster: "khan" reduces to K-N, and so does the
+        # ordinary Malayalam word "കാണണം" ("to see") — so "എനിക്ക് സൽമാൻ
+        # ഡോക്ടറെ കാണണം" ("I want to see Dr Salman") matched the doctor
+        # "Nazima khan". Booking the wrong doctor is the worst thing this
+        # module can do, so short needles are refused outright; callers with a
+        # same-script literal to try should try it separately.
         return False
 
     # Every comparison is scoped to a SINGLE spoken word — the needle must sit

@@ -63,7 +63,15 @@ def _matches_text(utterance: str, phrase: str, loose: bool = False) -> bool:
     ``loose`` is passed for specialization text only — see
     indic_text._fold_loanword for why, and why never for a name.
     """
+    low = (utterance or "").lower()
     for word in _significant_words(phrase):
+        # Literal, on word boundaries, first. This is what carries a name too
+        # short for the skeleton to touch: "Ravi" and "Ram" reduce to two
+        # consonant classes, which indic_text refuses as unidentifiable, but a
+        # caller who types or says them in the SAME script as the roster is
+        # unambiguous and must still match.
+        if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", low):
+            return True
         if skeleton_contains(utterance, word, loose=loose):
             return True
     return False

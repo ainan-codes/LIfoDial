@@ -260,3 +260,87 @@ def test_distinct_names_keep_distinct_skeletons():
         f"the skeleton is too lossy to tell these names apart: "
         f"{dict(zip(names, skeletons))}"
     )
+
+
+# ── The requested time must survive all the way into the DB row ───────────────
+
+def test_baje_is_parseable_as_a_time():
+    """booking_processor's slot regex has always ACCEPTED "11 baje" and
+    his._try_parse_time has always REJECTED it, so the extracted slot was thrown
+    away and parse_slot_datetime fell back to "now" — which the availability
+    gate then refused. The two halves now agree."""
+    from backend.services.his import is_time_str_parseable
+
+    for spoken in ("11 baje", "11 bajey", "11 o'clock", "11", "9:30 baje"):
+        assert is_time_str_parseable(spoken), f"{spoken!r} still unparseable"
+
+
+def test_a_bare_hour_is_read_as_clinic_hours():
+    """A bare hour carries no AM/PM. Clinics here run 9 AM - 7 PM, so 1-7 is the
+    afternoon and 8-12 the morning."""
+    from backend.services.his import _try_parse_time
+
+    assert _try_parse_time("11 baje").hour == 11      # 11 AM
+    assert _try_parse_time("3 baje").hour == 15       # 3 PM
+    assert _try_parse_time("9 baje").hour == 9        # 9 AM
+    assert _try_parse_time("7 baje").hour == 19       # 7 PM
+    # An explicit marker still wins over the heuristic.
+    assert _try_parse_time("11 PM").hour == 23
+    assert _try_parse_time("14:30").hour == 14
+
+
+def test_nonsense_is_still_refused():
+    from backend.services.his import _try_parse_time
+
+    for junk in ("", "N/A", "sometime", "99 baje", "tomorrow"):
+        assert _try_parse_time(junk) is None, f"{junk!r} was accepted as a time"
+
+
+def test_the_commit_receives_the_day_and_time_separately():
+    """The voice commit used to pass the combined display string
+    ("Tomorrow 11 baje") as slot_time with no date, so parse_slot_datetime could
+    read neither field and wrote TODAY at NOW — while the availability gate had
+    validated tomorrow at 11. Verified live: rows landed at 12:32 UTC instead of
+    the requested slot."""
+    import inspect
+
+    from backend.agent.processors import booking_processor as bp
+
+    src = inspect.getsource(bp.BookingProcessor._commit_and_inject_result)
+    assert 'slot_date=self.booking_state.get("pending_slot_day_str")' in src
+    assert 'slot_time=self.booking_state.get("pending_slot_time_str")' in src
+
+    # And the helper must forward it, or the fix stops at the door.
+    helper = inspect.getsource(bp._commit_booking_to_db)
+    assert "slot_date=slot_date" in helper
+
+
+def test_an_indic_patient_name_keeps_its_vowel_marks():
+    r"""re.sub(r"[^\w]") looks Unicode-safe and is not: \w excludes combining
+    marks, so "विनोद" was stored as "वनद" — verified in a live row."""
+    from backend.agent.processors.booking_processor import BookingProcessor
+
+    bp = BookingProcessor(
+        tenant={"id": "t", "doctors": []},
+        agent_config={},
+        call_meta={"caller_phone": "+910000000000"},
+    )
+    bp._try_extract_name("मेरा नाम विनोद है", "मेरा नाम विनोद है")
+    assert bp.booking_state["patient_name"] == "विनोद"
+
+
+@pytest.mark.parametrize("utterance,expected", [
+    ("എന്റെ പേര് അനു", "അനു"),
+    ("ನನ್ನ ಹೆಸರು ರಮೇಶ್", "ರಮೇಶ್"),
+    ("my name is vinod", "Vinod"),
+])
+def test_patient_name_captured_in_any_script(utterance, expected):
+    from backend.agent.processors.booking_processor import BookingProcessor
+
+    bp = BookingProcessor(
+        tenant={"id": "t", "doctors": []},
+        agent_config={},
+        call_meta={"caller_phone": "+910000000000"},
+    )
+    bp._try_extract_name(utterance, utterance.lower())
+    assert bp.booking_state["patient_name"] == expected

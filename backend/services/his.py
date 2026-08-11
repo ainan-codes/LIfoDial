@@ -19,6 +19,25 @@ _TIME_FORMATS = ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%H.%M")
 _DATE_FORMATS = ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d %b %Y", "%d %B %Y")
 
 
+#: Words that mark a bare hour as a clock time rather than a quantity. "baje"
+#: is the one that mattered: booking_processor's own slot regex has always
+#: ACCEPTED "11 baje", and this parser has always REJECTED it — so a caller
+#: saying the time the way most of India says it had their slot extracted and
+#: then thrown away ("Could not parse appointment time '11 baje'; defaulting to
+#: now", followed by the availability gate refusing the fabricated time).
+#: indic_text.normalise_spoken_numbers rewrites every language's o'clock word to
+#: "baje" before the slot regex runs, so this one spelling covers all of them.
+_OCLOCK_MARKERS = ("baje", "bajey", "baja", "o'clock", "oclock", "hrs", "hours")
+
+#: A bare hour has no AM/PM, and the 12-hour ambiguity has to be resolved
+#: somehow. Clinics in this product run 9 AM - 7 PM, so 1-7 means the afternoon
+#: and 8-12 means the morning. This is a reading of what the caller said, not an
+#: invention of a time they did not say: the agent repeats it back for
+#: confirmation, and availability.is_doctor_open_at still refuses anything
+#: outside the doctor's real schedule.
+_BARE_HOUR_PM_UNTIL = 7
+
+
 def _try_parse_time(time_str: str | None) -> datetime | None:
     """Parse time_str against _TIME_FORMATS, or None if empty/unparseable.
 
@@ -34,6 +53,21 @@ def _try_parse_time(time_str: str | None) -> datetime | None:
             return datetime.strptime(norm.strip(), fmt)
         except ValueError:
             continue
+
+    # A bare hour, with or without an o'clock word: "11 baje", "11 o'clock", "3".
+    bare = ts.lower()
+    # Longest first, or "baje" strips the front of "bajey" and leaves a stray "y".
+    for marker in sorted(_OCLOCK_MARKERS, key=len, reverse=True):
+        bare = bare.replace(marker, " ")
+    bare = bare.strip().strip(".").strip()
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", bare)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2) or 0)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        if 1 <= hour <= _BARE_HOUR_PM_UNTIL:
+            hour += 12
+        return datetime.strptime(f"{hour:02d}:{minute:02d}", "%H:%M")
     return None
 
 
