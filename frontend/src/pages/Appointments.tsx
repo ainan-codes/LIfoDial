@@ -1,4 +1,7 @@
-import { CalendarCheck, Clock, Download, Filter, Headphones, XCircle } from 'lucide-react';
+import {
+  CalendarCheck, Clock, Download, Filter, Globe, HelpCircle, MessageSquare, Mic,
+  Phone, UserRound, XCircle,
+} from 'lucide-react';
 import React, { useEffect, useState } from 'react';
 import type { Appointment } from '../fixtures/data';
 import fetchWithAuth from '../api/client';
@@ -16,6 +19,31 @@ interface BackendAppointment {
   slot_time: string;
   patient_phone: string;
   status: 'pending' | 'confirmed' | 'cancelled';
+  patient_name?: string | null;
+  source?: string | null;
+}
+
+// ── Booking channel ────────────────────────────────────────────────────────
+// Mirrors backend/models/appointment.py's vocabulary. This column used to be a
+// hardcoded "AI Voice" badge on every row, on the assumption that voice was the
+// only way to book — which was wrong about every appointment in the database:
+// on 2026-08-12 all of them had come from the chat/embed channel and no voice
+// call had ever produced one. `null` is a row written before the channel was
+// recorded, so it reads "Unknown" rather than being attributed to a guess.
+type SourceKey = 'voice' | 'web_voice' | 'chat' | 'embed' | 'dashboard' | 'unknown';
+
+const SOURCE_META: Record<SourceKey, { label: string; icon: React.ElementType; tone: 'accent' | 'info' | 'muted' }> = {
+  voice:     { label: 'Phone Call',    icon: Phone,          tone: 'accent' },
+  web_voice: { label: 'Web Call',      icon: Mic,            tone: 'accent' },
+  chat:      { label: 'Chat',          icon: MessageSquare,  tone: 'info'   },
+  embed:     { label: 'Website Chat',  icon: Globe,          tone: 'info'   },
+  dashboard: { label: 'Added by Staff',icon: UserRound,      tone: 'muted'  },
+  unknown:   { label: 'Unknown',       icon: HelpCircle,     tone: 'muted'  },
+};
+
+function sourceKey(source?: string | null): SourceKey {
+  const s = (source || '').toLowerCase();
+  return (s in SOURCE_META ? s : 'unknown') as SourceKey;
 }
 
 const STATUS_FROM_BACKEND: Record<BackendAppointment['status'], Appointment['status']> = {
@@ -32,18 +60,24 @@ function formatSlotTime(iso: string): string {
   });
 }
 
-function fromBackend(a: BackendAppointment): Appointment {
+interface Row extends Appointment {
+  source: SourceKey;
+  patient_name: string;
+}
+
+function fromBackend(a: BackendAppointment): Row {
+  const key = sourceKey(a.source);
   return {
     id: a.id,
     patient_phone: a.patient_phone,
     doctor: a.doctor_name,
     specialization: a.specialization,
     slot_time: formatSlotTime(a.slot_time),
-    // Every appointment today is created by the voice booking pipeline —
-    // there is no manual/staff-created booking path yet.
-    booked_via: 'AI Voice',
+    booked_via: SOURCE_META[key].label,
     call_id: '',
     status: STATUS_FROM_BACKEND[a.status] ?? 'PENDING',
+    source: key,
+    patient_name: (a.patient_name || '').trim(),
   };
 }
 
@@ -71,22 +105,33 @@ function StatusBadge({ status }: { status: Appointment['status'] }) {
   );
 }
 
-// ── Voice badge ───────────────────────────────────────────────────────────────────────
-function AIBadge() {
+// ── Booked-via badge ─────────────────────────────────────────────────────────
+function SourceBadge({ source }: { source: SourceKey }) {
+  const meta = SOURCE_META[source];
+  const Icon = meta.icon;
+  const tone = {
+    accent: { color: 'var(--accent)', bg: 'var(--accent-dim)', border: 'var(--accent-border)' },
+    info:   { color: 'var(--text-primary)', bg: 'var(--bg-surface-2)', border: 'var(--border-strong)' },
+    muted:  { color: 'var(--text-muted)', bg: 'var(--bg-surface-2)', border: 'var(--border)' },
+  }[meta.tone];
   return (
-    <span className="flex items-center gap-1.5" style={{
-      display: 'inline-flex',
-      padding: '2px 8px',
-      borderRadius: '9999px',
-      fontSize: '11px',
-      fontWeight: 600,
-      color: 'var(--accent)',
-      backgroundColor: 'var(--accent-dim)',
-      border: '1px solid var(--accent-border)',
-      whiteSpace: 'nowrap',
-    }}>
-      <Headphones size={11} />
-      Voice
+    <span
+      title={`Booked via ${meta.label}`}
+      className="flex items-center gap-1.5"
+      style={{
+        display: 'inline-flex',
+        padding: '2px 8px',
+        borderRadius: '9999px',
+        fontSize: '11px',
+        fontWeight: 600,
+        color: tone.color,
+        backgroundColor: tone.bg,
+        border: `1px solid ${tone.border}`,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      <Icon size={11} />
+      {meta.label}
     </span>
   );
 }
@@ -117,11 +162,12 @@ function StatCard({ label, value, icon: Icon, color }: {
 
 // ── Appointments Page ─────────────────────────────────────────────────────────
 export default function Appointments() {
-  const [appointments, setAppointments] = useState<Appointment[]>([]);
+  const [appointments, setAppointments] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filterStatus, setFilterStatus] = useState<string>('ALL');
   const [filterSpec, setFilterSpec]     = useState<string>('ALL');
+  const [filterSource, setFilterSource] = useState<string>('ALL');
 
   useEffect(() => {
     const tenantId = getTenantId();
@@ -144,9 +190,12 @@ export default function Appointments() {
 
   const specs = Array.from(new Set(appointments.map(a => a.specialization)));
 
+  const sources = Array.from(new Set(appointments.map(a => a.source)));
+
   const filtered = appointments.filter(a =>
     (filterStatus === 'ALL' || a.status === filterStatus) &&
-    (filterSpec   === 'ALL' || a.specialization === filterSpec)
+    (filterSpec   === 'ALL' || a.specialization === filterSpec) &&
+    (filterSource === 'ALL' || a.source === filterSource)
   );
 
   const stats = {
@@ -158,9 +207,9 @@ export default function Appointments() {
 
   // CSV export (client-side, no API needed)
   const handleExport = () => {
-    const headers = ['ID', 'Patient Phone', 'Doctor', 'Specialization', 'Slot Time', 'Booked Via', 'Status'];
+    const headers = ['ID', 'Patient Name', 'Patient Phone', 'Doctor', 'Specialization', 'Slot Time', 'Booked Via', 'Status'];
     const rows = appointments.map(a =>
-      [a.id, a.patient_phone, a.doctor, a.specialization, a.slot_time, a.booked_via, a.status].join(',')
+      [a.id, a.patient_name, a.patient_phone, a.doctor, a.specialization, a.slot_time, a.booked_via, a.status].join(',')
     );
     const csv = [headers.join(','), ...rows].join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -269,9 +318,16 @@ export default function Appointments() {
             <option value="PENDING">Pending</option>
           </select>
 
-          {(filterStatus !== 'ALL' || filterSpec !== 'ALL') && (
+          {/* Only channels this clinic has actually booked through are listed —
+              a dropdown of five options where four can never match is noise. */}
+          <select value={filterSource} onChange={e => setFilterSource(e.target.value)} style={selectStyle}>
+            <option value="ALL">All Channels</option>
+            {sources.map(s => <option key={s} value={s}>{SOURCE_META[s].label}</option>)}
+          </select>
+
+          {(filterStatus !== 'ALL' || filterSpec !== 'ALL' || filterSource !== 'ALL') && (
             <button
-              onClick={() => { setFilterStatus('ALL'); setFilterSpec('ALL'); }}
+              onClick={() => { setFilterStatus('ALL'); setFilterSpec('ALL'); setFilterSource('ALL'); }}
               style={{ fontSize: '12px', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer' }}
             >
               Clear filters
@@ -310,7 +366,7 @@ export default function Appointments() {
                   {appointments.length === 0 ? 'No appointments yet' : 'No appointments match your filters'}
                 </p>
                 <p style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
-                  {appointments.length === 0 ? 'Bookings made by the voice receptionist will show up here.' : 'Try clearing the filters above.'}
+                  {appointments.length === 0 ? 'Bookings made by the receptionist — on a call or in chat — will show up here.' : 'Try clearing the filters above.'}
                 </p>
               </div>
             ) : (
@@ -347,8 +403,15 @@ export default function Appointments() {
                       <td className="px-5 py-3.5" style={{ fontSize: '13px', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
                         {apt.slot_time}
                       </td>
-                      <td className="px-5 py-3.5" style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '12px', color: 'var(--text-primary)' }}>
-                        {apt.patient_phone}
+                      <td className="px-5 py-3.5">
+                        {apt.patient_name && (
+                          <div style={{ fontSize: '13px', fontWeight: 500, color: 'var(--text-primary)' }}>
+                            {apt.patient_name}
+                          </div>
+                        )}
+                        <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: '12px', color: apt.patient_name ? 'var(--text-muted)' : 'var(--text-primary)' }}>
+                          {apt.patient_phone}
+                        </div>
                       </td>
                       <td className="px-5 py-3.5" style={{ fontSize: '13px', fontWeight: 500, color: 'var(--text-primary)' }}>
                         {apt.doctor}
@@ -357,7 +420,7 @@ export default function Appointments() {
                         {apt.specialization}
                       </td>
                       <td className="px-5 py-3.5">
-                        <AIBadge />
+                        <SourceBadge source={apt.source} />
                       </td>
                       <td className="px-5 py-3.5">
                         <StatusBadge status={apt.status} />

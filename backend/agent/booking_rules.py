@@ -33,6 +33,59 @@ BOOKING_RESULT_FALSE = "[BOOKING_RESULT success=false]"
 # unlike the static per-call doctor roster in pipeline.py.
 AVAILABILITY_NOTE = "[AVAILABILITY_NOTE]"
 
+def voice_action_tag_block(today_str: str) -> str:
+    """The VOICE path's ``[ACTION: …]`` tag instructions.
+
+    The chat path has told the model to emit this tag since the beginning, and
+    that is the only reason chat bookings reach the database. The voice path
+    never did: it relied entirely on the keyword state machine in
+    processors/booking_processor.py, which cannot fire on a normal call (the
+    AGENT picks the doctor, and callers rarely say a bare "yes" in a turn of
+    their own). The result, measured in production on 2026-08-12, was that no
+    voice call had ever created an appointment row while every caller was told
+    theirs was booked. See processors/voice_action.py.
+
+    Two differences from the chat wording, both load-bearing:
+
+      * The tag must come FIRST, before any words. On voice the reply is streamed
+        into TTS as it is generated, so a tag at the END would arrive after the
+        caller had already heard a confirmation that had not happened yet. Tag
+        first means nothing is spoken until the outcome is known.
+      * The reply that carries the tag says NOTHING to the caller. It is
+        discarded: the system performs the action and then asks for a fresh reply
+        with the real result. Anything written next to the tag is thrown away, so
+        writing prose there only wastes the caller's time.
+
+    ``today_str`` anchors relative days ("tomorrow") to a real date, exactly as
+    the chat block does — the tag's Date field must never contain a day word.
+    """
+    return (
+        "\n\n--- HOW TO ACTUALLY BOOK, RESCHEDULE OR CANCEL (STRICT) ---\n"
+        "You cannot change the appointment book by talking about it. The ONLY way anything is saved "
+        "is a machine tag, which the system reads and acts on. Speech alone changes nothing.\n"
+        f"Today is {today_str}. Convert every relative day the caller says ('today', 'tomorrow', "
+        "'day after tomorrow', a weekday name) into a real DD/MM/YYYY date. Never put a day word in "
+        "the tag.\n"
+        "When — and only when — the caller has asked you to book, move or cancel an appointment AND "
+        "you have every field below, your ENTIRE reply must be exactly ONE of these tags and NOTHING "
+        "else. No greeting, no confirmation, no words at all around it:\n"
+        "  [ACTION: BOOK|Name|Phone|DD/MM/YYYY|Time|Doctor|Notes]\n"
+        "  [ACTION: RESCHEDULE|Name|Phone|DD/MM/YYYY|Time|Doctor|Notes]\n"
+        "  [ACTION: CANCEL|Name|Phone|DD/MM/YYYY|Time|Doctor|Notes]\n"
+        "The system then carries the action out and immediately asks you for the caller-facing reply, "
+        "telling you exactly what happened. That is when — and the only time — you confirm anything.\n"
+        "Fields: Name and Phone are the caller's own (ask for the name if you do not have it; use "
+        "'N/A' for the phone only if they will not give one — the number they are calling from is used "
+        "instead). Doctor is the doctor's name. Notes is the symptom or reason, or 'N/A'. Use 'N/A' "
+        "for a field that does not apply to the change.\n"
+        "NEVER write 'N/A' as the Time of a BOOK or RESCHEDULE. If you do not have a real time yet, "
+        "ask for it and emit no tag.\n"
+        "NEVER emit a tag when the caller is only ASKING something — 'what times are free?', 'is the "
+        "doctor in tomorrow?'. Answer those from the availability information above, with no tag.\n"
+        "--- END ---"
+    )
+
+
 BOOKING_RULES_BLOCK = (
     "\n\n--- APPOINTMENT BOOKING RULES (STRICT) ---\n"
     "1. When the user wants a NEW appointment, ask which doctor and what day/time "

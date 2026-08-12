@@ -363,6 +363,37 @@ async def test_no_tag_but_promised_followup_is_repaired_into_a_real_booking(seed
 
 
 @pytest.mark.asyncio
+async def test_a_chat_booking_is_recorded_as_chat_not_as_a_call(seeded_db):
+    """The clinic's Appointments view shows which channel booked each row, and
+    the value has to come from the channel that actually did it. Before the
+    column existed both dashboards claimed every appointment was a phone
+    booking — including, on 2026-08-12, all three real ones, which were chat.
+    """
+    async def fake_dispatch(provider, api_key, system_prompt, history, model, max_tokens):
+        if "SYSTEM UPDATE (AUTHORITATIVE" in system_prompt:
+            return f"Your appointment with {REAL_DOCTOR_NAME} is confirmed."
+        return f"Okay. [ACTION: BOOK|Asha|9845012345|{BOOK_DATE_STR}|2 PM|{REAL_DOCTOR_NAME}|N/A]"
+
+    with patch.object(chat_mod, "_dispatch_llm", side_effect=fake_dispatch), \
+         patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        async with AsyncSessionLocal() as db:
+            agent = (await db.execute(select(AgentConfig).where(AgentConfig.id == AGENT_ID))).scalar_one()
+            # The public website widget passes its own channel; the default is
+            # dashboard chat.
+            await chat_mod.generate_llm_response(
+                agent, "Book it please.", db, session_id="s-source",
+                user_language="en-IN", channel="embed",
+            )
+
+    appts = await _appointments()
+    assert len(appts) == 1
+    assert appts[0].source == "embed", (
+        f"a website-widget booking was attributed to {appts[0].source!r}"
+    )
+    assert appts[0].call_id is None, "a chat booking must not carry a call id"
+
+
+@pytest.mark.asyncio
 async def test_successful_write_never_replies_with_please_wait(seeded_db):
     """The nastiest production variant: the row WAS written, but the model's
     regenerated reply still said 'please wait to confirm', so the patient never

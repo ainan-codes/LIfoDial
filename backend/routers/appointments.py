@@ -21,6 +21,14 @@ class AppointmentResponse(BaseModel):
     slot_time: datetime
     patient_phone: str
     status: str
+    #: Patient's name as the agent captured it, when it captured one.
+    patient_name: Optional[str] = None
+    #: Which channel booked this — 'voice' | 'web_voice' | 'chat' | 'embed' |
+    #: 'dashboard', or null for a row written before the column existed whose
+    #: channel could not be inferred. The dashboard's "Booked Via" column reads
+    #: this; it used to hardcode "Voice" for every row, which was wrong about
+    #: every appointment in production.
+    source: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -67,7 +75,9 @@ async def list_appointments(
             "specialization": specialization or "General",
             "slot_time": r.slot_time,
             "patient_phone": masked_phone,
-            "status": r.status
+            "status": r.status,
+            "patient_name": r.patient_name,
+            "source": r.source,
         })
 
     return res
@@ -111,4 +121,6 @@ async def update_appointment(
         "slot_time": appointment.slot_time,
         "patient_phone": masked_phone,
         "status": appointment.status,
+        "patient_name": appointment.patient_name,
+        "source": appointment.source,
     }

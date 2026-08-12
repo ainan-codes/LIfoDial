@@ -500,6 +500,19 @@ async def delete_clinic(tenant_id: str, user: SuperAdmin = None, db: AsyncSessio
         raise HTTPException(status_code=500, detail=str(e))
 
 # ── Global Appointments View ─────────────────────────────────────────────────
+
+#: Appointment.source -> the label the superadmin table shows. The clinic-facing
+#: dashboard maps the same values in the frontend (Appointments.tsx); this one is
+#: server-side because the superadmin view returns display strings.
+_CHANNEL_LABELS = {
+    "voice": "Phone Call",
+    "web_voice": "Web Call",
+    "chat": "Chat",
+    "embed": "Website Chat",
+    "dashboard": "Added by Staff",
+}
+
+
 @router.get("/appointments")
 async def list_all_appointments(
     status: Optional[str] = None,
@@ -542,7 +555,13 @@ async def list_all_appointments(
                 "doctor_name": (doctor.name if doctor else "—"),
                 "slot_time": apt.slot_time.isoformat(),
                 "status": apt.status,
-                "channel": "AI Call",
+                # The REAL channel. This was hardcoded "AI Call", which was wrong
+                # about every appointment in the database: on 2026-08-12 all of
+                # them had come from chat, and no voice call had ever booked one.
+                # null means the row predates the column and its channel could
+                # not be inferred — the UI shows "Unknown", not a guess.
+                "source": apt.source,
+                "channel": _CHANNEL_LABELS.get(apt.source or "", "Unknown"),
             }
             for apt, tenant, doctor in rows
         ]

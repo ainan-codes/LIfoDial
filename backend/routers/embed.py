@@ -17,6 +17,7 @@ from sqlalchemy import select
 from backend.auth import CurrentUser
 from backend.db import async_session
 from backend.models.agent_config import AgentConfig
+from backend.models.appointment import SOURCE_EMBED
 from backend.models.embed_analytics import EmbedEvent
 
 logger = logging.getLogger(__name__)
@@ -199,6 +200,9 @@ async def embed_chat(agent_id: str, body: EmbedChatRequest, request: Request) ->
             user_message=body.message,
             db=db,
             session_id=f"embed-{session_id}",
+            # The public website widget, not the dashboard's own chat — a clinic
+            # reading its Appointments list needs to be able to tell those apart.
+            channel=SOURCE_EMBED,
         )
 
         # Track event

@@ -29,6 +29,7 @@ from backend.auth import CurrentUser
 from backend.db import async_session as AsyncSessionLocal, get_db
 from backend.models.agent_config import AgentConfig
 from backend.models.api_key_config import ApiKeyConfig
+from backend.models.appointment import SOURCE_CHAT, SOURCE_WEB_VOICE
 from backend.config import settings
 from backend.security import decode_access_token
 from backend.services.impersonation import claims_still_active
@@ -1584,7 +1585,11 @@ async def handle_audio_turn(
             llm_start = time.monotonic()
             try:
                 response_text = await asyncio.wait_for(
-                    generate_llm_response(agent, transcript, db, session_id=session_id, user_language=current_dominant, websocket=websocket),
+                    # This turn came from the caller's microphone, not a keyboard —
+                    # a booking made here is a web call, not a chat.
+                    generate_llm_response(agent, transcript, db, session_id=session_id,
+                                          user_language=current_dominant, websocket=websocket,
+                                          channel=SOURCE_WEB_VOICE),
                     timeout=15.0,
                 )
             except asyncio.TimeoutError:
@@ -2344,7 +2349,7 @@ async def openai_transcribe(api_key: str, audio_bytes: bytes) -> tuple[str, str]
 _sheets_tasks: set = set()
 
 
-async def sync_and_log_appointment(action: str, name: str, phone: str, date: str, time: str, doctor: str, notes: str, tenant_id: str, webhook_url: str | None, websocket: WebSocket = None, call_id: str | None = None) -> dict:
+async def sync_and_log_appointment(action: str, name: str, phone: str, date: str, time: str, doctor: str, notes: str, tenant_id: str, webhook_url: str | None, websocket: WebSocket = None, call_id: str | None = None, source: str = SOURCE_CHAT) -> dict:
     """AWAIT a Book/Reschedule/Cancel, then log only REAL successes to Sheets.
 
     Returns the execute_booking_action() result dict::
@@ -2376,7 +2381,7 @@ async def sync_and_log_appointment(action: str, name: str, phone: str, date: str
         res = await execute_booking_action(
             action=action, tenant_id=tenant_id, name=name, phone=phone,
             date_str=date, time_str=time, doctor_name=doctor, notes=notes,
-            call_id=call_id,
+            call_id=call_id, source=source,
         )
     except Exception as e:
         logger.error(f"Error in sync_and_log_appointment DB step: {e}", exc_info=True)
@@ -2445,149 +2450,32 @@ async def sync_and_log_appointment(action: str, name: str, phone: str, date: str
 # Store conversation history per session (in-memory for now)
 _conversation_history: dict[str, list] = {}
 
-# Matches the [ACTION: BOOK|Name|Phone|Date|Time|Doctor|Notes] tag the LLM emits.
+# ── Machine-tag parsing and honesty detectors ─────────────────────────────────
 #
-# Whitespace is tolerated everywhere the model actually puts it. Production
-# 2026-08-11 (Indiana Hospital): the model emitted
-#   "[ ACTION: RESCHEDULE|Ainan|9090909090|11/08/2026|03:00 PM|Rajesh|N/A ]"
-# — a space after the opening bracket. The old pattern required "[ACTION"
-# adjacently, so it did not match, NOTHING was executed, and (because the
-# loose scrubber below had the same gap) the raw tag was shown to the patient
-# verbatim. Both are now whitespace- and case-tolerant; the fields themselves
-# are .strip()ed by the caller.
-_ACTION_RE = re.compile(
-    r'\[\s*ACTION\s*:\s*(BOOK|RESCHEDULE|CANCEL)\s*\|(.*?)\|(.*?)\|(.*?)\|(.*?)\|(.*?)(?:\|(.*?))?\]',
-    re.IGNORECASE,
+# These all used to be defined here, private to this router — which is exactly
+# why the voice path had no way for the model to signal a booking and never
+# wrote a single appointment row in the product's lifetime. They now live in
+# services/action_tag.py and are SHARED with backend/agent/processors/
+# voice_action.py. The private aliases below are kept so this module (and the
+# tests that import these names from it) read unchanged: one implementation,
+# two channels.
+from backend.services.action_tag import (  # noqa: E402
+    ACTION_RE as _ACTION_RE,
+    COMPLETION_MARKERS as _COMPLETION_MARKERS,
+    FOLLOWUP_PROMISE_PATTERNS as _FOLLOWUP_PROMISE_PATTERNS,
+    LOOSE_ACTION_RE as _LOOSE_ACTION_RE,
+    PLACEHOLDER_VALUES as _PLACEHOLDER_VALUES,
+    TRUNCATED_TAG_RE as _TRUNCATED_TAG_RE,
+    asserts_completion as _asserts_completion,
+    claims_any_completion as _claims_any_completion,
+    is_only_a_tag as _is_only_a_tag,
+    is_placeholder as _is_placeholder,
+    missing_identity_fields as _missing_identity_fields,
+    needs_real_time as _needs_real_time,
+    parse_action_tag as _parse_action_tag,
+    promises_followup as _promises_followup,
+    scrub_reply as _scrub_reply,
 )
-
-# ANY [ACTION: ...]-shaped fragment, including malformed ones _ACTION_RE cannot
-# parse. Observed in production 2026-08-10: the model emitted a bare
-# "[ACTION: None]", which the strict regex ignored and which therefore leaked
-# into the patient's chat verbatim. Every user-facing reply is scrubbed with
-# this, not just the ones where a valid tag was found.
-_LOOSE_ACTION_RE = re.compile(r'\[\s*ACTION\b[^\]]*\]', re.IGNORECASE)
-
-# A machine tag whose closing bracket never arrived — the model ran into the
-# max_tokens cap mid-tag, or stopped early. There is no valid patient-facing
-# text that starts "[ACTION"/"[BOOKING_RESULT" and never closes, so the whole
-# tail is dropped rather than spoken.
-_TRUNCATED_TAG_RE = re.compile(
-    r'\[\s*(?:ACTION|BOOKING_RESULT|AVAILABILITY_NOTE)\b[^\]]*$',
-    re.IGNORECASE,
-)
-
-# Phrases that promise a LATER message ("hold on", "I'll confirm shortly").
-#
-# This path is strictly request/response: one patient message in, one reply
-# out. There is no queue, no callback, no polling — nothing that can ever
-# deliver a promised follow-up. So a reply ending on one of these strands the
-# patient in a permanent "waiting to be confirmed" state.
-#
-# That is the exact 2026-08-10 production bug: the agent said "please hold on
-# for a moment while I complete your booking" / "I've sent the request, please
-# wait for a moment to confirm" and then went silent forever — in one case
-# even though the appointment row HAD been written successfully.
-_FOLLOWUP_PROMISE_PATTERNS = (
-    "hold on", "please hold", "one moment", "a moment", "a minute",
-    "bear with me", "please wait", "kindly wait", "shortly", "momentarily",
-    "i'll confirm", "i will confirm", "let me confirm", "let me check",
-    "i'm checking", "i am checking", "checking availability", "checking the availability",
-    "sent the request", "processing your", "working on it", "get back to you",
-    # "The action is underway" — the same stranding without the word "wait".
-    # Measured live 2026-08-11 on a reschedule: asked "is it done?", the model
-    # replied "Yes, proceeding with the change." and emitted no tag, so nothing
-    # happened and the patient was told it was in progress forever. Note these
-    # must NOT match "please reply yes to proceed", which is a legitimate
-    # question — hence "proceeding", not "proceed".
-    "proceeding", "going ahead", "i'll go ahead", "i will go ahead",
-    "doing that now", "i'll do that now", "i will do that now",
-    "making that change", "making the change", "updating your appointment",
-    "changing your appointment", "in progress", "being processed",
-    "इंतज़ार", "इंतजार", "प्रतीक्षा", "थोड़ा रुक", "एक मिनट",
-)
-
-
-def _promises_followup(text: str) -> bool:
-    """True if the reply tells the patient to wait for something that will
-    never arrive. False positives are safe here: the caller's response is to
-    substitute a deterministic, outcome-accurate reply, which is correct
-    either way."""
-    low = (text or "").lower()
-    return any(p in low for p in _FOLLOWUP_PROMISE_PATTERNS)
-
-
-# Values a model writes when it does not actually have the detail. The tag
-# instructions themselves say to use 'N/A' for fields that don't apply, so the
-# model readily fills these in for BOOK fields it hasn't collected yet.
-_PLACEHOLDER_VALUES = frozenset({
-    "", "n/a", "na", "n.a.", "none", "null", "-", "--", "unknown", "not provided",
-    "not given", "patient", "customer", "tbd", "xxx",
-})
-
-
-def _is_placeholder(value: str) -> bool:
-    return (value or "").strip().lower() in _PLACEHOLDER_VALUES
-
-
-# Words that make a reply an actual ASSERTION that the action completed. A
-# reply may mention "confirm" and still not confirm anything ("To confirm, you
-# are Ramesh Kumar… is that right?"), so a trailing question mark disqualifies
-# it regardless — see _asserts_completion.
-_COMPLETION_MARKERS = {
-    "BOOK": ("confirmed", "booked", "scheduled", "reserved", "is set", "all set",
-             "कन्फर्म", "बुक", "निश्चित"),
-    "RESCHEDULE": ("rescheduled", "moved", "changed", "updated", "new time",
-                   "रीशेड्यूल", "बदल"),
-    "CANCEL": ("cancelled", "canceled", "called off", "रद्द"),
-}
-
-
-def _asserts_completion(text: str, action: str) -> bool:
-    """True if this reply actually TELLS the patient the action is done.
-
-    Guards the success path: the write really happened, so a reply that merely
-    asks another question ("…is that correct?") leaves the patient believing
-    nothing has been booked — the same stranding as a "please wait", just
-    phrased differently. Observed live 2026-08-10.
-    """
-    t = (text or "").strip()
-    if not t or t.endswith("?"):
-        return False
-    low = t.lower()
-    return any(k in low for k in _COMPLETION_MARKERS.get((action or "").upper(), ()))
-
-
-def _claims_any_completion(text: str) -> bool:
-    """True if the reply claims ANY appointment action is done.
-
-    Used where no [ACTION:] tag was emitted — in which case nothing was
-    written, so such a claim is a fabricated confirmation. Measured
-    2026-08-10: llama-3.1-8b-instant produced exactly this ("Your appointment
-    with Dr. Rajesh is booked", no tag) in 2 of 3 runs, and the stronger
-    llama-3.3-70b does it occasionally too.
-    """
-    return any(_asserts_completion(text, action) for action in _COMPLETION_MARKERS)
-
-
-def _scrub_reply(text: str) -> str:
-    """Strip machine tags (valid, malformed, or truncated) out of anything shown
-    to a patient. Every user-facing string on this path passes through here."""
-    text = _LOOSE_ACTION_RE.sub("", text or "")
-    text = re.sub(r'\[\s*BOOKING_RESULT[^\]]*\]', "", text, flags=re.IGNORECASE)
-    text = re.sub(r'\[\s*AVAILABILITY_NOTE[^\]]*\]', "", text, flags=re.IGNORECASE)
-    text = _TRUNCATED_TAG_RE.sub("", text)
-    return re.sub(r'[ \t]{2,}', ' ', text).strip()
-
-
-def _is_only_a_tag(text: str) -> bool:
-    """True if the model's whole reply was machine tag(s) and nothing else.
-
-    Scrubbing such a reply yields "" — and an empty chat bubble tells the
-    patient nothing at all, which is the same dead end as leaking the tag. The
-    2026-08-11 production reply was exactly this: a bare
-    "[ ACTION: RESCHEDULE|…]" with no prose around it.
-    """
-    return bool((text or "").strip()) and not _scrub_reply(text)
 
 
 # Used when the model promised a follow-up, could not be repaired into either a
@@ -2802,6 +2690,7 @@ async def _handle_booking_action(
     response: str, *, agent: AgentConfig, db: AsyncSession, history: list,
     provider: str, api_key: str, model: str, max_tokens: int,
     base_system_prompt: str, user_language: str, websocket: WebSocket = None,
+    channel: str = SOURCE_CHAT,
 ) -> str:
     """If the model emitted an [ACTION:] tag, AWAIT the real DB write and return
     an honest reply generated with the true outcome injected. No tag → return
@@ -2820,9 +2709,9 @@ async def _handle_booking_action(
     # voice: the patient has already agreed by the time the model emits a tag,
     # so INTENT and CONFIRMED land together once the tag parses.
     trace_id = new_trace_id()
-    m = _ACTION_RE.search(response or "")
+    tag = _parse_action_tag(response)
 
-    if not m:
+    if tag is None:
         # No parseable tag means NOTHING was written. Two replies are unsafe to
         # pass through in that state:
         #   * a promise to go do it ("hold on…") — the patient waits on silence
@@ -2853,8 +2742,8 @@ async def _handle_booking_action(
             provider=provider, api_key=api_key, model=model, max_tokens=max_tokens,
             base_system_prompt=base_system_prompt, history=history,
         )
-        m = _ACTION_RE.search(repaired or "")
-        if not m:
+        tag = _parse_action_tag(repaired)
+        if tag is None:
             cleaned = _scrub_reply(repaired or "")
             # Accept the repair only if it stopped BOTH promising and claiming.
             if cleaned and not _promises_followup(cleaned) and not _claims_any_completion(cleaned):
@@ -2864,14 +2753,13 @@ async def _handle_booking_action(
             trace(trace_id, CHAT, REPLIED, outcome="canned_needs_details")
             return _NEEDS_DETAILS_REPLY.get(lang, _NEEDS_DETAILS_REPLY["en-IN"])
 
-    g = m.groups()
-    b_action = (g[0] or "").strip().upper()
-    b_name = (g[1] or "").strip()
-    b_phone = (g[2] or "").strip()
-    b_date = (g[3] or "").strip()
-    b_time = (g[4] or "").strip()
-    b_doctor = (g[5] or "").strip()
-    b_notes = (g[6].strip() if (len(g) > 6 and g[6] is not None) else "N/A")
+    b_action = tag.action
+    b_name = tag.name
+    b_phone = tag.phone
+    b_date = tag.date
+    b_time = tag.time
+    b_doctor = tag.doctor
+    b_notes = tag.notes
 
     trace(trace_id, CHAT, INTENT, action=b_action, doctor=b_doctor or None,
           slot=f"{b_date} {b_time}".strip() or None)
@@ -2885,30 +2773,15 @@ async def _handle_booking_action(
     allowed = can_book if b_action in ("BOOK", "RESCHEDULE") else (
         can_cancel if b_action == "CANCEL" else False)
 
-    # Time gate — BOOK/RESCHEDULE need a REAL caller-given time. The model's
-    # [ACTION:] tag can carry an empty/"N/A" Time field (observed live
-    # 2026-08-10: the tag had a correct Date but a blank Time), and
-    # parse_slot_datetime's fallback-on-unparseable behavior would silently
-    # book midnight instead of refusing — exactly the kind of fabricated slot
-    # audit FIX 4 already bans for the voice path. CANCEL needs no time at
-    # all (matched by name+phone), so it is not gated here.
+    # Time gate (BOOK/RESCHEDULE need a REAL patient-given time) and identity
+    # gate (a placeholder Name/Phone produces a row nobody can be identified
+    # from, and which can never be found again to cancel or reschedule). Both
+    # rules, and the reasoning behind them, live in services/action_tag.py —
+    # shared with the voice path so the two channels cannot validate the same
+    # tag differently.
     from backend.services.his import is_time_str_parseable
-    needs_real_time = b_action in ("BOOK", "RESCHEDULE")
-
-    # Identity gate — a BOOK with a placeholder Name/Phone creates a row nobody
-    # can be identified from, and which the patient can NEVER cancel or
-    # reschedule, because that lookup matches on name AND phone
-    # (his.py::sync_appointment_to_db). Observed live 2026-08-10: the model
-    # emitted a BOOK tag with "N/A" for both before it had asked for them, and
-    # a real appointment was written for "N/A".
-    #
-    # CANCEL/RESCHEDULE need the same two fields for the opposite reason: the
-    # existing appointment is FOUND by name + phone, so a placeholder there can
-    # only ever produce "no appointment found" — which reads to the patient as
-    # "your appointment doesn't exist" when the truth is "you were never asked
-    # who you are". Ask instead.
-    missing = [label for label, val in (("name", b_name), ("phone number", b_phone))
-               if _is_placeholder(val)] if b_action in ("BOOK", "RESCHEDULE", "CANCEL") else []
+    needs_real_time = _needs_real_time(b_action)
+    missing = _missing_identity_fields(tag)
 
     if needs_real_time and not is_time_str_parseable(b_time):
         res = {"success": False, "reason": "invalid_time", "appointment_id": None,
@@ -2926,7 +2799,7 @@ async def _handle_booking_action(
         res = await sync_and_log_appointment(
             action=b_action, name=b_name, phone=b_phone, date=b_date, time=b_time,
             doctor=b_doctor, notes=b_notes, tenant_id=str(agent.tenant_id),
-            webhook_url=webhook, websocket=websocket,
+            webhook_url=webhook, websocket=websocket, source=channel,
         )
 
     trace(trace_id, CHAT, EXECUTED, action=b_action,
@@ -3022,11 +2895,19 @@ async def generate_llm_response(
     session_id: str = None,
     user_language: str = "",
     websocket: WebSocket = None,
+    channel: str = SOURCE_CHAT,
 ) -> str:
     """Generate LLM response using configured provider, system prompt, and knowledge base.
-    
+
     `user_language` is the BCP-47 code detected from the user's latest utterance
     (e.g. 'en-IN', 'hi-IN'). When provided, the LLM is instructed to mirror it.
+
+    `channel` says WHICH surface this conversation is happening on, and is stored
+    on any appointment it books so the clinic's Appointments view can show it (see
+    backend/models/appointment.py). It defaults to plain 'chat' because that is
+    what a caller passing nothing is: dashboard text chat. The two callers that
+    are something else — the public website widget and the browser-mic voice
+    widget — pass their own.
     """
     
     llm_provider = agent.llm_provider or "gemini"
@@ -3308,7 +3189,7 @@ async def generate_llm_response(
             reply, agent=agent, db=db, history=history,
             provider=provider, api_key=key, model=model,
             max_tokens=max_tokens, base_system_prompt=system_prompt,
-            user_language=user_language, websocket=websocket,
+            user_language=user_language, websocket=websocket, channel=channel,
         )
 
         history.append({"role": "assistant", "content": reply})

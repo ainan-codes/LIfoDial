@@ -84,11 +84,12 @@ def _clinic(tenant_id: str):
     return {"Authorization": f"Bearer {create_access_token(tenant_id, 'admin')}"}
 
 
-async def _book(tenant_id: str, doctor_id: str, phone: str, call_id: str) -> dict:
+async def _book(tenant_id: str, doctor_id: str, phone: str, call_id: str,
+                source: str = "voice", slot_time: str = "3 pm") -> dict:
     """Book through the REAL service function every booking path funnels into."""
     return await create_appointment(
         tenant_id=tenant_id, doctor_id=doctor_id,
-        slot_time="3 pm", patient_phone=phone, call_id=call_id,
+        slot_time=slot_time, patient_phone=phone, call_id=call_id, source=source,
     )
 
 
@@ -168,6 +169,86 @@ async def test_a_clinic_admin_cannot_reach_the_global_view(two_clinics):
     must not open it."""
     r = await two_clinics.get("/admin/appointments", headers=_clinic(CLINIC_A))
     assert r.status_code in (401, 403), r.text
+
+
+# ── Which channel booked it ───────────────────────────────────────────────────
+#
+# Both dashboards used to assert "voice" for every row — the clinic table
+# hardcoded a Voice badge and /admin/appointments hardcoded "channel": "AI Call".
+# On 2026-08-12 that was wrong about every appointment in production: all of them
+# came from chat, and no voice call had ever booked one. These tests are the
+# regression guard for the claim being real.
+
+@pytest.mark.asyncio
+async def test_the_clinic_sees_which_channel_booked_each_appointment(two_clinics):
+    client = two_clinics
+    voice = await _book(CLINIC_A, DOCTOR_A, "+919876543210", "call-a-1",
+                        source="voice", slot_time="3 pm")
+    chat = await _book(CLINIC_A, DOCTOR_A, "+919876543211", "chat-a-1",
+                       source="chat", slot_time="4 pm")
+    embed = await _book(CLINIC_A, DOCTOR_A, "+919876543212", "embed-a-1",
+                        source="embed", slot_time="5 pm")
+
+    rows = (await client.get(f"/tenants/{CLINIC_A}/appointments",
+                             headers=_clinic(CLINIC_A))).json()
+    by_id = {r["id"]: r for r in rows}
+    assert by_id[voice["appointment_id"]]["source"] == "voice"
+    assert by_id[chat["appointment_id"]]["source"] == "chat"
+    assert by_id[embed["appointment_id"]]["source"] == "embed"
+
+
+@pytest.mark.asyncio
+async def test_the_superadmin_view_reports_the_real_channel(two_clinics):
+    client = two_clinics
+    voice = await _book(CLINIC_A, DOCTOR_A, "+919876543210", "call-a-1", source="voice")
+    chat = await _book(CLINIC_B, DOCTOR_B, "+919812345678", "chat-b-1",
+                       source="chat", slot_time="4 pm")
+
+    rows = (await client.get("/admin/appointments", headers=_superadmin())).json()
+    by_id = {r["id"]: r for r in rows}
+    assert by_id[voice["appointment_id"]]["channel"] == "Phone Call"
+    assert by_id[chat["appointment_id"]]["channel"] == "Chat", (
+        "a chat booking is still being reported as a call"
+    )
+    # The raw value travels too, so the UI can style/filter without parsing labels.
+    assert by_id[chat["appointment_id"]]["source"] == "chat"
+
+
+@pytest.mark.asyncio
+async def test_a_row_with_no_recorded_channel_reads_as_unknown(two_clinics):
+    """Rows written before the column existed, whose channel the migration could
+    not infer. "Unknown" is the honest answer; attributing them to a channel
+    would be the original bug in a new form."""
+    client = two_clinics
+    async with AsyncSessionLocal() as s:
+        from backend.models.appointment import Appointment
+        from datetime import datetime, timedelta, timezone
+        s.add(Appointment(
+            id="00000000-dead-beef-0000-000000000001",
+            tenant_id=CLINIC_A, doctor_id=DOCTOR_A,
+            slot_time=datetime.now(timezone.utc) + timedelta(days=1),
+            patient_phone="+919876543299", status="confirmed", source=None,
+        ))
+        await s.commit()
+
+    rows = (await client.get(f"/tenants/{CLINIC_A}/appointments",
+                             headers=_clinic(CLINIC_A))).json()
+    assert rows[0]["source"] is None
+
+    rows = (await client.get("/admin/appointments", headers=_superadmin())).json()
+    assert rows[0]["channel"] == "Unknown"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_channel_name_is_never_stored(two_clinics):
+    """A channel added without teaching the dashboards about it must not silently
+    become a label nobody renders."""
+    res = await _book(CLINIC_A, DOCTOR_A, "+919876543210", "call-a-1",
+                      source="carrier-pigeon")
+    rows = (await two_clinics.get(f"/tenants/{CLINIC_A}/appointments",
+                                  headers=_clinic(CLINIC_A))).json()
+    assert rows[0]["id"] == res["appointment_id"]
+    assert rows[0]["source"] is None
 
 
 @pytest.mark.asyncio

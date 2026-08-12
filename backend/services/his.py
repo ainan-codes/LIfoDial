@@ -271,6 +271,29 @@ async def send_to_sheets_webhook(webhook_url: str | None, payload: dict):
         logger.error(f"Error pushing to Google Sheets: {e}", exc_info=True)
 
 
+def normalize_source(source: str | None) -> str | None:
+    """Validate a booking-channel value, or None.
+
+    An unknown value is stored as NULL and logged, so a channel added without
+    teaching the dashboards about it reads as "Unknown" instead of being
+    silently mis-attributed. See backend/models/appointment.py for the
+    vocabulary and why the column is nullable.
+    """
+    from backend.models.appointment import VALID_SOURCES
+
+    s = (source or "").strip().lower()
+    if not s:
+        return None
+    if s not in VALID_SOURCES:
+        logger.warning(
+            "Unknown booking source %r — storing NULL rather than mis-attributing the row. "
+            "Add it to backend/models/appointment.py::VALID_SOURCES and to both dashboards.",
+            source,
+        )
+        return None
+    return s
+
+
 async def create_appointment(
     tenant_id: str,
     doctor_id: str,
@@ -279,6 +302,7 @@ async def create_appointment(
     call_id: str | None = None,
     slot_date: str | None = None,
     patient_name: str | None = None,
+    source: str | None = None,
 ) -> dict:
     """Create an appointment row and return its details.
 
@@ -290,6 +314,10 @@ async def create_appointment(
     (which passes only slot_time) keeps working unchanged; the chat path passes
     a separate date and the patient's name so appointment rows carry the real
     name instead of a placeholder.
+
+    ``source`` records WHICH channel booked it (voice / web_voice / chat /
+    embed / dashboard) — the clinic's Appointments view shows it, and before this
+    existed both dashboards claimed every row came from a phone call.
     """
     # Future HIS Integration: POST to /appointments
     # if settings.oxzygen_base_url: ...
@@ -320,6 +348,7 @@ async def create_appointment(
                     "slot_time": slot_time,
                     "patient_phone": patient_phone,
                     "status": existing.status,
+                    "source": existing.source,
                     "idempotent_hit": True,
                 }
 
@@ -343,6 +372,7 @@ async def create_appointment(
             patient_name=(patient_name.strip() if patient_name and patient_name.strip() else None),
             status="confirmed",
             call_id=call_id,
+            source=normalize_source(source),
         )
         session.add(appointment)
         try:
@@ -367,7 +397,8 @@ async def create_appointment(
             "specialization": specialization,
             "slot_time": slot_time,
             "patient_phone": patient_phone,
-            "status": "confirmed"
+            "status": "confirmed",
+            "source": appointment.source,
         }
 
         # Fire Google Sheets sync dynamically in background to avoid blocking the voice agent
@@ -448,7 +479,7 @@ async def find_active_appointment(tenant_id: str, name: str, phone: str) -> dict
         }
 
 
-async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: str, time_str: str, doctor_name: str, tenant_id: str, notes: str = None, new_doctor_id: str | None = None) -> dict | None:
+async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: str, time_str: str, doctor_name: str, tenant_id: str, notes: str = None, new_doctor_id: str | None = None, source: str | None = None) -> dict | None:
     """
     Intelligently Book, Reschedule, or Cancel an appointment in the local DB.
     `action` is one of: BOOK, RESCHEDULE, CANCEL.
@@ -460,6 +491,10 @@ async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: s
     disagree about which doctor's calendar the new slot belongs to: if the
     caller named a different doctor, the slot was validated against THAT
     doctor, so the row has to move there too.
+
+    ``source`` is the booking channel, recorded on a BOOK only. A
+    CANCEL/RESCHEDULE deliberately leaves it alone: the column answers "how was
+    this appointment booked", so rewriting it on a later edit would erase that.
     """
     try:
         async with AsyncSessionLocal() as session:
@@ -533,7 +568,8 @@ async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: s
                     patient_phone=phone_clean,
                     patient_name=name_clean,
                     status="confirmed",
-                    notes=notes_clean
+                    notes=notes_clean,
+                    source=normalize_source(source),
                 )
                 session.add(new_appt)
                 try:
@@ -709,6 +745,7 @@ async def execute_booking_action(
     doctor_name: str,
     notes: str | None = None,
     call_id: str | None = None,
+    source: str | None = None,
 ) -> dict:
     """Perform a Book / Reschedule / Cancel and report the REAL outcome.
 
@@ -777,6 +814,7 @@ async def execute_booking_action(
                 patient_phone=phone,
                 patient_name=name,
                 call_id=call_id,
+                source=source,
             )
         except Exception as e:
             logger.error("execute_booking_action BOOK failed: %s", e, exc_info=True)
@@ -864,7 +902,7 @@ async def execute_booking_action(
             result = await sync_appointment_to_db(
                 action=act, name=name, phone=phone, date_str=date_str,
                 time_str=time_str, doctor_name=doctor_name, tenant_id=tenant_id,
-                notes=notes, new_doctor_id=new_doctor_id,
+                notes=notes, new_doctor_id=new_doctor_id, source=source,
             )
         except Exception as e:
             logger.error("execute_booking_action %s failed: %s", act, e, exc_info=True)

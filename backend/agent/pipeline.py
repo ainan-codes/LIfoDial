@@ -82,6 +82,7 @@ from backend.agent.processors.call_logger_processor import (
 )
 from backend.agent.processors.language_switcher import LanguageSwitchProcessor
 from backend.agent.processors.tag_scrub import TagScrubProcessor
+from backend.agent.processors.voice_action import VoiceActionProcessor
 from backend.agent.processors.transcript_publisher import LiveKitTranscriptPublisher
 
 # ── App config ────────────────────────────────────────────────────────────────
@@ -391,6 +392,8 @@ def _doctor_availability_block(tenant: dict) -> str:
 # shared with the chat/embed path (agent_test.py) so the two implementations
 # cannot drift apart again.
 from backend.agent.booking_rules import BOOKING_RULES_BLOCK as _BOOKING_RULES_BLOCK
+from backend.agent.booking_rules import voice_action_tag_block as _voice_action_tag_block
+from backend.services.timeutil import ist_now as _ist_now
 
 
 # Also appended to EVERY system prompt. The blocks above each forbid inventing one
@@ -498,6 +501,13 @@ def _build_system_prompt(
         # the model reads about availability.
         + (availability_block or "")
         + _BOOKING_RULES_BLOCK
+        # HOW to actually perform an action, as opposed to how to talk about one.
+        # Appended to every prompt shape (custom, template, fallback) for the same
+        # reason the honesty rules are: a clinic that writes its own prompt must
+        # not thereby lose the only mechanism that writes to the appointment book.
+        # The anchor date is the clinic's own IST today — the tag's Date field is
+        # required to be a real DD/MM/YYYY.
+        + _voice_action_tag_block(_ist_now().strftime("%A, %d/%m/%Y"))
         + _NO_FABRICATION_RULE
         + _LANGUAGE_MIRROR_RULE
     )
@@ -1852,12 +1862,29 @@ async def entrypoint(ctx) -> None:
         agent_config=agent_config,
         call_meta=call_meta,
     )
-    # Delivers the caller's words to the booking state machine. booking_processor
-    # itself sits downstream of context_aggregator.user() (it needs the
-    # LLMContextFrame), and the aggregator eats TranscriptionFrames — so without
-    # this tap the FSM receives nothing at all and no call can ever book. See
+    # Executes the [ACTION: …] tags the MODEL emits — the mechanism that makes a
+    # spoken "your appointment is booked" correspond to a real row. The FSM above
+    # can only commit when the caller names the doctor themselves and then says a
+    # bare "yes" in a later turn, which a real call does not do; until this
+    # processor existed, no voice call in the product's lifetime had ever written
+    # an appointment. Both writers stay: they share one idempotency key
+    # (call_record_id), so whichever fires first wins and the other is a no-op.
+    voice_action = VoiceActionProcessor(
+        context=context,
+        tenant=tenant,
+        agent_config=agent_config,
+        call_meta=call_meta,
+    )
+    # Delivers the caller's words to the booking state machine, and starts a fresh
+    # turn for voice_action (its one-action-and-one-repair-per-utterance caps have
+    # to lift when the caller speaks again). booking_processor itself sits
+    # downstream of context_aggregator.user() (it needs the LLMContextFrame), and
+    # the aggregator eats TranscriptionFrames — so without this tap the FSM
+    # receives nothing at all and no call can ever book. See
     # BookingTranscriptTap's docstring for the full account.
-    booking_transcript_tap = BookingTranscriptTap(booking_processor)
+    booking_transcript_tap = BookingTranscriptTap(
+        booking_processor, on_new_turn=voice_action.reset_turn,
+    )
     call_logger = CallLoggerProcessor(
         tenant_id=tenant_id or "",
         agent_id=agent_id,
@@ -1961,6 +1988,7 @@ async def entrypoint(ctx) -> None:
         context_aggregator.user(),               # Accumulates user turns into LLMContext
         booking_processor,                       # Booking state machine (transparent)
         llm,                                     # LLMContext → LLMResponseFrame (streaming)
+        voice_action,                            # Execute the model's [ACTION:] tags for real
         tag_scrub,                               # Never speak a machine tag (transparent)
         tts,                                     # LLMResponseFrame → TTSAudioRawFrame
         call_logger,                             # Metrics + call record updates (transparent)
@@ -1992,6 +2020,16 @@ async def entrypoint(ctx) -> None:
     # shipped until now — the booking FSM received zero utterances and no voice
     # call could book, cancel or reschedule anything. Verified by
     # test_transcription_reaches_booking_processor_through_pipeline.
+    #
+    # ⚠️ `voice_action` MUST sit between `llm` and `tag_scrub`. It has to see the
+    # model's RAW streamed text (tag_scrub strips exactly the tags it acts on), and
+    # it has to sit upstream of `tts` so a reply that starts with a tag can be held
+    # back and never spoken. Its LLM re-run also depends on the tail of the
+    # pipeline: it pushes an LLMRunFrame downstream to context_aggregator.assistant(),
+    # which pushes the updated context back UPSTREAM to `llm` (pipecat's own re-run
+    # path — llm_response_universal.py:1623). Downstream of `tts` it could no longer
+    # withhold anything, and upstream of `llm` it would never see the text at all.
+    #
     # ⚠️ context_aggregator.assistant() MUST be the LAST processor — never between
     # the LLM and TTS. LLMAssistantAggregator.process_frame() CONSUMES
     # LLMFullResponseStartFrame / LLMFullResponseEndFrame / TextFrame without

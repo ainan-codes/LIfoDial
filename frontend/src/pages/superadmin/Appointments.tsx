@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { CalendarCheck, Search, Filter, Clock, User, Building2, Stethoscope, Phone } from 'lucide-react';
+import { CalendarCheck, Search, Filter, Clock, User, Building2, Stethoscope, Phone, MessageSquare } from 'lucide-react';
 import { EmptyState, StatusBadge } from '../../components/superadmin/SAShared';
 import fetchWithAuth from '../../api/client';
 
@@ -12,9 +12,18 @@ interface SAAppointment {
   doctor_name: string;
   slot_time: string;
   status: 'Confirmed' | 'Pending' | 'Cancelled' | 'Completed' | 'No-Show';
-  channel: 'AI Call' | 'Manual';
+  /** Which channel booked it. The backend sends both the raw `source` and this
+   *  label (backend/routers/admin.py::_CHANNEL_LABELS). It used to be hardcoded
+   *  "AI Call" for every row, which was wrong about every appointment in the
+   *  database — on 2026-08-12 all of them had come from chat. */
+  channel: string;
+  source: string;
   duration?: string;
 }
+
+/** Voice channels get the phone/mic treatment, text channels the chat one.
+ *  Keys are Appointment.source values (backend/models/appointment.py). */
+const VOICE_SOURCES = new Set(['voice', 'web_voice']);
 
 // ── Skeleton Row ─────────────────────────────────────────────────────────────
 function SkeletonRow() {
@@ -69,7 +78,8 @@ export default function SAAppointments() {
         doctor_name: a.doctor_name || '—',
         slot_time: a.slot_time,
         status: normalizeStatus(a.status),
-        channel: a.channel === 'Manual' ? 'Manual' : 'AI Call',
+        channel: a.channel || 'Unknown',
+        source: (a.source || 'unknown').toLowerCase(),
         duration: a.duration,
       })));
     } catch (e: any) {
@@ -81,8 +91,9 @@ export default function SAAppointments() {
     }
   }
 
-  // Unique clinics for filter
+  // Unique clinics + channels for the filters
   const clinics = Array.from(new Set(appointments.map(a => a.clinic_name)));
+  const channels = Array.from(new Set(appointments.map(a => a.channel)));
 
   // Filter + sort
   const filtered = appointments
@@ -183,10 +194,12 @@ export default function SAAppointments() {
           <option value="All">All Clinics</option>
           {clinics.map(c => <option key={c} value={c}>{c}</option>)}
         </select>
+        {/* Built from the channels actually present, so it can never offer a
+            filter that matches nothing (the old fixed "AI Call"/"Manual" pair
+            did exactly that — "Manual" has never been a real value). */}
         <select value={channelFilter} onChange={e => setChannelFilter(e.target.value)} style={sel}>
           <option value="All">All Channels</option>
-          <option value="AI Call">AI Call</option>
-          <option value="Manual">Manual</option>
+          {channels.map(c => <option key={c} value={c}>{c}</option>)}
         </select>
       </div>
 
@@ -274,16 +287,25 @@ export default function SAAppointments() {
                         {formatDateTime(a.slot_time)}
                       </td>
                       <td style={{ padding: '14px 20px' }}>
-                        <span style={{
-                          backgroundColor: a.channel === 'AI Call' ? '#3ECF8E15' : '#3B82F615',
-                          color: a.channel === 'AI Call' ? '#3ECF8E' : '#60A5FA',
-                          border: `1px solid ${a.channel === 'AI Call' ? '#3ECF8E30' : '#3B82F630'}`,
-                          padding: '2px 8px', borderRadius: '4px', fontSize: '11px', fontWeight: 600,
-                          display: 'inline-flex', alignItems: 'center', gap: '4px',
-                        }}>
-                          {a.channel === 'AI Call' ? <Phone size={10} /> : null}
-                          {a.channel}
-                        </span>
+                        {(() => {
+                          const isVoice = VOICE_SOURCES.has(a.source);
+                          const known = a.source !== 'unknown';
+                          const hue = !known ? '#888' : isVoice ? '#3ECF8E' : '#60A5FA';
+                          const Icon = isVoice ? Phone : MessageSquare;
+                          return (
+                            <span style={{
+                              backgroundColor: `${hue}15`,
+                              color: hue,
+                              border: `1px solid ${hue}30`,
+                              padding: '2px 8px', borderRadius: '4px', fontSize: '11px', fontWeight: 600,
+                              display: 'inline-flex', alignItems: 'center', gap: '4px',
+                              whiteSpace: 'nowrap',
+                            }}>
+                              {known ? <Icon size={10} /> : null}
+                              {a.channel}
+                            </span>
+                          );
+                        })()}
                       </td>
                       <td style={{ padding: '14px 20px' }}>
                         <StatusBadge status={a.status} />

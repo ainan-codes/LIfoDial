@@ -7,6 +7,32 @@ from backend.db import Base
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
+
+# ── Booking channel vocabulary (Appointment.source) ───────────────────────────
+#
+# WHICH channel produced a booking is something the clinic has to be able to see
+# — "the phone agent booked this" and "someone typed it into the website widget"
+# are different facts about the clinic's day, and both dashboards used to assert
+# the first one for every row regardless ("AI Voice" / "AI Call" were hardcoded
+# in the UI). They were wrong about every row that existed: on 2026-08-12 all
+# three real appointments had come from chat.
+#
+# The values are deliberately narrower than "voice or chat", because the product
+# has two of each and the difference is visible to the clinic:
+SOURCE_VOICE = "voice"           # inbound/outbound phone call — the LiveKit voice agent
+SOURCE_WEB_VOICE = "web_voice"   # browser-mic call through the WebSocket widget
+SOURCE_CHAT = "chat"             # text chat in the dashboard (agent test / API)
+SOURCE_EMBED = "embed"           # text chat in the public website widget
+SOURCE_DASHBOARD = "dashboard"   # entered by clinic staff by hand
+
+#: Everything a writer is allowed to store. A value outside this set means a new
+#: channel was added without teaching the dashboards about it, so his.py logs and
+#: stores NULL ("Unknown") rather than inventing an attribution.
+VALID_SOURCES = frozenset({
+    SOURCE_VOICE, SOURCE_WEB_VOICE, SOURCE_CHAT, SOURCE_EMBED, SOURCE_DASHBOARD,
+})
+
+
 class Appointment(Base):
     __tablename__ = "appointments"
     __table_args__ = (
@@ -55,6 +81,14 @@ class Appointment(Base):
     his_booking_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     call_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     notes: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+    #: Which channel booked this — one of VALID_SOURCES above. Nullable ON
+    #: PURPOSE, with no default: a row whose writer did not say where it came
+    #: from must read as "Unknown" in the dashboards, never be silently
+    #: attributed to a channel it may not have come from. (The migration
+    #: backfills existing rows from call_id, which is the only evidence those
+    #: rows carry.)
+    source: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

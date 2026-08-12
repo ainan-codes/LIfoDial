@@ -20,7 +20,7 @@ import datetime as dt
 import logging
 import re
 import unicodedata
-from typing import Optional
+from typing import Callable, Optional
 
 from pipecat.frames.frames import Frame, LLMContextFrame, TranscriptionFrame, TTSSpeakFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -1120,9 +1120,20 @@ class BookingTranscriptTap(FrameProcessor):
     never swallow the caller's words on the way to the LLM.
     """
 
-    def __init__(self, booking_processor: BookingProcessor) -> None:
+    def __init__(
+        self,
+        booking_processor: BookingProcessor,
+        on_new_turn: Optional[Callable[[], None]] = None,
+    ) -> None:
         super().__init__()
         self._booking = booking_processor
+        # Called once per finalised caller utterance, before the FSM sees it.
+        # VoiceActionProcessor uses it to lift its per-turn caps — it cannot
+        # detect a new turn itself for exactly the reason described above (the
+        # aggregator between it and `stt` eats the TranscriptionFrames), and
+        # giving it its own tap would cost a second passthrough hop for every
+        # audio frame on a CPU-starved free-tier worker.
+        self._on_new_turn = on_new_turn
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         # REQUIRED first (pipecat 1.5): handle system frames + mark started.
@@ -1133,6 +1144,12 @@ class BookingTranscriptTap(FrameProcessor):
         # from half a sentence — and could fire a confirm on a "yes" the caller
         # never finished saying.
         if isinstance(frame, TranscriptionFrame) and (frame.text or "").strip():
+            if self._on_new_turn is not None:
+                try:
+                    self._on_new_turn()
+                except Exception as exc:
+                    logger.error("BookingTranscriptTap: new-turn listener failed: %s", exc)
+
             # Awaited BEFORE the frame is pushed on, deliberately: the
             # aggregator downstream turns this same transcription into the
             # LLMContextFrame, and BookingProcessor must already have armed
@@ -1209,6 +1226,8 @@ async def _commit_booking_to_db(
     try:
         from backend.services.his import create_appointment  # Lazy import — avoids circular deps
 
+        from backend.models.appointment import SOURCE_VOICE
+
         result = await create_appointment(
             tenant_id=tenant_id,
             doctor_id=doctor_id,
@@ -1217,6 +1236,7 @@ async def _commit_booking_to_db(
             patient_phone=patient_phone,
             patient_name=patient_name,
             call_id=call_record_id,
+            source=SOURCE_VOICE,
         )
         if not result or not result.get("appointment_id"):
             logger.error("[BookingProcessor] create_appointment returned no appointment_id: %r", result)
@@ -1293,6 +1313,8 @@ async def _commit_action_to_db(
     try:
         from backend.services.his import execute_booking_action  # Lazy import — avoids circular deps
 
+        from backend.models.appointment import SOURCE_VOICE
+
         result = await execute_booking_action(
             action=action,
             tenant_id=tenant_id,
@@ -1302,6 +1324,7 @@ async def _commit_action_to_db(
             time_str=new_slot_time or "",
             doctor_name="",
             call_id=call_record_id,
+            source=SOURCE_VOICE,
         )
         if not result.get("success"):
             logger.warning("[BookingProcessor] %s failed: %s", action, result)
