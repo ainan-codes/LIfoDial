@@ -344,9 +344,20 @@ class BookingProcessor(FrameProcessor):
 
             # Native digit shapes and spoken number words become ASCII first, so a
             # number said as "नौ एक चार आठ..." is still a number here.
-            digits = re.sub(r"\D", "", normalise_spoken_numbers(text))
-            if len(digits) >= 10:
-                self._call_meta["stated_phone"] = digits[-10:]
+            #
+            # Matched as a RUN of digits (spaces and dashes allowed inside it, since
+            # a spoken number arrives as separate words) rather than by stripping
+            # every non-digit from the whole sentence: "मेरा नंबर 9148768120 है और
+            # 3 बजे" concatenates to 11 digits, and taking the last 10 of that
+            # yields 1487681203 — a number the caller does not have, which would
+            # then fail to find any of their appointments.
+            from backend.services.his import normalize_phone
+
+            for run in re.findall(r"\d[\d\s-]{8,}\d", normalise_spoken_numbers(text)):
+                candidate = normalize_phone(run)
+                if len(candidate) == 10:
+                    self._call_meta["stated_phone"] = candidate
+                    break
         except Exception as exc:
             # Advisory only — never let it cost the caller their turn.
             logger.warning("Could not record what the caller said (non-fatal): %s", exc)

@@ -338,6 +338,29 @@ async def test_the_agent_is_shown_the_callers_real_appointments(seeded_db):
     assert await caller_appointments_block(TENANT_ID, "9999999999") == ""
 
 
+@pytest.mark.parametrize("utterance,expected", [
+    ("मेरा नंबर 9148768120 है", "9148768120"),
+    # The one that corrupted it: a time follows the number, and stripping every
+    # non-digit from the sentence yields 11 digits whose last 10 are a number the
+    # caller does not have.
+    ("मेरा नंबर 9148768120 है और 3 बजे", "9148768120"),
+    ("my number is +91 98450 12345", "9845012345"),
+    ("098450-12345 pe call karo", "9845012345"),
+    ("3 बजे", None),
+    ("I'll come at 11", None),
+])
+def test_the_callers_number_is_read_out_of_their_sentence_intact(utterance, expected):
+    from backend.agent.processors.booking_processor import BookingProcessor
+
+    proc = BookingProcessor(
+        tenant={"id": TENANT_ID, "doctors": []},
+        agent_config={},
+        call_meta={"caller_phone": "unknown"},
+    )
+    proc._note_what_the_caller_said(utterance)
+    assert proc._call_meta.get("stated_phone") == expected
+
+
 @pytest.mark.asyncio
 async def test_a_reschedule_moves_the_day_the_caller_asked_for(seeded_db):
     """Day words go through the resolver on the reschedule path too."""
