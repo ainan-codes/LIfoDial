@@ -25,6 +25,19 @@ from typing import Optional
 from pipecat.frames.frames import Frame, LLMContextFrame, TranscriptionFrame, TTSSpeakFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+from backend.services.booking_trace import (
+    ARMED,
+    CONFIRMED,
+    DROPPED,
+    EXECUTED,
+    EXECUTING,
+    INTENT,
+    REPLIED,
+    VOICE,
+    new_trace_id,
+    trace,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,6 +75,12 @@ _CONFIRM_WORDS: frozenset[str] = frozenset({
     "হ্যাঁ", "ঠিক আছে", "હા", "બરાબર", "ਹਾਂ", "ਠੀਕ ਹੈ", "ହଁ", "ଠିକ୍ ଅଛି",
     # Tamil, Telugu, Kannada, Malayalam
     "ஆம்", "சரி", "అవును", "సరే", "ಹೌದು", "ಸರಿ", "അതെ", "ശരി", "ഉവ്വ്",
+    # English loanwords as STT actually returns them — in native script, not
+    # romanised. Callers code-switch constantly ("ഓക്കേ", "ആ യെസ്"), and no
+    # amount of romanised spelling in this set matches those bytes: the literal
+    # test needs the native form, and the skeleton test cannot bridge scripts
+    # for a needle this short.
+    "ഓക്കേ", "യെസ്", "ഒകെ", "ओके", "यस", "ওকে", "ઓકે", "ਓਕੇ", "ஓகே", "ఓకే", "ಓಕೆ",
 })
 
 _CANCEL_WORDS: frozenset[str] = frozenset({
@@ -209,15 +228,20 @@ class BookingProcessor(FrameProcessor):
         # "tomorrow" does not trigger a pointless DB read on the audio path.
         self._days_in_prompt: set = set()
 
+        # Correlates every stage of this call's booking attempt in the logs —
+        # see services/booking_trace.py. Per-call, not per-attempt: a caller may
+        # abandon one booking and start another, and both belong to this call.
+        self._trace_id: str = new_trace_id()
+
         logger.info(
-            "BookingProcessor initialised | tenant=%s caller=%s",
-            tenant.get("id"), self.booking_state["patient_phone"],
+            "BookingProcessor initialised | tenant=%s caller=%s trace_id=%s",
+            tenant.get("id"), self.booking_state["patient_phone"], self._trace_id,
         )
 
     # ── FrameProcessor interface ──────────────────────────────────────────────
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        """Pass every frame through; inspect TranscriptionFrames for state triggers.
+        """Pass every frame through, acting on LLMContextFrames.
 
         LLMContextFrame is the frame that triggers LLM generation downstream —
         when a booking commit is pending, we HOLD it here, await the DB write,
@@ -225,6 +249,17 @@ class BookingProcessor(FrameProcessor):
         mechanism that makes "booked" impossible to speak before the row
         exists. Only the confirmation turn pays this DB round-trip; every
         other frame passes straight through (no hot-path latency added).
+
+        ⚠️ This processor does NOT see TranscriptionFrames and must not try to.
+        It sits downstream of context_aggregator.user(), which CONSUMES
+        TranscriptionFrame without pushing it (pipecat 1.5.0,
+        llm_response_universal.py:794 — the branch calls _handle_transcription()
+        and returns, with no push_frame). It has to sit there, because
+        LLMContextFrame does not exist upstream of the aggregator. Utterances
+        therefore arrive sideways, from BookingTranscriptTap — which sits where
+        the transcriptions still exist and calls on_user_utterance(). See that
+        class's docstring; it is the SAME split UserTranscriptTap already uses
+        to feed the call logger.
         """
         # REQUIRED first: lets the base FrameProcessor handle system frames
         # (StartFrame/CancelFrame/…) and mark itself started. Without it,
@@ -232,18 +267,57 @@ class BookingProcessor(FrameProcessor):
         # and blocks CancelFrame from reaching the pipeline end at teardown.
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, TranscriptionFrame) and frame.text:
-            await self._handle_transcription(frame.text)
+        # Nothing in here may propagate. pipecat catches an exception raised by
+        # process_frame and turns it into push_error() — which routes the
+        # ErrorFrame UPSTREAM (frame_processor.py:722) and, critically, SKIPS
+        # the push_frame below. The in-flight LLMContextFrame is then never
+        # delivered to the LLM: no generation, no TTS, no ErrorFrame anywhere
+        # downstream, and the never-silence guard cannot fire because it sits
+        # downstream too. The caller just hears nothing, forever. That is the
+        # exact shape of the 2026-08-11 Hindi call that ended on "हेलो" into
+        # dead air, so this guard is load-bearing, not defensive habit.
+        try:
+            if isinstance(frame, LLMContextFrame):
+                await self._apply_pending_context_work(frame)
+        except Exception as exc:
+            logger.error(
+                "BookingProcessor: turn work failed, passing the frame on anyway "
+                "so the caller still gets a reply: %s", exc, exc_info=True,
+            )
+            trace(self._trace_id, VOICE, DROPPED, error=type(exc).__name__)
 
-        if isinstance(frame, LLMContextFrame) and self._commit_pending:
+        # Always push the frame downstream — never block the voice pipeline
+        await self.push_frame(frame, direction)
+
+    async def on_user_utterance(self, text: str) -> None:
+        """Feed one finalised caller utterance to the state machine.
+
+        The public entry point, called by BookingTranscriptTap from upstream of
+        context_aggregator.user(). Kept separate from _handle_transcription so
+        the guard lives in exactly one place: an exception here must never
+        reach the tap, because the tap would then drop the TranscriptionFrame
+        and the caller's words would never reach the LLM at all.
+        """
+        if not text or not text.strip():
+            return
+        try:
+            await self._handle_transcription(text)
+        except Exception as exc:
+            logger.error(
+                "BookingProcessor: utterance handling failed for %r: %s",
+                text[:80], exc, exc_info=True,
+            )
+            trace(self._trace_id, VOICE, DROPPED, error=type(exc).__name__)
+
+    async def _apply_pending_context_work(self, frame: LLMContextFrame) -> None:
+        """Commit whatever this turn armed, and inject what the LLM must know."""
+        if self._commit_pending:
             await self._commit_and_inject_result(frame)
 
-        if isinstance(frame, LLMContextFrame) and self._action_commit_pending:
+        if self._action_commit_pending:
             await self._commit_and_inject_action_result(frame)
 
-        if isinstance(frame, LLMContextFrame) and (
-            self._info_message or self._availability_refresh
-        ):
+        if self._info_message or self._availability_refresh:
             context = getattr(frame, "context", None)
             for content in (self._availability_refresh, self._info_message):
                 if not content or context is None:
@@ -254,9 +328,6 @@ class BookingProcessor(FrameProcessor):
                     logger.error("Failed to inject availability note into LLM context: %s", exc)
             self._info_message = None
             self._availability_refresh = None
-
-        # Always push the frame downstream — never block the voice pipeline
-        await self.push_frame(frame, direction)
 
     # ── Internal state machine ────────────────────────────────────────────────
 
@@ -344,6 +415,11 @@ class BookingProcessor(FrameProcessor):
                         self.booking_state["pending_doctor_name"],
                         self.booking_state["pending_slot"],
                     )
+                    trace(
+                        self._trace_id, VOICE, ARMED, action="BOOK",
+                        doctor=self.booking_state["pending_doctor_name"],
+                        slot=self.booking_state["pending_slot"],
+                    )
                 else:
                     logger.info(
                         "Booking: requested slot '%s' not open (reason=%s) — not arming confirmation.",
@@ -376,6 +452,11 @@ class BookingProcessor(FrameProcessor):
             if _said(text, _CONFIRM_WORDS):
                 self._commit_pending = True
                 logger.info("Booking confirm keyword heard — commit will be awaited before LLM reply.")
+                trace(
+                    self._trace_id, VOICE, CONFIRMED, action="BOOK",
+                    doctor=self.booking_state["pending_doctor_name"],
+                    slot=self.booking_state["pending_slot"],
+                )
 
     async def _maybe_refresh_availability(self, text: str) -> None:
         """Queue a refreshed shared availability block when the caller brings up
@@ -528,6 +609,10 @@ class BookingProcessor(FrameProcessor):
             "Booking: matched doctor '%s' (id=%s) — waiting for the caller's requested time.",
             doc.get("name"), doc.get("id"),
         )
+        trace(
+            self._trace_id, VOICE, INTENT, action="BOOK",
+            doctor=doc.get("name"), doctor_id=doc.get("id"),
+        )
 
     def _try_extract_slot(self, text: str) -> None:
         """Extract the requested slot from the caller's own words. Captures an
@@ -658,6 +743,10 @@ class BookingProcessor(FrameProcessor):
         # nothing complained. Chat has always passed the two fields separately
         # (execute_booking_action takes date_str, time_str) — this is the voice
         # side of that same contract.
+        trace(
+            self._trace_id, VOICE, EXECUTING, action="BOOK",
+            doctor_id=str(doctor_id), slot=slot_time,
+        )
         ok, result = await _commit_booking_to_db(
             tenant_id=str(tenant_id),
             doctor_id=str(doctor_id),
@@ -666,6 +755,11 @@ class BookingProcessor(FrameProcessor):
             patient_phone=patient_phone,
             patient_name=self.booking_state.get("patient_name"),
             call_record_id=self._call_meta.get("call_record_id"),
+        )
+        trace(
+            self._trace_id, VOICE, EXECUTED, action="BOOK", ok=str(ok).lower(),
+            appointment_id=(result or {}).get("appointment_id"),
+            reason=(result or {}).get("reason"),
         )
 
         context = getattr(frame, "context", None)
@@ -706,6 +800,7 @@ class BookingProcessor(FrameProcessor):
             except Exception as exc:
                 logger.error("Failed to inject booking result into LLM context: %s", exc)
         logger.info("Booking commit result injected: ok=%s slot=%s", ok, slot_time)
+        trace(self._trace_id, VOICE, REPLIED, action="BOOK", ok=str(ok).lower())
 
     def check_availability_allowed(self) -> bool:
         """Gate for the 'Check Availability' tool toggle — it governs the
@@ -742,9 +837,11 @@ class BookingProcessor(FrameProcessor):
             if _said(text, _RESCHEDULE_APPOINTMENT_PHRASES):
                 state["mode"] = "reschedule"
                 logger.info("Reschedule-existing-appointment intent detected.")
+                trace(self._trace_id, VOICE, INTENT, action="RESCHEDULE")
             elif _said(text, _CANCEL_APPOINTMENT_PHRASES):
                 state["mode"] = "cancel"
                 logger.info("Cancel-existing-appointment intent detected.")
+                trace(self._trace_id, VOICE, INTENT, action="CANCEL")
             else:
                 return
 
@@ -776,6 +873,11 @@ class BookingProcessor(FrameProcessor):
                 state["mode"], state["patient_name"],
                 state["new_slot_day"], state["new_slot_time"],
             )
+            trace(
+                self._trace_id, VOICE, ARMED, action=state["mode"].upper(),
+                patient=state["patient_name"],
+                slot=f"{state['new_slot_day'] or ''} {state['new_slot_time'] or ''}".strip() or None,
+            )
 
         if not state["action_awaiting_confirm"]:
             return
@@ -786,6 +888,7 @@ class BookingProcessor(FrameProcessor):
         if _said(text, _CONFIRM_WORDS):
             self._action_commit_pending = True
             logger.info("%s confirm keyword heard — commit will be awaited before LLM reply.", state["mode"])
+            trace(self._trace_id, VOICE, CONFIRMED, action=state["mode"].upper())
             return
 
         # Caller backs out before confirming — drop the whole flow so the
@@ -899,6 +1002,7 @@ class BookingProcessor(FrameProcessor):
             return
 
         action = "CANCEL" if mode == "cancel" else "RESCHEDULE"
+        trace(self._trace_id, VOICE, EXECUTING, action=action, patient=patient_name)
         ok, result = await _commit_action_to_db(
             action=action,
             tenant_id=str(tenant_id),
@@ -907,6 +1011,11 @@ class BookingProcessor(FrameProcessor):
             new_slot_day=state.get("new_slot_day"),
             new_slot_time=state.get("new_slot_time"),
             call_record_id=self._call_meta.get("call_record_id"),
+        )
+        trace(
+            self._trace_id, VOICE, EXECUTED, action=action, ok=str(ok).lower(),
+            appointment_id=(result or {}).get("appointment_id"),
+            reason=(result or {}).get("reason"),
         )
 
         context = getattr(frame, "context", None)
@@ -981,6 +1090,57 @@ class BookingProcessor(FrameProcessor):
             except Exception as exc:
                 logger.error("Failed to inject %s result into LLM context: %s", mode, exc)
         logger.info("%s commit result injected: ok=%s", mode, ok)
+        trace(self._trace_id, VOICE, REPLIED, action=action, ok=str(ok).lower())
+
+
+class BookingTranscriptTap(FrameProcessor):
+    """Feeds finalised caller utterances to a BookingProcessor.
+
+    Exists purely because of frame placement — the same split UserTranscriptTap
+    already uses for the call logger, and for the same underlying reason.
+
+    BookingProcessor must sit AFTER context_aggregator.user(), because the
+    LLMContextFrame it injects [BOOKING_RESULT ...] into does not exist before
+    the aggregator builds it. But TranscriptionFrames never get that far: the
+    aggregator CONSUMES them without pushing downstream (pipecat 1.5.0,
+    llm_response_universal.py:794).
+
+    The consequence, until this tap existed, was total: BookingProcessor
+    received zero transcriptions for the entire life of the product, so the
+    voice state machine never matched a doctor, never captured a slot, never
+    heard a confirmation, and never wrote a row. Production bore that out —
+    every appointment ever created had ``call_id IS NULL`` (chat), and not one
+    came from a call. The FSM and its unit tests were correct throughout; the
+    frames simply never arrived, because every test called
+    ``_handle_transcription`` directly instead of driving the pipeline.
+
+    This tap sits between `stt` and the aggregator, where the frames still
+    exist, and hands the text sideways. Fully transparent: every frame is
+    pushed on unchanged, and the handler is guarded, so a booking error can
+    never swallow the caller's words on the way to the LLM.
+    """
+
+    def __init__(self, booking_processor: BookingProcessor) -> None:
+        super().__init__()
+        self._booking = booking_processor
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        # REQUIRED first (pipecat 1.5): handle system frames + mark started.
+        await super().process_frame(frame, direction)
+
+        # Finalised transcriptions only. InterimTranscriptionFrame is a running
+        # hypothesis that gets revised, so acting on one would arm a booking
+        # from half a sentence — and could fire a confirm on a "yes" the caller
+        # never finished saying.
+        if isinstance(frame, TranscriptionFrame) and (frame.text or "").strip():
+            # Awaited BEFORE the frame is pushed on, deliberately: the
+            # aggregator downstream turns this same transcription into the
+            # LLMContextFrame, and BookingProcessor must already have armed
+            # (or committed) by the time that frame reaches it. Pushing first
+            # would let the context frame overtake the state it depends on.
+            await self._booking.on_user_utterance(frame.text)
+
+        await self.push_frame(frame, direction)
 
 
 async def _build_availability_note(

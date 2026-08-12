@@ -39,6 +39,16 @@ from backend.agent.booking_rules import (
     BOOKING_RESULT_TRUE,
     BOOKING_RESULT_FALSE,
 )
+from backend.services.booking_trace import (
+    CHAT,
+    CONFIRMED,
+    EXECUTED,
+    EXECUTING,
+    INTENT,
+    REPLIED,
+    new_trace_id,
+    trace,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -2805,6 +2815,11 @@ async def _handle_booking_action(
     failure, or a question. It never returns a promise of a later message,
     because this path is request/response and no later message can exist.
     """
+    # One id for this turn's whole attempt — see services/booking_trace.py. On
+    # chat the arm and the confirm are not separate turns the way they are on
+    # voice: the patient has already agreed by the time the model emits a tag,
+    # so INTENT and CONFIRMED land together once the tag parses.
+    trace_id = new_trace_id()
     m = _ACTION_RE.search(response or "")
 
     if not m:
@@ -2831,6 +2846,9 @@ async def _handle_booking_action(
             else ("CLAIMED THE ACTION WAS DONE" if fabricated else "promised a follow-up"),
             (response or "")[:160],
         )
+        trace(trace_id, CHAT, "action_tag_missing",
+              repairing="true", tag_only=str(tag_only).lower(),
+              fabricated=str(fabricated).lower())
         repaired = await _repair_missing_action_tag(
             provider=provider, api_key=api_key, model=model, max_tokens=max_tokens,
             base_system_prompt=base_system_prompt, history=history,
@@ -2840,8 +2858,10 @@ async def _handle_booking_action(
             cleaned = _scrub_reply(repaired or "")
             # Accept the repair only if it stopped BOTH promising and claiming.
             if cleaned and not _promises_followup(cleaned) and not _claims_any_completion(cleaned):
+                trace(trace_id, CHAT, REPLIED, outcome="repair_asked_for_details")
                 return cleaned
             lang = (user_language or "en-IN").strip() or "en-IN"
+            trace(trace_id, CHAT, REPLIED, outcome="canned_needs_details")
             return _NEEDS_DETAILS_REPLY.get(lang, _NEEDS_DETAILS_REPLY["en-IN"])
 
     g = m.groups()
@@ -2852,6 +2872,10 @@ async def _handle_booking_action(
     b_time = (g[4] or "").strip()
     b_doctor = (g[5] or "").strip()
     b_notes = (g[6].strip() if (len(g) > 6 and g[6] is not None) else "N/A")
+
+    trace(trace_id, CHAT, INTENT, action=b_action, doctor=b_doctor or None,
+          slot=f"{b_date} {b_time}".strip() or None)
+    trace(trace_id, CHAT, CONFIRMED, action=b_action)
 
     # Capability gate — the chat path used to book even when the clinic admin had
     # the tool switched off. BOOK/RESCHEDULE need can_book_appointments; CANCEL
@@ -2898,11 +2922,16 @@ async def _handle_booking_action(
                "doctor_name": None, "available_doctors": [], "slot": ""}
     else:
         webhook = await _resolve_tenant_webhook(agent, db)
+        trace(trace_id, CHAT, EXECUTING, action=b_action, tenant=str(agent.tenant_id))
         res = await sync_and_log_appointment(
             action=b_action, name=b_name, phone=b_phone, date=b_date, time=b_time,
             doctor=b_doctor, notes=b_notes, tenant_id=str(agent.tenant_id),
             webhook_url=webhook, websocket=websocket,
         )
+
+    trace(trace_id, CHAT, EXECUTED, action=b_action,
+          ok=str(bool(res.get("success"))).lower(),
+          appointment_id=res.get("appointment_id"), reason=res.get("reason"))
 
     result_line = _booking_result_message(b_action, res)
 
@@ -2936,6 +2965,8 @@ async def _handle_booking_action(
             ok = (_asserts_completion(final, b_action) if assert_completion
                   else not _promises_followup(final))
             if ok:
+                trace(trace_id, CHAT, REPLIED, action=b_action,
+                      ok=str(bool(res.get("success"))).lower(), source="model")
                 return final
             logger.warning(
                 "Regenerated booking reply did not resolve the outcome (success=%s) — "
@@ -2945,6 +2976,8 @@ async def _handle_booking_action(
     except Exception as e:
         logger.error("Honest booking regeneration failed (%s) — using deterministic reply: %s", provider, e)
 
+    trace(trace_id, CHAT, REPLIED, action=b_action,
+          ok=str(bool(res.get("success"))).lower(), source="deterministic")
     return _deterministic_booking_reply(b_action, res, user_language)
 
 

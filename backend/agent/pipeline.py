@@ -75,7 +75,7 @@ def _import_deepgram_stt():
 from livekit import api as livekit_api
 
 # ── Local processors ──────────────────────────────────────────────────────────
-from backend.agent.processors.booking_processor import BookingProcessor
+from backend.agent.processors.booking_processor import BookingProcessor, BookingTranscriptTap
 from backend.agent.processors.call_logger_processor import (
     CallLoggerProcessor,
     UserTranscriptTap,
@@ -1852,6 +1852,12 @@ async def entrypoint(ctx) -> None:
         agent_config=agent_config,
         call_meta=call_meta,
     )
+    # Delivers the caller's words to the booking state machine. booking_processor
+    # itself sits downstream of context_aggregator.user() (it needs the
+    # LLMContextFrame), and the aggregator eats TranscriptionFrames — so without
+    # this tap the FSM receives nothing at all and no call can ever book. See
+    # BookingTranscriptTap's docstring for the full account.
+    booking_transcript_tap = BookingTranscriptTap(booking_processor)
     call_logger = CallLoggerProcessor(
         tenant_id=tenant_id or "",
         agent_id=agent_id,
@@ -1945,11 +1951,13 @@ async def entrypoint(ctx) -> None:
 
     pipeline = Pipeline([
         transport.input(),                       # Audio in from LiveKit room
+        resilience,                              # Never-silence: ErrorFrame → spoken fallback
         vad,                                     # Silero VAD → speech start/stop (barge-in + segmentation)
         stt,                                     # Speech → Transcription/InterimTranscriptionFrame
         language_switcher,                       # Caller changed language? retune STT/TTS (transparent)
         user_transcript_tap,                     # Feed user turns to call_logger (transparent)
         user_transcript_publisher,               # Mirror USER text → room data channel (transparent)
+        booking_transcript_tap,                  # Feed caller utterances to booking_processor (transparent)
         context_aggregator.user(),               # Accumulates user turns into LLMContext
         booking_processor,                       # Booking state machine (transparent)
         llm,                                     # LLMContext → LLMResponseFrame (streaming)
@@ -1957,10 +1965,33 @@ async def entrypoint(ctx) -> None:
         tts,                                     # LLMResponseFrame → TTSAudioRawFrame
         call_logger,                             # Metrics + call record updates (transparent)
         agent_transcript_publisher,              # Mirror AGENT text → room transcript (transparent)
-        resilience,                              # Never-silence: ErrorFrame → spoken fallback
         transport.output(),                      # Audio out to LiveKit room
         context_aggregator.assistant(),          # Stores assistant reply in context — MUST BE LAST
     ])
+    # ⚠️ `resilience` MUST sit UPSTREAM of stt / llm / tts — never at the tail.
+    # Pipecat pushes ErrorFrames UPSTREAM, not downstream:
+    # FrameProcessor.push_error() → push_error_frame() → push_frame(error,
+    # FrameDirection.UPSTREAM) (pipecat 1.5.0, frame_processor.py:722). While
+    # this processor sat second-from-last, every provider ErrorFrame travelled
+    # away from it and it never fired once in production — so a Groq 429, a TTS
+    # failure, or an exception in any processor produced pure dead air, and the
+    # model-failover added in 0816a4e could never run either. Both the fallback
+    # phrase and the failover are reached only from here, so the position is the
+    # feature. Verified by test_error_frame_reaches_resilience_from_llm_position.
+    #
+    # It costs one extra passthrough hop per input audio frame, which is the
+    # price of also covering STT: an STT service that dies upstream of any other
+    # placement would otherwise be the one provider failure still able to hang a
+    # call silently.
+    #
+    # ⚠️ `booking_transcript_tap` MUST sit BEFORE context_aggregator.user(), and
+    # `booking_processor` AFTER it. The two halves need frames that exist on
+    # opposite sides of the aggregator (TranscriptionFrame before, LLMContextFrame
+    # after), and the aggregator consumes the former without forwarding it
+    # (llm_response_universal.py:794). With both on the downstream side — as
+    # shipped until now — the booking FSM received zero utterances and no voice
+    # call could book, cancel or reschedule anything. Verified by
+    # test_transcription_reaches_booking_processor_through_pipeline.
     # ⚠️ context_aggregator.assistant() MUST be the LAST processor — never between
     # the LLM and TTS. LLMAssistantAggregator.process_frame() CONSUMES
     # LLMFullResponseStartFrame / LLMFullResponseEndFrame / TextFrame without

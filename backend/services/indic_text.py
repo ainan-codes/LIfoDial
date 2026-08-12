@@ -342,9 +342,20 @@ def contains_any(text: str, phrases) -> bool:
     "what happened", which in the booking FSM reads as the caller confirming.
     Indic-script phrases keep the substring test, because Python's \\b means
     nothing against those scripts and their words are agglutinated anyway.
+
+    The skeleton pass delegates to skeleton_contains, which scopes every
+    comparison to a SINGLE spoken word. It must not be re-inlined as a test
+    against the whole utterance's skeleton: that version let a needle stretch
+    across a word boundary, and the booking FSM's keyword sets are exactly
+    where that is unaffordable. Measured — the Malayalam "വേണ്ട" ("don't
+    want", a cancel word) folds to the same classes as the "want to" in
+    *"I want to see Dr Salman tomorrow at 2 PM"*, so an ordinary English
+    booking request read as a CANCELLATION. In BookingProcessor that lands one
+    step after the slot is armed, which un-armed the booking on the very
+    utterance that set it up, on every call.
     """
     low = (text or "").lower()
-    skeleton = consonant_skeleton(text)
+    text_is_ascii = low.isascii()
     for phrase in phrases:
         p = (phrase or "").strip().lower()
         if not p:
@@ -354,8 +365,19 @@ def contains_any(text: str, phrases) -> bool:
                 return True
         elif p in low:
             return True
-        ps = consonant_skeleton(p)
-        if len(ps) >= MIN_SKELETON and ps in skeleton:
+        # The skeleton pass exists so a ROMANISED keyword list can match Indic
+        # speech ("haan" ↔ "हाँ"), and so same-script spelling variants merge.
+        # Running an Indic needle against an all-ASCII utterance serves neither
+        # purpose — the caller is plainly not speaking that language, and every
+        # keyword set here already carries romanised entries for the English
+        # case. It is also actively harmful: consonant classes are coarse enough
+        # that the Malayalam cancel word "വേണ്ട" (V-N-T) collides with the
+        # English "want" (W-N-T), so *"I want to see Dr Salman tomorrow at
+        # 2 PM"* was read as a cancellation and un-armed the booking one step
+        # after it was armed.
+        if text_is_ascii and not p.isascii():
+            continue
+        if skeleton_contains(text, p):
             return True
     return False
 
@@ -486,15 +508,36 @@ def normalise_spoken_numbers(text: str) -> str:
 
     out = _ascii_digits(text)
 
-    # Longest first so "पदकొండు"-style multiword forms win over their prefixes.
+    # Longest first so "పదకొండు"-style multiword forms win over their prefixes.
     for word in sorted(_NUMBER_WORDS, key=len, reverse=True):
         if word in out.lower():
             # Case-insensitive replace, preserving the rest of the string.
-            out = re.sub(re.escape(word), f" {_NUMBER_WORDS[word]} ", out,
+            out = re.sub(_boundaried(word), f" {_NUMBER_WORDS[word]} ", out,
                          flags=re.IGNORECASE)
 
     for marker in _OCLOCK_WORDS:
         if marker in out.lower():
-            out = re.sub(re.escape(marker), " baje ", out, flags=re.IGNORECASE)
+            out = re.sub(_boundaried(marker), " baje ", out, flags=re.IGNORECASE)
 
     return re.sub(r"\s+", " ", out).strip()
+
+
+def _boundaried(word: str) -> str:
+    """``word`` as a regex that only matches a WHOLE word, in any script.
+
+    A bare re.escape() substring replace corrupts any longer word that happens
+    to start with a number word, and Indic languages build those constantly:
+    Hindi "दोपहर" (afternoon) literally begins with "दो" (two), so
+    *"दोपहर के दो बजे"* ("2 in the afternoon") normalised to "2 पहर के 2 baje".
+    _SLOT_PATTERN then took the FIRST digit and booked "2" with no meridiem —
+    2 AM, outside every clinic's hours — instead of the 2 PM the caller asked
+    for. That is a wrong appointment written from a correctly-heard sentence.
+
+    \\w is the right boundary for this even though Python's \\b is useless
+    against Indic script: \\w matches base letters but NOT the combining marks
+    (category Mn) that Indic vowel signs and viramas live in. So the lookarounds
+    reject a following base consonant ("दो" inside "दोपहर") while still allowing
+    a trailing vowel sign or virama that belongs to the number word's own
+    cluster ("പതിനൊന്ന്").
+    """
+    return rf"(?<!\w){re.escape(word)}(?!\w)"

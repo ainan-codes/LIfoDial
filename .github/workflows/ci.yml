@@ -3,10 +3,12 @@ name: CI
 # Test/build gate the audit (I3) called for: before this, nothing ran pytest or
 # built the SPA before code shipped. Runs on every push to main and every PR.
 #
-# NOTE: Render auto-deploys from main independently of this workflow, so a red
-# run here does not physically block that deploy. Treat a failing run as
-# "do not merge / roll back", and ideally switch Render to deploy on tagged
-# releases so this gate becomes binding.
+# NOTE: this gate is advisory, not binding. The backend and agent worker deploy
+# from Railway, which needs an explicit serviceInstanceDeployV2 trigger, and the
+# frontend auto-deploys from Vercel on push. Neither consults this workflow, so
+# a red run here does not physically stop anything shipping. Treat a failing run
+# as "do not deploy / roll back" — in particular, do not trigger the Railway
+# deploy until the booking end-to-end gate below is green.
 
 on:
   push:
@@ -47,6 +49,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.agent.txt
           pip install pytest==8.3.5 pytest-asyncio==0.26.0
+
+      - name: Booking end-to-end gate (all 6 channel × intent combinations)
+        # Run first and named separately so a break here is unmissable. These
+        # drive frames through an assembled pipeline and assert on DB rows,
+        # which is the only thing that would have caught the voice booking FSM
+        # never receiving a single transcription — every other booking test
+        # calls the state machine directly and passed throughout.
+        run: python -m pytest backend/tests/test_booking_pipeline_e2e.py -q
 
       - name: Run tests
         run: python -m pytest backend/tests tests -q
