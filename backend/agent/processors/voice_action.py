@@ -132,6 +132,18 @@ def build_result_message(action: str, res: dict) -> str:
         action, "done"
     )
 
+    if res.get("reason") == "already_booked":
+        # The caller asked again — usually because they did not hear the first
+        # confirmation. This must not be answered with a slot conflict against
+        # their own booking (which is what happened live on 2026-08-12).
+        return (
+            f"{BOOKING_RESULT_TRUE} This caller ALREADY has an appointment booked on this call: "
+            f"{res.get('doctor_name') or 'the doctor'}, {res.get('slot') or 'the time agreed'}. "
+            "Nothing more was needed and nothing is wrong. Tell them in ONE short spoken sentence "
+            "that it IS confirmed, with the doctor and the time. Do NOT say the time is unavailable "
+            "or taken — it is taken BY THEM. If they want a different time, use RESCHEDULE; if they "
+            "no longer want it, use CANCEL."
+        )
     if res.get("reason") == "already_at_that_time":
         return (
             f"{BOOKING_RESULT_TRUE} The caller's appointment was ALREADY at exactly that time "
@@ -595,12 +607,23 @@ class VoiceActionProcessor(FrameProcessor):
         trace(self._trace_id, VOICE, CONFIRMED, action=action)
         self._acted_this_turn = True
 
+        # A phone number the model left out, in order of how good the evidence is:
+        # what it wrote, then the number the CALLER read out during the call, then
+        # caller ID. The middle one was missing and it mattered — on 2026-08-12 the
+        # caller said "मेरा नंबर है 9148768120" and the appointment was still stored
+        # with patient_phone='unknown', because a browser call has no caller ID and
+        # nothing else was consulted. A row with no number cannot be found by
+        # number later, which is how cancel/reschedule find it.
         phone = tag.phone
         if is_placeholder(phone):
-            caller = self._call_meta.get("caller_phone") or ""
-            if not is_placeholder(caller):
-                phone = caller
-                logger.info("VoiceActionProcessor: using caller ID for the patient's phone.")
+            for source, candidate in (
+                ("what the caller said", self._call_meta.get("stated_phone")),
+                ("caller ID", self._call_meta.get("caller_phone")),
+            ):
+                if candidate and not is_placeholder(str(candidate)):
+                    phone = str(candidate)
+                    logger.info("VoiceActionProcessor: took the phone from %s.", source)
+                    break
 
         filled = tag._replace(phone=phone)
 

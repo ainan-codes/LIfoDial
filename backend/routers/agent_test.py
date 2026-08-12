@@ -2543,6 +2543,13 @@ def _booking_result_message(action: str, res: dict) -> str:
     # Checked before the generic success branch: the appointment IS at the
     # requested time (so the patient's goal holds and success is true), but
     # saying "rescheduled" would imply a change that did not happen.
+    if res.get("reason") == "already_booked":
+        return (f"{BOOKING_RESULT_TRUE} This patient ALREADY has an appointment from this "
+                f"conversation: {res.get('doctor_name') or 'the doctor'}, "
+                f"{res.get('slot') or 'the time agreed'}. Nothing more was needed. Tell them in ONE "
+                "short sentence that it IS confirmed, with the doctor and the time. Do NOT say that "
+                "time is unavailable — it is taken BY THEM. To change it use RESCHEDULE; to drop it "
+                "use CANCEL.")
     if res.get("reason") == "already_at_that_time":
         return (f"{BOOKING_RESULT_TRUE} The patient's appointment was ALREADY at exactly that time "
                 f"(appointment id {res.get('appointment_id')}), so nothing needed to change and nothing "

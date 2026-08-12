@@ -569,6 +569,48 @@ async def _find_active_appointment_in_session(session, tenant_id: str, name: str
     return None
 
 
+async def appointment_for_call(tenant_id: str, call_id: str) -> dict | None:
+    """The appointment THIS call already created, if any.
+
+    One call produces one appointment — the rule create_appointment's idempotency
+    key has always enforced. This exposes it BEFORE the availability gate, which
+    is what stops the following exchange (measured live, 2026-08-12):
+
+        caller   "tomorrow at 2, yes, do it"
+        system   booked  ✓
+        caller   "is it done?"                      (they had not heard the reply)
+        agent    "sorry, 2 PM tomorrow is already booked, only mornings are free"
+
+    The slot WAS taken — by the caller's own appointment, thirty seconds earlier.
+    The gate cannot tell the difference, so the answer has to come from here.
+    """
+    if not call_id:
+        return None
+    from backend.services.timeutil import format_ist_clock, to_ist
+
+    async with AsyncSessionLocal() as session:
+        appt = (
+            await session.execute(
+                select(Appointment).where(
+                    Appointment.tenant_id == tenant_id,
+                    Appointment.call_id == call_id,
+                    Appointment.status.in_(["pending", "confirmed"]),
+                ).order_by(Appointment.created_at.asc())
+            )
+        ).scalars().first()
+        if not appt:
+            return None
+        doctor = (
+            await session.execute(select(Doctor).where(Doctor.id == appt.doctor_id))
+        ).scalar_one_or_none()
+        slot_ist = to_ist(_as_utc(appt.slot_time))
+        return {
+            "appointment_id": str(appt.id),
+            "doctor_name": doctor.name if doctor else None,
+            "slot": f"{slot_ist:%A %d/%m/%Y} at {format_ist_clock(slot_ist)}",
+        }
+
+
 async def caller_appointments(tenant_id: str, phone: str, name: str = "") -> List[dict]:
     """This caller's active appointments, as plain dicts (doctor name + IST slot).
 
@@ -965,6 +1007,23 @@ async def execute_booking_action(
     }
 
     if act == "BOOK":
+        # Has this call ALREADY booked? Checked before the availability gate,
+        # because the gate would report the caller's own thirty-second-old
+        # appointment as "that slot is taken" — see appointment_for_call.
+        mine = await appointment_for_call(tenant_id, call_id or "")
+        if mine:
+            logger.info(
+                "BOOK on a call that already booked %s — reporting the existing "
+                "appointment rather than a slot conflict.", mine["appointment_id"],
+            )
+            return {
+                "success": True, "reason": "already_booked",
+                "appointment_id": mine["appointment_id"],
+                "doctor_name": mine.get("doctor_name"),
+                "available_doctors": [], "alternatives": [],
+                "slot": mine.get("slot") or slot,
+            }
+
         # A booking with no day would land on TODAY — a day the patient never
         # asked for, which is the same class of invention as a fabricated time.
         if not date_str.strip():

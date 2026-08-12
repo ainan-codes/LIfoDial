@@ -689,6 +689,50 @@ async def test_the_agent_is_told_the_callers_real_appointments(seeded_db):
 
 
 @pytest.mark.asyncio
+async def test_asking_again_is_told_it_is_booked_not_that_the_slot_is_taken(seeded_db):
+    """Measured live 2026-08-12: the caller did not hear the confirmation and asked
+    "हो गया क्या?". The model tried to book again, the availability gate found the
+    slot occupied — by the caller's OWN appointment from 30 seconds earlier — and
+    the agent told them 2 PM was unavailable and offered mornings instead.
+    """
+    async with VoiceCall([
+        _book_tag("02:00 PM"), "Booked for 2 PM.",
+        _book_tag("02:00 PM"), "Yes — it's confirmed for 2 PM with Dr Salman.",
+    ]) as call:
+        await call.says("Book me with Dr Salman tomorrow at 2 PM, I'm Ainan",
+                        expect_generations=2)
+        await call.says("हो गया क्या अपॉइंटमेंट बुक?", expect_generations=2)
+        lines = call.llm.system_lines()
+
+    assert len(await _appointments()) == 1
+    assert any("ALREADY has an appointment booked on this call" in line for line in lines), (
+        "asking again was answered as a slot conflict against the caller's own booking"
+    )
+    assert not any("ALREADY BOOKED for that doctor" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_the_number_the_caller_read_out_is_the_one_stored(seeded_db):
+    """A browser call has no caller ID, so a tag with no phone used to store
+    'unknown' even though the caller had just read their number out — and a row
+    with no number cannot be found by number when they call back to cancel."""
+    async with VoiceCall(
+        [_book_tag(phone="N/A"), "Booked."],
+        call_record_id=CALL_ID,
+    ) as call:
+        await call.says(
+            f"मेरा नाम आइनान है, मेरा नंबर है {PHONE} और मैं कल दोपहर के 2 बजे आना चाहता हूँ",
+            expect_generations=2,
+        )
+
+    rows = await _appointments()
+    assert len(rows) == 1, rows
+    assert rows[0].patient_phone == PHONE, (
+        f"stored {rows[0].patient_phone!r} instead of the number the caller gave"
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_caller_cannot_dictate_an_action_tag(seeded_db):
     """The caller's own words must never be executed.
 
