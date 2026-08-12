@@ -2572,13 +2572,18 @@ def _booking_result_message(action: str, res: dict) -> str:
         return (f"{BOOKING_RESULT_FALSE} {req}, so NOTHING was booked. Do NOT say it is booked.{avail} "
                 "Ask the patient which of the available doctors they'd like, or offer to connect them to staff.")
     if reason == "not_found":
-        return (f"{BOOKING_RESULT_FALSE} No matching appointment was found for that name and phone number, "
-                "so nothing was changed. Do NOT say it was done. Ask the patient to re-check their name and "
-                "phone number.")
+        return (f"{BOOKING_RESULT_FALSE} There is no active appointment on that phone number, so nothing was "
+                "changed. Do NOT say it was done. Do NOT ask the patient to spell their name again — the "
+                "search does not depend on spelling, so re-asking cannot change this answer. Ask ONCE for the "
+                "phone number the appointment was booked under, or offer to pass them to the clinic's staff.")
     if reason == "invalid_time":
         return (f"{BOOKING_RESULT_FALSE} No valid appointment TIME was given, so nothing was booked or "
                 "changed — never assume or invent a time. Do NOT say it was done. Ask the patient to state "
                 "the time again, e.g. '3 PM' or '11:30 AM'.")
+    if reason == "invalid_date":
+        return (f"{BOOKING_RESULT_FALSE} The DAY in your tag was not a real date, so nothing was booked or "
+                "changed — a day must never be guessed at. Do NOT say it was done. Ask the patient which "
+                "day they want, and write it as their own word ('tomorrow') or as DD/MM/YYYY.")
     if reason == "missing_details":
         need = " and ".join(res.get("missing") or ["the patient's details"])
         if action in ("RESCHEDULE", "CANCEL"):
@@ -2657,6 +2662,8 @@ def _deterministic_booking_reply(action: str, res: dict, user_language: str) -> 
                 "changed. Could you re-check those details?")
     if res.get("reason") == "invalid_time":
         return "I'm sorry, I didn't catch a clear time for that. Could you say it again, like '3 PM' or '11:30 AM'?"
+    if res.get("reason") == "invalid_date":
+        return "I'm sorry, I didn't catch which day you meant. Could you tell me the day again?"
     if res.get("reason") == "missing_details":
         need = " and ".join(res.get("missing") or ["your details"])
         return f"Before I book that, could you give me your {need}?"
@@ -2684,6 +2691,35 @@ def _deterministic_booking_reply(action: str, res: dict, user_language: str) -> 
     if res.get("reason") == "disabled":
         return "I'm sorry, I'm not able to do that here. Let me connect you with the clinic's staff."
     return "I'm sorry, I couldn't complete that just now, so nothing was changed. Would you like me to try again?"
+
+
+def _reconcile_date_with_history(tag_date: str, history: list) -> str:
+    """The day the PATIENT named beats the day the model calculated.
+
+    Reads the recent user turns (this turn is the last one) for calendar words in
+    any supported language and hands them to dayref.reconcile_requested_date. The
+    voice equivalent lives in VoiceActionProcessor._resolve_date, which gets the
+    same information from the caller's transcriptions.
+    """
+    try:
+        from backend.services.dayref import note_dates_said, reconcile_requested_date
+        from backend.services.timeutil import ist_now
+
+        today = ist_now().date()
+        said: list = []
+        for msg in (history or [])[-6:]:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                note_dates_said(said, str(msg.get("content") or ""), today)
+
+        new_date, correction = reconcile_requested_date(tag_date, said, today)
+        if correction:
+            logger.warning(
+                "Booking date OVERRULED — %s. Using %s.", correction, new_date,
+            )
+        return new_date
+    except Exception as e:
+        logger.error("Date reconciliation failed, using the tag's date: %s", e)
+        return tag_date
 
 
 async def _handle_booking_action(
@@ -2779,12 +2815,26 @@ async def _handle_booking_action(
     # rules, and the reasoning behind them, live in services/action_tag.py —
     # shared with the voice path so the two channels cannot validate the same
     # tag differently.
-    from backend.services.his import is_time_str_parseable
+    from backend.services.his import is_date_str_parseable, is_time_str_parseable
     needs_real_time = _needs_real_time(b_action)
     missing = _missing_identity_fields(tag)
 
+    # The patient's OWN words decide the day, not the model's arithmetic. A live
+    # voice call on 2026-08-12 had the model turn "tomorrow" into a date three days
+    # out with today's date sitting in its prompt; chat has the identical exposure,
+    # so both channels reconcile against what the user actually said. Rules and
+    # reasoning: services/dayref.py.
+    b_date = _reconcile_date_with_history(b_date, history)
+
     if needs_real_time and not is_time_str_parseable(b_time):
         res = {"success": False, "reason": "invalid_time", "appointment_id": None,
+               "doctor_name": None, "available_doctors": [], "slot": ""}
+    elif needs_real_time and not _is_placeholder(b_date) and not is_date_str_parseable(b_date):
+        # A day that was GIVEN but names nothing ("next week") silently becomes
+        # TODAY, a day the patient never asked for — refuse, as for a missing time.
+        # A day not given at all is left to execute_booking_action, which alone can
+        # give it the right per-action meaning (see its date handling).
+        res = {"success": False, "reason": "invalid_date", "appointment_id": None,
                "doctor_name": None, "available_doctors": [], "slot": ""}
     elif missing:
         res = {"success": False, "reason": "missing_details", "appointment_id": None,

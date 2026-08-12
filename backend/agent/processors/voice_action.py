@@ -101,6 +101,7 @@ from backend.services.action_tag import (
     missing_identity_fields,
     needs_real_time,
     parse_action_tag,
+    promises_followup,
     scrub_reply,
 )
 from backend.services.booking_trace import (
@@ -172,15 +173,26 @@ def build_result_message(action: str, res: dict) -> str:
         )
     if reason == "not_found":
         return (
-            f"{BOOKING_RESULT_FALSE} No appointment was found under that name and phone number, so "
-            f"NOTHING was {done}. Do NOT say it is {done}. Ask the caller to confirm the name the "
-            "appointment was booked under."
+            f"{BOOKING_RESULT_FALSE} There is no active appointment on that phone number, so NOTHING "
+            f"was {done}. Do NOT say it is {done}.\n"
+            "Do NOT ask the caller to spell or repeat their name — the search does not depend on "
+            "spelling, so asking again cannot change this answer. (On a live call this instruction "
+            "was missing and the agent asked the same caller to spell their name four times, for 280 "
+            "seconds, and cancelled nothing.) Ask ONCE for the phone number the appointment was "
+            "booked under, and if that is no help, offer to pass them to the clinic's staff."
         )
     if reason == "invalid_time":
         return (
             f"{BOOKING_RESULT_FALSE} No valid TIME was given, so NOTHING was {done} — never assume "
             f"a time. Do NOT say it is {done}. Ask the caller to say the time again, like "
             "'3 PM' or '11:30 AM'."
+        )
+    if reason == "invalid_date":
+        return (
+            f"{BOOKING_RESULT_FALSE} The DAY in your tag was not a real date, so NOTHING was "
+            f"{done} — and it must never be guessed at. Do NOT say it is {done}. Ask the caller "
+            "which day they want, and write it as the caller's own word ('tomorrow') or as "
+            "DD/MM/YYYY."
         )
     if reason == "missing_details":
         need = " and ".join(res.get("missing") or ["the caller's details"])
@@ -235,14 +247,19 @@ _NO_SECOND_TAG = (
 #: booked/cancelled/rescheduled without emitting a tag — so nothing happened.
 #: The voice analogue of the chat path's _repair_missing_action_tag.
 _REPAIR_INSTRUCTION = (
-    "[BOOKING_RESULT success=false] You just told the caller their appointment was booked, "
-    "cancelled or rescheduled, but you did NOT emit an [ACTION: ...] tag — so NOTHING was saved "
-    "and what you said is not true. Fix it NOW in your next reply, choosing EXACTLY ONE of:\n"
-    "  (a) If you already have the caller's Name, Phone, Date, Time and Doctor: output the correct "
-    "[ACTION: ...] tag as the FIRST thing in your reply, followed by nothing else.\n"
-    "  (b) If any of those is missing: ask the caller for the missing detail in ONE short question, "
-    "and do not claim anything is done.\n"
-    "Never say 'hold on', 'one moment' or 'I'll confirm shortly' — nothing will follow it."
+    "[BOOKING_RESULT success=false] You just told the caller an appointment was booked, cancelled "
+    "or rescheduled — or that you were about to do it — but you did NOT emit an [ACTION: ...] tag, "
+    "so NOTHING happened and what you said is not true. Saying it does not do it; only the tag "
+    "does. There is nothing running in the background and nothing will happen later.\n"
+    "Fix it NOW in your next reply, choosing EXACTLY ONE of:\n"
+    "  (a) Output the correct [ACTION: ...] tag as the WHOLE of your reply, nothing else. For a "
+    "CANCEL you need only the caller's name and number — put N/A in the date, time and doctor "
+    "fields. If the caller's existing appointments are listed above, every detail you need is "
+    "already there; do not ask for it again.\n"
+    "  (b) If a detail is genuinely missing, ask for THAT ONE detail in one short question, and "
+    "claim nothing.\n"
+    "Never say 'hold on', 'one moment', 'I'll start the process' or 'I'll proceed' — nothing "
+    "follows it, and the caller will wait for a reply that never comes."
 )
 
 #: The model's whole reply was a machine tag this system could not parse (a
@@ -489,20 +506,33 @@ class VoiceActionProcessor(FrameProcessor):
                 # sentence would only repeat them.
                 self._inject(build_result_message(tag.action, res), rerun=not res.get("success"))
 
-            # ── Recovery 2: claimed success with no tag at all ─────────────────
+            # ── Recovery 2: talked about acting, without acting ────────────────
+            #
+            # Two shapes, one cause — the model described an action it never
+            # signalled, so NOTHING was written:
+            #
+            #   claimed  "your appointment is booked"        (2026-08-12, 2 of 2 calls)
+            #   promised "I'll start cancelling it now"      (2026-08-12 cancel call:
+            #            "मैं इस अपॉइंटमेंट को कैंसिल करने की प्रक्रिया शुरू करूंगा", then
+            #            280 seconds and nothing cancelled)
+            #
+            # A promise is worse than a claim, because the caller waits for it. The
+            # chat path has caught both since 2026-08-10; voice caught neither.
             elif (
                 tag is None
                 and not acted
                 and not self._repaired_this_turn
-                and claims_any_completion(speakable)
+                and (claims_any_completion(speakable) or promises_followup(speakable))
             ):
+                fabricated = claims_any_completion(speakable)
                 logger.error(
-                    "VoiceActionProcessor: the agent CLAIMED an appointment action with no "
-                    "[ACTION:] tag — nothing was written. Re-prompting for the tag. Said: %r",
+                    "VoiceActionProcessor: the agent %s an appointment action with no [ACTION:] "
+                    "tag — nothing was written. Re-prompting for the tag. Said: %r",
+                    "CLAIMED" if fabricated else "PROMISED to perform",
                     speakable[:160],
                 )
                 trace(self._trace_id, VOICE, "action_tag_missing",
-                      repairing="true", fabricated="true")
+                      repairing="true", fabricated=str(fabricated).lower())
                 self._repaired_this_turn = True
                 self._inject(_REPAIR_INSTRUCTION, rerun=True)
 
@@ -581,11 +611,30 @@ class VoiceActionProcessor(FrameProcessor):
         allowed = can_book if action in ("BOOK", "RESCHEDULE") else (
             can_cancel if action == "CANCEL" else False)
 
-        from backend.services.his import execute_booking_action, is_time_str_parseable
+        from backend.services.his import (
+            execute_booking_action,
+            is_date_str_parseable,
+            is_time_str_parseable,
+        )
+
+        date_str = self._resolve_date(tag)
 
         missing = missing_identity_fields(filled)
         if needs_real_time(action) and not is_time_str_parseable(tag.time):
             res = {"success": False, "reason": "invalid_time", "appointment_id": None}
+        elif (
+            needs_real_time(action)
+            and not is_placeholder(date_str)
+            and not is_date_str_parseable(date_str)
+        ):
+            # A day that was GIVEN but names nothing ("next week") would silently
+            # become TODAY. Refuse and ask, exactly as for a missing time.
+            #
+            # A day that was not given at all is left to execute_booking_action,
+            # which is the one place that can give it the right meaning per action:
+            # a BOOK with no day is refused, a RESCHEDULE with no day stays on the
+            # day the appointment is already on.
+            res = {"success": False, "reason": "invalid_date", "appointment_id": None}
         elif missing:
             res = {"success": False, "reason": "missing_details", "appointment_id": None,
                    "missing": missing}
@@ -599,7 +648,7 @@ class VoiceActionProcessor(FrameProcessor):
                     tenant_id=tenant_id,
                     name=filled.name,
                     phone=filled.phone,
-                    date_str=tag.date,
+                    date_str=date_str,
                     time_str=tag.time,
                     doctor_name=tag.doctor,
                     notes=tag.notes,
@@ -624,6 +673,39 @@ class VoiceActionProcessor(FrameProcessor):
             await self._mark_call_outcome(action)
 
         return res
+
+    def _resolve_date(self, tag: ActionTag) -> str:
+        """The day to actually book: the CALLER's word beats the model's arithmetic.
+
+        Measured live 2026-08-12 — the caller said "कल दोपहर 3 बजे" with
+        "Today is Wednesday, 12/08/2026" in the prompt, and the model wrote
+        15/08/2026 into the tag. A real appointment was created three days out, and
+        nothing downstream could have caught it: 15/08 was a valid future date and
+        the doctor really was free at 3 PM on it.
+
+        The days the caller named come from BookingProcessor via the shared
+        ``call_meta`` dict; the reconciliation rules (and why they are deliberately
+        conservative) are in services/dayref.py.
+        """
+        said = self._call_meta.get("said_dates") or []
+        if not said:
+            return tag.date
+        try:
+            from backend.services.dayref import reconcile_requested_date
+            from backend.services.timeutil import ist_now
+
+            date_str, correction = reconcile_requested_date(tag.date, said, ist_now().date())
+            if correction:
+                logger.warning(
+                    "VoiceActionProcessor: OVERRULING the model's date — %s. Using %s.",
+                    correction, date_str,
+                )
+                trace(self._trace_id, VOICE, "date_corrected",
+                      model=tag.date or "-", used=date_str)
+            return date_str
+        except Exception as exc:
+            logger.error("Date reconciliation failed, using the tag's date: %s", exc)
+            return tag.date
 
     async def _mark_call_outcome(self, action: str) -> None:
         """Record the real outcome on the call record, so the dashboard's

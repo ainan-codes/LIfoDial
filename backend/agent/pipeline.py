@@ -1183,12 +1183,30 @@ async def entrypoint(ctx) -> None:
     # failure it returns the "could not look it up" block, never an empty string
     # and never a claim that the clinic has no doctors.
     availability_block = ""
+    caller_appointments = ""
     if tenant.get("id") and not tenant.get("_facts_unavailable"):
-        from backend.services.availability_prompt import real_availability_block
+        from backend.services.availability_prompt import (
+            caller_appointments_block,
+            real_availability_block,
+        )
 
         availability_block = await real_availability_block(str(tenant["id"]))
 
-    system_prompt = _build_system_prompt(agent_config, tenant, availability_block)
+        # What this caller ALREADY has booked, keyed on the number they are
+        # calling from — so "cancel my appointment" is answered from the database
+        # instead of interrogating them for details it already holds. Empty (and
+        # therefore absent from the prompt) when there is no caller ID or no
+        # existing appointment; BookingProcessor injects it mid-call once the
+        # caller says a name or a number.
+        caller_phone = (call_meta or {}).get("caller_phone") or ""
+        if caller_phone:
+            caller_appointments = await caller_appointments_block(
+                str(tenant["id"]), str(caller_phone),
+            )
+
+    system_prompt = _build_system_prompt(
+        agent_config, tenant, availability_block + caller_appointments,
+    )
 
     # ── Build first message ────────────────────────────────────────────────
     first_message: str = (

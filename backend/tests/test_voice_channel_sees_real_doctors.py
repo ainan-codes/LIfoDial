@@ -250,8 +250,14 @@ def test_chat_and_voice_use_the_same_availability_builder():
     pipeline_src = open(
         os.path.join(REPO_ROOT, "backend", "agent", "pipeline.py"), encoding="utf-8"
     ).read()
-    assert "from backend.services.availability_prompt import real_availability_block" in pipeline_src
-    assert "_build_system_prompt(agent_config, tenant, availability_block)" in pipeline_src
+    # Matched on the names rather than one exact import line: the pipeline now
+    # imports a second block from the same module (the caller's own appointments),
+    # so a formatting-exact assertion here breaks on a change that keeps the
+    # property it is guarding perfectly intact.
+    assert "from backend.services.availability_prompt import" in pipeline_src
+    assert "real_availability_block" in pipeline_src
+    assert "_build_system_prompt(" in pipeline_src
+    assert "availability_block" in pipeline_src
 
 
 def test_voice_roster_comes_from_the_shared_doctor_accessor():

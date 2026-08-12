@@ -548,7 +548,11 @@ async def test_a_cancel_for_someone_with_no_appointment_says_so(seeded_db):
         await call.says("Cancel my appointment, I'm Nobody", expect_generations=2)
         lines = call.llm.system_lines()
 
-    assert any("No appointment was found" in line for line in lines)
+    assert any("no active appointment on that phone number" in line for line in lines)
+    # And it must not restart the spell-your-name loop that burned 280 seconds of
+    # a live call: the lookup is script-independent now, so asking again cannot
+    # change the answer.
+    assert any("Do NOT ask the caller to spell" in line for line in lines)
 
 
 # ── 5. Bounds and safety ──────────────────────────────────────────────────────
@@ -617,6 +621,71 @@ async def test_ordinary_bracketed_speech_is_still_spoken(seeded_db):
         assert "we're open until 5 PM" in call.speaker.spoken
 
     assert await _appointments() == []
+
+
+@pytest.mark.asyncio
+async def test_the_day_the_caller_said_beats_the_day_the_model_calculated(seeded_db):
+    """The live 2026-08-12 booking: caller said "कल" (tomorrow), model wrote a date
+    three days out, and a real appointment was created on it.
+
+    The caller's own words reach the executor through call_meta, which
+    BookingProcessor fills in from the transcriptions the executor cannot see.
+    """
+    wrong_date = (ist_now().date() + timedelta(days=3)).strftime("%d/%m/%Y")
+    async with VoiceCall([
+        _book_tag("03:00 PM", date=wrong_date),
+        "कल दोपहर 3 बजे डॉक्टर सलमान के साथ आपकी अपॉइंटमेंट कन्फर्म है।",
+    ]) as call:
+        await call.says("मेरा नाम ऐनान है, कल दोपहर 3 बजे डॉक्टर सलमान के पास",
+                        expect_generations=2)
+
+    rows = await _appointments()
+    assert len(rows) == 1, rows
+    booked = to_ist(rows[0].slot_time if rows[0].slot_time.tzinfo
+                    else rows[0].slot_time.replace(tzinfo=timezone.utc))
+    assert booked.date() == TOMORROW, (
+        f"the caller said tomorrow ({TOMORROW}) and got {booked.date()}"
+    )
+    assert booked.hour == 15
+
+
+@pytest.mark.asyncio
+async def test_promising_to_cancel_without_acting_is_repaired(seeded_db):
+    """The live 2026-08-12 cancel call, verbatim: the agent said it would begin
+    cancelling, emitted no tag, and cancelled nothing in 280 seconds while the
+    caller asked "हो गया क्या?" over and over."""
+    await _seed_appointment(hour=15)
+    promise = "मैं इस अपॉइंटमेंट को कैंसिल करने की प्रक्रिया शुरू करूंगा।"
+    async with VoiceCall([
+        promise,
+        f"[ACTION: CANCEL|{PATIENT}|{PHONE}|N/A|N/A|N/A|N/A]",
+        "आपका अपॉइंटमेंट कैंसिल कर दिया गया है।",
+    ]) as call:
+        await call.says("मुझे एक अपॉइंटमेंट कैंसिल करना है, मेरा नाम ऐनान है",
+                        expect_generations=3)
+        lines = call.llm.system_lines()
+
+    rows = await _appointments()
+    assert rows[0].status == "cancelled", "the promised cancellation never happened"
+    assert any("did NOT emit an [ACTION: ...] tag" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_the_agent_is_told_the_callers_real_appointments(seeded_db):
+    """So a cancel is a confirmation, not an interrogation. On the live call the
+    agent asked which doctor, which date and which time — all three were rows in
+    the database, keyed on the number the caller was calling from."""
+    await _seed_appointment(hour=15)
+    async with VoiceCall(["मैं देखता हूँ।"]) as call:
+        await call.says(f"मेरा नाम ऐनान है और मेरा नंबर {PHONE} है")
+        lines = call.llm.system_lines()
+
+    joined = "\n".join(lines)
+    assert "EXISTING APPOINTMENTS" in joined, (
+        "the agent was never shown the appointment it was about to discuss"
+    )
+    assert DOCTOR_NAME in joined
+    assert "3:00 PM" in joined or "3 PM" in joined.upper()
 
 
 @pytest.mark.asyncio

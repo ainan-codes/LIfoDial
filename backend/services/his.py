@@ -3,7 +3,7 @@ import re
 from typing import List, Dict, Any, Optional
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 import json
 
 from backend.config import settings
@@ -16,7 +16,13 @@ logger = logging.getLogger(__name__)
 
 # ── Slot parsing ──────────────────────────────────────────────────────────────
 _TIME_FORMATS = ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%H.%M")
-_DATE_FORMATS = ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d %b %Y", "%d %B %Y")
+
+#: Date parsing (formats AND every language's relative-day words) lives in
+#: services/dayref.py — see that module for why a model must never be the thing
+#: that computes what "tomorrow" is. Re-exported under the old name because
+#: availability_prompt.py imports `_DATE_FORMATS` from here.
+from backend.services.dayref import DATE_FORMATS as _DATE_FORMATS  # noqa: E402
+from backend.services.dayref import parse_day_string  # noqa: E402
 
 
 #: Words that mark a bare hour as a clock time rather than a quantity. "baje"
@@ -88,6 +94,23 @@ def is_time_str_parseable(time_str: str | None) -> bool:
     return _try_parse_time(time_str) is not None
 
 
+def is_date_str_parseable(date_str: str | None) -> bool:
+    """True if ``date_str`` names a REAL day — i.e. parse_slot_datetime will use
+    it rather than silently falling back to today.
+
+    An EMPTY string is fine (it means "the day was not specified", which the
+    caller may legitimately treat as today). A non-empty string that resolves to
+    nothing is not: the fallback would book today, and "today" is a day the
+    patient never asked for. This is the date half of is_time_str_parseable, and
+    it exists because a model writes things like "kal ke baad" or "next week"
+    into the tag's Date field, none of which name a computable day.
+    """
+    ds = (date_str or "").strip()
+    if not ds:
+        return True
+    return parse_day_string(ds, ist_now().date()) is not None
+
+
 def parse_slot_datetime(date_str: str | None, time_str: str | None) -> datetime:
     """Best-effort parse of a requested appointment slot into a tz-aware UTC datetime.
 
@@ -107,20 +130,21 @@ def parse_slot_datetime(date_str: str | None, time_str: str | None) -> datetime:
     now = ist_now()
 
     # ── Date ──
+    # Resolved by services/dayref.py, which knows the relative-day words of every
+    # language this product speaks ("कल", "നാളെ", "ನಾಳೆ", …) as well as weekday
+    # names and explicit formats. It used to understand exactly "today",
+    # "tomorrow" and "tmrw", so a caller's own word in any other language fell
+    # through to "defaulting to today" — and a booking landed on the wrong day
+    # while every log line looked healthy.
     day: datetime | None = None
-    ds = (date_str or "").strip().lower()
-    if ds in ("", "today"):
+    ds = (date_str or "").strip()
+    if not ds:
         day = now
-    elif ds in ("tomorrow", "tmrw"):
-        day = now + timedelta(days=1)
     else:
-        for fmt in _DATE_FORMATS:
-            try:
-                day = datetime.strptime(date_str.strip(), fmt).replace(tzinfo=IST)
-                break
-            except (ValueError, AttributeError):
-                continue
-        if day is None:
+        resolved = parse_day_string(ds, now.date())
+        if resolved is not None:
+            day = datetime.combine(resolved, dt_time(0, 0)).replace(tzinfo=IST)
+        else:
             logger.warning("Could not parse appointment date %r; defaulting to today", date_str)
             day = now
 
@@ -428,33 +452,168 @@ def normalize_phone(phone: str | None) -> str:
     return digits
 
 
-async def _find_active_appointment_in_session(session, tenant_id: str, name: str, phone: str):
-    """The single lookup that identifies WHICH appointment a cancel/reschedule
-    refers to: tenant + patient name (fuzzy) + phone (format-insensitive),
-    earliest active slot first.
+def names_refer_to_same_person(stored: str | None, spoken: str | None) -> bool:
+    """Could ``spoken`` be the person whose appointment is stored as ``stored``?
 
-    Shared so the pre-commit availability check and the write itself always
-    resolve the SAME row. Two lookups with different rules would let the agent
-    validate one appointment's new slot and then move another.
+    Script-independent, because a name is written down once and then said out
+    loud many times, in whatever script the STT is running in. This is the exact
+    failure that made cancellation impossible on a live call (2026-08-12): the
+    row said ``आइनान``, the caller's next call transcribed as ``ऐनान`` and
+    ``आइनन``, and a SQL ``ilike '%ऐनान%'`` can never match any of those — nor
+    could it ever match the same name written ``Ainan``, which is how a
+    transliterating model stores it. The agent therefore reported "no appointment
+    found" and then asked the caller to spell their own name, four times.
+
+    Uses the same consonant-skeleton comparison doctor_match uses for doctors —
+    one matching implementation for names in this product, not two.
     """
-    name_clean = (name or "").strip()
-    if not name_clean:
-        return None
-    candidates = (
+    from backend.services.indic_text import consonant_skeleton, skeleton_contains
+
+    a = (stored or "").strip().lower()
+    b = (spoken or "").strip().lower()
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    # Either direction: the caller may give one part of a stored full name, or a
+    # fuller version of a stored first name.
+    if skeleton_contains(a, b) or skeleton_contains(b, a):
+        return True
+    sa, sb = consonant_skeleton(a), consonant_skeleton(b)
+    return bool(sa) and bool(sb) and (sa == sb or sa in sb or sb in sa)
+
+
+async def active_appointments_for_phone(session, tenant_id: str, phone: str) -> list:
+    """Every active appointment on this tenant for ``phone``, earliest first.
+
+    The phone is the strong identifier on a voice call — it is the number the
+    caller is calling FROM — so this is the set a cancel/reschedule is chosen
+    from, and it is also what the agent is shown so it can stop asking the
+    caller for details the database already holds.
+    """
+    wanted = normalize_phone(phone)
+    if not wanted:
+        return []
+    rows = (
         await session.execute(
             select(Appointment).where(
                 Appointment.tenant_id == tenant_id,
-                Appointment.patient_name.ilike(f"%{name_clean}%"),
                 Appointment.status.in_(["pending", "confirmed"]),
             ).order_by(Appointment.slot_time.asc())
         )
     ).scalars().all()
+    return [a for a in rows if normalize_phone(a.patient_phone) == wanted]
 
-    wanted = normalize_phone(phone)
-    for appt in candidates:
-        if normalize_phone(appt.patient_phone) == wanted:
-            return appt
+
+async def _find_active_appointment_in_session(session, tenant_id: str, name: str, phone: str):
+    """The single lookup that identifies WHICH appointment a cancel/reschedule
+    refers to.
+
+    Shared so the pre-commit availability check and the write itself always
+    resolve the SAME row. Two lookups with different rules would let the agent
+    validate one appointment's new slot and then move another.
+
+    Phone FIRST, then name — the reverse of the original order, and the change
+    that makes cancellation work at all:
+
+      * one active appointment on that number  -> that is the one, however the
+        name was spelled or transcribed. The number is the caller's own; a
+        spelling variant of their name is not evidence of a different person.
+      * several on that number                 -> pick by name; failing that, the
+        earliest, because they are all the same person's appointments.
+      * nothing on that number (or none given) -> fall back to matching the name
+        across the tenant, script-independently.
+
+    A row is never returned unless the phone or the name identifies it, so one
+    patient's appointment still cannot be cancelled by another.
+    """
+    name_clean = (name or "").strip()
+    phone_clean = (phone or "").strip()
+
+    by_phone = await active_appointments_for_phone(session, tenant_id, phone_clean)
+    if by_phone:
+        if len(by_phone) == 1:
+            return by_phone[0]
+        if name_clean:
+            for appt in by_phone:
+                if names_refer_to_same_person(appt.patient_name, name_clean):
+                    return appt
+        return by_phone[0]
+
+    if not name_clean:
+        return None
+
+    rows = (
+        await session.execute(
+            select(Appointment).where(
+                Appointment.tenant_id == tenant_id,
+                Appointment.status.in_(["pending", "confirmed"]),
+            ).order_by(Appointment.slot_time.asc())
+        )
+    ).scalars().all()
+    wanted = normalize_phone(phone_clean)
+    for appt in rows:
+        if not names_refer_to_same_person(appt.patient_name, name_clean):
+            continue
+        stored = normalize_phone(appt.patient_phone)
+        if wanted and stored and stored != wanted:
+            # A DIFFERENT identifiable person who happens to share a name. This
+            # is the case the original both-must-match rule existed to prevent,
+            # and it still holds.
+            continue
+        # Reachable when the row carries no usable number (booked from a call
+        # with no caller ID, so patient_phone is "unknown") or when the caller
+        # gave no number at all. The name is then the only identity either side
+        # has, which is exactly the situation a clinic receptionist works in.
+        return appt
     return None
+
+
+async def caller_appointments(tenant_id: str, phone: str, name: str = "") -> List[dict]:
+    """This caller's active appointments, as plain dicts (doctor name + IST slot).
+
+    Feeds the ``[CALLER'S APPOINTMENTS]`` prompt block. Matched the same way a
+    cancel/reschedule is matched, so what the agent is SHOWN and what the write
+    RESOLVES can never disagree — an agent reading out an appointment the write
+    then cannot find is worse than showing nothing.
+    """
+    from backend.services.timeutil import format_ist_clock, to_ist
+
+    out: List[dict] = []
+    try:
+        async with AsyncSessionLocal() as session:
+            rows = await active_appointments_for_phone(session, tenant_id, phone)
+            if not rows and (name or "").strip():
+                appt = await _find_active_appointment_in_session(
+                    session, tenant_id, name, phone,
+                )
+                rows = [appt] if appt else []
+            if not rows:
+                return []
+
+            doctors = {
+                str(d.id): d for d in (
+                    await session.execute(
+                        select(Doctor).where(Doctor.tenant_id == tenant_id)
+                    )
+                ).scalars().all()
+            }
+            for a in rows:
+                slot_ist = to_ist(_as_utc(a.slot_time))
+                doc = doctors.get(str(a.doctor_id))
+                out.append({
+                    "appointment_id": str(a.id),
+                    "patient_name": a.patient_name or "",
+                    "doctor_name": doc.name if doc else "Unknown",
+                    "date": slot_ist.strftime("%d/%m/%Y"),
+                    "day": slot_ist.strftime("%A"),
+                    "time": format_ist_clock(slot_ist),
+                    "status": a.status,
+                })
+    except Exception as exc:
+        logger.error("caller_appointments lookup failed: %s", exc, exc_info=True)
+        return []
+    return out
 
 
 async def find_active_appointment(tenant_id: str, name: str, phone: str) -> dict | None:
@@ -606,6 +765,14 @@ _NO_DOCTOR_TOKENS = {
     "", "n/a", "na", "none", "null", "-", "any", "anyone", "any doctor",
     "no preference", "not sure", "dont know", "don't know", "whoever",
 }
+
+#: Field values that mean "nothing was given here". The model fills unused tag
+#: fields with these because the tag instructions tell it to.
+_NO_VALUE_TOKENS = {"", "n/a", "na", "n.a.", "none", "null", "-", "--", "unknown"}
+
+
+def _is_no_value(value: str | None) -> bool:
+    return (value or "").strip().lower() in _NO_VALUE_TOKENS
 
 
 async def find_doctor_for_booking(
@@ -780,6 +947,14 @@ async def execute_booking_action(
     availability check of any kind: it wrote whatever time it was handed.
     """
     act = (action or "").upper().strip()
+
+    # "N/A" (and friends) in the Date field means "no day was given", not a day
+    # named "N/A". Normalising it here rather than at each call site is what lets
+    # the two branches below give it their own, correct meaning: a BOOK with no day
+    # is refused, a RESCHEDULE with no day keeps the day the appointment is on.
+    if _is_no_value(date_str):
+        date_str = ""
+
     slot = " ".join(
         p.strip() for p in (date_str, time_str)
         if p and p.strip() and p.strip().lower() != "n/a"
@@ -790,6 +965,12 @@ async def execute_booking_action(
     }
 
     if act == "BOOK":
+        # A booking with no day would land on TODAY — a day the patient never
+        # asked for, which is the same class of invention as a fabricated time.
+        if not date_str.strip():
+            base["reason"] = "invalid_date"
+            return base
+
         doctor, available = await find_doctor_for_booking(tenant_id, doctor_name)
         base["available_doctors"] = available
         if not doctor:
@@ -851,6 +1032,20 @@ async def execute_booking_action(
 
             target_doctor_id = existing["doctor_id"]
             target_doctor_name = existing["doctor_name"]
+
+            # "Move it to 4 PM" means 4 PM on the day the appointment is ALREADY
+            # on — not today, which is what an empty date resolves to. Without
+            # this, a patient with a booking on the 15th asking for 4 PM had it
+            # silently moved to this afternoon (and then usually refused as
+            # already past, which reads to them as "4 PM isn't available").
+            if not date_str.strip() and existing.get("slot_time") is not None:
+                from backend.services.timeutil import to_ist
+
+                date_str = to_ist(_as_utc(existing["slot_time"])).strftime("%d/%m/%Y")
+                logger.info(
+                    "RESCHEDULE with no day given — keeping the appointment's own day (%s).",
+                    date_str,
+                )
             named_doctor, available = await find_doctor_for_booking(tenant_id, doctor_name)
             base["available_doctors"] = available
             if named_doctor and str(named_doctor.id) != str(target_doctor_id):

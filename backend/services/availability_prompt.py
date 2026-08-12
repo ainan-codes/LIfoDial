@@ -32,15 +32,10 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# Relative-day words the patient may use, mapped to an offset from today (IST).
-# Weekday names are handled separately (next occurrence of that weekday).
-_RELATIVE_DAYS: dict[str, int] = {
-    "today": 0, "tonight": 0, "aaj": 0, "आज": 0,
-    "tomorrow": 1, "tmrw": 1, "kal": 1, "कल": 1,
-    "day after tomorrow": 2, "parso": 2, "परसों": 2,
-}
-_WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday",
-                  "friday", "saturday", "sunday")
+# Relative-day words and weekday names live in services/dayref.py — ONE map, used
+# by dates_mentioned() below, by his.parse_slot_datetime (which does the actual
+# resolving) and by the voice FSM. A local copy used to live here covering only
+# English + Devanagari, which is how a Malayalam caller's "നാളെ" resolved to today.
 
 # How much real availability data goes into one prompt. Bounded because each
 # extra doctor/day is real DB work inside the patient's reply latency, and a
@@ -121,42 +116,62 @@ async def _cached_digest(tenant_id: str, doctor_ids: list[str], dates: list):
 def dates_mentioned(text: str) -> list:
     """IST dates the patient's words refer to, in the order found.
 
-    Recognises the same relative-day words and DD/MM/YYYY-style dates the
-    booking tag itself uses, so the availability we look up is for the day
-    actually being discussed rather than always today. Devanagari forms of the
-    relative-day words are included because voice transcripts of a Hindi call
-    arrive in Devanagari, not romanised — "कल" never matched "kal".
+    Thin wrapper over services/dayref.dates_in_text, which owns the relative-day
+    vocabulary for every language this product speaks. This function used to own
+    a smaller copy of that vocabulary (English + Devanagari only), while
+    booking_processor.py owned another — and neither was what
+    his.parse_slot_datetime actually parsed. One map now serves all three.
     """
-    from backend.services.his import _DATE_FORMATS
+    from backend.services.dayref import dates_in_text
     from backend.services.timeutil import ist_now
 
-    low = (text or "").lower()
-    today = ist_now().date()
-    found: list = []
+    return dates_in_text(text, ist_now().date())
 
-    def _add(d):
-        if d not in found:
-            found.append(d)
 
-    # Longest phrases first so "day after tomorrow" is not read as "tomorrow".
-    for word in sorted(_RELATIVE_DAYS, key=len, reverse=True):
-        if word.strip() and word.strip() in low:
-            _add(today + _dt.timedelta(days=_RELATIVE_DAYS[word]))
+async def caller_appointments_block(tenant_id: str, phone: str, name: str = "") -> str:
+    """What THIS caller already has booked, as a prompt block — or "" if nothing.
 
-    for idx, name in enumerate(_WEEKDAY_NAMES):
-        if name in low:
-            ahead = (idx - today.weekday()) % 7 or 7
-            _add(today + _dt.timedelta(days=ahead))
+    Why: on a live cancel call (2026-08-12) the agent asked the caller which
+    doctor, which date and which time their appointment was, then asked them to
+    spell their own name four times, and cancelled nothing in 280 seconds. Every
+    fact it was asking for was already in the database, keyed by the number the
+    caller was calling from.
 
-    for token in re.findall(r'\b\d{1,4}[/-]\d{1,2}[/-]\d{2,4}\b', text or ""):
-        for fmt in _DATE_FORMATS:
-            try:
-                _add(_dt.datetime.strptime(token, fmt).date())
-                break
-            except ValueError:
-                continue
+    Handing the agent the real rows turns cancel/reschedule from an interrogation
+    into a confirmation, and it removes the room to invent: it cannot describe an
+    appointment that is not in this list, because the list is all there is.
+    """
+    try:
+        from backend.services.his import caller_appointments
 
-    return found
+        rows = await caller_appointments(tenant_id, phone, name)
+    except Exception as exc:
+        logger.error("caller_appointments_block failed: %s", exc, exc_info=True)
+        return ""
+
+    if not rows:
+        return ""
+
+    lines = "\n".join(
+        f"  {i}. {r['patient_name'] or 'name not recorded'} — Dr {r['doctor_name']}, "
+        f"{r['day']} {r['date']} at {r['time']} (appointment id {r['appointment_id']})"
+        for i, r in enumerate(rows, 1)
+    )
+    only_one = len(rows) == 1
+    return (
+        "\n\n--- THIS CALLER'S EXISTING APPOINTMENTS (REAL, from the database) ---\n"
+        f"{lines}\n"
+        "This is the COMPLETE list for this caller. Use it:\n"
+        "* To cancel or move an appointment you ALREADY have every detail — the doctor, "
+        "the date and the time are above. Do NOT ask the caller for them, and do NOT ask "
+        "them to spell their name; you know it.\n"
+        + ("* There is exactly one, so that is the one they mean. Read it back in ONE short "
+           "sentence and ask them to confirm, then act.\n" if only_one else
+           "* There is more than one, so ask WHICH of these they mean — by doctor and time, "
+           "in one short question.\n")
+        + "* Never describe, confirm or act on an appointment that is not in this list.\n"
+        "--- END THIS CALLER'S EXISTING APPOINTMENTS ---"
+    )
 
 
 async def real_availability_block(tenant_id: str, recent_text: str = "") -> str:

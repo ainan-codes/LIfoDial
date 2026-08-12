@@ -130,19 +130,17 @@ _DAY_PATTERN = re.compile(
 )
 
 # Native day words -> the English word his.parse_slot_datetime understands.
-# Without this the captured day_part would be Devanagari text that the parser
-# does not recognise, and the booking would silently fall back to today.
-_DAY_WORD_TO_ENGLISH: dict[str, str] = {
-    "आज": "Today", "कल": "Tomorrow", "परसों": "Parso",
-    "আজ": "Today", "আগামীকাল": "Tomorrow",
-    "આજે": "Today", "કાલે": "Tomorrow",
-    "ਅੱਜ": "Today", "ਕੱਲ੍ਹ": "Tomorrow",
-    "ଆଜି": "Today", "କାଲି": "Tomorrow",
-    "இன்று": "Today", "நாளை": "Tomorrow",
-    "ఈరోజు": "Today", "రేపు": "Tomorrow",
-    "ಇಂದು": "Today", "ನಾಳೆ": "Tomorrow",
-    "ഇന്ന്": "Today", "നാളെ": "Tomorrow",
-}
+#
+# Kept as a thin view over services/dayref.RELATIVE_DAYS, which is now the ONE
+# place every language's calendar vocabulary lives. This mapping existed because
+# the parser only understood English day words; it understands all of them now,
+# so this is belt-and-braces (and keeps the FSM's stored pending_slot readable in
+# logs). "Parso" used to be emitted here for परसों and the parser did NOT
+# understand it — a "day after tomorrow" booking silently landed on today.
+def _day_word_to_english(word: str) -> str:
+    from backend.services.dayref import to_english_day_word
+
+    return to_english_day_word(word) or (word or "").capitalize()
 
 # Triggers for extracting patient name from transcription. Native-script forms
 # for the same reason as the confirm words above — "मेरा नाम" is what a Hindi
@@ -228,6 +226,14 @@ class BookingProcessor(FrameProcessor):
         # "tomorrow" does not trigger a pointless DB read on the audio path.
         self._days_in_prompt: set = set()
 
+        # The caller's REAL existing appointments, queued for the next
+        # LLMContextFrame. Own slot (not shared with _info_message) so a
+        # slot-unavailable note and this cannot overwrite each other.
+        self._appointments_note: Optional[str] = None
+        # What the last lookup was keyed on, so an unchanged (name, phone) does
+        # not re-read the DB on every turn of the audio path.
+        self._appointments_key: Optional[tuple] = None
+
         # Correlates every stage of this call's booking attempt in the logs —
         # see services/booking_trace.py. Per-call, not per-attempt: a caller may
         # abandon one booking and start another, and both belong to this call.
@@ -300,6 +306,7 @@ class BookingProcessor(FrameProcessor):
         """
         if not text or not text.strip():
             return
+        self._note_what_the_caller_said(text)
         try:
             await self._handle_transcription(text)
         except Exception as exc:
@@ -309,6 +316,41 @@ class BookingProcessor(FrameProcessor):
             )
             trace(self._trace_id, VOICE, DROPPED, error=type(exc).__name__)
 
+    def _note_what_the_caller_said(self, text: str) -> None:
+        """Record the caller's OWN day words and phone number into ``call_meta``.
+
+        ``call_meta`` is the same dict object VoiceActionProcessor holds (both are
+        constructed with it in pipeline.py), and this is the channel by which "what
+        the caller actually said" reaches the thing that performs the write. It has
+        to be a channel: the executor sits downstream of context_aggregator.user(),
+        which consumes every TranscriptionFrame, so it never sees a caller's words.
+
+        Both facts exist to stop the MODEL being the authority on them:
+
+        * days — measured live 2026-08-12: the caller said "कल" with today's date in
+          the prompt and the model wrote 15/08/2026, three days out. A real
+          appointment was created on a day nobody asked for. Dates are arithmetic;
+          see services/dayref.py.
+        * phone — the number a caller reads out is the key their existing
+          appointments are found by, and it survives STT far better than a name.
+        """
+        try:
+            from backend.services.dayref import note_dates_said
+            from backend.services.indic_text import normalise_spoken_numbers
+            from backend.services.timeutil import ist_now
+
+            said = self._call_meta.setdefault("said_dates", [])
+            note_dates_said(said, text, ist_now().date())
+
+            # Native digit shapes and spoken number words become ASCII first, so a
+            # number said as "नौ एक चार आठ..." is still a number here.
+            digits = re.sub(r"\D", "", normalise_spoken_numbers(text))
+            if len(digits) >= 10:
+                self._call_meta["stated_phone"] = digits[-10:]
+        except Exception as exc:
+            # Advisory only — never let it cost the caller their turn.
+            logger.warning("Could not record what the caller said (non-fatal): %s", exc)
+
     async def _apply_pending_context_work(self, frame: LLMContextFrame) -> None:
         """Commit whatever this turn armed, and inject what the LLM must know."""
         if self._commit_pending:
@@ -317,9 +359,9 @@ class BookingProcessor(FrameProcessor):
         if self._action_commit_pending:
             await self._commit_and_inject_action_result(frame)
 
-        if self._info_message or self._availability_refresh:
+        if self._info_message or self._availability_refresh or self._appointments_note:
             context = getattr(frame, "context", None)
-            for content in (self._availability_refresh, self._info_message):
+            for content in (self._appointments_note, self._availability_refresh, self._info_message):
                 if not content or context is None:
                     continue
                 try:
@@ -328,6 +370,7 @@ class BookingProcessor(FrameProcessor):
                     logger.error("Failed to inject availability note into LLM context: %s", exc)
             self._info_message = None
             self._availability_refresh = None
+            self._appointments_note = None
 
     # ── Internal state machine ────────────────────────────────────────────────
 
@@ -351,6 +394,11 @@ class BookingProcessor(FrameProcessor):
                 )
                 await self._handle_emergency()
             return  # Don't process booking after emergency
+
+        # 0.2. This caller's REAL appointments, once we know who they are. Runs
+        #      before the cancel/reschedule flow below so the agent has the actual
+        #      rows in hand for the very turn it starts talking about them.
+        await self._maybe_refresh_caller_appointments()
 
         # 0.5. Cancel/reschedule of an EXISTING appointment — an independent flow
         #      from the NEW-booking one below (a caller may cancel one appointment
@@ -457,6 +505,50 @@ class BookingProcessor(FrameProcessor):
                     doctor=self.booking_state["pending_doctor_name"],
                     slot=self.booking_state["pending_slot"],
                 )
+
+    async def _maybe_refresh_caller_appointments(self) -> None:
+        """Queue the caller's real appointments for the LLM, once identifiable.
+
+        The number the caller is calling from is enough at call setup; a number or
+        name they say during the call is enough after that. Re-read only when that
+        identity actually changes, so this costs one DB read per new fact rather
+        than one per turn of the audio path.
+
+        This is what turns a cancel from an interrogation into a confirmation. On
+        the 2026-08-12 call the agent asked which doctor, which date, which time,
+        and then for the caller's name four times — every one of which was already
+        a row in the database.
+        """
+        tenant_id = self._tenant.get("id")
+        if not tenant_id:
+            return
+
+        phone = (
+            self._call_meta.get("stated_phone")
+            or self.booking_state.get("patient_phone")
+            or ""
+        )
+        name = self.booking_state.get("patient_name") or ""
+        if not str(phone).strip() and not name.strip():
+            return
+
+        key = (str(phone), name)
+        if key == self._appointments_key:
+            return
+        self._appointments_key = key
+
+        try:
+            from backend.services.availability_prompt import caller_appointments_block
+
+            block = await caller_appointments_block(str(tenant_id), str(phone), name)
+            if block:
+                self._appointments_note = block
+                logger.info(
+                    "Caller's existing appointments injected for phone=%s name=%r",
+                    phone, name,
+                )
+        except Exception as exc:
+            logger.warning("Caller-appointments lookup failed (non-fatal): %s", exc)
 
     async def _maybe_refresh_availability(self, text: str) -> None:
         """Queue a refreshed shared availability block when the caller brings up
@@ -641,7 +733,7 @@ class BookingProcessor(FrameProcessor):
             # Native-script day words must be translated, not just capitalised:
             # his.parse_slot_datetime only knows the English/romanised forms and
             # silently treats anything else as today.
-            day_part = _DAY_WORD_TO_ENGLISH.get(raw_day, raw_day.capitalize())
+            day_part = _day_word_to_english(raw_day)
         slot = f"{day_part} {time_part}" if day_part else time_part
 
         self.booking_state["pending_slot"] = slot

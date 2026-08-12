@@ -30,7 +30,7 @@ from backend.agent.processors.booking_processor import (
     _CANCEL_WORDS,
     _CONFIRM_WORDS,
     _DAY_PATTERN,
-    _DAY_WORD_TO_ENGLISH,
+    _day_word_to_english,
     _SLOT_PATTERN,
     _said,
 )
@@ -236,7 +236,7 @@ def test_native_day_words_translate_to_what_the_parser_understands(utterance, ex
     match = _DAY_PATTERN.search(utterance)
     assert match, f"no day word found in {utterance!r}"
     raw = match.group(0).strip()
-    assert _DAY_WORD_TO_ENGLISH.get(raw, raw.capitalize()) == expected_day
+    assert _day_word_to_english(raw) == expected_day
 
 
 # ── The skeleton itself ───────────────────────────────────────────────────────

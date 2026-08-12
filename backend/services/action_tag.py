@@ -182,6 +182,18 @@ FOLLOWUP_PROMISE_PATTERNS = (
     "making that change", "making the change", "updating your appointment",
     "changing your appointment", "in progress", "being processed",
     "इंतज़ार", "इंतजार", "प्रतीक्षा", "थोड़ा रुक", "एक मिनट",
+    # Measured on a live Hindi CANCEL call, 2026-08-12: the agent said
+    # "मैं इस अपॉइंटमेंट को कैंसिल करने की प्रक्रिया शुरू करूंगा" and then
+    # "अब मैं इसे कैंसिल करने के लिए आगे बढ़ूंगा", emitted no tag, and cancelled
+    # nothing in 280 seconds while the caller asked "हो गया क्या?" four times.
+    # The English list above could not see any of it.
+    # Deliberately NOT the broader "कर दूंगा" / "करने वाला हूँ" / "देख रहा हूँ":
+    # each of those appears in perfectly good replies ("बताते ही मैं बुक कर दूँगा"
+    # is a QUESTION turn, not a promise), and a false positive here throws away a
+    # good reply on chat and spends an extra LLM call on voice.
+    "प्रक्रिया शुरू", "आगे बढ़ूंगा", "आगे बढ़ता हूँ", "आगे बढ़ रहा",
+    "कोशिश करूंगा", "कोशिश कर रहा", "शुरू कर रहा",
+    "जाँच रहा", "जांच रहा", "चेक कर", "प्रोसेस", "थोड़ी देर",
 )
 
 

@@ -314,7 +314,7 @@ async def test_reschedule_for_an_unknown_patient_says_so(seeded_db):
 
     appt = await _the_appointment()
     assert _ist_hour(appt) == 14
-    assert "No matching appointment was found" in captured["regen_system"]
+    assert "no active appointment on that phone number" in captured["regen_system"]
     assert not chat_mod._promises_followup(reply)
 
 
