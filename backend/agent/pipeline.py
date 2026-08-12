@@ -1880,6 +1880,15 @@ async def entrypoint(ctx) -> None:
         agent_config=agent_config,
         call_meta=call_meta,
     )
+    # Constructed BEFORE voice_action so its action_in_progress flag (see
+    # _enforce_silence_timeout) exists to be passed in — the two have no other
+    # dependency on each other's order.
+    call_logger = CallLoggerProcessor(
+        tenant_id=tenant_id or "",
+        agent_id=agent_id,
+        call_meta=call_meta,
+        agent_config=agent_config,
+    )
     # Executes the [ACTION: …] tags the MODEL emits — the mechanism that makes a
     # spoken "your appointment is booked" correspond to a real row. The FSM above
     # can only commit when the caller names the doctor themselves and then says a
@@ -1892,6 +1901,7 @@ async def entrypoint(ctx) -> None:
         tenant=tenant,
         agent_config=agent_config,
         call_meta=call_meta,
+        call_logger=call_logger,
     )
     # Delivers the caller's words to the booking state machine, and starts a fresh
     # turn for voice_action (its one-action-and-one-repair-per-utterance caps have
@@ -1902,12 +1912,6 @@ async def entrypoint(ctx) -> None:
     # BookingTranscriptTap's docstring for the full account.
     booking_transcript_tap = BookingTranscriptTap(
         booking_processor, on_new_turn=voice_action.reset_turn,
-    )
-    call_logger = CallLoggerProcessor(
-        tenant_id=tenant_id or "",
-        agent_id=agent_id,
-        call_meta=call_meta,
-        agent_config=agent_config,
     )
     # Feeds user utterances to call_logger from a position where
     # TranscriptionFrames still exist. Without it the logger counts zero turns
@@ -2373,8 +2377,15 @@ async def _enforce_silence_timeout(
     multi-sentence reply (doctor names, dates, slots) could exceed the timeout and
     hang up on a caller who was simply listening, mid-sentence.
 
-    Two things fix that, both keyed on real playback rather than an estimate:
+    Three things fix that, all keyed on something real rather than an estimate:
       * while call_logger.bot_speaking is True the timer does not advance at all;
+      * while call_logger.action_in_progress is True the timer does not advance
+        either — set by VoiceActionProcessor while a booking/cancel/reschedule
+        write, or the corrected reply that follows one, is in flight. Measured
+        live 2026-08-12: a booking round trip plus one repair pass is 2-3 LLM
+        calls end to end, and without this the caller's own request could
+        outrun the timeout and get their call ended mid-booking — punished for
+        the system being slow, not for having gone quiet.
       * BotStoppedSpeakingFrame — pushed from the output transport's audio task
         after the audio has drained — resets last_activity_ts, so the countdown
         starts from the moment the caller could actually begin replying.
@@ -2385,9 +2396,10 @@ async def _enforce_silence_timeout(
         while True:
             await asyncio.sleep(2.0)
 
-            # The agent is talking: the caller is listening, not silent. Keep the
-            # clock pinned to now so no silence accrues during playback.
-            if call_logger.bot_speaking:
+            # The agent is talking, or the system is working on the caller's own
+            # request: the caller is not silent either way. Keep the clock pinned
+            # to now so no silence accrues.
+            if call_logger.bot_speaking or call_logger.action_in_progress:
                 call_logger.last_activity_ts = time.time()
                 continue
 

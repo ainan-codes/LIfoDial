@@ -226,6 +226,16 @@ class CallLoggerProcessor(FrameProcessor):
         self._playback_complete = asyncio.Event()
         self._playback_complete.set()  # nothing is playing at construction
 
+        # Set by VoiceActionProcessor while it is awaiting a booking/cancel/
+        # reschedule write, or waiting for the corrected reply that follows one,
+        # per the same rule as bot_speaking above: the caller is not silent, the
+        # system is working on their request. Without this, a DB round trip plus
+        # a repair's extra LLM call could together run past the silence timeout
+        # and the call would be ended mid-booking with a generic goodbye — a
+        # real appointment action abandoned for a reason that has nothing to do
+        # with the caller having gone quiet.
+        self.action_in_progress: bool = False
+
         # Set by pipeline.py: awaits the LiveKit AudioSource actually draining.
         # BotStoppedSpeakingFrame only means pipecat finished WRITING audio to the
         # transport — LiveKit's AudioSource is created with a 1000ms queue, so up

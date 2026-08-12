@@ -299,6 +299,14 @@ class VoiceActionProcessor(FrameProcessor):
         call_meta: call metadata — ``caller_phone`` fills in a phone the model
             never had to ask for, ``call_record_id`` is the booking idempotency
             key and the row's ``call_id``.
+        call_logger: the pipeline's ``CallLoggerProcessor``, whose
+            ``action_in_progress`` flag this processor sets while a DB write or
+            a repair's extra LLM call is in flight — so that time is never
+            mistaken for the caller having gone silent (see
+            pipeline.py::_enforce_silence_timeout). Optional so tests that
+            build this processor standalone need not construct one; when
+            omitted, this processor simply has no silence-timer effect, which
+            is the pre-existing behaviour.
     """
 
     def __init__(
@@ -307,12 +315,14 @@ class VoiceActionProcessor(FrameProcessor):
         tenant: dict,
         agent_config: dict,
         call_meta: dict,
+        call_logger=None,
     ) -> None:
         super().__init__()
         self._context = context
         self._tenant = tenant or {}
         self._agent_config = agent_config or {}
         self._call_meta = call_meta or {}
+        self._call_logger = call_logger
 
         # ── Per-response state (one LLM generation) ───────────────────────────
         #: Everything the model produced this response, kept whole. The end-of-
@@ -367,11 +377,16 @@ class VoiceActionProcessor(FrameProcessor):
                 # and an owed re-run would speak over them.
                 self._reset_response()
                 self.reset_turn()
+                self._set_busy(False)
 
             elif isinstance(frame, LLMFullResponseStartFrame):
                 self._reset_response()
                 self._is_followup = self._next_is_followup
                 self._next_is_followup = False
+                # Whatever was owed (a DB write, a wait for this very response to
+                # start) is now either done or superseded — the silence timer no
+                # longer needs shielding from it.
+                self._set_busy(False)
 
             elif isinstance(frame, TextFrame) and not isinstance(frame, _USER_TEXT_FRAMES):
                 if await self._on_text(frame, direction):
@@ -393,6 +408,9 @@ class VoiceActionProcessor(FrameProcessor):
             await self._release_held(direction)
             self._holding = False
             self._dropping = False
+            # Safety net: whatever this exception interrupted, nothing further
+            # is coming from it, so the silence timer must not stay pinned.
+            self._set_busy(False)
 
         await self.push_frame(frame, direction)
 
@@ -553,9 +571,17 @@ class VoiceActionProcessor(FrameProcessor):
     async def _flush_rerun(self, direction: FrameDirection) -> None:
         """Push the LLMRunFrame owed to the pipeline, if any."""
         if not self._pending_rerun:
+            # Nothing more is coming for this turn (e.g. a late tag that
+            # succeeded, so the already-spoken reply stands) — the silence timer
+            # no longer needs shielding.
+            self._set_busy(False)
             return
         self._pending_rerun = False
         self._next_is_followup = True
+        # Stays True across the gap between here and the rerun's
+        # LLMFullResponseStartFrame — the LLM call for the corrected reply is
+        # real latency the caller did nothing to cause.
+        self._set_busy(True)
         trace(self._trace_id, VOICE, REPLIED, source="regenerated")
         await self.push_frame(LLMRunFrame(), direction)
 
@@ -588,12 +614,19 @@ class VoiceActionProcessor(FrameProcessor):
     async def _execute(self, tag: ActionTag) -> dict:
         """Run one tag against the real booking service and return its result dict.
 
+        Marks the silence timer busy for the DB round trip (see _set_busy) —
+        cleared by whichever comes next: _flush_rerun deciding no rerun is
+        needed, or the rerun's own LLMFullResponseStartFrame. Never left
+        dangling: both call sites (the compliant path and the late-tag repair)
+        always reach one of those.
+
         Every gate the chat path applies is applied here, from the same shared
         module — with one voice-only addition: a phone number the model never
         collected falls back to the CALLER'S OWN number from caller ID. On a
         phone call that is better evidence than anything the model could have
         transcribed, and it is what BookingProcessor has always stored.
         """
+        self._set_busy(True)
         tenant_id = str(self._tenant.get("id") or "")
         action = tag.action
         if not tenant_id:
@@ -785,6 +818,23 @@ class VoiceActionProcessor(FrameProcessor):
             self._context.add_message({"role": "system", "content": message})
         except Exception as exc:
             logger.error("VoiceActionProcessor: failed to inject the booking result: %s", exc)
+
+    # ── Silence-timer coordination ────────────────────────────────────────────
+
+    def _set_busy(self, busy: bool) -> None:
+        """Tell the silence watchdog whether the caller's own request is still
+        being worked on. Two windows are covered, both real latency the caller
+        did nothing to cause:
+
+          1. ``_execute()`` itself — the DB write, availability check, etc.
+          2. between deciding a re-run is needed and that re-run's reply actually
+             starting to generate (the LLM call for the corrected/repaired
+             reply). Cleared the instant a new response begins (LLMFullResponseStartFrame)
+             rather than waiting for audio, so the margin errs toward the caller
+             never being penalised for the system's own speed.
+        """
+        if self._call_logger is not None:
+            self._call_logger.action_in_progress = busy
 
     # ── State ─────────────────────────────────────────────────────────────────
 

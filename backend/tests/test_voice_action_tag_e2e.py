@@ -161,13 +161,18 @@ class ScriptedLLM(FrameProcessor):
     exactly as a real stream does.
     """
 
-    def __init__(self, replies: list[str]) -> None:
+    def __init__(self, replies: list[str], call_logger=None) -> None:
         super().__init__()
         self._replies = list(replies)
         #: The context messages as they stood at each generation — what the model
         #: was actually told, in order.
         self.seen_messages: list[list[dict]] = []
         self.calls: int = 0
+        #: call_logger.action_in_progress at the moment EACH generation's
+        #: LLMContextFrame arrived — i.e. was the silence timer already shielded
+        #: for the wait this generation is about to impose. One entry per call.
+        self._call_logger = call_logger
+        self.busy_at_call: list[bool] = []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -177,6 +182,8 @@ class ScriptedLLM(FrameProcessor):
             return
 
         self.calls += 1
+        if self._call_logger is not None:
+            self.busy_at_call.append(bool(self._call_logger.action_in_progress))
         ctx = frame.context
         getter = getattr(ctx, "get_messages", None)
         msgs = getter() if callable(getter) else list(ctx.messages)
@@ -246,10 +253,20 @@ class VoiceCall:
         context = LLMContext(messages=[])
         pair = LLMContextAggregatorPair(context)
 
+        from backend.agent.processors.call_logger_processor import CallLoggerProcessor
+
+        # A real CallLoggerProcessor, not a stand-in — action_in_progress is
+        # exercised as the actual attribute pipeline.py's silence watchdog reads,
+        # not a value the test asserts into existence.
+        self.call_logger = CallLoggerProcessor(
+            tenant_id=TENANT_ID, agent_id=None, call_meta=call_meta,
+        )
         self.booking = BookingProcessor(tenant=tenant, agent_config=cfg, call_meta=call_meta)
         self.action = VoiceActionProcessor(
-            context=context, tenant=tenant, agent_config=cfg, call_meta=call_meta)
-        self.llm = ScriptedLLM(replies)
+            context=context, tenant=tenant, agent_config=cfg, call_meta=call_meta,
+            call_logger=self.call_logger,
+        )
+        self.llm = ScriptedLLM(replies, call_logger=self.call_logger)
         self.speaker = SpeakerSink()
 
         self.pipeline = Pipeline([
@@ -730,6 +747,47 @@ async def test_the_number_the_caller_read_out_is_the_one_stored(seeded_db):
     assert rows[0].patient_phone == PHONE, (
         f"stored {rows[0].patient_phone!r} instead of the number the caller gave"
     )
+
+
+@pytest.mark.asyncio
+async def test_the_silence_timer_is_shielded_for_the_whole_booking_round_trip(seeded_db):
+    """The function's own latency (the DB write, then the LLM call for the
+    corrected reply) must never be mistaken for the caller having gone silent —
+    pipeline.py's watchdog reads call_logger.action_in_progress for exactly this.
+
+    Asserted on the REAL CallLoggerProcessor instance the pipeline would use, not
+    a mock: busy must already be True by the time the rerun's generation starts
+    (covering the full LLM-call latency, not just the DB write), and it must be
+    False again once that reply is available to speak — never left dangling.
+    """
+    async with VoiceCall([_book_tag(), "Confirmed for 2 PM."]) as call:
+        assert call.call_logger.action_in_progress is False, (
+            "must not be busy before any action has started"
+        )
+        await call.says("Book me with Dr Salman tomorrow at 2 PM, I'm Ainan",
+                        expect_generations=2)
+
+    assert call.llm.busy_at_call == [False, True], (
+        "generation 1 (the tag turn) owes nothing prior; generation 2 (the "
+        "corrected reply) must find the timer ALREADY shielded, covering its "
+        "own LLM-call latency end to end"
+    )
+    assert call.call_logger.action_in_progress is False, (
+        "must not stay busy after the corrected reply is in hand — that would "
+        "let the silence timer sit shielded forever and never fire on a "
+        "genuinely silent caller"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_turn_never_touches_the_silence_timer(seeded_db):
+    """A turn with no action in it must have zero effect on action_in_progress —
+    proof that this is scoped to real booking latency, not a blanket shield."""
+    async with VoiceCall(["We're open 9 to 5, Monday to Saturday."]) as call:
+        await call.says("What are your timings?")
+
+    assert call.llm.busy_at_call == [False]
+    assert call.call_logger.action_in_progress is False
 
 
 @pytest.mark.asyncio
