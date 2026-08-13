@@ -1482,27 +1482,42 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
             # groq_catalog.check_model.
             _llm_model_ok: bool | None = None
 
+            # Captured BEFORE any field is applied — the provider-change check
+            # below needs to know where the row was.
+            _prev_llm_provider = (getattr(agent, "llm_provider", None) or "").strip().lower()
+            _new_llm_provider = (payload.llm_provider or "").strip().lower()
+
             if payload.llm_model is not None and payload.llm_model.strip():
-                from backend.services import groq_catalog
                 from backend.services.provider_status import resolve_provider_key
 
-                _model = payload.llm_model.strip()
-                _key = await resolve_provider_key(
-                    session, agent_defaults.LOCKED_LLM_PROVIDER, category="llm"
+                # Check the model against the provider it is BEING SAVED WITH —
+                # the one in this payload if the provider is also changing,
+                # otherwise the stored one. Asking the wrong vendor is not a
+                # harmless mistake: every Gemini id would come back DEAD from
+                # Groq's catalogue and the save would be refused with a message
+                # naming the wrong models.
+                _provider = (
+                    (payload.llm_provider or "").strip().lower()
+                    or (agent.llm_provider or "").strip().lower()
+                    or agent_defaults.LOCKED_LLM_PROVIDER
                 )
-                _verdict = await groq_catalog.check_model(_key or "", _model)
+                _catalog = agent_defaults.llm_catalog_for(_provider)
 
-                if _verdict == groq_catalog.DEAD:
+                _model = payload.llm_model.strip()
+                _key = await resolve_provider_key(session, _provider, category="llm")
+                _verdict = await _catalog.check_model(_key or "", _model)
+
+                if _verdict == _catalog.DEAD:
                     raise HTTPException(
                         status_code=422,
                         detail=(
-                            f"'{_model}' is not a Groq model this platform can run an "
-                            "agent on. Available now: "
-                            + ", ".join(sorted(groq_catalog.cached_ids()))
+                            f"'{_model}' is not a {_provider} model this platform can "
+                            "run an agent on. Available now: "
+                            + ", ".join(sorted(_catalog.cached_ids()))
                             + "."
                         ),
                     )
-                if _verdict == groq_catalog.UNKNOWN:
+                if _verdict == _catalog.UNKNOWN:
                     # Unverifiable: let the rest of the save through untouched rather
                     # than failing it, and leave the row on its existing model.
                     logger.warning(
@@ -1602,25 +1617,55 @@ async def update_agent(agent_id: str, payload: AgentPatchPayload, user: CurrentU
             # the catalogue has been fetched; only a row that really is on a dead
             # model pays a fetch per save, and it gets repaired in exchange.
             if _llm_model_ok is None and (getattr(agent, "llm_model", None) or "").strip():
-                from backend.services import groq_catalog
                 from backend.services.provider_status import resolve_provider_key
 
+                # Against the row's OWN provider, for the same reason as the
+                # payload check above.
+                _stored_provider = (
+                    (payload.llm_provider or "").strip().lower()
+                    or (agent.llm_provider or "").strip().lower()
+                    or agent_defaults.LOCKED_LLM_PROVIDER
+                )
+                _stored_catalog = agent_defaults.llm_catalog_for(_stored_provider)
+
                 _stored = agent.llm_model.strip()
-                _stored_verdict = await groq_catalog.check_model(
+                _stored_verdict = await _stored_catalog.check_model(
                     await resolve_provider_key(
-                        session, agent_defaults.LOCKED_LLM_PROVIDER, category="llm"
+                        session, _stored_provider, category="llm"
                     ) or "",
                     _stored,
                 )
-                if _stored_verdict == groq_catalog.DEAD:
+                if _stored_verdict == _stored_catalog.DEAD:
                     _llm_model_ok = False
                     logger.warning(
-                        "Agent %s was on LLM model %r, which Groq no longer serves; "
+                        "Agent %s was on LLM model %r, which %s no longer serves; "
                         "repairing to %s.",
-                        agent_id, _stored, agent_defaults.DEFAULT_LLM_MODEL,
+                        agent_id, _stored, _stored_provider,
+                        agent_defaults.DEFAULT_LLM_MODEL_BY_PROVIDER.get(
+                            _stored_provider, agent_defaults.DEFAULT_LLM_MODEL),
                     )
-                elif _stored_verdict == groq_catalog.LIVE:
+                elif _stored_verdict == _stored_catalog.LIVE:
                     _llm_model_ok = True
+
+            # Switching PROVIDER without naming a model must not leave the old
+            # vendor's model behind. A model is meaningless without its provider,
+            # and this specific pair — a Gemini id sitting next to
+            # llm_provider='groq' — is the one that left a live agent's LLM
+            # answering 404. Unlocking the provider made it reachable again from
+            # the opposite direction: pick Gemini in the dropdown, send no model,
+            # and the row would keep its Llama id.
+            #
+            # Only when the payload did not successfully supply a model of its
+            # own; an explicit choice always wins.
+            if _new_llm_provider and _new_llm_provider != _prev_llm_provider and not payload.llm_model:
+                agent.llm_model = agent_defaults.DEFAULT_LLM_MODEL_BY_PROVIDER.get(
+                    _new_llm_provider, agent_defaults.DEFAULT_LLM_MODEL,
+                )
+                logger.info(
+                    "Agent %s moved from LLM provider %r to %r with no model given; "
+                    "starting it on %s.",
+                    agent_id, _prev_llm_provider, _new_llm_provider, agent.llm_model,
+                )
 
             # Re-apply on EVERY update, not just when language changed. That makes
             # this endpoint self-healing: any row still carrying a legacy

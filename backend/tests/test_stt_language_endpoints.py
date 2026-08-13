@@ -271,19 +271,25 @@ async def test_client_supplied_language_mirrors_are_ignored_not_honoured(app_cli
 
 
 @pytest.mark.asyncio
-async def test_the_llm_provider_is_locked_and_a_dead_model_is_refused(app_client):
-    """The two halves of the LLM pair are protected DIFFERENTLY, because only one of
-    them is a choice.
+async def test_a_dead_model_is_refused_against_its_own_provider(app_client, monkeypatch):
+    """The LLM PROVIDER was unlocked on 2026-08-13 so Gemini can be chosen. The
+    model half is still refused loudly when the vendor says it does not exist.
 
-    * The PROVIDER has no dropdown, so a client sending one is echoing a field it
-      should not be sending. Silently ignored.
-    * The MODEL does have a dropdown, so a wrong value means someone (or some stale
-      build) is really trying to write it. Refused with a 422, loudly.
+    The check must run against the provider the model is being saved WITH. Asking
+    Groq about a Gemini id would return DEAD for every Gemini model and refuse
+    every legitimate save with a message naming the wrong vendor's models.
 
-    Both halves of the exact gemini-on-groq combination that left a live agent's LLM
-    answering HTTP 404 must still be unable to reach the row.
+    ``gemini-2.5-flash-8b`` is the id from the real incident — it sat next to
+    ``llm_provider='groq'`` on a live agent and 404'd every call.
     """
+    from backend.services import gemini_catalog
+
     _, agent_id = await _make_agent()
+
+    async def _dead(_key, _model):
+        return gemini_catalog.DEAD
+
+    monkeypatch.setattr(gemini_catalog, "check_model", _dead)
 
     r = await app_client.patch(
         f"/agents/{agent_id}", headers=_super(),
@@ -291,11 +297,59 @@ async def test_the_llm_provider_is_locked_and_a_dead_model_is_refused(app_client
     )
     assert r.status_code == 422, r.text
     assert "gemini-2.5-flash-8b" in r.json()["detail"]
+    assert "gemini" in r.json()["detail"], "the error named the wrong vendor"
 
-    # Refused, so NOTHING was written — not even the ignorable provider.
     row = await _row(agent_id)
-    assert row.llm_provider == agent_defaults.LOCKED_LLM_PROVIDER
     assert row.llm_model != "gemini-2.5-flash-8b"
+
+
+@pytest.mark.asyncio
+async def test_an_unselectable_llm_provider_is_still_refused(app_client):
+    """Unlocking the provider widened the whitelist; it did not remove it.
+
+    While the provider was locked this value was silently discarded, so the
+    registry's own guard never ran on it. Now that the field is honoured, that
+    guard is what stands between a typo and an agent that cannot be constructed —
+    which on this product means dead air on a live call, not an error page.
+
+    Refused with a 422 naming the real reason (no SDK in the agent worker), NOT
+    normalised to a working provider: a silent swap is how a deliberate choice
+    became a different vendor without anyone being told.
+    """
+    _, agent_id = await _make_agent()
+
+    r = await app_client.patch(
+        f"/agents/{agent_id}", headers=_super(), json={"llm_provider": "anthropic"},
+    )
+    assert r.status_code == 422, r.text
+    assert "anthropic" in r.json()["detail"]
+
+    row = await _row(agent_id)
+    assert row.llm_provider in agent_defaults.SELECTABLE_LLM_PROVIDERS
+    assert row.llm_provider != "anthropic"
+
+
+@pytest.mark.asyncio
+async def test_switching_provider_does_not_keep_the_old_vendors_model(app_client):
+    """A model is meaningless without its provider.
+
+    Unlocking the provider re-opened the 404 pair from the opposite direction:
+    choose Gemini, send no model, and the row would keep its Llama id. The model
+    must move to the new provider's default.
+    """
+    _, agent_id = await _make_agent(llm_model=agent_defaults.DEFAULT_LLM_MODEL)
+
+    r = await app_client.patch(
+        f"/agents/{agent_id}", headers=_super(), json={"llm_provider": "gemini"},
+    )
+    assert r.status_code == 200, r.text
+
+    row = await _row(agent_id)
+    assert row.llm_provider == "gemini"
+    assert row.llm_model == agent_defaults.DEFAULT_LLM_MODEL_BY_PROVIDER["gemini"]
+    assert not row.llm_model.startswith("llama"), (
+        "the Groq model survived a move to Gemini — this is the 404 pair"
+    )
 
 
 @pytest.mark.asyncio
@@ -337,17 +391,20 @@ async def test_a_groq_outage_does_not_make_agents_read_only(app_client, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_the_locked_provider_alone_is_still_silently_ignored(app_client):
-    """The provider half on its own does not fail the save. The editor auto-saves on
-    a debounce and an older in-flight build sends llm_provider on every keystroke;
-    422ing that would break saving mid-deploy for anyone on the old bundle."""
+async def test_a_selectable_provider_sent_alone_is_honoured(app_client):
+    """The reversal of the old lock, asserted directly: sending only
+    ``llm_provider`` used to be silently discarded, and now it is a real choice.
+
+    It still must not 422 — the editor auto-saves on a debounce, so an older
+    in-flight build sending the field on every keystroke must not break saving
+    mid-deploy."""
     _, agent_id = await _make_agent()
 
     r = await app_client.patch(
         f"/agents/{agent_id}", headers=_super(), json={"llm_provider": "gemini"},
     )
     assert r.status_code == 200, r.text
-    assert (await _row(agent_id)).llm_provider == agent_defaults.LOCKED_LLM_PROVIDER
+    assert (await _row(agent_id)).llm_provider == "gemini"
 
 
 @pytest.mark.asyncio

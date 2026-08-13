@@ -1769,27 +1769,53 @@ async def stt_languages(
 # ── GET /platform/llm/models ──────────────────────────────────────────────────
 # Populates the agent editor's LLM Model dropdown.
 #
-# There is no provider parameter and no provider dropdown: the LLM provider is
-# locked to Groq (backend/services/agent_defaults.py). The MODEL is a real
-# per-agent choice, so it is fetched live from Groq's own API on every cache miss.
+# ``provider`` selects which vendor's catalogue to list. It was absent while the
+# LLM provider was locked to Groq; the provider was unlocked on 2026-08-13 so
+# Gemini can be chosen, and the allowed values are
+# agent_defaults.SELECTABLE_LLM_PROVIDERS. An unknown one is a 422 rather than a
+# silent fall back to Groq — answering with a different vendor's models than the
+# ones asked for is precisely how a model ends up saved against the wrong
+# provider.
 #
-# Failure answers 503 with Groq's own reason, and NO models. That is deliberate:
-# a stale or invented list is how the product came to offer four models Groq had
-# already decommissioned (see the rewrite rule in backend/agent/resilience.py).
-# An empty dropdown with a visible error is recoverable; a plausible-looking list
-# that 404s in the middle of a live call is not.
+# Failure answers 503 with the vendor's own reason, and NO models. That is
+# deliberate: a stale or invented list is how the product came to offer four
+# models Groq had already decommissioned (see the rewrite rule in
+# backend/agent/resilience.py), and how the Gemini fallback came to point at two
+# retired ids. An empty dropdown with a visible error is recoverable; a
+# plausible-looking list that 404s in the middle of a live call is not.
 @router.get("/platform/llm/models")
 async def llm_models(
-    refresh: bool = Query(default=False, description="Bypass the cache and re-ask Groq."),
+    provider: str = Query(default="", description="Which LLM vendor to list. Defaults to the platform default."),
+    refresh: bool = Query(default=False, description="Bypass the cache and re-ask the vendor."),
     user: CurrentUser = None,
     db: AsyncSession = Depends(get_db),
 ):
-    from backend.services import agent_defaults, groq_catalog, llm_failover
+    from backend.services import agent_defaults, gemini_catalog, groq_catalog, llm_failover
 
-    raw_key = await _get_raw_key(agent_defaults.LOCKED_LLM_PROVIDER, db, category="llm")
+    # ``isinstance`` guard, not just ``or``: several tests call this coroutine
+    # directly rather than through FastAPI, so the parameter still holds the
+    # ``Query`` default object and ``.strip()`` on it raises AttributeError.
+    prov = (provider if isinstance(provider, str) else "").strip().lower()
+    prov = prov or agent_defaults.LOCKED_LLM_PROVIDER
+    if prov not in agent_defaults.SELECTABLE_LLM_PROVIDERS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"'{prov}' is not a selectable LLM provider. Choose one of: "
+                + ", ".join(agent_defaults.SELECTABLE_LLM_PROVIDERS)
+            ),
+        )
+
+    catalog = gemini_catalog if prov == "gemini" else groq_catalog
+    unavailable = (
+        gemini_catalog.GeminiModelsUnavailable if prov == "gemini"
+        else groq_catalog.GroqModelsUnavailable
+    )
+
+    raw_key = await _get_raw_key(prov, db, category="llm")
     try:
-        models = await groq_catalog.fetch_models(raw_key or "", force=refresh)
-    except groq_catalog.GroqModelsUnavailable as exc:
+        models = await catalog.fetch_models(raw_key or "", force=refresh)
+    except unavailable as exc:
         # 503, not 500: the request was valid and the fault is upstream/transient,
         # so the UI should invite a retry rather than present a broken page.
         raise HTTPException(status_code=503, detail=str(exc))
@@ -1810,21 +1836,34 @@ async def llm_models(
     #  * daily_token_budget — Groq meters its free-tier token budget per model, and
     #    no response header reports it, so an operator has no other way to see that
     #    moving an agent to gpt-oss-120b doubles the calls it can serve in a day.
+    #
+    # Both annotations are Groq-specific facts and are reported as such: the
+    # measured booking chain is a list of Groq model ids, and the token budget is
+    # Groq's free-tier metering. Claiming "booking not verified" on every Gemini
+    # model would read as a warning about Gemini when it only means nobody has run
+    # that measurement — so on other providers the fields are null, which the UI
+    # renders as "unknown" rather than "bad".
+    is_groq = prov == "groq"
     verified = set(llm_failover.GROQ_MODEL_CHAIN)
     annotated = [
         {
             **m,
-            "booking_verified": m["id"] in verified,
-            "daily_token_budget": llm_failover.GROQ_FREE_TIER_TPD.get(m["id"]),
+            "booking_verified": (m["id"] in verified) if is_groq else None,
+            "daily_token_budget": (
+                llm_failover.GROQ_FREE_TIER_TPD.get(m["id"]) if is_groq else None
+            ),
         }
         for m in models
     ]
 
     return {
-        "provider": agent_defaults.LOCKED_LLM_PROVIDER,
+        "provider": prov,
+        "providers": list(agent_defaults.SELECTABLE_LLM_PROVIDERS),
         "source": "live",
         "models": annotated,
-        "default": agent_defaults.DEFAULT_LLM_MODEL,
+        "default": agent_defaults.DEFAULT_LLM_MODEL_BY_PROVIDER.get(
+            prov, agent_defaults.DEFAULT_LLM_MODEL,
+        ),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 

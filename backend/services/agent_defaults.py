@@ -150,7 +150,34 @@ from __future__ import annotations
 # Changing a value here changes it for every agent, existing and new, on the next
 # write. There is deliberately no per-agent override and no UI that exposes one.
 
+#: UNLOCKED 2026-08-13 on the stakeholder's explicit instruction ("I want to
+#: choose gemini models"). Retained as the name of the DEFAULT provider — a new
+#: agent still starts on Groq — but it is no longer enforced on write.
+#:
+#: Both entries in SELECTABLE_LLM_PROVIDERS satisfy the same two conditions the
+#: STT/TTS whitelists do: a real build branch exists
+#: (provider_registry.BUILDABLE_LLM, and the ``elif`` chain in
+#: agent/resilience.py), and a key is genuinely configured. Gemini was already
+#: buildable and already first in resilience.PROVIDER_ORDER as the failover — the
+#: only thing missing was the ability to choose it deliberately.
 LOCKED_LLM_PROVIDER = "groq"
+
+#: Providers the LLM dropdown may offer.
+SELECTABLE_LLM_PROVIDERS: tuple[str, ...] = ("groq", "gemini")
+
+#: The starting model per provider. A model is meaningless without its provider —
+#: ``llm_provider='groq'`` next to ``llm_model='gemini-2.5-flash-8b'`` is exactly
+#: the pair that left a live agent's LLM answering 404, and it is what
+#: normalize_provider_choice exists to prevent.
+#:
+#: Gemini's entry is an ALIAS, not a pinned snapshot. Verified 2026-08-13:
+#: ``gemini-2.5-flash`` and ``gemini-2.0-flash`` both still LIST but return 404
+#: "no longer available to new users" when called. Google retires dated snapshots
+#: on a rolling basis, so a pinned id here is a scheduled outage.
+DEFAULT_LLM_MODEL_BY_PROVIDER: dict[str, str] = {
+    "groq": "llama-3.3-70b-versatile",
+    "gemini": "gemini-flash-latest",
+}
 
 #: The model a NEW agent starts on, and the repair value for a row holding a model
 #: Groq no longer serves. This is a starting value, not a lock: the agent editor has
@@ -228,6 +255,7 @@ LOCKED_BY_CATEGORY: dict[str, tuple[str, str]] = {
 SELECTABLE_BY_CATEGORY: dict[str, tuple[str, ...]] = {
     "stt": SELECTABLE_STT_PROVIDERS,
     "tts": SELECTABLE_TTS_PROVIDERS,
+    "llm": SELECTABLE_LLM_PROVIDERS,
 }
 
 #: Fields the API must never accept from a client any more. They are still
@@ -242,11 +270,15 @@ SELECTABLE_BY_CATEGORY: dict[str, tuple[str, ...]] = {
 #: land in the row. Only the two language MIRRORS and the locked LLM pair are
 #: computed rather than accepted.
 #: ``llm_model`` is NOT here: it is a real choice made in the editor's Model
-#: dropdown, so it must be accepted and persisted. ``llm_provider`` stays derived
-#: (locked to Groq).
+#: dropdown, so it must be accepted and persisted.
+#:
+#: ``llm_provider`` was here until 2026-08-13, when the provider was unlocked so
+#: Gemini could be chosen. It is now validated on write by
+#: ``normalize_provider_choice`` exactly like the STT/TTS pairs, rather than
+#: overwritten — same mechanism, so an unbuildable or unconfigured LLM provider
+#: still cannot land in the row.
 DERIVED_FIELDS: frozenset[str] = frozenset({
     "stt_language", "tts_language",
-    "llm_provider",
 })
 
 #: What a CREATE additionally refuses to take from the client: ``llm_model``.
@@ -290,6 +322,24 @@ def normalize_provider_choice(category: str, provider: str | None, model: str | 
     if mdl not in valid:
         mdl = valid[0] if valid else mdl
     return prov, mdl
+
+
+def llm_catalog_for(provider: str | None):
+    """The catalogue module that owns ``provider``'s model list.
+
+    One place to resolve this, so the dropdown endpoint, the write-time validator
+    and the self-healing path cannot end up asking different vendors about the
+    same model. Both modules expose the same surface — ``fetch_models``,
+    ``check_model``, ``cached_ids``, ``LIVE``/``DEAD``/``UNKNOWN`` and an
+    ``*Unavailable`` exception — which is what makes them interchangeable here.
+
+    Unknown providers fall back to the default vendor's catalogue: callers reach
+    this only after ``normalize_provider_choice`` has already coerced the provider
+    to a selectable one.
+    """
+    from backend.services import gemini_catalog, groq_catalog
+
+    return gemini_catalog if (provider or "").strip().lower() == "gemini" else groq_catalog
 
 
 def models_for(category: str, provider: str) -> list[str]:
@@ -611,13 +661,27 @@ def apply_locked_defaults(
 
     target.language = resolved
 
-    # PROVIDER is locked. MODEL is not: it is only replaced when absent, or when
-    # the caller has confirmed Groq no longer serves it. Overwriting it
-    # unconditionally is what made the dropdown cosmetic in an earlier draft;
-    # NEVER overwriting it is what left a dead model in the row forever.
-    target.llm_provider = LOCKED_LLM_PROVIDER
+    # The PROVIDER was locked to Groq until 2026-08-13. It is now a real choice,
+    # so it gets the same treatment as STT/TTS: validated against the whitelist,
+    # not overwritten. A row naming a provider that is not selectable falls back
+    # to the first entry, and its model goes with it — a model is meaningless
+    # without its provider.
+    #
+    # The MODEL is still only replaced when absent, or when the caller has
+    # established that the vendor no longer serves it (``llm_model_ok``).
+    # Overwriting it unconditionally is what made the dropdown cosmetic in an
+    # earlier draft; NEVER overwriting it is what left a dead model in the row
+    # forever.
+    llm_provider = (getattr(target, "llm_provider", None) or "").strip().lower()
+    if llm_provider not in SELECTABLE_LLM_PROVIDERS:
+        llm_provider = LOCKED_LLM_PROVIDER
+        target.llm_model = ""   # chosen for the rejected provider; cannot be kept
+    target.llm_provider = llm_provider
+
     if not (getattr(target, "llm_model", None) or "").strip() or llm_model_ok is False:
-        target.llm_model = DEFAULT_LLM_MODEL
+        target.llm_model = DEFAULT_LLM_MODEL_BY_PROVIDER.get(
+            llm_provider, DEFAULT_LLM_MODEL,
+        )
 
     # Validated, not overwritten. A row naming a provider that was dropped from
     # the whitelist (elevenlabs, whisper, openai) falls back to the default pair.

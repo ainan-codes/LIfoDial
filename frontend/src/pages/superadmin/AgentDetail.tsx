@@ -20,8 +20,9 @@ import React, { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useRef,
 import { useNavigate, useParams } from 'react-router-dom';
 import fetchWithAuth, { API_URL } from '../../api/client';
 import {
-  DEFAULT_LANGUAGE, DEFAULT_LLM_MODEL, DEFAULT_STT_MODEL, DEFAULT_STT_PROVIDER,
-  DEFAULT_TTS_MODEL, DEFAULT_TTS_PROVIDER,
+  DEFAULT_LANGUAGE, DEFAULT_LLM_MODEL, DEFAULT_LLM_PROVIDER, DEFAULT_STT_MODEL,
+  DEFAULT_STT_PROVIDER, DEFAULT_TTS_MODEL, DEFAULT_TTS_PROVIDER,
+  LLM_PROVIDER_LABELS, SELECTABLE_LLM_PROVIDERS,
 } from '../../api/lockedDefaults';
 import { getToken } from '../../api/auth';
 // Lazy: pulls in the LiveKit/WebRTC client stack (~526kB alone, the single
@@ -493,22 +494,38 @@ export default function AgentDetail() {
   const [llmModelsError, setLlmModelsError] = useState<string | null>(null);
   const [refreshingModels, setRefreshingModels] = useState(false);
 
-  const loadLlmModels = useCallback(async (opts?: { refresh?: boolean }) => {
+  // Declared BEFORE loadLlmModels because it is one of its dependencies — a const
+  // referenced in a deps array before its declaration is a TDZ ReferenceError at
+  // render, not a lint warning.
+  const currentLlmProvider = agent?.llm_provider || DEFAULT_LLM_PROVIDER;
+
+  const loadLlmModels = useCallback(async (opts?: { refresh?: boolean; provider?: string }) => {
     const refresh = opts?.refresh === true;
     if (refresh) setRefreshingModels(true);
     try {
-      const d = await fetchWithAuth(`/platform/llm/models${refresh ? '?refresh=true' : ''}`);
+      // The provider is part of the request, not an assumption. Listing one
+      // vendor's models while the row names another is exactly how a model gets
+      // saved against the wrong provider — the 404 pair this file's header warns
+      // about. `opts.provider` lets a provider switch fetch the NEW vendor's list
+      // before the re-read of the agent row has landed.
+      const prov = opts?.provider || currentLlmProvider;
+      const qs = new URLSearchParams({ provider: prov });
+      if (refresh) qs.set('refresh', 'true');
+      const d = await fetchWithAuth(`/platform/llm/models?${qs.toString()}`);
       setLlmModels(Array.isArray(d?.models) ? d.models : []);
       setLlmModelsError(null);
     } catch (e: any) {
-      // fetchWithAuth surfaces the backend's `detail`, which is Groq's own reason
-      // (bad key, unreachable, nothing usable) — far more actionable than "failed".
+      // fetchWithAuth surfaces the backend's `detail`, which is the vendor's own
+      // reason (bad key, unreachable, nothing usable) — far more actionable than
+      // "failed".
       setLlmModels(null);
-      setLlmModelsError(e?.message || 'Could not load the model list from Groq.');
+      setLlmModelsError(e?.message || 'Could not load the model list.');
     } finally {
       if (refresh) setRefreshingModels(false);
     }
-  }, []);
+    // Re-fetches whenever the provider changes, which is what keeps the Model
+    // dropdown showing the CHOSEN vendor's models rather than the previous one's.
+  }, [currentLlmProvider]);
 
   useEffect(() => { loadLlmModels(); }, [loadLlmModels]);
 
@@ -552,11 +569,11 @@ export default function AgentDetail() {
         // facts, and the backend keeps them distinct too (groq_catalog.check_model).
         label: llmModels === null
           ? currentLlmModel
-          : `${currentLlmModel} · no longer served by Groq`,
+          : `${currentLlmModel} · no longer served by ${LLM_PROVIDER_LABELS[currentLlmProvider] || currentLlmProvider}`,
       });
     }
     return opts;
-  }, [llmModels, currentLlmModel]);
+  }, [llmModels, currentLlmModel, currentLlmProvider]);
 
   // `quiet` re-reads the agent WITHOUT touching the page-level `loading` flag.
   //
@@ -1349,6 +1366,32 @@ export default function AgentDetail() {
                   and the reasoning caveat. */}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '24px' }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                  {/* Provider FIRST, because the model list depends on it. Locked to
+                      Groq with no dropdown until 2026-08-13; now a real choice.
+
+                      Changing it sends ONLY llm_provider and deliberately does not
+                      send a model: the backend starts the agent on that provider's
+                      default (agent_defaults.DEFAULT_LLM_MODEL_BY_PROVIDER). Sending
+                      the model still on screen would write the OLD vendor's id
+                      against the NEW provider — the exact 404 pair this file's
+                      header describes. */}
+                  <div>
+                    <Label>LLM Provider</Label>
+                    <Select
+                      value={currentLlmProvider}
+                      onChange={(v: any) => {
+                        // Fetch the new vendor's list immediately rather than
+                        // waiting for the agent re-read, so the Model dropdown is
+                        // never briefly showing the previous provider's models.
+                        loadLlmModels({ provider: v });
+                        changeProviderOrModel({ llm_provider: v });
+                      }}
+                      options={SELECTABLE_LLM_PROVIDERS.map((p) => ({
+                        value: p,
+                        label: LLM_PROVIDER_LABELS[p] || p,
+                      }))}
+                    />
+                  </div>
                   <div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <Label>LLM Model</Label>
