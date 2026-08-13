@@ -21,6 +21,7 @@ interface BackendAppointment {
   status: 'pending' | 'confirmed' | 'cancelled';
   patient_name?: string | null;
   source?: string | null;
+  rescheduled_at?: string | null;
 }
 
 // ── Booking channel ────────────────────────────────────────────────────────
@@ -63,6 +64,12 @@ function formatSlotTime(iso: string): string {
 interface Row extends Appointment {
   source: SourceKey;
   patient_name: string;
+  //: True only when a RESCHEDULE genuinely moved this row (backend:
+  //: Appointment.rescheduled_at). `status` itself stays CONFIRMED either way —
+  //: this is a purely cosmetic signal, so it must never affect the stats
+  //: counts or the status filter, both of which keep working off `status`
+  //: exactly as before.
+  wasRescheduled: boolean;
 }
 
 function fromBackend(a: BackendAppointment): Row {
@@ -78,17 +85,24 @@ function fromBackend(a: BackendAppointment): Row {
     status: STATUS_FROM_BACKEND[a.status] ?? 'PENDING',
     source: key,
     patient_name: (a.patient_name || '').trim(),
+    wasRescheduled: Boolean(a.rescheduled_at),
   };
 }
 
 // ── Status badge ──────────────────────────────────────────────────────────────
-function StatusBadge({ status }: { status: Appointment['status'] }) {
-  const map: Record<string, { color: string; bg: string; border?: string }> = {
-    CONFIRMED: { color: 'var(--accent)',      bg: 'var(--accent-dim)',      border: 'var(--accent-border)' },
-    CANCELLED: { color: 'var(--destructive)', bg: 'var(--destructive-dim)' },
-    PENDING:   { color: 'var(--warning)',     bg: 'var(--warning-dim)' },
+// Confirmed = green, Cancelled = red, Rescheduled = blue (a confirmed
+// appointment whose slot has genuinely moved at least once) — `wasRescheduled`
+// only ever changes the COLOUR/LABEL shown here, never `status` itself or
+// anything that counts/filters by it.
+function StatusBadge({ status, wasRescheduled }: { status: Appointment['status']; wasRescheduled?: boolean }) {
+  const map: Record<string, { label: string; color: string; bg: string; border?: string }> = {
+    CONFIRMED: { label: 'CONFIRMED',   color: 'var(--accent)',      bg: 'var(--accent-dim)',      border: 'var(--accent-border)' },
+    RESCHEDULED: { label: 'RESCHEDULED', color: 'var(--info)',      bg: 'var(--info-dim)' },
+    CANCELLED: { label: 'CANCELLED',   color: 'var(--destructive)', bg: 'var(--destructive-dim)' },
+    PENDING:   { label: 'PENDING',     color: 'var(--warning)',     bg: 'var(--warning-dim)' },
   };
-  const s = map[status] ?? map.PENDING;
+  const key = status === 'CONFIRMED' && wasRescheduled ? 'RESCHEDULED' : status;
+  const s = map[key] ?? map.PENDING;
   return (
     <span style={{
       display: 'inline-block',
@@ -100,7 +114,7 @@ function StatusBadge({ status }: { status: Appointment['status'] }) {
       backgroundColor: s.bg,
       border: s.border ? `1px solid ${s.border}` : undefined,
     }}>
-      {status}
+      {s.label}
     </span>
   );
 }
@@ -253,7 +267,7 @@ export default function Appointments() {
   };
 
   return (
-    <div data-testid="appointments-page" className="h-full flex flex-col">
+    <div data-testid="appointments-page" className="h-full flex flex-col" style={{ minHeight: 0 }}>
       {/* Top bar */}
       <div
         className="px-8 py-5 flex items-center justify-between flex-shrink-0"
@@ -289,7 +303,7 @@ export default function Appointments() {
         </button>
       </div>
 
-      <div className="flex-1 flex flex-col overflow-hidden" style={{ backgroundColor: 'var(--bg-page)' }}>
+      <div className="flex-1 flex flex-col overflow-hidden" style={{ backgroundColor: 'var(--bg-page)', minHeight: 0 }}>
         {/* Stats row */}
         <div className="px-8 pt-6 pb-4 grid grid-cols-4 gap-4 flex-shrink-0">
           <StatCard label="Total Today"  value={stats.total}     icon={CalendarCheck} />
@@ -372,7 +386,7 @@ export default function Appointments() {
             ) : (
               <table className="w-full" style={{ borderCollapse: 'collapse' }}>
                 <thead>
-                  <tr style={{ backgroundColor: 'var(--bg-surface-2)' }}>
+                  <tr style={{ backgroundColor: 'var(--bg-surface-2)', position: 'sticky', top: 0, zIndex: 1 }}>
                     {['Time', 'Patient', 'Doctor', 'Specialization', 'Booked Via', 'Status', 'Actions'].map(h => (
                       <th
                         key={h}
@@ -423,7 +437,7 @@ export default function Appointments() {
                         <SourceBadge source={apt.source} />
                       </td>
                       <td className="px-5 py-3.5">
-                        <StatusBadge status={apt.status} />
+                        <StatusBadge status={apt.status} wasRescheduled={apt.wasRescheduled} />
                       </td>
                       <td className="px-5 py-3.5">
                         {apt.status === 'CONFIRMED' && (

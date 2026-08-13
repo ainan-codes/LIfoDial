@@ -29,6 +29,8 @@
     --warning-dim:     rgba(251,191,36,0.10);
     --purple:          #A78BFA;
     --purple-dim:      rgba(167,139,250,0.10);
+    --info:            #60A5FA;
+    --info-dim:        rgba(96,165,250,0.10);
     --shadow-card:     none;
   }
 
@@ -52,6 +54,8 @@
     --warning-dim:     rgba(217,119,6,0.08);
     --purple:          #7C3AED;
     --purple-dim:      rgba(124,58,237,0.08);
+    --info:            #2563EB;
+    --info-dim:        rgba(37,99,235,0.08);
     --shadow-card:     0 1px 3px rgba(0,0,0,0.08);
   }
 

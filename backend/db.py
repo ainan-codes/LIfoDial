@@ -150,6 +150,36 @@ else:
     except ValueError:
         _pool_size = 0
 
+    # ── Bounded connect + bounded query, always ───────────────────────────────
+    #
+    # Neither was set anywhere before this, and asyncpg's own defaults do not
+    # save you: `timeout` (connection establishment) defaults to 60s, and
+    # `command_timeout` (a single query, once connected) has NO default at all —
+    # a query that never gets a reply from a stalled pooler connection hangs
+    # FOREVER. Measured live, 2026-08-12: a voice CANCEL logged
+    # "execute_started action=CANCEL" and then nothing — ever, for over 20
+    # minutes — with no exception anywhere and no lock on the Postgres side
+    # (confirmed via pg_stat_activity: nothing blocked, nothing idle-in-
+    # transaction). The request never reached a state Postgres could see at
+    # all, which is exactly the signature of a client stuck waiting on a
+    # connection a proxy/pooler queue never serviced.
+    #
+    # The fix is not "retry harder" — it's "fail fast enough that the calling
+    # code's own error handling (which already exists everywhere DB calls are
+    # made: create_appointment, execute_booking_action, VoiceActionProcessor's
+    # _execute) gets a chance to run at all." Both call paths (the awaited
+    # asyncpg connect, and any single statement after connecting) are bounded
+    # to single-digit seconds — long enough for Supabase's real handshake +
+    # query latency (measured 1.5-4s per call, see DB_POOL_SIZE comment above),
+    # short enough that a voice caller is never left in dead air for minutes
+    # over a hung connection instead of a spoken "please try again."
+    _connect_args = {
+        "statement_cache_size": 0,
+        "server_settings": {"jit": "off"},
+        "timeout": 8,            # connection establishment
+        "command_timeout": 8,    # any single query, once connected
+    }
+
     if _pool_size > 0:
         logger.info(
             "DB connection pooling ENABLED (DB_POOL_SIZE=%d) — connections are reused "
@@ -164,20 +194,14 @@ else:
             pool_pre_ping=True,
             pool_recycle=280,
             pool_timeout=10,
-            connect_args={
-                "statement_cache_size": 0,
-                "server_settings": {"jit": "off"},
-            },
+            connect_args=_connect_args,
         )
     else:
         engine = create_async_engine(
             DATABASE_URL,
             echo=False,
             poolclass=NullPool,
-            connect_args={
-                "statement_cache_size": 0,
-                "server_settings": {"jit": "off"},
-            },
+            connect_args=_connect_args,
         )
 
 AsyncSessionLocal = async_sessionmaker(

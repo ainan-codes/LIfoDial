@@ -721,6 +721,10 @@ async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: s
                     appt.slot_time = parse_slot_datetime(date_str, time_str)
                     if new_doctor_id and str(new_doctor_id) != str(appt.doctor_id):
                         appt.doctor_id = new_doctor_id
+                    # Reached only past execute_booking_action's own
+                    # already_at_that_time short-circuit, so this branch is only
+                    # ever hit for a genuine move — safe to mark unconditionally.
+                    appt.rescheduled_at = datetime.now(timezone.utc)
 
                 if notes_clean:
                     appt.notes = notes_clean

@@ -33,6 +33,13 @@ export function StatusBadge({ status }: { status: string }) {
     Rejected:  { dot: '#ef4444', text: '#ef4444' },
     Paid:      { dot: '#3ECF8E', text: '#3ECF8E' },
     Overdue:   { dot: '#ef4444', text: '#ef4444' },
+    // Appointment statuses — previously absent, so every appointment row on
+    // the superadmin table rendered this badge in the fallback grey.
+    Confirmed:   { dot: '#3ECF8E', text: '#3ECF8E' },
+    Cancelled:   { dot: '#ef4444', text: '#ef4444' },
+    Rescheduled: { dot: '#60A5FA', text: '#60A5FA' },
+    Completed:   { dot: '#3ECF8E', text: '#3ECF8E' },
+    'No-Show':   { dot: '#ef4444', text: '#ef4444' },
   };
   const c = colors[status] ?? { dot: '#888', text: '#888' };
   return (

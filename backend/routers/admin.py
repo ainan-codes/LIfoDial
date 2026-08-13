@@ -562,6 +562,9 @@ async def list_all_appointments(
                 # not be inferred — the UI shows "Unknown", not a guess.
                 "source": apt.source,
                 "channel": _CHANNEL_LABELS.get(apt.source or "", "Unknown"),
+                # Same "Rescheduled" signal as the clinic view — see
+                # backend/models/appointment.py::Appointment.rescheduled_at.
+                "rescheduled_at": apt.rescheduled_at.isoformat() if apt.rescheduled_at else None,
             }
             for apt, tenant, doctor in rows
         ]

@@ -29,6 +29,10 @@ class AppointmentResponse(BaseModel):
     #: this; it used to hardcode "Voice" for every row, which was wrong about
     #: every appointment in production.
     source: Optional[str] = None
+    #: Set the moment a RESCHEDULE actually moved this row — null otherwise.
+    #: `status` stays 'confirmed' either way (see the model); this is what lets
+    #: the UI show a third "Rescheduled" colour without touching that.
+    rescheduled_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -78,6 +82,7 @@ async def list_appointments(
             "status": r.status,
             "patient_name": r.patient_name,
             "source": r.source,
+            "rescheduled_at": r.rescheduled_at,
         })
 
     return res
@@ -123,4 +128,5 @@ async def update_appointment(
         "status": appointment.status,
         "patient_name": appointment.patient_name,
         "source": appointment.source,
+        "rescheduled_at": appointment.rescheduled_at,
     }

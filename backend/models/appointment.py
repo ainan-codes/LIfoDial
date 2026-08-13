@@ -90,6 +90,19 @@ class Appointment(Base):
     #: rows carry.)
     source: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
 
+    #: Set the moment a RESCHEDULE actually moves this row's slot_time (never on
+    #: BOOK, never on a no-op reschedule that lands on the time it already held —
+    #: see his.sync_appointment_to_db). Deliberately separate from `status`,
+    #: which stays 'confirmed' either way: the availability engine and every
+    #: existing "active appointment" query filters on status alone
+    #: (status.in_(['pending','confirmed'])), and widening that vocabulary to a
+    #: 'rescheduled' status would mean re-auditing every one of those call
+    #: sites. This column exists purely so the dashboards can show a distinct
+    #: "Rescheduled" badge without touching that logic at all.
+    rescheduled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

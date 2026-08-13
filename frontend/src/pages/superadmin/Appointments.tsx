@@ -19,6 +19,10 @@ interface SAAppointment {
   channel: string;
   source: string;
   duration?: string;
+  //: True only when a RESCHEDULE genuinely moved this row (backend:
+  //: Appointment.rescheduled_at). `status` stays 'Confirmed' either way — this
+  //: only changes which badge/colour is SHOWN, never the counts or filter.
+  wasRescheduled: boolean;
 }
 
 /** Voice channels get the phone/mic treatment, text channels the chat one.
@@ -81,6 +85,7 @@ export default function SAAppointments() {
         channel: a.channel || 'Unknown',
         source: (a.source || 'unknown').toLowerCase(),
         duration: a.duration,
+        wasRescheduled: Boolean(a.rescheduled_at),
       })));
     } catch (e: any) {
       // No mock fallback — show an honest error and an empty table.
@@ -308,7 +313,7 @@ export default function SAAppointments() {
                         })()}
                       </td>
                       <td style={{ padding: '14px 20px' }}>
-                        <StatusBadge status={a.status} />
+                        <StatusBadge status={a.status === 'Confirmed' && a.wasRescheduled ? 'Rescheduled' : a.status} />
                       </td>
                       <td style={{ padding: '14px 20px', color: '#555', fontFamily: 'monospace', fontSize: '12px' }}>
                         {a.duration ?? '—'}

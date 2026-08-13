@@ -376,3 +376,25 @@ async def test_a_reschedule_moves_the_day_the_caller_asked_for(seeded_db):
                    else appt.slot_time.replace(tzinfo=dt.timezone.utc))
     assert moved.date() == ist_now().date() + dt.timedelta(days=2)
     assert moved.hour == 11
+    assert appt.rescheduled_at is not None, (
+        "a real move must set rescheduled_at — it's the only thing that lets "
+        "the dashboards show a distinct 'Rescheduled' (blue) badge instead of "
+        "an indistinguishable 'Confirmed' (green) one"
+    )
+    assert appt.status == "confirmed", "rescheduled_at must never change status itself"
+
+
+@pytest.mark.asyncio
+async def test_a_no_op_reschedule_does_not_mark_it_as_rescheduled(seeded_db):
+    """Asking to move an appointment to the time it is ALREADY at is a success
+    (nothing is broken), but it is not a MOVE — the blue badge would be a lie."""
+    await _add_appointment("आइनान", PHONE, hour=15, days=1)
+    tomorrow_tag = (ist_now().date() + dt.timedelta(days=1)).strftime("%d/%m/%Y")
+    res = await execute_booking_action(
+        action="RESCHEDULE", tenant_id=TENANT_ID, name="ऐनान", phone=PHONE,
+        date_str=tomorrow_tag, time_str="3 PM", doctor_name="", source=SOURCE_VOICE,
+    )
+    assert res["success"] is True and res["reason"] == "already_at_that_time"
+    async with AsyncSessionLocal() as s:
+        appt = (await s.execute(select(Appointment))).scalars().one()
+    assert appt.rescheduled_at is None
