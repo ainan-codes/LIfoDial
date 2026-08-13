@@ -148,7 +148,15 @@ export default function SAAppointments() {
   );
 
   return (
-    <div style={{ padding: '32px', display: 'flex', flexDirection: 'column', gap: '24px', height: '100%', overflowY: 'auto' }}>
+    // `height: 100%` + `overflowY: auto` here made this a SECOND scroll
+    // container nested inside SuperAdminLayout's `<main>`, which is already
+    // `flex: 1; overflow-y: auto`. Two stacked scrollers of identical height is
+    // the classic way for a long table to look truncated: the outer one has
+    // nothing to scroll, and the inner one's scrollbar sits inside the padded
+    // card rather than at the window edge, so there is no visible affordance.
+    // One scroller — `<main>`'s — and `minHeight` so a short list still fills
+    // the viewport.
+    <div style={{ padding: '32px', display: 'flex', flexDirection: 'column', gap: '24px', minHeight: '100%', boxSizing: 'border-box' }}>
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>

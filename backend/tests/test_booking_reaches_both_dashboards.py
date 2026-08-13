@@ -108,10 +108,11 @@ async def test_a_booking_appears_in_both_dashboards(two_clinics):
     assert rows[0]["id"] == result["appointment_id"]
     assert rows[0]["doctor_name"] == "Dr Anjali Sharma"
     assert rows[0]["status"] == "confirmed"
-    # The phone is masked for the clinic view — assert the masking is real, not
-    # that a masked-looking string is present.
-    assert rows[0]["patient_phone"].endswith("****")
-    assert "3210" not in rows[0]["patient_phone"]
+    # The clinic sees the WHOLE number. It was masked to "+91987654****", which
+    # hid the clinic's own patient's callback number from the clinic and went
+    # out through the CSV export too. Assert the real digits, so a
+    # re-introduced mask fails here rather than in a receptionist's hands.
+    assert rows[0]["patient_phone"] == "+919876543210"
 
     # ── Superadmin's All Appointments view ────────────────────────────────────
     r = await client.get("/admin/appointments", headers=_superadmin())
@@ -122,6 +123,7 @@ async def test_a_booking_appears_in_both_dashboards(two_clinics):
     # Attributed to the right clinic — the whole point of this view.
     assert rows[0]["clinic_name"] == "Clinic A"
     assert rows[0]["doctor_name"] == "Dr Anjali Sharma"
+    assert rows[0]["patient_phone"] == "+919876543210"
 
 
 @pytest.mark.asyncio

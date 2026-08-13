@@ -421,6 +421,47 @@ _NO_FABRICATION_RULE = (
 )
 
 
+# VOICE ONLY. Appended here in pipeline.py and deliberately not in
+# booking_rules.py, because the chat channel and the embed widget render
+# Markdown and a numbered list is genuinely useful there.
+#
+# Measured on a live Hindi call 2026-08-13: the agent opened by SPEAKING its four
+# intake questions as a list — "1. आपका पूरा नाम क्या है? 2. ... 3. ... 4. ..." —
+# which is unbearable to listen to and asks a caller to hold four questions in
+# their head at once. The model was not misbehaving; it was pattern-matching its
+# instructions. Every block we append to the voice prompt is itself an ordered
+# numbered list (BOOKING_RULES_BLOCK's rules 1-8, the per-template "BOOKING FLOW"
+# steps in prompt_templates.py), and nothing anywhere told it that its OUTPUT is
+# spoken aloud rather than rendered. Note the templates DO say "ask only ONE
+# question at a time" — so the instruction existed and lost to the surrounding
+# format. Stating the channel explicitly is what makes it stick.
+#
+# The rules below are about SHAPE only. Nothing here may relax the booking
+# honesty contract or the [ACTION:] tag rules — a tag-only reply is not prose and
+# is still exactly correct.
+_VOICE_STYLE_RULE = (
+    "\n\n--- YOU ARE SPEAKING OUT LOUD ---\n"
+    "Everything you write is read to the caller by a text-to-speech voice over a "
+    "phone line. They HEAR it; they cannot see it, scroll back, or re-read it.\n"
+    "Never use a numbered or bulleted list. Never say or write '1.', '2.', "
+    "'first, second, third' as a way of listing questions. Speak the way a human "
+    "receptionist speaks on the phone: ordinary sentences.\n"
+    "Ask for ONE thing at a time and then STOP and wait for the answer. A caller "
+    "cannot answer four questions at once, and a reply that asks four is a reply "
+    "they will get wrong. If you need several details, collect them over several "
+    "short turns — that is faster in practice than one long question.\n"
+    "Keep each reply to about two short sentences. No headings, no asterisks, no "
+    "bullet characters, no emoji, no formatting marks of any kind: they are read "
+    "aloud literally and sound like noise.\n"
+    "When you must offer a few choices, such as open appointment times, say them "
+    "in one flowing sentence — 'I have eleven in the morning, or two or four in "
+    "the afternoon' — not as a list.\n"
+    "This rule governs the SHAPE of your speech only. It never overrides the "
+    "booking rules above: when it is time to act, your entire reply is still the "
+    "[ACTION: ...] tag alone, with no words around it.\n"
+)
+
+
 def _build_system_prompt(
     agent_config: dict, tenant: dict, availability_block: str = "",
 ) -> str:
@@ -509,6 +550,7 @@ def _build_system_prompt(
         # required to be a real DD/MM/YYYY.
         + _voice_action_tag_block(_ist_now().strftime("%A, %d/%m/%Y"))
         + _NO_FABRICATION_RULE
+        + _VOICE_STYLE_RULE
         + _LANGUAGE_MIRROR_RULE
     )
 

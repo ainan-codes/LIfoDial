@@ -51,8 +51,27 @@ async def list_appointments(
     """
     List appointments for a tenant, with the doctor's name/specialization
     joined in (the dashboard needs both, not just doctor_id).
-    Returns masked patient phone number.
     Filters implicitly via tenant_id enforce Multi-Tenancy.
+
+    The phone number is returned IN FULL. It used to be masked as
+    ``phone[:-4] + "****"``, which was wrong on its own terms and actively
+    harmful in use:
+
+      * The audience here is the clinic that OWNS the appointment, reached
+        through ``require_owns``. They took the booking; the patient gave the
+        number expressly so the clinic could ring back about it. There is no
+        third party to protect it from — masking hid the clinic's data from
+        the clinic.
+      * It broke the reason the column exists. The Appointments page offers a
+        CSV export (frontend/src/pages/Appointments.tsx) which was exporting
+        the masked string, so no downstream list could ever dial it.
+      * It masked the wrong half. ``[:-4]`` blanks the last four digits — the
+        part that distinguishes two patients — and keeps the country/operator
+        prefix that identifies nobody.
+      * It made a data bug unreadable. A row stored with the placeholder
+        ``"unknown"`` renders as ``unk****``, which looks like a masked number
+        rather than the missing-data marker it is. That is exactly how it was
+        first reported to us.
     """
     user.require_owns(str(tenant_id))
     stmt = (
@@ -68,17 +87,15 @@ async def list_appointments(
     result = await db.execute(stmt)
     rows = result.all()
 
-    # Mask patient phone (e.g. +91XXXXXXXX99)
     res = []
     for r, doctor_name, specialization in rows:
-        masked_phone = r.patient_phone[:-4] + "****" if len(r.patient_phone) > 4 else "****"
         res.append({
             "id": str(r.id),
             "doctor_id": str(r.doctor_id),
             "doctor_name": doctor_name or "Unknown",
             "specialization": specialization or "General",
             "slot_time": r.slot_time,
-            "patient_phone": masked_phone,
+            "patient_phone": r.patient_phone,
             "status": r.status,
             "patient_name": r.patient_name,
             "source": r.source,
@@ -115,16 +132,13 @@ async def update_appointment(
     await db.refresh(appointment)
 
     doctor = (await db.execute(select(Doctor).where(Doctor.id == appointment.doctor_id))).scalar_one_or_none()
-    masked_phone = (
-        appointment.patient_phone[:-4] + "****" if len(appointment.patient_phone) > 4 else "****"
-    )
     return {
         "id": str(appointment.id),
         "doctor_id": str(appointment.doctor_id),
         "doctor_name": doctor.name if doctor else "Unknown",
         "specialization": doctor.specialization if doctor else "General",
         "slot_time": appointment.slot_time,
-        "patient_phone": masked_phone,
+        "patient_phone": appointment.patient_phone,
         "status": appointment.status,
         "patient_name": appointment.patient_name,
         "source": appointment.source,

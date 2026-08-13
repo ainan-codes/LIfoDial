@@ -371,6 +371,45 @@ class BookingProcessor(FrameProcessor):
             # Advisory only — never let it cost the caller their turn.
             logger.warning("Could not record what the caller said (non-fatal): %s", exc)
 
+    def _resolve_patient_phone(self) -> str:
+        """The caller's real number, or "" if we genuinely do not have one.
+
+        ``booking_state["patient_phone"]`` is seeded ONCE in __init__ from
+        ``call_meta["caller_phone"]`` and is never updated again. On a browser
+        call there is no caller ID, so that seed is the literal string
+        "unknown" — and every commit path below read the seed directly.
+
+        Measured live 2026-08-13 (call 3163364c): the caller said "मेरा नाम ऐनान
+        है और मेरा नंबर है 9148768120", the number was correctly transcribed,
+        correctly extracted, and correctly stored in ``call_meta["stated_phone"]``
+        by _note_what_the_caller_said — and the appointment was still written with
+        patient_phone='unknown'. Nothing was broken in the capture. The commit
+        simply never read it. Two earlier rows (2026-08-12) are the same.
+
+        Those rows are not merely untidy. The number is half the key
+        CANCEL/RESCHEDULE find an appointment by (his.find_active_appointment),
+        so a row stored this way can never be changed by the person who booked
+        it, and the clinic has nothing to ring back on. In the dashboard it
+        renders as the phone "unk" — which is how this was first reported.
+
+        Precedence matches VoiceActionProcessor._execute deliberately, so the two
+        voice write paths cannot disagree about the same call: what the caller
+        read out beats caller ID, because a caller giving a number is choosing
+        the one they want to be reached on.
+        """
+        from backend.services.action_tag import is_placeholder
+
+        for source, candidate in (
+            ("what the caller said", self._call_meta.get("stated_phone")),
+            ("the booking state", self.booking_state.get("patient_phone")),
+            ("caller ID", self._call_meta.get("caller_phone")),
+        ):
+            value = str(candidate or "").strip()
+            if value and not is_placeholder(value):
+                logger.debug("BookingProcessor: phone taken from %s.", source)
+                return value
+        return ""
+
     async def _apply_pending_context_work(self, frame: LLMContextFrame) -> None:
         """Commit whatever this turn armed, and inject what the LLM must know."""
         if self._commit_pending:
@@ -543,11 +582,7 @@ class BookingProcessor(FrameProcessor):
         if not tenant_id:
             return
 
-        phone = (
-            self._call_meta.get("stated_phone")
-            or self.booking_state.get("patient_phone")
-            or ""
-        )
+        phone = self._resolve_patient_phone()
         name = self.booking_state.get("patient_name") or ""
         if not str(phone).strip() and not name.strip():
             return
@@ -811,13 +846,47 @@ class BookingProcessor(FrameProcessor):
         tenant_id = self._tenant.get("id")
         doctor_id = self.booking_state.get("pending_doctor_id")
         slot_time = self.booking_state.get("pending_slot")
-        patient_phone = self.booking_state.get("patient_phone", "unknown")
+        patient_phone = self._resolve_patient_phone()
 
         if not tenant_id or not doctor_id or not slot_time:
             logger.warning(
                 "Confirm heard but booking incomplete (tenant=%s doctor=%s slot=%s) — not committing.",
                 tenant_id, doctor_id, slot_time,
             )
+            return
+
+        context = getattr(frame, "context", None)
+
+        # No number means no row. This used to write the placeholder "unknown"
+        # and report success, which is the worst of the three options: the
+        # caller is told they are booked, the clinic cannot ring them, and the
+        # caller can never cancel or move it because that lookup needs the
+        # number. Ask instead — the [ACTION:] path already refuses on exactly
+        # this condition (action_tag.missing_identity_fields), and the two voice
+        # write paths must not disagree.
+        if not patient_phone:
+            logger.warning(
+                "Confirm heard but no phone number for this caller — asking instead of "
+                "writing a row nobody can be identified from.",
+            )
+            # Re-arm: the details are still good, so a fresh confirm after the
+            # caller gives their number retries this commit rather than
+            # restarting the whole booking.
+            self.booking_state["awaiting_confirm"] = True
+            self.booking_state["confirmed"] = False
+            if context is not None:
+                try:
+                    context.add_message({
+                        "role": "system",
+                        "content": (
+                            "[BOOKING_RESULT success=false] NOT booked: we do not have the "
+                            "caller's phone number, and the clinic cannot hold an appointment "
+                            "without one. Do NOT say it is booked. Ask them for their phone "
+                            "number in one short sentence, and nothing else."
+                        ),
+                    })
+                except Exception as exc:
+                    logger.error("Failed to inject missing-phone result into LLM context: %s", exc)
             return
 
         # Final pre-commit re-check — closes the race window as tightly as
@@ -844,7 +913,6 @@ class BookingProcessor(FrameProcessor):
             self.booking_state["pending_slot"] = None
             self.booking_state["pending_slot_day_str"] = None
             self.booking_state["pending_slot_time_str"] = None
-            context = getattr(frame, "context", None)
             if context is not None:
                 try:
                     context.add_message({
@@ -888,7 +956,6 @@ class BookingProcessor(FrameProcessor):
             reason=(result or {}).get("reason"),
         )
 
-        context = getattr(frame, "context", None)
         if ok:
             self.booking_state["confirmed"] = True
             self.booking_state["awaiting_confirm"] = False
@@ -1057,7 +1124,7 @@ class BookingProcessor(FrameProcessor):
 
             existing = await find_active_appointment(
                 str(tenant_id), state.get("patient_name") or "",
-                state.get("patient_phone") or "",
+                self._resolve_patient_phone(),
             )
             if not existing:
                 logger.info(
@@ -1132,7 +1199,12 @@ class BookingProcessor(FrameProcessor):
         tenant_id = self._tenant.get("id")
         mode = state.get("mode")
         patient_name = state.get("patient_name")
-        patient_phone = state.get("patient_phone", "unknown")
+        # Same resolver as the BOOK commit. Here the number is not just stored,
+        # it is the KEY: _commit_action_to_db finds the existing appointment by
+        # name + phone, so passing the placeholder "unknown" could only ever
+        # return "no appointment found" — reported to the caller as "you have no
+        # appointment" when the truth is that we never looked with their number.
+        patient_phone = self._resolve_patient_phone()
 
         if not tenant_id or not patient_name or mode not in ("cancel", "reschedule"):
             logger.warning(

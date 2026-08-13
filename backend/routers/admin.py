@@ -549,7 +549,11 @@ async def list_all_appointments(
                     if apt.patient_name and apt.patient_name.strip()
                     else f"Patient {str(apt.patient_phone)[-4:]}"
                 ),
-                "patient_phone": (apt.patient_phone[:-4] + "****") if len(apt.patient_phone or "") > 4 else "****",
+                # Full number, not masked — see the reasoning in
+                # backend/routers/appointments.py::list_appointments. This
+                # endpoint is SuperAdmin-gated, so the audience is strictly
+                # narrower than the clinic view that already shows it in full.
+                "patient_phone": apt.patient_phone,
                 "clinic_name": tenant.clinic_name,
                 "doctor_id": str(apt.doctor_id),
                 "doctor_name": (doctor.name if doctor else "—"),
