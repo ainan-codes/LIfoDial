@@ -352,6 +352,15 @@ class VoiceActionProcessor(FrameProcessor):
         self._acted_this_turn: bool = False
         self._repaired_this_turn: bool = False
         self._next_is_followup: bool = False
+        #: True once ANY text has actually been pushed downstream toward TTS in
+        #: this turn. The silence backstop keys off this rather than off which
+        #: recovery branch ran: "the caller heard nothing" is the condition that
+        #: actually matters, and enumerating the branches that can cause it is
+        #: what let this bug survive three fixes. See _speak_backstop.
+        self._spoke_this_turn: bool = False
+        #: ``(action, result)`` of the last action executed this turn, so the
+        #: backstop can state the REAL outcome instead of a generic apology.
+        self._outcome_this_turn: Optional[tuple[str, dict]] = None
 
         self._trace_id: str = new_trace_id()
 
@@ -427,6 +436,7 @@ class VoiceActionProcessor(FrameProcessor):
         self._full += frame.text or ""
 
         if self._holding is False:
+            self._spoke_this_turn = True
             return False  # streaming — push it straight through
 
         self._buf += frame.text or ""
@@ -443,6 +453,7 @@ class VoiceActionProcessor(FrameProcessor):
                 # Only whitespace-only chunks preceded this one, so pushing this
                 # frame emits everything that matters.
                 self._buf = ""
+                self._spoke_this_turn = True
                 return False
 
         # Holding. Has a complete tag arrived?
@@ -496,10 +507,11 @@ class VoiceActionProcessor(FrameProcessor):
                     "VoiceActionProcessor: held a bracketed reply that never became a tag — "
                     "speaking it: %r", speakable_held[:120],
                 )
+                self._spoke_this_turn = True
                 await self.push_frame(TextFrame(speakable_held), direction)
 
         if owed_rerun or not full.strip():
-            await self._flush_rerun(direction)
+            await self._flush_rerun(direction, backstop=True)
             return
 
         speakable = scrub_reply(full)
@@ -531,10 +543,28 @@ class VoiceActionProcessor(FrameProcessor):
                     "it now. It is required to come first; see VOICE_ACTION_TAG_BLOCK."
                 )
                 res = await self._execute(tag)
-                # Re-run the LLM only when the outcome CONTRADICTS what was said.
-                # On success the words the caller heard are now true, and a second
-                # sentence would only repeat them.
-                self._inject(build_result_message(tag.action, res), rerun=not res.get("success"))
+                # Re-run the LLM unless what the caller ALREADY heard is a true
+                # account of the outcome. Two conditions, and the second one was
+                # missing:
+                #
+                #   * the outcome failed — the spoken words now contradict it, or
+                #   * the outcome succeeded but the spoken words never claimed it.
+                #
+                # Only skipping on `success` assumed that a late tag always comes
+                # attached to a confirmation. It does not. Measured live 2026-08-13
+                # (call 7b775fc9): the model spoke "क्या यह समय आपके लिए उपयुक्त
+                # है?" — a QUESTION — and appended a BOOK tag. The booking
+                # succeeded, the re-run was skipped as redundant, and the caller
+                # was left answering a question about an appointment that had
+                # already been made. They said "जी ठीक है" into a system that
+                # thought it was finished.
+                outcome_already_spoken = (
+                    bool(res.get("success")) and claims_any_completion(speakable)
+                )
+                self._inject(
+                    build_result_message(tag.action, res),
+                    rerun=not outcome_already_spoken,
+                )
 
             # ── Recovery 2: talked about acting, without acting ────────────────
             #
@@ -566,11 +596,21 @@ class VoiceActionProcessor(FrameProcessor):
                 self._repaired_this_turn = True
                 self._inject(_REPAIR_INSTRUCTION, rerun=True)
 
-        await self._flush_rerun(direction)
+        await self._flush_rerun(direction, backstop=True)
 
-    async def _flush_rerun(self, direction: FrameDirection) -> None:
-        """Push the LLMRunFrame owed to the pipeline, if any."""
+    async def _flush_rerun(
+        self, direction: FrameDirection, backstop: bool = False,
+    ) -> None:
+        """Push the LLMRunFrame owed to the pipeline, if any.
+
+        ``backstop`` marks the call sites that END a turn. If one of those is
+        reached with no re-run owed and nothing ever spoken, the caller is about
+        to be left in silence, and _speak_backstop is the last thing that can
+        prevent it.
+        """
         if not self._pending_rerun:
+            if backstop:
+                await self._speak_backstop(direction)
             # Nothing more is coming for this turn (e.g. a late tag that
             # succeeded, so the already-spoken reply stands) — the silence timer
             # no longer needs shielding.
@@ -728,6 +768,11 @@ class VoiceActionProcessor(FrameProcessor):
         if res.get("success") and res.get("reason") != "already_at_that_time":
             await self._mark_call_outcome(action)
 
+        # Remembered for the whole turn so the silence backstop can state what
+        # REALLY happened rather than a generic apology — crucially, this is the
+        # case where the row exists and only the telling of it failed.
+        self._outcome_this_turn = (action, res)
+
         return res
 
     def _resolve_date(self, tag: ActionTag) -> str:
@@ -857,7 +902,59 @@ class VoiceActionProcessor(FrameProcessor):
         self._repaired_this_turn = False
         self._pending_rerun = False
         self._next_is_followup = False
+        self._spoke_this_turn = False
+        self._outcome_this_turn = None
         self._is_followup = False
+
+    async def _speak_backstop(self, direction: FrameDirection) -> None:
+        """Say SOMETHING when a turn is about to end having said nothing.
+
+        The last line of defence, and the only one that does not depend on the
+        LLM — which matters because the LLM is what fails here.
+
+        Measured live 2026-08-13 (call 7b775fc9). The caller confirmed, the
+        appointment was written at 08:29:00, and the agent never spoke again; the
+        caller sat saying "हेलो? हेलो?" into a line that was still open. The
+        worker log shows why: two `voice_action` errors nine seconds apart, which
+        is _on_response_end's unspeakable-reply path firing, re-prompting once,
+        getting a second unspeakable reply, and then taking the
+        `_repaired_this_turn` branch — "giving up on this turn rather than
+        looping". Giving up was right. Giving up in SILENCE was not.
+
+        Every previous fix in this family patched one branch. This keys off the
+        condition the caller actually experiences — nothing was spoken — so a
+        future branch that forgets to speak is covered before it is written. That
+        is deliberate: this exact bug has now been reported four times.
+
+        It states the REAL outcome when an action ran this turn, because the
+        common case is that the write succeeded and only the telling of it
+        failed. Saying "sorry, that didn't work" over a booking that exists would
+        trade silence for a lie.
+        """
+        if self._spoke_this_turn:
+            return
+
+        from backend.agent import spoken_fallback
+
+        if self._outcome_this_turn is not None:
+            action, res = self._outcome_this_turn
+            key = spoken_fallback.outcome_key(action, bool(res.get("success")))
+            logger.error(
+                "VoiceActionProcessor: turn ending with nothing spoken after a %s "
+                "(success=%s) — speaking the constant fallback so the caller is not "
+                "left in silence.", action, res.get("success"),
+            )
+        else:
+            key = spoken_fallback.NOT_UNDERSTOOD
+            logger.error(
+                "VoiceActionProcessor: turn ending with nothing spoken and no action "
+                "performed — asking the caller to repeat rather than going silent.",
+            )
+
+        text = spoken_fallback.sentence(key, self._agent_config.get("language"))
+        trace(self._trace_id, VOICE, REPLIED, source="backstop", outcome=key)
+        self._spoke_this_turn = True
+        await self.push_frame(TextFrame(text), direction)
 
     async def _release_held(self, direction: FrameDirection) -> None:
         """Speak text that was held and turned out not to be a machine tag."""
@@ -865,4 +962,5 @@ class VoiceActionProcessor(FrameProcessor):
             return
         text, self._buf = self._buf, ""
         if text.strip():
+            self._spoke_this_turn = True
             await self.push_frame(TextFrame(text), direction)
