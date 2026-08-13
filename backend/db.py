@@ -215,6 +215,90 @@ AsyncSessionLocal = async_sessionmaker(
 async_session = AsyncSessionLocal
 
 
+# ── Reusing ONE connection across a multi-step operation ──────────────────────
+#
+# NullPool means every ``async with AsyncSessionLocal()`` is a fresh TCP + TLS +
+# auth round trip to Supabase. Measured against the live database on 2026-08-13:
+# **1.97-3.01s, median 2.31s**, for a session that only runs ``SELECT 1``. The
+# work is not the cost; the connect is.
+#
+# That made the SESSION COUNT of an operation its latency. Measured the same day,
+# per voice action, before this existed:
+#
+#     BOOK         4 sessions   ~9.2s   (appointment_for_call, find_doctor,
+#                                        availability gate, create_appointment)
+#     RESCHEDULE   4 sessions   ~9.2s
+#     CANCEL       1 session    ~2.3s
+#     ...plus 2 more per turn for the availability + caller-appointment prompt
+#     blocks, and ~1.6-2.7s for each LLM call.
+#
+# which is how a booking turn reached the 15-31s measured on live calls. For
+# contrast, the 11,951-character system prompt costs only ~0.1-0.2s of that: the
+# LLM was never the bottleneck, and trimming the prompt would have been the wrong
+# fix.
+#
+# WHY THIS AND NOT A CONNECTION POOL. A pool is the obvious answer and it does not
+# work here — see the long comment above ``DB_POOL_SIZE``. livekit-agents gives
+# each job its own event loop and closes it when the job ends, so pooled
+# connections outlive the loop they were created on and corrupt. That was tried,
+# measured, and reverted on 2026-07-31. This is the part of the win that IS
+# available without owning a long-lived loop: stop opening four connections where
+# one would do.
+#
+# HOW IT WORKS. ``session_scope()`` puts one session in a ContextVar for the
+# duration of a block. ``scoped_session()`` hands that session to anything inside
+# the block, and opens a normal short-lived one when there is no scope — so every
+# existing caller (the API, tests, one-off scripts) is completely unaffected.
+# A ContextVar, not a global, because concurrent calls share this process.
+#
+# TRANSACTION SEMANTICS. Inside a scope the session is shared, so a ``commit()``
+# in one step commits everything staged so far, and a ``rollback()`` discards it.
+# That is correct for the booking actions this wraps — one logical operation whose
+# earlier steps are reads — but it is why this is opt-in per call site rather than
+# applied globally.
+import contextvars
+from contextlib import asynccontextmanager
+
+_scoped: contextvars.ContextVar = contextvars.ContextVar("lifodial_db_session", default=None)
+
+
+@asynccontextmanager
+async def session_scope():
+    """Reuse ONE database connection for everything inside this block.
+
+    Nesting is safe: an inner scope reuses the outer one rather than opening a
+    second connection, so a helper that opens its own scope stays correct when
+    called from inside a larger one.
+    """
+    existing = _scoped.get()
+    if existing is not None:
+        yield existing
+        return
+    async with AsyncSessionLocal() as session:
+        token = _scoped.set(session)
+        try:
+            yield session
+        finally:
+            _scoped.reset(token)
+
+
+@asynccontextmanager
+async def scoped_session():
+    """The session to use for one step of work.
+
+    Inside a ``session_scope()`` this is the shared session, and it is NOT closed
+    on exit — the scope owns its lifetime. Outside one it is an ordinary
+    short-lived session, closed as usual. Drop-in for
+    ``async with AsyncSessionLocal() as s``.
+    """
+    existing = _scoped.get()
+    if existing is not None:
+        yield existing
+        return
+    async with AsyncSessionLocal() as session:
+        yield session
+
+
 class Base(DeclarativeBase):
     pass
 

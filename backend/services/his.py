@@ -7,7 +7,7 @@ from datetime import datetime, time as dt_time, timedelta, timezone
 import json
 
 from backend.config import settings
-from backend.db import AsyncSessionLocal
+from backend.db import AsyncSessionLocal, scoped_session, session_scope
 from backend.models.doctor import Doctor
 from backend.models.appointment import Appointment
 from backend.services.timeutil import IST, ist_now
@@ -206,7 +206,7 @@ async def get_doctors(tenant_id: str, specialization: str = None) -> List[dict]:
         # Check HIS API setup in the future
         # if settings.oxzygen_base_url: ... (HTTPX Call) ...
         # Fallback to local database logic
-        async with AsyncSessionLocal() as session:
+        async with scoped_session() as session:
             stmt = select(Doctor).where(Doctor.tenant_id == tenant_id)
             result = await session.execute(stmt)
             db_docs = result.scalars().all()
@@ -346,7 +346,7 @@ async def create_appointment(
     # Future HIS Integration: POST to /appointments
     # if settings.oxzygen_base_url: ...
 
-    async with AsyncSessionLocal() as session:
+    async with scoped_session() as session:
         # Idempotency guard: a call can only produce one booking. Retries of
         # the same confirmed call (reconnects, duplicate confirm keywords)
         # must not create a second appointment row.
@@ -588,7 +588,7 @@ async def appointment_for_call(tenant_id: str, call_id: str) -> dict | None:
         return None
     from backend.services.timeutil import format_ist_clock, to_ist
 
-    async with AsyncSessionLocal() as session:
+    async with scoped_session() as session:
         appt = (
             await session.execute(
                 select(Appointment).where(
@@ -623,7 +623,7 @@ async def caller_appointments(tenant_id: str, phone: str, name: str = "") -> Lis
 
     out: List[dict] = []
     try:
-        async with AsyncSessionLocal() as session:
+        async with scoped_session() as session:
             rows = await active_appointments_for_phone(session, tenant_id, phone)
             if not rows and (name or "").strip():
                 appt = await _find_active_appointment_in_session(
@@ -664,7 +664,7 @@ async def find_active_appointment(tenant_id: str, name: str, phone: str) -> dict
     Returns a plain dict (not the ORM object, which would be detached once the
     session closes) with the fields a pre-commit availability check needs.
     """
-    async with AsyncSessionLocal() as session:
+    async with scoped_session() as session:
         appt = await _find_active_appointment_in_session(session, tenant_id, name, phone)
         if not appt:
             return None
@@ -698,7 +698,7 @@ async def sync_appointment_to_db(action: str, name: str, phone: str, date_str: s
     this appointment booked", so rewriting it on a later edit would erase that.
     """
     try:
-        async with AsyncSessionLocal() as session:
+        async with scoped_session() as session:
             # Clean inputs
             name_clean = name.strip()
             phone_clean = phone.strip()
@@ -831,7 +831,7 @@ async def find_doctor_for_booking(
     placeholder — an unknown or unspecified name yields ``(None, names)`` so the
     caller can refuse/redirect honestly (audit FIX: no fabricated bookings).
     """
-    async with AsyncSessionLocal() as session:
+    async with scoped_session() as session:
         docs = (
             await session.execute(select(Doctor).where(Doctor.tenant_id == tenant_id))
         ).scalars().all()
@@ -991,7 +991,36 @@ async def execute_booking_action(
     confirmed to a patient that the doctor's real schedule and existing
     bookings do not actually have open. RESCHEDULE previously had NO
     availability check of any kind: it wrote whatever time it was handed.
+
+    ONE connection is used for the whole action. Every step below used to open
+    its own, and with NullPool each one is a fresh TCP + TLS + auth round trip to
+    Supabase — measured at a median of 2.31s each on 2026-08-13. A BOOK made four
+    of them (appointment_for_call, find_doctor_for_booking, the availability
+    gate, create_appointment), so ~9.2s of a booking turn was spent connecting
+    rather than doing anything. See backend/db.py::session_scope.
     """
+    async with session_scope():
+        return await _execute_booking_action(
+            action=action, tenant_id=tenant_id, name=name, phone=phone,
+            date_str=date_str, time_str=time_str, doctor_name=doctor_name,
+            notes=notes, call_id=call_id, source=source,
+        )
+
+
+async def _execute_booking_action(
+    *,
+    action: str,
+    tenant_id: str,
+    name: str,
+    phone: str,
+    date_str: str,
+    time_str: str,
+    doctor_name: str,
+    notes: str | None = None,
+    call_id: str | None = None,
+    source: str | None = None,
+) -> dict:
+    """The body of execute_booking_action, run inside its session scope."""
     act = (action or "").upper().strip()
 
     # "N/A" (and friends) in the Date field means "no day was given", not a day

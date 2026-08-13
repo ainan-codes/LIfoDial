@@ -23,7 +23,7 @@ from datetime import date as date_cls, datetime, time as time_cls, timedelta, ti
 
 from sqlalchemy import select
 
-from backend.db import AsyncSessionLocal
+from backend.db import AsyncSessionLocal, scoped_session
 from backend.models.appointment import Appointment
 from backend.models.doctor import Doctor
 from backend.models.doctor_availability import DoctorAvailability
@@ -159,7 +159,7 @@ async def compute_available_slots(
     returns []. An on-leave doctor (is_available=False) always returns [],
     regardless of any configured schedule.
     """
-    async with AsyncSessionLocal() as session:
+    async with scoped_session() as session:
         return await _slots_in_session(session, tenant_id, doctor_id, target_date)
 
 
@@ -182,7 +182,7 @@ async def availability_digest(
     if not ids or not dates:
         return out
 
-    async with AsyncSessionLocal() as session:
+    async with scoped_session() as session:
         bookable = {
             str(d.id) for d in (
                 await session.execute(
@@ -253,7 +253,7 @@ async def is_doctor_open_at(
     # One session for the whole check (it used to open a second one for the
     # slot computation) — every booking and reschedule now pays this check
     # immediately before its write, so the handshake count matters.
-    async with AsyncSessionLocal() as session:
+    async with scoped_session() as session:
         doctor = (
             await session.execute(
                 select(Doctor).where(Doctor.id == doctor_id, Doctor.tenant_id == tenant_id)

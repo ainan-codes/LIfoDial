@@ -186,77 +186,93 @@ async def real_availability_block(tenant_id: str, recent_text: str = "") -> str:
     that the clinic has no doctors.
     """
     try:
+        from backend.db import session_scope
         from backend.services.his import get_doctors
         from backend.services.timeutil import format_ist_clock, ist_now, to_ist
 
-        doctors = await get_doctors(tenant_id)
-        if not doctors:
-            return _EMPTY_ROSTER_BLOCK
+        # The roster lookup and the slot digest are two separate queries, and
+        # under NullPool two separate Supabase handshakes — ~2.3s each, measured
+        # 2026-08-13. This block is built on the caller's turn, so that was 4.6s
+        # of a live call spent connecting twice to the same database.
+        # See backend/db.py::session_scope.
+        async with session_scope():
+            return await _build_availability_block(
+                tenant_id, recent_text, get_doctors, format_ist_clock, ist_now, to_ist,
+            )
+    except Exception as exc:
+        logger.warning("Availability block build failed (non-fatal): %s", exc)
+    return _LOOKUP_FAILED_BLOCK
 
-        # Which days? Exactly the ones being discussed; today + tomorrow only
-        # when nothing specific was said, so a patient who asks "what's free?"
-        # still gets real numbers. Listing extra days would only spend tokens
-        # and dilute the day that is actually under discussion.
-        today = ist_now().date()
-        dates = dates_mentioned(recent_text)[:MAX_DAYS] or [
-            today, today + _dt.timedelta(days=1),
-        ]
 
-        # Which doctors? The ones named in the conversation, else the roster.
-        low = (recent_text or "").lower()
+async def _build_availability_block(
+    tenant_id, recent_text, get_doctors, format_ist_clock, ist_now, to_ist,
+) -> str:
+    """The body of real_availability_block, run inside its session scope."""
+    doctors = await get_doctors(tenant_id)
+    if not doctors:
+        return _EMPTY_ROSTER_BLOCK
 
-        def _mentioned(doc: dict) -> bool:
-            words = [w for w in (doc.get("name") or "").lower().split() if len(w) > 2]
-            words += [w for w in (doc.get("specialization") or "").lower().split() if len(w) > 2]
-            return any(w in low for w in words)
+    # Which days? Exactly the ones being discussed; today + tomorrow only
+    # when nothing specific was said, so a patient who asks "what's free?"
+    # still gets real numbers. Listing extra days would only spend tokens
+    # and dilute the day that is actually under discussion.
+    today = ist_now().date()
+    dates = dates_mentioned(recent_text)[:MAX_DAYS] or [
+        today, today + _dt.timedelta(days=1),
+    ]
 
-        named = [d for d in doctors if _mentioned(d)]
-        chosen = (named or doctors)[:MAX_DOCTORS]
-        bookable = [d for d in chosen if d.get("is_available", True)]
+    # Which doctors? The ones named in the conversation, else the roster.
+    low = (recent_text or "").lower()
 
-        digest = await _cached_digest(tenant_id, [d["id"] for d in bookable], dates)
+    def _mentioned(doc: dict) -> bool:
+        words = [w for w in (doc.get("name") or "").lower().split() if len(w) > 2]
+        words += [w for w in (doc.get("specialization") or "").lower().split() if len(w) > 2]
+        return any(w in low for w in words)
 
-        lines = [f"Today is {today.strftime('%A, %d/%m/%Y')} (IST). All times are IST."]
-        lines.append("Doctors at this clinic:")
-        for d in doctors:
-            label = f"  - {d['name']} ({d.get('specialization') or 'Specialist'})"
-            if not d.get("is_available", True):
-                reason = f" — {d['leave_reason']}" if d.get("leave_reason") else ""
-                label += f" — ON LEAVE{reason}, cannot be booked"
-            lines.append(label)
+    named = [d for d in doctors if _mentioned(d)]
+    chosen = (named or doctors)[:MAX_DOCTORS]
+    bookable = [d for d in chosen if d.get("is_available", True)]
 
-        lines.append("Real open appointment slots (already excludes booked times):")
-        for d in bookable:
-            for day in dates:
-                slots = digest.get((str(d["id"]), day)) or []
-                when = day.strftime("%A %d/%m/%Y")
-                if not slots:
-                    lines.append(
-                        f"  - {d['name']}, {when}: NO open slots — do not offer any time that day."
-                    )
-                    continue
-                shown = [format_ist_clock(to_ist(s)) for s in slots[:MAX_SLOTS_SHOWN]]
-                extra = len(slots) - len(shown)
+    digest = await _cached_digest(tenant_id, [d["id"] for d in bookable], dates)
+
+    lines = [f"Today is {today.strftime('%A, %d/%m/%Y')} (IST). All times are IST."]
+    lines.append("Doctors at this clinic:")
+    for d in doctors:
+        label = f"  - {d['name']} ({d.get('specialization') or 'Specialist'})"
+        if not d.get("is_available", True):
+            reason = f" — {d['leave_reason']}" if d.get("leave_reason") else ""
+            label += f" — ON LEAVE{reason}, cannot be booked"
+        lines.append(label)
+
+    lines.append("Real open appointment slots (already excludes booked times):")
+    for d in bookable:
+        for day in dates:
+            slots = digest.get((str(d["id"]), day)) or []
+            when = day.strftime("%A %d/%m/%Y")
+            if not slots:
                 lines.append(
-                    f"  - {d['name']}, {when}: " + ", ".join(shown)
-                    + (f", and {extra} further slots after that (this list was cut short — "
-                       "do NOT tell the patient a later time is unavailable)" if extra > 0 else "")
+                    f"  - {d['name']}, {when}: NO open slots — do not offer any time that day."
                 )
+                continue
+            shown = [format_ist_clock(to_ist(s)) for s in slots[:MAX_SLOTS_SHOWN]]
+            extra = len(slots) - len(shown)
+            lines.append(
+                f"  - {d['name']}, {when}: " + ", ".join(shown)
+                + (f", and {extra} further slots after that (this list was cut short — "
+                   "do NOT tell the patient a later time is unavailable)" if extra > 0 else "")
+            )
 
-        return (
-            "\n\n--- REAL DOCTOR AVAILABILITY (live from this clinic's schedule) ---\n"
-            + "\n".join(lines)
-            + "\n--- END REAL DOCTOR AVAILABILITY ---\n"
-            "This section is the ONLY source of truth for who works here and what is "
-            "free. When the patient asks which doctors you have, or what is available, "
-            "answer from the list above IMMEDIATELY — never say you will check and get "
-            "back to them, because you cannot send a later message. Only offer times "
-            "listed above for that doctor and that day, and if they ask for a listed day "
-            "at a time that is NOT listed, say plainly that it is taken and offer the "
-            "listed times instead. For a day not covered above, just ask them to confirm "
-            "the day — the system checks every time against the real schedule before "
-            "anything is saved, so never guess and never invent a time.\n"
-        )
-    except Exception as e:
-        logger.warning("Could not build the real availability block: %s", e, exc_info=True)
-        return _LOOKUP_FAILED_BLOCK
+    return (
+        "\n\n--- REAL DOCTOR AVAILABILITY (live from this clinic's schedule) ---\n"
+        + "\n".join(lines)
+        + "\n--- END REAL DOCTOR AVAILABILITY ---\n"
+        "This section is the ONLY source of truth for who works here and what is "
+        "free. When the patient asks which doctors you have, or what is available, "
+        "answer from the list above IMMEDIATELY — never say you will check and get "
+        "back to them, because you cannot send a later message. Only offer times "
+        "listed above for that doctor and that day, and if they ask for a listed day "
+        "at a time that is NOT listed, say plainly that it is taken and offer the "
+        "listed times instead. For a day not covered above, just ask them to confirm "
+        "the day — the system checks every time against the real schedule before "
+        "anything is saved, so never guess and never invent a time.\n"
+    )
