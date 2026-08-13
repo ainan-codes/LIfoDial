@@ -727,7 +727,10 @@ async def _load_tenant_and_config(
         "tts_speed":       metadata.get("tts_speed"),
         "stt_model":       metadata.get("stt_model", "saaras:v2"),
         "stt_language":    metadata.get("stt_language", "hi-IN"),
-        "llm_model":       metadata.get("llm_model", "gemini-2.0-flash"),
+        # "gemini-2.0-flash" was RETIRED — it 404s on generateContent while still
+        # appearing in ListModels (verified 2026-08-13). See
+        # resilience.PROVIDER_DEFAULT_MODEL for why this is an alias, not a pin.
+        "llm_model":       metadata.get("llm_model", agent_defaults.DEFAULT_LLM_MODEL),
         # The agent's EXPLICIT LLM provider choice. Without this key,
         # resilience.select_llm_provider() only ever saw "" and had to guess the
         # provider from the model-name prefix (_provider_from_model), so choosing
@@ -821,7 +824,8 @@ async def _load_tenant_and_config(
                         "tts_speed":           cfg.tts_speed,
                         "stt_model":           cfg.stt_model or "saaras:v2",
                         "stt_language":        cfg.stt_language or "hi-IN",
-                        "llm_model":           cfg.llm_model or "gemini-2.0-flash",
+                        # Retired model — see the note at the other default above.
+                        "llm_model":           cfg.llm_model or agent_defaults.DEFAULT_LLM_MODEL,
                         # See the note on "llm_provider" in the metadata-only branch
                         # above — the AgentConfig row has always had this column, the
                         # pipeline just never read it, so the provider was inferred

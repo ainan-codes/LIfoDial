@@ -83,7 +83,20 @@ log = logging.getLogger(__name__)
 PROVIDER_ORDER = ["gemini", "groq", "openai", "deepseek"]
 
 PROVIDER_DEFAULT_MODEL = {
-    "gemini": "gemini-2.5-flash",
+    # An ALIAS, not a pinned version. Verified against the live API on
+    # 2026-08-13: "gemini-2.5-flash" and "gemini-2.0-flash" — the two values this
+    # file and pipeline.py used to carry — both now return
+    #   404 "This model is no longer available to new users"
+    # while still appearing in the ListModels response, so nothing that merely
+    # enumerates models would have caught it. Gemini is FIRST in PROVIDER_ORDER,
+    # so this is the model the failover reaches for when Groq rate-limits, and a
+    # 404 there means the fallback silently has no fallback.
+    #
+    # Google retires dated Gemini snapshots on a rolling basis; a pinned id here
+    # is a scheduled outage. The "-latest" aliases track whatever is current and
+    # were confirmed generating on the same date. Same reasoning as the no-
+    # hardcoded-model-list rule in services/groq_catalog.py.
+    "gemini": "gemini-flash-latest",
     "groq": "llama-3.3-70b-versatile",
     "openai": "gpt-4o-mini",
     "deepseek": "deepseek-chat",
