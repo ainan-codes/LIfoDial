@@ -710,7 +710,9 @@ async def _load_tenant_and_config(
         "silence_timeout_seconds": int(metadata.get("silence_timeout_seconds", 10) or 10),
         "max_duration_seconds":    int(metadata.get("max_duration_seconds", 300) or 300),
         "end_call_phrases":        metadata.get("end_call_phrases") or [],
-        "end_call_message":        metadata.get("end_call_message", "Thank you for calling. Goodbye!"),
+        # None (not the hardcoded English phrase) when the clinic hasn't set
+        # one — resolved to a language-appropriate default just before return.
+        "end_call_message":        metadata.get("end_call_message"),
         "recording_consent_plan":  metadata.get("recording_consent_plan", "none"),
         # No real agent_id (ad-hoc/metadata-only test room) => nothing to
         # unpublish, so default to allowed. Overwritten below when a real
@@ -728,6 +730,9 @@ async def _load_tenant_and_config(
 
     if not tenant_id and not agent_id:
         log.warning("No tenant_id or agent_id in room metadata — using defaults.")
+        if not agent_config.get("end_call_message"):
+            from backend.agent.resilience import default_end_call_message
+            agent_config["end_call_message"] = default_end_call_message(agent_config["language"])
         return agent_config, tenant
 
     try:
@@ -793,7 +798,7 @@ async def _load_tenant_and_config(
                         "silence_timeout_seconds": int(cfg.silence_timeout_seconds or 10),
                         "max_duration_seconds":    int(cfg.max_duration_seconds or 300),
                         "end_call_phrases":        cfg.end_call_phrases or [],
-                        "end_call_message":        cfg.end_call_message or "Thank you for calling. Goodbye!",
+                        "end_call_message":        cfg.end_call_message or None,
                         "recording_consent_plan":  getattr(cfg, "recording_consent_plan", None) or "none",
                         # Clinic-owned facts the receptionist must know: working
                         # hours, address, emergency number, services, FAQs. This is
@@ -896,6 +901,17 @@ async def _load_tenant_and_config(
                 await db.rollback()
             except Exception as rb_exc:
                 log.warning("Rollback after failed config load also failed: %s", rb_exc)
+
+    # Only a bare TTSSpeakFrame (see speak_and_end_call in
+    # call_logger_processor.py) — it never passes through the LLM, so unlike
+    # every other reply it cannot pick up the call's language on its own.
+    # Resolved here, after "language" has settled to its final value above, so
+    # a clinic that never configured a custom end_call_message still gets one
+    # spoken in the call's actual language instead of a hardcoded English
+    # phrase every caller heard regardless of what language the call was in.
+    if not agent_config.get("end_call_message"):
+        from backend.agent.resilience import default_end_call_message
+        agent_config["end_call_message"] = default_end_call_message(agent_config["language"])
 
     return agent_config, tenant
 
@@ -1875,19 +1891,26 @@ async def entrypoint(ctx) -> None:
         )
 
     # Custom processors — booking state machine + call logging
-    booking_processor = BookingProcessor(
-        tenant=tenant,
-        agent_config=agent_config,
-        call_meta=call_meta,
-    )
-    # Constructed BEFORE voice_action so its action_in_progress flag (see
-    # _enforce_silence_timeout) exists to be passed in — the two have no other
-    # dependency on each other's order.
+    # call_logger is constructed FIRST now: both booking_processor and
+    # voice_action need its action_in_progress flag (see
+    # _enforce_silence_timeout) so the silence watchdog can see EITHER
+    # processor's own DB commit in flight, not just voice_action's. Before this,
+    # a cancel/reschedule committed via booking_processor's keyword-confirm path
+    # (the FSM, still live in production alongside voice_action's [ACTION:] tag
+    # mechanism) raised nothing, so a slow commit + LLM/TTS turn could outrun
+    # the silence timeout and end the call with the hardcoded end_call_message
+    # BEFORE the caller ever heard whether their booking succeeded.
     call_logger = CallLoggerProcessor(
         tenant_id=tenant_id or "",
         agent_id=agent_id,
         call_meta=call_meta,
         agent_config=agent_config,
+    )
+    booking_processor = BookingProcessor(
+        tenant=tenant,
+        agent_config=agent_config,
+        call_meta=call_meta,
+        call_logger=call_logger,
     )
     # Executes the [ACTION: …] tags the MODEL emits — the mechanism that makes a
     # spoken "your appointment is booked" correspond to a real row. The FSM above

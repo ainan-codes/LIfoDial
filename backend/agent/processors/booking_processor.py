@@ -160,6 +160,13 @@ class BookingProcessor(FrameProcessor):
         tenant (dict): Tenant record with 'id', 'clinic_name', 'doctors' list.
         agent_config (dict): Agent config with language, voice settings etc.
         call_meta (dict): Call metadata — caller_phone, call_record_id, etc.
+        call_logger (CallLoggerProcessor | None): Set so this processor's own
+            AWAITed DB commits can raise call_logger.action_in_progress while
+            they're in flight — see _commit_and_inject_result and
+            _commit_and_inject_action_result. Without it, _enforce_silence_timeout
+            (pipeline.py) has no way to know this processor is mid-write, and the
+            silence clock can outrun a real book/cancel/reschedule round trip and
+            hang up before the caller ever hears whether it succeeded.
     """
 
     def __init__(
@@ -167,12 +174,14 @@ class BookingProcessor(FrameProcessor):
         tenant: dict,
         agent_config: dict,
         call_meta: dict,
+        call_logger=None,
     ) -> None:
         super().__init__()
 
         self._tenant = tenant
         self._agent_config = agent_config
         self._call_meta = call_meta
+        self._call_logger = call_logger
 
         # ── Booking state ─────────────────────────────────────────────────────
         self.booking_state: dict = {
@@ -775,6 +784,20 @@ class BookingProcessor(FrameProcessor):
         return parse_slot_datetime(self.booking_state.get("pending_slot_day_str"), time_str)
 
     async def _commit_and_inject_result(self, frame: LLMContextFrame) -> None:
+        """Raises call_logger.action_in_progress for the duration of the real
+        commit below — see the constructor docstring's call_logger note — then
+        always lowers it again, even on an early return or an exception, so a
+        failed commit can never leave the silence watchdog permanently paused.
+        """
+        if self._call_logger is not None:
+            self._call_logger.action_in_progress = True
+        try:
+            await self._do_commit_and_inject_result(frame)
+        finally:
+            if self._call_logger is not None:
+                self._call_logger.action_in_progress = False
+
+    async def _do_commit_and_inject_result(self, frame: LLMContextFrame) -> None:
         """AWAIT the appointment DB write, then inject the REAL outcome into the
         LLM context carried by this frame — before the LLM generates.
 
@@ -1083,6 +1106,20 @@ class BookingProcessor(FrameProcessor):
         return day_part, time_part
 
     async def _commit_and_inject_action_result(self, frame: LLMContextFrame) -> None:
+        """Raises call_logger.action_in_progress for the duration of the real
+        commit below — see the constructor docstring's call_logger note — then
+        always lowers it again, even on an early return or an exception, so a
+        failed commit can never leave the silence watchdog permanently paused.
+        """
+        if self._call_logger is not None:
+            self._call_logger.action_in_progress = True
+        try:
+            await self._do_commit_and_inject_action_result(frame)
+        finally:
+            if self._call_logger is not None:
+                self._call_logger.action_in_progress = False
+
+    async def _do_commit_and_inject_action_result(self, frame: LLMContextFrame) -> None:
         """AWAIT the cancel/reschedule DB write, then inject the REAL outcome
         into the LLM context — the cancel/reschedule analogue of
         _commit_and_inject_result above, kept as a separate method (and a

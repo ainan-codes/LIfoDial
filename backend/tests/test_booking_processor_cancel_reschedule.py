@@ -197,6 +197,43 @@ async def test_successful_reschedule_commit_passes_new_slot_separately():
 
 
 @pytest.mark.asyncio
+async def test_reschedule_commit_raises_action_in_progress_while_awaited():
+    """pipeline.py's _enforce_silence_timeout pins its idle clock to "now"
+    while call_logger.action_in_progress is True, so the caller's own
+    reschedule/cancel round trip can never outrun the silence timeout and get
+    the call hung up before they hear whether it succeeded. Before this,
+    BookingProcessor's own commit never touched that flag at all — only
+    VoiceActionProcessor did — so a call driven through the keyword-confirm
+    FSM (this file) had no such protection."""
+
+    class FakeCallLogger:
+        def __init__(self):
+            self.action_in_progress = False
+
+    call_logger = FakeCallLogger()
+    proc = _make_processor()
+    proc._call_logger = call_logger
+    with _slot_is_open():
+        await proc._handle_transcription("I want to reschedule my appointment")
+        await proc._handle_transcription("my name is Priya, tomorrow at 5 pm")
+        await proc._handle_transcription("yes")
+
+    busy_during_commit = None
+
+    async def fake_commit(**kwargs):
+        nonlocal busy_during_commit
+        busy_during_commit = call_logger.action_in_progress
+        return True, {"appointment_id": "appt-99"}
+
+    frame = _ctx_frame()
+    with patch.object(bp_mod, "_commit_action_to_db", fake_commit):
+        await proc._commit_and_inject_action_result(frame)
+
+    assert busy_during_commit is True, "action_in_progress must be True while the DB write is in flight"
+    assert call_logger.action_in_progress is False, "action_in_progress must be lowered again once the commit finishes"
+
+
+@pytest.mark.asyncio
 async def test_not_found_injects_honest_failure_and_allows_retry():
     proc = _make_processor()
     await proc._handle_transcription("I want to cancel my appointment")

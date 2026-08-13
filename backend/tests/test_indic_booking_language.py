@@ -306,7 +306,7 @@ def test_the_commit_receives_the_day_and_time_separately():
 
     from backend.agent.processors import booking_processor as bp
 
-    src = inspect.getsource(bp.BookingProcessor._commit_and_inject_result)
+    src = inspect.getsource(bp.BookingProcessor._do_commit_and_inject_result)
     assert 'slot_date=self.booking_state.get("pending_slot_day_str")' in src
     assert 'slot_time=self.booking_state.get("pending_slot_time_str")' in src
 

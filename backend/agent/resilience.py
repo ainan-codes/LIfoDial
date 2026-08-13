@@ -387,6 +387,30 @@ def fallback_phrase(language: str) -> str:
     return _FALLBACK_PHRASES.get(language, _DEFAULT_FALLBACK)
 
 
+# ── Default end-of-call phrase (agent's language) ─────────────────────────────
+# Spoken by speak_and_end_call() (call_logger_processor.py) via a bare
+# TTSSpeakFrame — it never passes through the LLM, so unlike every other reply
+# it cannot pick up the call's language on its own. Before this, every call in
+# every language ended with the literal English default below; a clinic that
+# sets its own custom end_call_message (AgentConfig.end_call_message) is
+# unaffected — this is only the fallback for clinics that never configured one.
+_END_CALL_PHRASES = {
+    "hi-IN": "Hamein call karne ke liye dhanyavaad. Namaste!",
+    "en-IN": "Thank you for calling. Goodbye!",
+    "ta-IN": "அழைத்ததற்கு நன்றி. போய் வருகிறேன்!",
+    "te-IN": "కాల్ చేసినందుకు ధన్యవాదాలు. వీడ్కోలు!",
+    "kn-IN": "ಕರೆ ಮಾಡಿದ್ದಕ್ಕೆ ಧನ್ಯವಾದಗಳು. ವಿದಾಯ!",
+    "ml-IN": "വിളിച്ചതിന് നന്ദി. വീണ്ടും കാണാം!",
+    "mr-IN": "कॉल केल्याबद्दल धन्यवाद. नमस्कार!",
+    "bn-IN": "কল করার জন্য ধন্যবাদ। বিদায়!",
+}
+_DEFAULT_END_CALL_MESSAGE = _END_CALL_PHRASES["en-IN"]
+
+
+def default_end_call_message(language: str) -> str:
+    return _END_CALL_PHRASES.get(language, _DEFAULT_END_CALL_MESSAGE)
+
+
 class ResilienceProcessor(FrameProcessor):
     """Transparent processor placed at the END of the pipeline. Watches every
     frame flowing downstream; on an ErrorFrame (LLM or TTS provider failure) it
