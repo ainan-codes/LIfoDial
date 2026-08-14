@@ -62,6 +62,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Read-only, but be explicit: nothing here may write.
 os.environ.setdefault("ENVIRONMENT", "production")
 
+# Transcripts are Hindi, Malayalam, Tamil… and a Windows console defaults to
+# cp1252, which raises UnicodeEncodeError on the first Devanagari character —
+# i.e. the tool for reading these calls would crash on exactly the calls worth
+# reading. `errors="replace"` keeps a console that genuinely cannot render a
+# script printing everything else rather than dying.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001  (a stream that cannot be reconfigured)
+        pass
+
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
