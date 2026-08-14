@@ -50,6 +50,15 @@ text before anything is spoken.
     hears is generated from the real result. This is deliberately identical to
     what the chat path does with its phase-1 text.
 
+    That costs a Supabase connect plus a whole second LLM round trip, and until
+    it finishes there is by construction nothing true to say — so the line goes
+    quiet for four to six seconds on the one turn where the caller most wants to
+    hear something. It cannot be made shorter without speaking an outcome that
+    is not known yet, so it is FILLED instead: if the write is still running
+    after FILLER_AFTER_SECONDS, the caller is told, in their language, that it
+    is being done. The filler claims no outcome and does NOT count as having
+    spoken — see _arm_filler and _mark_spoke.
+
 * Two recovery paths for a model that ignores the instructions:
 
   - tag emitted LATE (after prose that was already spoken): the write still
@@ -126,6 +135,29 @@ from backend.services.booking_trace import (
 #: pipeline.py), so the shield expiring gives the caller a real answer before the
 #: watchdog would end their call outright.
 BUSY_TIMEOUT_SECONDS = 12.0
+
+#: How long the line may stay quiet after a write has actually STARTED before the
+#: caller is told, in words, that it is being worked on.
+#:
+#: An action turn is the slowest turn this agent has, and none of it is a fault:
+#: ``execute_booking_action`` is one Supabase connect (~2.3s), and the reply that
+#: describes its outcome is a whole second LLM round trip after that. Four to six
+#: seconds of dead air, every time, on the one turn where the caller most wants to
+#: hear something. Reported 2026-08-14 as "it goes silent when it makes the
+#: booking", with everything else working.
+#:
+#: The silence cannot be removed — the outcome is not known until the write
+#: returns, and this system will not speak an outcome it does not know (that is
+#: the whole point of processors/voice_action.py). So it is FILLED instead.
+#:
+#: Delayed rather than immediate, because the fast paths are genuinely fast:
+#: every local validation failure (invalid_time, missing_details, disabled)
+#: returns in microseconds without touching the database, and prefacing those
+#: with "let me book that for you now" would narrate work that never started.
+#: 1.2s sits below the one thing that is always slow (the connect) and above
+#: everything that is not, so in production it fires on every real write and on
+#: nothing else.
+FILLER_AFTER_SECONDS = 1.2
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +347,7 @@ class VoiceActionProcessor(FrameProcessor):
         call_meta: dict,
         call_logger=None,
         busy_timeout_seconds: float = BUSY_TIMEOUT_SECONDS,
+        filler_after_seconds: float = FILLER_AFTER_SECONDS,
     ) -> None:
         super().__init__()
         self._context = context
@@ -323,8 +356,14 @@ class VoiceActionProcessor(FrameProcessor):
         self._call_meta = call_meta or {}
         self._call_logger = call_logger
         self._busy_timeout = float(busy_timeout_seconds)
+        self._filler_after = float(filler_after_seconds)
         #: The independent watchdog on _set_busy(True) — see _set_busy.
         self._busy_timer: Optional[asyncio.Task] = None
+        #: The "I'm doing it now" timer — see _arm_filler.
+        self._filler_timer: Optional[asyncio.Task] = None
+        #: One filler per caller utterance. A second one would be the agent
+        #: telling the caller to wait twice for the same request.
+        self._filler_spoken: bool = False
         #: The direction to speak in if that watchdog has to fire. Captured from
         #: real frame flow rather than assumed, so the backstop cannot be pushed
         #: the wrong way by a timer that has no frame of its own.
@@ -457,7 +496,7 @@ class VoiceActionProcessor(FrameProcessor):
         self._full += frame.text or ""
 
         if self._holding is False:
-            self._spoke_this_turn = True
+            self._mark_spoke()
             return False  # streaming — push it straight through
 
         self._buf += frame.text or ""
@@ -474,7 +513,7 @@ class VoiceActionProcessor(FrameProcessor):
                 # Only whitespace-only chunks preceded this one, so pushing this
                 # frame emits everything that matters.
                 self._buf = ""
-                self._spoke_this_turn = True
+                self._mark_spoke()
                 return False
 
         # Holding. Has a complete tag arrived?
@@ -620,7 +659,11 @@ class VoiceActionProcessor(FrameProcessor):
                 await self._speak_backstop(direction)
             # Nothing more is coming for this turn (e.g. a late tag that
             # succeeded, so the already-spoken reply stands) — the silence timer
-            # no longer needs shielding.
+            # no longer needs shielding, and there is no longer a gap to fill.
+            # (The backstop above has already spoken if this turn produced
+            # nothing, so a filler firing after this point would ask the caller
+            # to wait for something that has finished.)
+            self._cancel_filler()
             self._set_busy(False)
             return
         self._pending_rerun = False
@@ -750,6 +793,12 @@ class VoiceActionProcessor(FrameProcessor):
             res = {"success": False, "reason": "disabled", "appointment_id": None}
         else:
             trace(self._trace_id, VOICE, EXECUTING, action=action, tenant=tenant_id)
+            # Real work starts HERE — everything above returned without touching
+            # the database. From this point the caller is owed an explanation for
+            # the wait, so start the clock on giving them one. Disarmed by
+            # _mark_spoke as soon as any real text goes downstream, so a fast turn
+            # never hears it. See FILLER_AFTER_SECONDS.
+            self._arm_filler(action)
             try:
                 res = await execute_booking_action(
                     action=action,
@@ -971,12 +1020,102 @@ class VoiceActionProcessor(FrameProcessor):
             logger.error("VoiceActionProcessor: the busy-timeout backstop could not speak: %s",
                          exc, exc_info=True)
 
+    # ── "I'm doing it now" ────────────────────────────────────────────────────
+
+    def _arm_filler(self, action: str) -> None:
+        """Promise speech in ``_filler_after`` seconds unless the real reply beats it.
+
+        Armed at the moment a write ACTUALLY starts (not when a tag is parsed —
+        see FILLER_AFTER_SECONDS), and disarmed by _mark_spoke the instant any
+        real text goes downstream. So on a fast turn it never fires, and on a
+        slow one it covers the whole gap: the write, and the second LLM round
+        trip that follows it.
+
+        This is the one utterance in this processor that is spoken BEFORE the
+        outcome is known, so it says only what is certainly true — that the
+        request was understood and is being carried out. It never says booked.
+        """
+        self._cancel_filler()
+        if self._filler_spoken or self._spoke_this_turn:
+            return
+        try:
+            self._filler_timer = asyncio.get_running_loop().create_task(
+                self._filler_watchdog(action))
+        except RuntimeError:
+            # No running loop (a synchronous unit test). Nothing to time; the
+            # turn simply behaves as it did before this existed.
+            self._filler_timer = None
+
+    def _cancel_filler(self) -> None:
+        timer, self._filler_timer = self._filler_timer, None
+        if timer is not None and not timer.done():
+            timer.cancel()
+
+    async def _filler_watchdog(self, action: str) -> None:
+        try:
+            await asyncio.sleep(self._filler_after)
+            await self._speak_filler(action)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error("VoiceActionProcessor: the in-progress filler failed to "
+                         "speak: %s", exc, exc_info=True)
+
+    async def _speak_filler(self, action: str) -> None:
+        """Say that the work is under way, if the caller still has heard nothing."""
+        self._filler_timer = None
+        if self._spoke_this_turn or self._filler_spoken:
+            return
+
+        from backend.agent import spoken_fallback
+
+        key = spoken_fallback.working_key(action)
+        if not key:
+            # An action this system has no honest sentence for. Silence is worse
+            # than a wrong sentence in general, but not when the wrong sentence
+            # would describe the wrong operation — and the backstop still
+            # guarantees this turn ends in speech either way.
+            return
+
+        text = spoken_fallback.sentence(key, self._agent_config.get("language"))
+        self._filler_spoken = True
+        logger.info(
+            "VoiceActionProcessor: the %s has been in flight for %.1fs — telling the "
+            "caller it is being done rather than leaving the line quiet.",
+            action, self._filler_after,
+        )
+        trace(self._trace_id, VOICE, REPLIED, source="filler", action=action)
+        # NOT _mark_spoke: this says nothing about the outcome, so the turn has
+        # still not delivered what the caller is waiting for. Counting it as
+        # speech would switch off _speak_backstop — and the case the backstop
+        # exists for (the row was written and the telling of it failed) is
+        # precisely the case where this filler will have played.
+        #
+        # TTSSpeakFrame, not TextFrame: this is pushed from a timer, with no
+        # LLMFullResponseEndFrame coming to flush a sentence aggregator. See
+        # _speak_backstop for the full account of that distinction.
+        await self.push_frame(
+            TTSSpeakFrame(text, append_to_context=False), self._speak_direction)
+
     async def cleanup(self) -> None:
-        """Pipecat teardown — the timer must not outlive the call."""
+        """Pipecat teardown — the timers must not outlive the call."""
         self._cancel_busy_timer()
+        self._cancel_filler()
         await super().cleanup()
 
     # ── State ─────────────────────────────────────────────────────────────────
+
+    def _mark_spoke(self) -> None:
+        """Record that the caller has actually HEARD something this turn.
+
+        The single place the flag is set, because two things now hang off it and
+        they must not drift apart: the silence backstop is switched off by it,
+        and the in-progress filler is disarmed by it. "The reply arrived, so stop
+        telling them to wait" and "the reply arrived, so no backstop is needed"
+        are the same moment.
+        """
+        self._spoke_this_turn = True
+        self._cancel_filler()
 
     def _reset_response(self) -> None:
         self._full = ""
@@ -993,13 +1132,31 @@ class VoiceActionProcessor(FrameProcessor):
         1.5.0 llm_response_universal.py:794), and therefore the only place that
         can see a new utterance begin.
         """
+        # An outcome the caller NEVER HEARD survives into the next utterance.
+        #
+        # The turn's own backstop cannot always deliver it. The caller barging in
+        # is the case: they say "hello?" into the gap while the write is running,
+        # pipecat raises an InterruptionFrame, and the confirmation that was about
+        # to be spoken is cancelled — so the appointment exists, the reply was
+        # generated and logged, and nobody said it. That is the second half of the
+        # 2026-08-14 report ("it provides the llm message but it never says out"),
+        # and the same barge-in wipes the state the backstop would have used.
+        #
+        # Clearing it only once something has actually been SPOKEN keeps this
+        # bounded: a normal turn confirms and clears on the very next utterance,
+        # while an unheard outcome stays available until some turn tells the
+        # caller about it. It is only ever used to state a true, already-committed
+        # result, so carrying it is never a lie — only a repetition at worst.
+        if self._spoke_this_turn:
+            self._outcome_this_turn = None
         self._acted_this_turn = False
         self._repaired_this_turn = False
         self._pending_rerun = False
         self._next_is_followup = False
         self._spoke_this_turn = False
-        self._outcome_this_turn = None
         self._is_followup = False
+        self._filler_spoken = False
+        self._cancel_filler()
         # A new utterance supersedes whatever the last one was waiting for. Clear
         # the shield rather than only cancelling its timer: leaving the flag set
         # here with nothing timing it is the exact unbounded state this timer
@@ -1081,7 +1238,7 @@ class VoiceActionProcessor(FrameProcessor):
 
         text = spoken_fallback.sentence(key, self._agent_config.get("language"))
         trace(self._trace_id, VOICE, REPLIED, source="backstop", outcome=key)
-        self._spoke_this_turn = True
+        self._mark_spoke()
         # append_to_context=False, as in resilience.py: this sentence is a
         # constant the system said on the model's behalf, and the real outcome has
         # already been injected into the context by _execute's result message, so
@@ -1104,7 +1261,7 @@ class VoiceActionProcessor(FrameProcessor):
         # speech that tag_scrub then deletes reinstates the very hang this
         # processor exists to prevent.
         if scrub_reply(text):
-            self._spoke_this_turn = True
+            self._mark_spoke()
         await self.push_frame(TextFrame(text), direction)
 
     async def _speak_held_leftover(self, direction: FrameDirection) -> None:
@@ -1133,5 +1290,5 @@ class VoiceActionProcessor(FrameProcessor):
             "VoiceActionProcessor: held a bracketed reply that never became a tag — "
             "speaking it: %r", speakable_held[:120],
         )
-        self._spoke_this_turn = True
+        self._mark_spoke()
         await self.push_frame(TextFrame(speakable_held), direction)

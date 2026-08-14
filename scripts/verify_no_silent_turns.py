@@ -24,12 +24,19 @@ who spoke when, and the invariant becomes a query:
 A violation is exactly the reported symptom: the caller said something, the agent
 never answered, and the caller sat listening to an open line.
 
-Two stronger checks ride along:
+Three stronger checks ride along:
 
   * a call that BOOKED something and then ended on a user turn is the worst case
     in the whole family — the appointment exists and the caller was never told;
   * an assistant turn whose text still contains "[ACTION" means a machine tag was
-    read aloud to a caller.
+    read aloud to a caller;
+  * a user turn answered ONLY by the in-progress filler ("let me book that for
+    you now, one moment") is a silent turn wearing a disguise. The filler exists
+    to cover the write (agent/spoken_fallback.py), and it makes the plain
+    every-user-turn-has-an-answer check pass without the caller having learned
+    anything — so it is explicitly not counted as an answer here. Without this,
+    adding the filler would have quietly weakened the invariant this script is
+    the only real evidence for.
 
 Usage
 -----
@@ -89,6 +96,27 @@ def _parse_args() -> argparse.Namespace:
 
 # ── The invariant ─────────────────────────────────────────────────────────────
 
+def _filler_sentences() -> set[str]:
+    """Every "I'm doing it now" sentence, in every language.
+
+    Sourced from the module that speaks them rather than restated, so a new
+    language or a reworded phrase cannot silently start counting as an answer.
+    Returns an empty set if the import fails — this script must still run and
+    report the checks it CAN make.
+    """
+    try:
+        from backend.agent import spoken_fallback
+    except Exception:  # noqa: BLE001
+        return set()
+    keys = (spoken_fallback.WORKING_BOOK, spoken_fallback.WORKING_CANCEL,
+            spoken_fallback.WORKING_RESCHEDULE)
+    return {
+        spoken_fallback.sentence(key, lang).strip()
+        for lang in spoken_fallback.supported_languages()
+        for key in keys
+    }
+
+
 def check_transcript(transcript: list) -> list[str]:
     """Every way a transcript can show a turn that ended in silence.
 
@@ -110,6 +138,8 @@ def check_transcript(transcript: list) -> list[str]:
     def text(t: dict) -> str:
         return str(t.get("text") or t.get("content") or "")
 
+    fillers = _filler_sentences()
+
     for i, turn in enumerate(turns):
         if role(turn) != "user":
             continue
@@ -119,10 +149,25 @@ def check_transcript(transcript: list) -> list[str]:
                 f"turn {turn.get('turn', i + 1)}: the CALLER spoke last and the agent "
                 f"never answered — {text(turn)[:80]!r}"
             )
-        elif role(following[0]) == "user":
+            continue
+        if role(following[0]) == "user":
             failures.append(
                 f"turn {turn.get('turn', i + 1)}: two caller turns in a row, so the "
                 f"agent said nothing to the first — {text(turn)[:80]!r}"
+            )
+            continue
+        # Answered — but by what? Everything the agent said before the caller's
+        # next turn. If all of it is "one moment please", the caller was told to
+        # wait and then never told the outcome.
+        answers = []
+        for t in following:
+            if role(t) == "user":
+                break
+            answers.append(text(t).strip())
+        if fillers and answers and all(a in fillers for a in answers if a):
+            failures.append(
+                f"turn {turn.get('turn', i + 1)}: the agent said only that it was "
+                f"working on it and never reported the outcome — {answers[-1][:80]!r}"
             )
 
     for turn in turns:

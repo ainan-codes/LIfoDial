@@ -319,7 +319,8 @@ class VoiceCall:
     def __init__(self, replies: list[str], agent_config: dict | None = None,
                  call_record_id: str | None = CALL_ID,
                  swallow_reruns: bool = False,
-                 busy_timeout_seconds: float | None = None) -> None:
+                 busy_timeout_seconds: float | None = None,
+                 filler_after_seconds: float = 60.0) -> None:
         tenant = {
             "id": TENANT_ID,
             "clinic_name": "Indiana Hospital Mangalore",
@@ -343,7 +344,15 @@ class VoiceCall:
             tenant_id=TENANT_ID, agent_id=None, call_meta=call_meta,
         )
         self.booking = BookingProcessor(tenant=tenant, agent_config=cfg, call_meta=call_meta)
-        action_kwargs = {}
+        # The in-progress filler ("let me book that for you now") is a WALL-CLOCK
+        # behaviour: it speaks only if the write has not been reported on within
+        # its window. Against a local SQLite database that window is a race with
+        # the machine the suite happens to run on, so it is disabled by default
+        # here — every test below asserts what the caller is told about the
+        # OUTCOME, and a filler drifting in and out with CI load would make those
+        # assertions flap for a reason none of them are about. The filler has its
+        # own tests, which set this deliberately short.
+        action_kwargs = {"filler_after_seconds": filler_after_seconds}
         if busy_timeout_seconds is not None:
             action_kwargs["busy_timeout_seconds"] = busy_timeout_seconds
         self.action = VoiceActionProcessor(

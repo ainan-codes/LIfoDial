@@ -1,7 +1,8 @@
 """
 backend/agent/spoken_fallback.py
 
-The sentence the caller hears when the LLM could not produce one.
+The sentence the caller hears when the LLM has not produced one — either because
+it could not, or because it has not finished yet.
 
 Why this exists. On a phone call the failure mode of last resort must be SPEECH,
 never silence — a caller with a dead line has no way to tell a crashed system
@@ -28,6 +29,20 @@ module's whole value is that it cannot fail. Its job is to break the silence and
 state the outcome truthfully — the model's own reply, when it works, is what
 gives the pretty confirmation with the details in it.
 
+The WORKING_* sentences are here for the same reason, at the other end of the
+same problem. A booking turn is not slow because anything is broken — it is a
+Supabase connect (~2.3s, see services/his.execute_booking_action) plus a second
+LLM round trip to describe the outcome — but the caller cannot tell "working" from
+"dead", and on 2026-08-14 the reported symptom was exactly that: everything books
+correctly and the line goes quiet while it happens. Worse, a caller who says
+"hello?" into that gap BARGES IN, and pipecat cancels the confirmation that was
+about to be spoken — so the appointment exists and the reply is generated and
+logged, and the caller still never hears it. Filling the gap with speech is what
+stops the caller from talking over their own confirmation.
+
+They are constants for the same reason the outcome sentences are: they have to be
+available at the moment nothing has been generated yet.
+
 Languages: the ones a real clinic on this platform is configured for today, with
 English as the fallback. An unlisted language gets an English sentence spoken by
 a voice tuned for that language, which is imperfect — and still strictly better
@@ -45,11 +60,25 @@ RESCHEDULED = "rescheduled"
 ACTION_FAILED = "action_failed"
 NOT_UNDERSTOOD = "not_understood"
 
+#: "I am doing it now" — spoken while the write is actually in flight, never as
+#: an outcome. Per action, because "let me cancel that" and "let me book that"
+#: are not interchangeable to someone who is listening.
+WORKING_BOOK = "working_book"
+WORKING_CANCEL = "working_cancel"
+WORKING_RESCHEDULE = "working_reschedule"
+
 #: The action names VoiceActionProcessor uses -> the success key here.
 _SUCCESS_KEY = {
     "BOOK": BOOKED,
     "CANCEL": CANCELLED,
     "RESCHEDULE": RESCHEDULED,
+}
+
+#: The action names -> the "in progress" key here.
+_WORKING_KEY = {
+    "BOOK": WORKING_BOOK,
+    "CANCEL": WORKING_CANCEL,
+    "RESCHEDULE": WORKING_RESCHEDULE,
 }
 
 _EN = {
@@ -61,6 +90,9 @@ _EN = {
         "directly and they will help you."
     ),
     NOT_UNDERSTOOD: "Sorry, I did not catch that. Could you say it again?",
+    WORKING_BOOK: "Sure, let me book that for you now. One moment please.",
+    WORKING_CANCEL: "Alright, let me cancel that for you now. One moment please.",
+    WORKING_RESCHEDULE: "Sure, let me move that for you now. One moment please.",
 }
 
 #: Per-language overrides. Anything missing falls through to _EN.
@@ -75,6 +107,9 @@ _PHRASES: dict[str, dict[str, str]] = {
             "फ़ोन कीजिए, वे आपकी मदद करेंगे।"
         ),
         NOT_UNDERSTOOD: "माफ़ कीजिए, मैं समझ नहीं पाया। कृपया दोबारा कहिए।",
+        WORKING_BOOK: "ठीक है, मैं अभी आपकी अपॉइंटमेंट बुक कर रहा हूँ। एक पल रुकिए।",
+        WORKING_CANCEL: "ठीक है, मैं अभी आपकी अपॉइंटमेंट रद्द कर रहा हूँ। एक पल रुकिए।",
+        WORKING_RESCHEDULE: "ठीक है, मैं अभी आपकी अपॉइंटमेंट बदल रहा हूँ। एक पल रुकिए।",
     },
     "ml-IN": {
         BOOKED: "നിങ്ങളുടെ അപ്പോയിന്റ്മെന്റ് ഉറപ്പിച്ചു. വിളിച്ചതിന് നന്ദി.",
@@ -85,6 +120,9 @@ _PHRASES: dict[str, dict[str, str]] = {
             "ക്ലിനിക്കിലേക്ക് നേരിട്ട് വിളിക്കുക."
         ),
         NOT_UNDERSTOOD: "ക്ഷമിക്കണം, എനിക്ക് മനസ്സിലായില്ല. ഒന്നു കൂടി പറയാമോ?",
+        WORKING_BOOK: "ശരി, ഞാൻ ഇപ്പോൾ അപ്പോയിന്റ്മെന്റ് ബുക്ക് ചെയ്യുകയാണ്. ഒരു നിമിഷം കാത്തിരിക്കൂ.",
+        WORKING_CANCEL: "ശരി, ഞാൻ ഇപ്പോൾ അപ്പോയിന്റ്മെന്റ് റദ്ദാക്കുകയാണ്. ഒരു നിമിഷം കാത്തിരിക്കൂ.",
+        WORKING_RESCHEDULE: "ശരി, ഞാൻ ഇപ്പോൾ അപ്പോയിന്റ്മെന്റ് മാറ്റുകയാണ്. ഒരു നിമിഷം കാത്തിരിക്കൂ.",
     },
     "ta-IN": {
         BOOKED: "உங்கள் சந்திப்பு உறுதி செய்யப்பட்டது. அழைத்ததற்கு நன்றி.",
@@ -95,6 +133,9 @@ _PHRASES: dict[str, dict[str, str]] = {
             "மருத்துவமனையை நேரடியாக அழைக்கவும்."
         ),
         NOT_UNDERSTOOD: "மன்னிக்கவும், புரியவில்லை. மீண்டும் சொல்ல முடியுமா?",
+        WORKING_BOOK: "சரி, நான் இப்போது உங்கள் சந்திப்பைப் பதிவு செய்கிறேன். ஒரு நிமிடம் இருங்கள்.",
+        WORKING_CANCEL: "சரி, நான் இப்போது உங்கள் சந்திப்பை ரத்து செய்கிறேன். ஒரு நிமிடம் இருங்கள்.",
+        WORKING_RESCHEDULE: "சரி, நான் இப்போது உங்கள் சந்திப்பை மாற்றுகிறேன். ஒரு நிமிடம் இருங்கள்.",
     },
     "kn-IN": {
         BOOKED: "ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ದೃಢಪಟ್ಟಿದೆ. ಕರೆ ಮಾಡಿದ್ದಕ್ಕೆ ಧನ್ಯವಾದಗಳು.",
@@ -105,6 +146,9 @@ _PHRASES: dict[str, dict[str, str]] = {
             "ಕ್ಲಿನಿಕ್‌ಗೆ ನೇರವಾಗಿ ಕರೆ ಮಾಡಿ."
         ),
         NOT_UNDERSTOOD: "ಕ್ಷಮಿಸಿ, ನನಗೆ ಅರ್ಥವಾಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಇನ್ನೊಮ್ಮೆ ಹೇಳಿ.",
+        WORKING_BOOK: "ಸರಿ, ನಾನು ಈಗ ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಬುಕ್ ಮಾಡುತ್ತಿದ್ದೇನೆ. ಒಂದು ಕ್ಷಣ ಇರಿ.",
+        WORKING_CANCEL: "ಸರಿ, ನಾನು ಈಗ ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ರದ್ದು ಮಾಡುತ್ತಿದ್ದೇನೆ. ಒಂದು ಕ್ಷಣ ಇರಿ.",
+        WORKING_RESCHEDULE: "ಸರಿ, ನಾನು ಈಗ ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಬದಲಾಯಿಸುತ್ತಿದ್ದೇನೆ. ಒಂದು ಕ್ಷಣ ಇರಿ.",
     },
     "te-IN": {
         BOOKED: "మీ అపాయింట్‌మెంట్ ఖరారైంది. కాల్ చేసినందుకు ధన్యవాదాలు.",
@@ -115,6 +159,9 @@ _PHRASES: dict[str, dict[str, str]] = {
             "క్లినిక్‌కు నేరుగా కాల్ చేయండి."
         ),
         NOT_UNDERSTOOD: "క్షమించండి, నాకు అర్థం కాలేదు. మళ్ళీ చెప్పగలరా?",
+        WORKING_BOOK: "సరే, నేను ఇప్పుడు మీ అపాయింట్‌మెంట్ బుక్ చేస్తున్నాను. ఒక్క క్షణం ఆగండి.",
+        WORKING_CANCEL: "సరే, నేను ఇప్పుడు మీ అపాయింట్‌మెంట్ రద్దు చేస్తున్నాను. ఒక్క క్షణం ఆగండి.",
+        WORKING_RESCHEDULE: "సరే, నేను ఇప్పుడు మీ అపాయింట్‌మెంట్ మారుస్తున్నాను. ఒక్క క్షణం ఆగండి.",
     },
     "mr-IN": {
         BOOKED: "तुमची अपॉइंटमेंट निश्चित झाली आहे. फोन केल्याबद्दल धन्यवाद.",
@@ -125,8 +172,19 @@ _PHRASES: dict[str, dict[str, str]] = {
             "फोन करा."
         ),
         NOT_UNDERSTOOD: "क्षमस्व, मला समजले नाही. कृपया पुन्हा सांगा.",
+        WORKING_BOOK: "ठीक आहे, मी आत्ता तुमची अपॉइंटमेंट बुक करत आहे. एक क्षण थांबा.",
+        WORKING_CANCEL: "ठीक आहे, मी आत्ता तुमची अपॉइंटमेंट रद्द करत आहे. एक क्षण थांबा.",
+        WORKING_RESCHEDULE: "ठीक आहे, मी आत्ता तुमची अपॉइंटमेंट बदलत आहे. एक क्षण थांबा.",
     },
 }
+
+#: Every key the table is expected to carry, so a test can enforce coverage
+#: without being edited each time one is added — which is how a language would
+#: otherwise quietly ship with an English sentence in it.
+ALL_KEYS: tuple[str, ...] = (
+    BOOKED, CANCELLED, RESCHEDULED, ACTION_FAILED, NOT_UNDERSTOOD,
+    WORKING_BOOK, WORKING_CANCEL, WORKING_RESCHEDULE,
+)
 
 
 def outcome_key(action: str | None, success: bool) -> str:
@@ -134,6 +192,18 @@ def outcome_key(action: str | None, success: bool) -> str:
     if not success:
         return ACTION_FAILED
     return _SUCCESS_KEY.get((action or "").upper(), ACTION_FAILED)
+
+
+def working_key(action: str | None) -> str:
+    """Which "I'm doing it now" sentence an in-flight action deserves.
+
+    An action name this module does not recognise gets ``""`` rather than a
+    guess: this sentence is spoken BEFORE the outcome is known, so the one thing
+    it must never do is describe work that is not what is happening. The caller
+    of this function treats "" as "say nothing", which is the pre-existing
+    behaviour.
+    """
+    return _WORKING_KEY.get((action or "").upper(), "")
 
 
 def sentence(key: str, language: str | None) -> str:

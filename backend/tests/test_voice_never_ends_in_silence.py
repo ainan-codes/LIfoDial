@@ -28,6 +28,14 @@ The fix keys off the condition the caller actually experiences — nothing was
 spoken — rather than enumerating the branches that can cause it, so a future
 branch that forgets to speak is covered before it is written.
 
+A third defect, reported 2026-08-14, is covered further down. The turn does not
+end in silence — it CONTAINS one, the four to six seconds a write and its
+follow-up LLM call take, on every successful booking. That gap is not only
+unpleasant: a caller who talks into it barges in, pipecat cancels the
+confirmation forming behind it, and the appointment ends up real and unmentioned.
+So the gap is filled with speech that claims no outcome, and an outcome the
+caller never heard now outlives the turn it happened in.
+
 Run: python -m pytest backend/tests/test_voice_never_ends_in_silence.py -v
 """
 import os
@@ -37,6 +45,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 import asyncio
 
 import pytest
+from pipecat.frames.frames import InterruptionFrame
 
 from backend.agent import spoken_fallback
 
@@ -61,6 +70,10 @@ from backend.tests.test_voice_action_tag_e2e import (  # noqa: E402
 TRUNCATED_TAG = f"[ACTION: BOOK|{PATIENT}|{PHONE}|{TOMORROW_TAG}|02:00 PM"
 
 HINDI = {"language": "hi-IN"}
+
+
+def _filler(action: str, lang: str = "hi-IN") -> str:
+    return spoken_fallback.sentence(spoken_fallback.working_key(action), lang)
 
 
 @pytest.mark.asyncio
@@ -726,6 +739,17 @@ def test_the_live_checker_passes_a_healthy_call():
     ]) == []
 
 
+def test_the_live_checker_accepts_a_filler_that_was_followed_up():
+    """The filler is only a failure when it is ALL the caller got. A turn that
+    said "one moment" and then reported the outcome is the intended shape, and
+    flagging it would make every healthy booking call read as broken."""
+    assert _checker()([
+        _u(1, "हाँ बुक कर दो"),
+        _a(2, _filler("BOOK")),
+        _a(3, "आपकी अपॉइंटमेंट पक्की हो गई है।"),
+    ]) == []
+
+
 @pytest.mark.parametrize("transcript,expect", [
     # The reported symptom, exactly: the caller spoke and nothing came back.
     ([_u(1, "हैलो"), _a(2, "नमस्ते"), _u(3, "रद्द कर दो")], "CALLER spoke last"),
@@ -735,6 +759,12 @@ def test_the_live_checker_passes_a_healthy_call():
      "two caller turns in a row"),
     # Not silence, but the other way this processor can fail a caller.
     ([_u(1, "हैलो"), _a(2, "ठीक [ACTION: BOOK|a|b|c|d|e|f]")], "machine tag was SPOKEN"),
+    # Silence wearing a disguise: the in-progress filler makes the plain
+    # every-turn-has-an-answer check pass, and the caller still never learned
+    # whether they have an appointment. Adding the filler without this would have
+    # weakened the one check that runs against real calls.
+    ([_u(1, "हाँ बुक कर दो"), _a(2, _filler("BOOK"))],
+     "never reported the outcome"),
 ])
 def test_the_live_checker_catches_every_shape_of_the_bug(transcript, expect):
     failures = _checker()(transcript)
@@ -748,14 +778,215 @@ def test_the_live_checker_never_passes_a_call_it_cannot_read():
         assert _checker()(empty), f"{empty!r} was reported clean"
 
 
+# ── The gap while the write is running ────────────────────────────────────────
+#
+# The turn does not END in silence — the tests above cover that — it CONTAINS a
+# silence, four to six seconds of it, between the caller confirming and the agent
+# reporting the outcome. Reported 2026-08-14: "it goes silent when it makes the
+# booking… everything else works". None of it is a fault (one Supabase connect,
+# then a whole second LLM round trip to describe the result), and none of it can
+# be removed, because the outcome is not known until the write returns.
+#
+# It also does real damage rather than merely feeling slow: a caller who says
+# "hello?" into that gap BARGES IN, pipecat cancels the confirmation that was
+# about to be spoken, and the appointment then exists with the caller never told —
+# which is the other half of the same report, "sometimes it provides the llm
+# message but it never says out".
+
+
+def _slow_write(monkeypatch, seconds: float = 0.6) -> None:
+    """Give the write the duration it has in production.
+
+    Against local SQLite a booking completes in single-digit milliseconds, so a
+    test that simply set a tiny filler window would be racing the event loop and
+    the machine it runs on — it passed alone and failed inside the suite. The
+    thing being tested is a WAIT, so the wait is what the test supplies: this is
+    the ~2.3s Supabase connect (services/his.execute_booking_action) that makes
+    every real action turn slow, compressed to something a test can afford.
+    """
+    import backend.services.his as his
+
+    real = his.execute_booking_action
+
+    async def slow(**kwargs):
+        await asyncio.sleep(seconds)
+        return await real(**kwargs)
+
+    # _execute imports this by name at call time, so patching the module
+    # attribute is what the processor actually resolves.
+    monkeypatch.setattr(his, "execute_booking_action", slow)
+
+
+async def _write_finished(call) -> None:
+    """Wait until no write is in flight.
+
+    The row appearing is not the end of the action: the outcome is recorded, and
+    the call record marked, after the commit. A test that acts on the row alone
+    interleaves with the tail of _execute.
+    """
+    for _ in range(200):
+        if call.action._action_in_flight is None:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("the write never finished")
+
+
+@pytest.mark.asyncio
+async def test_the_caller_is_told_the_booking_is_being_made(seeded_db, monkeypatch):
+    """The gap is filled with speech, and the outcome still lands after it."""
+    _slow_write(monkeypatch)
+    async with VoiceCall(
+        [_book_tag(), "आपकी अपॉइंटमेंट पक्की हो गई है।"],
+        agent_config=HINDI, filler_after_seconds=0.05,
+    ) as call:
+        await call.says("कल दोपहर दो बजे डॉक्टर सलमान के पास, मेरा नाम आइनान है",
+                        expect_generations=2)
+        spoken = call.speaker.spoken
+        frame_types = list(call.speaker.frame_types)
+
+    assert len(await _appointments()) == 1, "the booking itself regressed"
+    assert _filler("BOOK") in spoken, (
+        f"the caller sat through the write in silence: {spoken!r}"
+    )
+    assert spoken.endswith("आपकी अपॉइंटमेंट पक्की हो गई है।"), (
+        f"the real confirmation must still be the last thing said: {spoken!r}"
+    )
+    # Pushed from a timer, with no LLMFullResponseEndFrame coming to flush a
+    # sentence aggregator — so it has to be the frame type that is synthesized
+    # whole and immediately, for the same reason the backstop is.
+    assert frame_types[0] == "TTSSpeakFrame", (
+        f"the filler was pushed as {frame_types[0]}, which can be stranded unspoken"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_filler_says_which_action_is_under_way(seeded_db, monkeypatch):
+    """"Let me cancel that" and "let me book that" are not interchangeable to
+    somebody who is listening."""
+    _slow_write(monkeypatch)
+    async with VoiceCall(
+        [f"[ACTION: CANCEL|{PATIENT}|{PHONE}]", "आपकी अपॉइंटमेंट रद्द कर दी गई है।"],
+        agent_config=HINDI, filler_after_seconds=0.05,
+    ) as call:
+        await call.says("मुझे अपॉइंटमेंट कैंसिल करनी है", expect_generations=2)
+        spoken = call.speaker.spoken
+
+    assert _filler("CANCEL") in spoken, f"expected the cancel filler, got {spoken!r}"
+    assert _filler("BOOK") not in spoken, (
+        f"the agent narrated a booking while cancelling: {spoken!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_fast_turn_is_never_told_to_wait(seeded_db):
+    """The filler is a delay, not a preamble. A turn that answers promptly — and
+    every turn that does no database work at all — must not acquire an extra
+    "one moment please" it does not need."""
+    async with VoiceCall(["We're open from 9 AM to 5 PM."]) as call:
+        await call.says("What are your hours?")
+        spoken = call.speaker.spoken
+
+    assert spoken == "We're open from 9 AM to 5 PM."
+
+
+@pytest.mark.asyncio
+async def test_a_validation_failure_narrates_no_work(seeded_db, monkeypatch):
+    """A tag with no real time never reaches the database, so there is nothing to
+    say is under way. Announcing "let me book that for you" and then asking for
+    the time would describe work that never started."""
+    _slow_write(monkeypatch)
+    async with VoiceCall(
+        [_book_tag(time_str="N/A"), "आप कितने बजे आना चाहेंगे?"],
+        agent_config=HINDI, filler_after_seconds=0.05,
+    ) as call:
+        await call.says("कल डॉक्टर सलमान के पास, मेरा नाम आइनान है",
+                        expect_generations=2)
+        spoken = call.speaker.spoken
+
+    assert len(await _appointments()) == 0, "an appointment without a time was written"
+    assert _filler("BOOK") not in spoken, (
+        f"the agent said it was booking something it never attempted: {spoken!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_filler_does_not_switch_the_backstop_off(seeded_db, monkeypatch):
+    """The filler says nothing about the OUTCOME, so a turn that plays one and
+    then fails to report is still a turn the caller learned nothing from.
+
+    This is the dangerous version of getting it wrong: _spoke_this_turn disarms
+    the backstop, so counting a "one moment please" as speech would reinstate the
+    exact hang this whole file exists to prevent — and reinstate it on the turn
+    where the row has already been written.
+    """
+    _slow_write(monkeypatch)
+    async with VoiceCall(
+        [_book_tag(), TRUNCATED_TAG, TRUNCATED_TAG],
+        agent_config=HINDI, filler_after_seconds=0.05,
+    ) as call:
+        await call.says("कल दोपहर दो बजे डॉक्टर सलमान के पास, मेरा नाम आइनान है",
+                        expect_generations=3)
+        spoken = call.speaker.spoken
+
+    assert len(await _appointments()) == 1, "the booking itself regressed"
+    assert _filler("BOOK") in spoken
+    assert spoken.endswith(spoken_fallback.sentence(spoken_fallback.BOOKED, "hi-IN")), (
+        f"the row exists and the caller was left with only a 'please wait': {spoken!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_outcome_the_caller_never_heard_survives_the_next_turn(seeded_db):
+    """The barge-in case, which the turn's own backstop cannot reach.
+
+    The caller speaks into the gap, pipecat cancels the reply that was forming,
+    and the turn ends having told them nothing — but the appointment is real. The
+    outcome must therefore outlive the turn, so that if the NEXT turn also fails
+    to speak, what the caller finally hears is the truth about their booking and
+    not "sorry, I did not catch that".
+    """
+    # swallow_reruns destroys the LLMRunFrame that would have produced the
+    # confirmation — the same end state a barge-in leaves behind (the reply is
+    # gone before a word of it is synthesized), and unlike a real interruption it
+    # does not race the test.
+    async with VoiceCall(
+        [_book_tag(), " "], agent_config=HINDI, swallow_reruns=True,
+    ) as call:
+        await call.says("कल दोपहर दो बजे डॉक्टर सलमान के पास, मेरा नाम आइनान है",
+                        expect_generations=1)
+        await _write_finished(call)
+        assert len(await _appointments()) == 1, "the booking itself regressed"
+        assert not call.speaker.spoken, "this turn was supposed to say nothing"
+
+        # The caller talks into the gap. This is what wiped the state the backstop
+        # needed: reset_turn cleared the outcome unconditionally.
+        await call.task.queue_frame(InterruptionFrame())
+        await asyncio.sleep(0.2)
+
+        # Turn 2 produces nothing speakable either, so the backstop must answer
+        # it — and it is the only thing left that can tell the caller anything.
+        await call.says("हेलो? हेलो?", expect_generations=1)
+        spoken = call.speaker.spoken
+
+    assert spoken == spoken_fallback.sentence(spoken_fallback.BOOKED, "hi-IN"), (
+        f"the appointment exists and the caller was told {spoken!r}"
+    )
+
+
 # ── The phrase table itself ───────────────────────────────────────────────────
 
 def test_every_language_has_every_sentence():
+    """Iterates ALL_KEYS rather than a list written out here, so a key added to
+    the module cannot ship translated into English by nobody noticing this test
+    was not extended."""
     for lang in spoken_fallback.supported_languages():
-        for key in (spoken_fallback.BOOKED, spoken_fallback.CANCELLED,
-                    spoken_fallback.RESCHEDULED, spoken_fallback.ACTION_FAILED,
-                    spoken_fallback.NOT_UNDERSTOOD):
-            assert spoken_fallback.sentence(key, lang).strip(), f"{lang}/{key} empty"
+        for key in spoken_fallback.ALL_KEYS:
+            spoken = spoken_fallback.sentence(key, lang)
+            assert spoken.strip(), f"{lang}/{key} empty"
+            if lang != "en-IN":
+                assert spoken != spoken_fallback.sentence(key, "en-IN"), (
+                    f"{lang}/{key} is still the English sentence"
+                )
 
 
 def test_an_unknown_language_or_key_still_returns_speech():
@@ -772,8 +1003,7 @@ def test_the_sentences_carry_no_placeholders():
     brace or percent would reach TTS literally, or crash the one path that must
     not crash."""
     for lang in spoken_fallback.supported_languages():
-        for key in (spoken_fallback.BOOKED, spoken_fallback.ACTION_FAILED,
-                    spoken_fallback.NOT_UNDERSTOOD):
+        for key in spoken_fallback.ALL_KEYS:
             s = spoken_fallback.sentence(key, lang)
             assert "{" not in s and "}" not in s and "%s" not in s, s
 
@@ -785,3 +1015,28 @@ def test_a_failed_action_is_not_reported_as_success():
     assert spoken_fallback.outcome_key("RESCHEDULE", True) == spoken_fallback.RESCHEDULED
     # An action name nobody recognises must not be announced as a success.
     assert spoken_fallback.outcome_key("FROBNICATE", True) == spoken_fallback.ACTION_FAILED
+
+
+def test_an_unknown_action_is_not_narrated_at_all():
+    """The working sentence is spoken BEFORE the outcome is known, so the one
+    thing it must never do is describe the wrong operation. An action this module
+    has no sentence for gets "" — say nothing — rather than a nearest guess."""
+    assert spoken_fallback.working_key("BOOK") == spoken_fallback.WORKING_BOOK
+    assert spoken_fallback.working_key("cancel") == spoken_fallback.WORKING_CANCEL
+    assert spoken_fallback.working_key("FROBNICATE") == ""
+    assert spoken_fallback.working_key(None) == ""
+
+
+def test_the_working_sentences_never_claim_an_outcome():
+    """They run while the write is still in flight. A "your appointment is
+    confirmed" here would be the fabricated confirmation this whole subsystem was
+    built to stop, just moved earlier in the turn."""
+    for lang in spoken_fallback.supported_languages():
+        for key in (spoken_fallback.WORKING_BOOK, spoken_fallback.WORKING_CANCEL,
+                    spoken_fallback.WORKING_RESCHEDULE):
+            working = spoken_fallback.sentence(key, lang)
+            for done in (spoken_fallback.BOOKED, spoken_fallback.CANCELLED,
+                         spoken_fallback.RESCHEDULED):
+                assert spoken_fallback.sentence(done, lang) not in working, (
+                    f"{lang}/{key} states an outcome it cannot know yet: {working!r}"
+                )
