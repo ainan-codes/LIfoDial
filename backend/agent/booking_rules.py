@@ -33,6 +33,11 @@ BOOKING_RESULT_FALSE = "[BOOKING_RESULT success=false]"
 # unlike the static per-call doctor roster in pipeline.py.
 AVAILABILITY_NOTE = "[AVAILABILITY_NOTE]"
 
+# The per-intent tag shapes. Imported rather than typed out here so the prompt
+# cannot describe a tag the parser does not accept — see TAG_GRAMMAR.
+from backend.services.action_tag import tag_templates  # noqa: E402
+
+
 def voice_action_tag_block(today_str: str) -> str:
     """The VOICE path's ``[ACTION: …]`` tag instructions.
 
@@ -75,18 +80,24 @@ def voice_action_tag_block(today_str: str) -> str:
         "When — and only when — the caller has asked you to book, move or cancel an appointment AND "
         "you have the fields for it, your ENTIRE reply must be exactly ONE of these tags and NOTHING "
         "else. No greeting, no confirmation, no words at all around it:\n"
-        "  [ACTION: BOOK|Name|Phone|Date|Time|Doctor|Notes]\n"
-        "  [ACTION: RESCHEDULE|Name|Phone|NewDate|NewTime|Doctor|Notes]\n"
-        "  [ACTION: CANCEL|Name|Phone|N/A|N/A|N/A|N/A]\n"
+        # Rendered from services/action_tag.py::TAG_GRAMMAR, so the shape asked
+        # for here and the shape the parser accepts cannot drift apart. They had:
+        # this block used to say a CANCEL needs "Name and Phone, and NOTHING else"
+        # while showing a template with four N/A fields nailed on, and a model
+        # obeying the prose emitted a tag the parser could not read — nothing was
+        # written, nothing was speakable, and the caller heard silence.
+        f"{tag_templates()}\n"
         "The system then carries the action out and immediately asks you for the caller-facing reply, "
         "telling you exactly what happened. That is when — and the only time — you confirm anything.\n"
-        "WHAT EACH ONE NEEDS:\n"
-        "* BOOK — the caller's Name and Phone, the Doctor, and a real Date and Time.\n"
-        "* RESCHEDULE — the caller's Name and Phone, and the NEW date and time. Put N/A for the "
-        "doctor unless they are changing doctor.\n"
+        "EACH ACTION HAS ITS OWN SHAPE — use exactly the fields listed for it, no more and no fewer:\n"
+        "* BOOK — the caller's Name and Phone, the Doctor, a real Date and Time, and Notes (the "
+        "symptom or reason, or 'N/A').\n"
+        "* RESCHEDULE — the caller's Name and Phone, and the NEW date and time. Nothing about the "
+        "old appointment: the system finds it. Only add a Doctor field if they are CHANGING doctor.\n"
         "* CANCEL — the caller's Name and Phone, and NOTHING else. Do NOT ask which doctor, which "
-        "date or which time an appointment was for: the system finds it. If this caller's existing "
-        "appointments are listed above, read one back to confirm and then emit the tag.\n"
+        "date or which time an appointment was for, and do NOT pad the tag with N/A fields: the "
+        "system finds it from the name and number alone. If this caller's existing appointments are "
+        "listed above, read one back to confirm and then emit the tag.\n"
         f"DATES: today is {today_str}. Write the Date as the caller's OWN word — 'today', "
         "'tomorrow', 'day after tomorrow', a weekday name, in their language — or, if they gave an "
         "actual calendar date, as DD/MM/YYYY. Do NOT do the arithmetic yourself: the system converts "

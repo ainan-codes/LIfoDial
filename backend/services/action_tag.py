@@ -31,6 +31,7 @@ Two rules make the duplication that caused that impossible to reintroduce:
      counts.
 """
 
+import logging
 import re
 from typing import NamedTuple, Optional
 
@@ -58,6 +59,99 @@ ACTION_RE = re.compile(
 #: into the patient's chat verbatim. Every user-facing reply is scrubbed with
 #: this, not just the ones where a valid tag was found.
 LOOSE_ACTION_RE = re.compile(r'\[\s*ACTION\b[^\]]*\]', re.IGNORECASE)
+
+# ── One grammar per intent ────────────────────────────────────────────────────
+#
+# The three actions do not need the same information, and pretending they do is
+# what produced the tag-only hang. A CANCEL is found by name + phone alone; the
+# instructions said so in prose ("Name and Phone, and NOTHING else") while showing
+# a template with four "N/A" fields nailed on. Asked to satisfy both, models drop
+# the padding — and a short tag was unparseable, so nothing was written, nothing
+# could be spoken, and the caller heard silence.
+#
+# These are the shapes the model is now ASKED for (voice: booking_rules.py, chat:
+# routers/agent_test.py both render them from here), so padding is no longer part
+# of the primary path.
+
+#: Action -> the fields that action actually needs, in tag order.
+TAG_GRAMMAR: dict[str, tuple[str, ...]] = {
+    # Everything: this one creates a row out of nothing.
+    "BOOK": ("Name", "Phone", "Date", "Time", "Doctor", "Notes"),
+    # The existing row is found by name + phone (his.py::sync_appointment_to_db).
+    # Nothing else is consulted, so nothing else is asked for — which also stops
+    # the agent interrogating a caller about a date it does not need, as it did
+    # for 280 seconds on a live call.
+    "CANCEL": ("Name", "Phone"),
+    # Found the same way, then moved — so it needs the NEW day and time, and
+    # nothing about the old ones. The doctor only changes if the caller says so.
+    "RESCHEDULE": ("Name", "Phone", "NewDate", "NewTime"),
+}
+
+#: The full six-field form every action used to share. Still accepted from every
+#: intent, for ever: it is what older prompts taught, what the chat path has
+#: always emitted, and what a model that has seen one BOOK example will copy.
+CANONICAL_FIELD_COUNT = 6
+
+#: What shape a tag actually arrived in — see classify_tag_shape.
+SHAPE_GRAMMAR = "grammar"      # exactly the fields its intent asks for
+SHAPE_CANONICAL = "canonical"  # the universal six-field form
+SHAPE_PADDED = "padded"        # neither; accepted defensively, trailing fields assumed
+
+
+def tag_grammar(action: str) -> tuple[str, ...]:
+    """The fields ``action`` is asked for. BOOK's, for an unknown verb."""
+    return TAG_GRAMMAR.get((action or "").strip().upper(), TAG_GRAMMAR["BOOK"])
+
+
+def tag_template(action: str) -> str:
+    """The tag shape to SHOW the model for one intent."""
+    action = (action or "").strip().upper()
+    return f"[ACTION: {action}|" + "|".join(tag_grammar(action)) + "]"
+
+
+def tag_templates() -> str:
+    """All three shapes, one per line, for a system prompt. Rendered rather than
+    typed out, so the prompt and the parser can never disagree about what a
+    CANCEL looks like — which is precisely how they came to disagree."""
+    return "\n".join(f"  {tag_template(a)}" for a in ("BOOK", "RESCHEDULE", "CANCEL"))
+
+
+def _tag_fields(text: str) -> Optional[tuple[str, list[str]]]:
+    """(ACTION, [fields]) for the first complete, correctly-bracketed tag."""
+    m = SHORT_ACTION_RE.search(text or "")
+    if not m:
+        return None
+    return (m.group(1) or "").strip().upper(), [
+        f.strip() for f in (m.group(2) or "").split("|")
+    ]
+
+
+def classify_tag_shape(text: str) -> Optional[str]:
+    """Which shape the model actually emitted, or None if there is no tag.
+
+    Exists to make "the fallback is doing routine work" observable instead of
+    invisible: SHAPE_PADDED in the logs means the model is emitting a shape
+    nobody asked it for, and the prompt — not the parser — is what needs fixing.
+    """
+    parsed = _tag_fields(text)
+    if parsed is None:
+        return None
+    action, fields = parsed
+    if len(fields) == len(tag_grammar(action)):
+        return SHAPE_GRAMMAR
+    if len(fields) == CANONICAL_FIELD_COUNT:
+        return SHAPE_CANONICAL
+    return SHAPE_PADDED
+
+
+#: A complete, correctly-bracketed tag with a valid verb whose FIELD COUNT is
+#: wrong — fewer than the six ``|`` fields ACTION_RE requires. Parsed by
+#: _parse_short_action_tag below, and only ever consulted after ACTION_RE has
+#: already failed.
+SHORT_ACTION_RE = re.compile(
+    r'\[\s*ACTION\s*:\s*(BOOK|RESCHEDULE|CANCEL)\s*\|([^\]]*)\]',
+    re.IGNORECASE,
+)
 
 #: A machine tag whose closing bracket never arrived — the model ran into the
 #: max_tokens cap mid-tag, or stopped early. There is no valid user-facing text
@@ -103,6 +197,71 @@ class ActionTag(NamedTuple):
     notes: str
 
 
+#: The tag's fields after the verb, in order. Named here because
+#: _parse_short_action_tag pads a short tag out to this length.
+_TAG_FIELDS = ("name", "phone", "date", "time", "doctor", "notes")
+
+
+#: Where each intent's grammar fields land in the seven-field ActionTag. BOOK and
+#: CANCEL are prefixes of it; RESCHEDULE's NewDate/NewTime are the date/time
+#: slots, so its four fields are a prefix too. Written out rather than assumed,
+#: because a grammar whose fields did NOT map to a prefix would otherwise be
+#: silently mis-filled.
+_GRAMMAR_IS_PREFIX = {"BOOK", "CANCEL", "RESCHEDULE"}
+
+
+def _parse_short_action_tag(text: str) -> Optional[ActionTag]:
+    """A tag with fewer than six fields — its intent's own grammar, or a short
+    shape nobody asked for — padded out to the full seven. None if unusable.
+
+    Two different jobs, and the difference matters:
+
+    * SHAPE_GRAMMAR — the shape the prompts now ASK for. A CANCEL carrying just a
+      name and a phone number is complete, not truncated, and this is its primary
+      parse. See TAG_GRAMMAR.
+    * SHAPE_PADDED — anything else. ACTION_RE demands six fields, so a tag that is
+      correct in every other way used to be not merely mis-parsed but INVISIBLE:
+      nothing written, and on voice the whole reply scrubs to nothing, so the
+      caller hears silence and the only recovery is a re-prompt that costs an
+      extra LLM call and may fail again. That was the reported Hindi CANCEL hang.
+      Accepting the shape beats re-prompting for it, so this stays as a defensive
+      net — but it is logged, because a model emitting shapes nobody asked for is
+      a prompt problem that this function would otherwise hide.
+
+    Padding fills TRAILING fields, which is sound because every intent's grammar
+    is a prefix of the seven-field tag (_GRAMMAR_IS_PREFIX). Being wrong about it
+    cannot create a bad row in any case: every gate still runs downstream, so a
+    BOOK or RESCHEDULE that lands here without a real Time is refused with
+    ``invalid_time`` and the caller is asked, exactly as if the field had been
+    blank. Name and phone are the two the whole tag is useless without — an
+    appointment carrying neither can never be found again — so a tag with fewer
+    than two fields is still rejected outright.
+    """
+    parsed = _tag_fields(text)
+    if parsed is None:
+        return None
+    action, fields = parsed
+    if len(fields) < 2:
+        return None
+
+    if action not in _GRAMMAR_IS_PREFIX:
+        # Unreachable via SHORT_ACTION_RE's verb list; here so that adding a verb
+        # whose fields are NOT a prefix fails loudly instead of mis-filling.
+        return None
+
+    shape = SHAPE_GRAMMAR if len(fields) == len(tag_grammar(action)) else SHAPE_PADDED
+    if shape is SHAPE_PADDED:
+        logging.getLogger(__name__).warning(
+            "action_tag: a %s tag arrived with %d field(s); its grammar asks for %d "
+            "(%s). Accepting it defensively and padding the rest — but the model is "
+            "emitting a shape nothing asked it for, which is a prompt problem.",
+            action, len(fields), len(tag_grammar(action)), tag_template(action),
+        )
+
+    fields += ["N/A"] * (len(_TAG_FIELDS) - len(fields))
+    return ActionTag(action, *fields)
+
+
 def parse_action_tag(text: str) -> Optional[ActionTag]:
     """The first well-formed tag in `text`, or None.
 
@@ -111,7 +270,7 @@ def parse_action_tag(text: str) -> Optional[ActionTag]:
     """
     m = ACTION_RE.search(text or "")
     if not m:
-        return None
+        return _parse_short_action_tag(text)
     g = m.groups()
     return ActionTag(
         action=(g[0] or "").strip().upper(),
@@ -194,6 +353,30 @@ FOLLOWUP_PROMISE_PATTERNS = (
     "प्रक्रिया शुरू", "आगे बढ़ूंगा", "आगे बढ़ता हूँ", "आगे बढ़ रहा",
     "कोशिश करूंगा", "कोशिश कर रहा", "शुरू कर रहा",
     "जाँच रहा", "जांच रहा", "चेक कर", "प्रोसेस", "थोड़ी देर",
+    # The other six languages this product ships. Their absence was not a
+    # judgement call, it was a gap: until 2026-08-14 this list was English plus
+    # Hindi/Marathi Devanagari only, so a Malayalam or Tamil agent could tell a
+    # caller to wait for a booking it never made and NOTHING here could see it —
+    # on voice that is a caller listening to silence, on chat a patient who never
+    # gets the promised message. Found by running this very detector over the
+    # product's OWN spoken fallback phrases (resilience.py::_FALLBACK_PHRASES),
+    # which promise a wait in all eight languages and tripped it in exactly one.
+    #
+    # Deliberately only the WAIT IMPERATIVE and the "one moment" idiom in each
+    # language — the forms that can only mean "expect something later". The
+    # broader "I am checking / I will try" shapes are left out for the same reason
+    # they are left out of Hindi above: they appear in perfectly good replies, and
+    # a false positive throws one away.
+    "காத்திரு", "ஒரு நிமிடம்",                    # Tamil
+    "ఆగండి", "వేచి", "ఒక్క క్షణం", "ఒక క్షణం",      # Telugu
+    "ಕಾಯಿ", "ಒಂದು ಕ್ಷಣ", "ಸ್ವಲ್ಪ ಸಮಯ",              # Kannada
+    "കാത്തിരി", "ഒരു നിമിഷം", "കുറച്ചു സമയം",       # Malayalam
+    "অপেক্ষা", "একটু সময়",                        # Bengali
+    "थांबा", "एक क्षण",                            # Marathi
+    # Romanized Hindi. Sarvam STT returns Latin script for some models, and the
+    # product's own constants have been written this way, so the Devanagari
+    # entries above cannot be assumed to cover Hindi.
+    "rukiye", "rukiyega", "thodi der", "ek pal", "ek minute", "intezaar",
 )
 
 

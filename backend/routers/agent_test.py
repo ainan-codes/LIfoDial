@@ -2475,18 +2475,16 @@ from backend.services.action_tag import (  # noqa: E402
     parse_action_tag as _parse_action_tag,
     promises_followup as _promises_followup,
     scrub_reply as _scrub_reply,
+    tag_templates as _tag_templates,
 )
+from backend.services import tag_recovery  # noqa: E402
 
-
-# Used when the model promised a follow-up, could not be repaired into either a
-# real action tag or a real question, and would otherwise leave the patient
-# waiting on silence. Asks for what is needed instead of promising anything.
-_NEEDS_DETAILS_REPLY = {
-    "en-IN": ("Sorry — could you confirm the doctor, and the date and time you'd like? "
-              "I'll book it as soon as you tell me."),
-    "hi-IN": ("क्षमा करें — कृपया बताइए किस डॉक्टर के साथ, और कौन सी तारीख़ और समय चाहिए? "
-              "बताते ही मैं बुक कर दूँगा।"),
-}
+# The reply used when the model described a booking action, could not be repaired
+# into either a real action tag or a real question, and would otherwise leave the
+# patient waiting on silence, now lives in services/tag_recovery.py as
+# needs_details_reply() — alongside the decision and the re-prompt that lead to
+# it, and in all seven languages this product ships rather than the two it had
+# here.
 
 
 # The clinic's real roster + real open slots, and the day/date parsing it needs,
@@ -2755,46 +2753,40 @@ async def _handle_booking_action(
     tag = _parse_action_tag(response)
 
     if tag is None:
-        # No parseable tag means NOTHING was written. Two replies are unsafe to
-        # pass through in that state:
-        #   * a promise to go do it ("hold on…") — the patient waits on silence
-        #     forever, since this path cannot send a follow-up;
-        #   * a claim that it is already done — a fabricated confirmation for a
-        #     booking that does not exist.
-        # Either way, give the model one strict chance to emit the tag or ask
-        # for what is missing.
-        #   * a reply that was ENTIRELY a machine tag this regex could not
-        #     parse — scrubbing leaves nothing to say, and the patient gets an
-        #     empty bubble (2026-08-11 production: a bare, space-padded
-        #     "[ ACTION: RESCHEDULE|…]" tag that no longer parses as a tag).
-        fabricated = _claims_any_completion(response)
-        tag_only = _is_only_a_tag(response)
-        if not (_promises_followup(response) or fabricated or tag_only):
+        # No parseable tag means NOTHING was written. Three replies are unsafe to
+        # pass through in that state — a promise to go do it, a claim that it is
+        # already done, and a reply that was ENTIRELY an unreadable machine tag —
+        # and each earns one strict chance to emit the tag or ask for what is
+        # missing. Which of the three it is, what the model is told about it, and
+        # whether its second attempt is usable are all decided by
+        # services/tag_recovery.py, shared with the voice path so a fix to either
+        # channel's recovery can no longer miss the other.
+        recovery = tag_recovery.classify_untagged_reply(response)
+        if recovery.decision == tag_recovery.PASS_THROUGH:
             return _scrub_reply(response)
 
         logger.error(
             "Booking reply %s with NO parseable action tag — nothing was written. Repairing: %r",
-            "WAS AN UNPARSEABLE TAG AND NOTHING ELSE" if tag_only
-            else ("CLAIMED THE ACTION WAS DONE" if fabricated else "promised a follow-up"),
-            (response or "")[:160],
+            tag_recovery.log_summary(recovery.reason), (response or "")[:160],
         )
         trace(trace_id, CHAT, "action_tag_missing",
-              repairing="true", tag_only=str(tag_only).lower(),
-              fabricated=str(fabricated).lower())
+              repairing="true", reason=recovery.reason,
+              tag_only=str(recovery.reason == tag_recovery.TAG_ONLY).lower(),
+              fabricated=str(recovery.reason == tag_recovery.FABRICATED).lower())
         repaired = await _repair_missing_action_tag(
             provider=provider, api_key=api_key, model=model, max_tokens=max_tokens,
             base_system_prompt=base_system_prompt, history=history,
+            reason=recovery.reason,
         )
         tag = _parse_action_tag(repaired)
         if tag is None:
-            cleaned = _scrub_reply(repaired or "")
-            # Accept the repair only if it stopped BOTH promising and claiming.
-            if cleaned and not _promises_followup(cleaned) and not _claims_any_completion(cleaned):
+            # Accept the repair only if it stopped BOTH promising and claiming —
+            # the same bar the voice path applies to its own re-run.
+            if tag_recovery.resolves_turn(repaired):
                 trace(trace_id, CHAT, REPLIED, outcome="repair_asked_for_details")
-                return cleaned
-            lang = (user_language or "en-IN").strip() or "en-IN"
+                return _scrub_reply(repaired or "")
             trace(trace_id, CHAT, REPLIED, outcome="canned_needs_details")
-            return _NEEDS_DETAILS_REPLY.get(lang, _NEEDS_DETAILS_REPLY["en-IN"])
+            return tag_recovery.needs_details_reply(user_language)
 
     b_action = tag.action
     b_name = tag.name
@@ -2913,29 +2905,27 @@ async def _handle_booking_action(
 
 async def _repair_missing_action_tag(
     *, provider: str, api_key: str, model: str, max_tokens: int,
-    base_system_prompt: str, history: list,
+    base_system_prompt: str, history: list, reason: str,
 ) -> str:
-    """One strict re-prompt after the model promised to complete a booking but
-    emitted no [ACTION:] tag. Returns the model's second attempt (or "" on
-    error) — the caller decides whether it produced a usable tag.
+    """One strict re-prompt after the model described a booking action it never
+    signalled. Returns the model's second attempt (or "" on error) — the caller
+    decides whether it produced a usable tag.
 
     This is a repair, not a retry loop: it runs at most once per turn, and only
     on the path that would otherwise end in permanent silence.
+
+    The instruction body is ``tag_recovery.repair_instruction`` — shared with the
+    voice path — and ``reason`` selects which of the three failures it opens by
+    describing. That mattered: this function used to send the same "you told the
+    patient it was already done, or told them to wait" text even when the reply
+    was an unreadable machine tag and the model had told the patient nothing at
+    all. Everything around it here is the chat envelope: the system-prompt header
+    this channel injects authoritative updates under, and the booking rules block.
     """
     repair_system = (
         base_system_prompt
         + "\n\n--- SYSTEM UPDATE (AUTHORITATIVE — obey exactly) ---\n"
-        "Your previous reply either told the patient to wait while you completed their request, or told "
-        "them it was already done — but you did NOT emit an [ACTION: ...] tag, so NOTHING happened. No "
-        "appointment was created, changed or cancelled. This system can only reply to the patient's own "
-        "messages: there is no way to send them a follow-up later, and you must never state that an "
-        "appointment is booked/cancelled/rescheduled unless the system has confirmed it back to you.\n"
-        "Reply once more, choosing EXACTLY ONE of:\n"
-        "  (a) If you already have Name, Phone, Date (DD/MM/YYYY), Time and Doctor — output the correct "
-        "[ACTION: ...] tag NOW, at the end of one short neutral sentence.\n"
-        "  (b) If any of those details is missing — ask for the missing detail in ONE short question.\n"
-        "NEVER say 'hold on', 'please wait', 'one moment', 'I'll confirm shortly' or anything else implying "
-        "a later message.\n"
+        + tag_recovery.repair_instruction(reason, spoken=False) + "\n"
         + BOOKING_RULES_BLOCK
     )
     try:
@@ -3105,11 +3095,15 @@ async def generate_llm_response(
         f"     *Convert relative dates ('today', 'tomorrow', 'day after tomorrow', 'next Monday', weekdays) into an actual DD/MM/YYYY date using the reference date: Today is {current_day_str}, {current_date_str}. Never output relative date words in the tag — only DD/MM/YYYY.*\n"
         "   - RESCHEDULE or CANCEL: you MUST ask for and confirm BOTH the patient's Name and Phone number before signalling the action.\n"
         "   - NOTES: capture symptoms/reasons/special requests, or 'N/A' if none.\n"
-        "   When (and only when) you have the required details, append exactly ONE of these tags at the very END of your reply:\n"
-        "   - [ACTION: BOOK|Name|Phone|Date|Time|Doctor|Notes]\n"
-        "   - [ACTION: RESCHEDULE|Name|Phone|Date|Time|Doctor|Notes]\n"
-        "   - [ACTION: CANCEL|Name|Phone|Date|Time|Doctor|Notes]\n"
-        "   (Use 'N/A' for fields that are not being changed.) The text before the tag must NOT claim the action is already done.\n"
+        "   When (and only when) you have the required details, append exactly ONE of these tags at the very END of your reply.\n"
+        "   EACH ACTION HAS ITS OWN SHAPE — use exactly the fields listed for it, no more and no fewer:\n"
+        # Rendered from services/action_tag.py::TAG_GRAMMAR — the same source the
+        # voice prompt and the parser read, so the three can never disagree about
+        # what a CANCEL looks like.
+        + "".join(f"   {line.strip()}\n" for line in _tag_templates().splitlines())
+        + "   A CANCEL is found from the name and number alone, and a RESCHEDULE from those plus the "
+        "NEW day and time — do NOT pad either with 'N/A' fields, and do not ask the patient for "
+        "details the tag does not list. The text before the tag must NOT claim the action is already done.\n"
         "   NEVER emit a tag when the patient is only ASKING something — 'what times are free?', 'is the "
         "doctor in tomorrow?', 'how much does it cost?'. A question about availability is answered "
         "straight from the REAL DOCTOR AVAILABILITY section above, with NO tag. Only emit a tag when the "

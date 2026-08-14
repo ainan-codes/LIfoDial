@@ -73,10 +73,72 @@ async def test_no_provider_reachable_raises():
 
 
 def test_fallback_phrase_language():
-    assert "one moment" in fallback_phrase("en-IN").lower()
+    assert fallback_phrase("en-IN").strip()
     assert fallback_phrase("hi-IN") != fallback_phrase("en-IN")
     # unknown language → default (english)
     assert fallback_phrase("zz-ZZ") == fallback_phrase("en-IN")
+
+
+# ── The phrases must not promise what nothing delivers ────────────────────────
+
+def test_no_fallback_phrase_promises_a_followup():
+    """These phrases used to say "one moment please" / "kripya thodi der rukiye" /
+    "ஒரு நிமிடம் காத்திருங்கள்" — a promise of a later message, in a place where
+    nothing can send one.
+
+    _speak_fallback is reached only AFTER _try_another_model has declined or run
+    out of models, so at that point nothing further is coming for this turn at
+    all: the caller waits, hears nothing, and hangs up. This is the identical
+    defect the codebase already bans in MODEL output via
+    action_tag.promises_followup — it was simply living in our own constants,
+    where no test looked.
+
+    Note this could only ever have been caught by widening that detector first: it
+    had patterns for English, Hindi and Marathi only, so of the eight offending
+    phrases it recognised exactly one.
+    """
+    from backend.services.action_tag import promises_followup
+
+    offenders = {
+        lang: phrase for lang, phrase in R._FALLBACK_PHRASES.items()
+        if promises_followup(phrase)
+    }
+    assert not offenders, (
+        f"{len(offenders)} fallback phrase(s) promise a follow-up nothing sends: {offenders}"
+    )
+
+
+def test_every_outbound_constant_resolves_its_turn():
+    """The same rule, over every constant this product speaks or writes without
+    the model's involvement. These are exactly the strings that get used when the
+    model is the broken part, so they are the last place a stranding phrase can
+    hide — and each lives in a different module, which is how one of them kept the
+    bug for a year while the others were audited."""
+    from backend.agent import spoken_fallback
+    from backend.services import tag_recovery
+    from backend.services.action_tag import promises_followup
+
+    tables: list[tuple[str, str, str]] = [
+        (f"resilience/{lang}", lang, phrase)
+        for lang, phrase in R._FALLBACK_PHRASES.items()
+    ] + [
+        (f"end_call/{lang}", lang, phrase)
+        for lang, phrase in R._END_CALL_PHRASES.items()
+    ] + [
+        (f"spoken_fallback/{lang}/{key}", lang, spoken_fallback.sentence(key, lang))
+        for lang in spoken_fallback.supported_languages()
+        for key in (spoken_fallback.BOOKED, spoken_fallback.CANCELLED,
+                    spoken_fallback.RESCHEDULED, spoken_fallback.ACTION_FAILED,
+                    spoken_fallback.NOT_UNDERSTOOD)
+    ] + [
+        (f"needs_details/{lang}", lang, tag_recovery.needs_details_reply(lang))
+        for lang in tag_recovery.supported_languages()
+    ]
+
+    offenders = [where for where, _lang, text in tables if promises_followup(text)]
+    assert not offenders, f"outbound constants that promise a follow-up: {offenders}"
+    for where, _lang, text in tables:
+        assert text.strip(), f"{where} is empty — that is silence, not a fallback"
 
 
 class _SpyTask:
@@ -100,7 +162,10 @@ async def test_errorframe_speaks_fallback_not_silence():
     # push_frame is a no-op stub for the test (no downstream linked)
     with patch.object(proc, "push_frame", new=_noop):
         await proc.process_frame(ErrorFrame(error="boom"), FrameDirection.DOWNSTREAM)
-    assert task.spoken == ["I'm having a little trouble right now, one moment please."]
+    # Compared against the constant, not a copy of its text: this test's subject
+    # is that SOMETHING is spoken, and a literal here just breaks whenever the
+    # wording is corrected (as it was when the phrase stopped promising a wait).
+    assert task.spoken == [fallback_phrase("en-IN")]
 
 
 @pytest.mark.asyncio

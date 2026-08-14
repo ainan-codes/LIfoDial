@@ -36,6 +36,7 @@ os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_voice_action_tag.db"
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-voice-action-tests")
 
 import asyncio
+import re
 from datetime import datetime, time as time_cls, timedelta, timezone
 
 import pytest
@@ -47,10 +48,13 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMRunFrame,
     LLMTextFrame,
     TextFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
 )
+from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
@@ -206,21 +210,96 @@ class ScriptedLLM(FrameProcessor):
 
 
 class SpeakerSink(FrameProcessor):
-    """Stands in for `tts`: whatever reaches here is what the caller HEARS."""
+    """Stands in for `tts`: whatever reaches here is what the caller HEARS.
+
+    It must model pipecat's REAL text contract, not "every TextFrame is speech",
+    because the difference between the two is a whole class of silent-hang bug
+    that this file could not see:
+
+    * A plain ``TextFrame`` is *aggregated*, not spoken. ``TTSService`` feeds it
+      to a ``SimpleTextAggregator`` (tts_service.py:695-701), which releases a
+      sentence only once sentence-ending punctuation is followed by non-whitespace
+      LOOKAHEAD (simple_text_aggregator.py:96-116). The tail after the last "."
+      or "।" therefore sits in the aggregator until something flushes it, and the
+      only things that flush it are ``LLMFullResponseEndFrame`` and ``EndFrame``
+      (tts_service.py:711-725).
+
+      Consequence: text pushed AFTER the response's end frame has already gone
+      downstream is stranded — its last sentence is never synthesized at all.
+      That is exactly where VoiceActionProcessor's silence backstop pushed from.
+
+    * A ``TTSSpeakFrame`` IS spoken immediately and in full, whatever the turn
+      state (tts_service.py:758-778). It is the only frame type that can be
+      relied on once the LLM turn is over, which is why resilience.py uses it.
+
+    So this sink runs the same aggregator the real service does, flushes on the
+    same frames, and speaks TTSSpeakFrames whole.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.chunks: list[str] = []
+        #: Which frame type each synthesis request arrived on. Recorded because
+        #: the frame type IS the behaviour here (see the class docstring), so a
+        #: test can assert the mechanism and not just today's audible outcome.
+        self.frame_types: list[str] = []
+
+        self._agg = SimpleTextAggregator()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
-        if isinstance(frame, TextFrame) and direction == FrameDirection.DOWNSTREAM:
-            self.chunks.append(frame.text or "")
+        if direction == FrameDirection.DOWNSTREAM:
+            if isinstance(frame, TTSSpeakFrame):
+                self._emit(frame.text, "TTSSpeakFrame")
+            elif isinstance(frame, LLMFullResponseStartFrame):
+                await self._agg.reset()
+            elif isinstance(frame, TextFrame):
+                async for aggregate in self._agg.aggregate(frame.text or ""):
+                    self._emit(aggregate.text, "TextFrame")
+            elif isinstance(frame, LLMFullResponseEndFrame):
+                remaining = await self._agg.flush()
+                if remaining:
+                    self._emit(remaining.text, "TextFrame")
         await self.push_frame(frame, direction)
+
+    def _emit(self, text: str, frame_type: str) -> None:
+        """One synthesis request, i.e. one thing the caller actually hears."""
+        if (text or "").strip():
+            self.chunks.append(text)
+            self.frame_types.append(frame_type)
 
     @property
     def spoken(self) -> str:
-        return "".join(self.chunks).strip()
+        """Everything the caller heard this call, as one string.
+
+        Joined with a space and re-normalised because the real service
+        synthesizes each aggregation separately and strips its edges
+        (tts_service.py:1017-1025), so inter-sentence spacing is not preserved
+        end-to-end and asserting on it would test nothing real.
+        """
+        return re.sub(r"\s+", " ", " ".join(self.chunks)).strip()
+
+
+class RerunSwallower(FrameProcessor):
+    """Drops every LLMRunFrame, so a re-run VoiceActionProcessor asks for never
+    reaches the LLM.
+
+    Stands in for the class of failure the busy watchdog exists for: a provider
+    that does not emit LLMFullResponseStartFrame, a processor that consumes the
+    run frame, a cancelled task. In all of them the re-run is requested, nothing
+    answers, and no frame ever comes back to clear the silence shield.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.swallowed: int = 0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMRunFrame) and direction == FrameDirection.DOWNSTREAM:
+            self.swallowed += 1
+            return
+        await self.push_frame(frame, direction)
 
 
 class VoiceCall:
@@ -238,7 +317,9 @@ class VoiceCall:
     """
 
     def __init__(self, replies: list[str], agent_config: dict | None = None,
-                 call_record_id: str | None = CALL_ID) -> None:
+                 call_record_id: str | None = CALL_ID,
+                 swallow_reruns: bool = False,
+                 busy_timeout_seconds: float | None = None) -> None:
         tenant = {
             "id": TENANT_ID,
             "clinic_name": "Indiana Hospital Mangalore",
@@ -262,12 +343,18 @@ class VoiceCall:
             tenant_id=TENANT_ID, agent_id=None, call_meta=call_meta,
         )
         self.booking = BookingProcessor(tenant=tenant, agent_config=cfg, call_meta=call_meta)
+        action_kwargs = {}
+        if busy_timeout_seconds is not None:
+            action_kwargs["busy_timeout_seconds"] = busy_timeout_seconds
         self.action = VoiceActionProcessor(
             context=context, tenant=tenant, agent_config=cfg, call_meta=call_meta,
-            call_logger=self.call_logger,
+            call_logger=self.call_logger, **action_kwargs,
         )
         self.llm = ScriptedLLM(replies, call_logger=self.call_logger)
         self.speaker = SpeakerSink()
+        # Sits immediately downstream of voice_action so a re-run it asks for is
+        # destroyed before anything can act on it — see RerunSwallower.
+        self.swallower = RerunSwallower() if swallow_reruns else None
 
         self.pipeline = Pipeline([
             BookingTranscriptTap(self.booking, on_new_turn=self.action.reset_turn),
@@ -275,6 +362,7 @@ class VoiceCall:
             self.booking,
             self.llm,
             self.action,
+            *([self.swallower] if self.swallower else []),
             TagScrubProcessor(),
             self.speaker,
             pair.assistant(),      # MUST be last — it turns LLMRunFrame into a re-run

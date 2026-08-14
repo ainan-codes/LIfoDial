@@ -383,15 +383,36 @@ async def build_llm(provider: str, api_key: str, model: str, system_prompt: str,
 
 
 # ── Spoken fallback phrases (short; agent's language) ─────────────────────────
+#
+# These must RESOLVE the turn, not defer it. Every one of them used to promise a
+# wait — "one moment please", "kripya thodi der rukiye", "ஒரு நிமிடம்
+# காத்திருங்கள்", "ഒരു നിമിഷം കാത്തിരിക്കൂ" — and nothing schedules what they
+# promise: _speak_fallback is only ever reached AFTER _try_another_model has
+# declined or run out of models, so at that point nothing further is coming for
+# this turn at all. The caller waits, hears nothing, and says "हेलो? हेलो?" into an
+# open line. That is the identical defect this codebase already bans in MODEL
+# output through action_tag.promises_followup — it was simply sitting in our own
+# constants instead, where no test looked.
+#
+# So each phrase now apologises and hands the turn back to the caller, whose next
+# utterance is the only thing that can actually produce a reply. Enforced by
+# test_no_outbound_constant_promises_a_followup, which runs this whole table
+# through promises_followup — and note that detector had to be widened first: it
+# had patterns for English, Hindi and Marathi only, so it caught exactly one of
+# the eight offending phrases.
+#
+# hi-IN is Devanagari now, not romanized Latin. The same TTS already speaks
+# Devanagari for every phrase in agent/spoken_fallback.py, and romanized text is
+# invisible to the Devanagari half of the guard.
 _FALLBACK_PHRASES = {
-    "hi-IN": "Ek pal ke liye kuch takneeki dikkat aa rahi hai, kripya thodi der rukiye.",
-    "en-IN": "I'm having a little trouble right now, one moment please.",
-    "ta-IN": "சிறிது தொழில்நுட்பச் சிக்கல் உள்ளது, ஒரு நிமிடம் காத்திருங்கள்.",
-    "te-IN": "కొంచెం సాంకేతిక సమస్య వస్తోంది, ఒక్క క్షణం ఆగండి.",
-    "kn-IN": "ಸ್ವಲ್ಪ ತಾಂತ್ರಿಕ ತೊಂದರೆ ಇದೆ, ಒಂದು ಕ್ಷಣ ನಿಲ್ಲಿ.",
-    "ml-IN": "ചെറിയ ഒരു സാങ്കേതിക പ്രശ്നം ഉണ്ട്, ഒരു നിമിഷം കാത്തിരിക്കൂ.",
-    "mr-IN": "थोडी तांत्रिक अडचण येत आहे, कृपया एक क्षण थांबा.",
-    "bn-IN": "একটু প্রযুক্তিগত সমস্যা হচ্ছে, একটু অপেক্ষা করুন।",
+    "hi-IN": "माफ़ कीजिए, एक तकनीकी दिक्कत आ गई। कृपया अपनी बात दोबारा कहिए।",
+    "en-IN": "Sorry, I hit a technical problem just then. Could you say that again?",
+    "ta-IN": "மன்னிக்கவும், ஒரு தொழில்நுட்பச் சிக்கல் ஏற்பட்டது. மீண்டும் சொல்ல முடியுமா?",
+    "te-IN": "క్షమించండి, ఒక సాంకేతిక సమస్య వచ్చింది. మళ్ళీ చెప్పగలరా?",
+    "kn-IN": "ಕ್ಷಮಿಸಿ, ಒಂದು ತಾಂತ್ರಿಕ ತೊಂದರೆ ಆಯಿತು. ದಯವಿಟ್ಟು ಇನ್ನೊಮ್ಮೆ ಹೇಳಿ.",
+    "ml-IN": "ക്ഷമിക്കണം, ഒരു സാങ്കേതിക പ്രശ്നം ഉണ്ടായി. ഒന്നു കൂടി പറയാമോ?",
+    "mr-IN": "क्षमस्व, एक तांत्रिक अडचण आली. कृपया पुन्हा सांगाल का?",
+    "bn-IN": "দুঃখিত, একটি প্রযুক্তিগত সমস্যা হয়েছে। আবার বলবেন কি?",
 }
 _DEFAULT_FALLBACK = _FALLBACK_PHRASES["en-IN"]
 

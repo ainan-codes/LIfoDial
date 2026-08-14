@@ -378,7 +378,11 @@ async def test_voice_speaks_rather_than_going_silent_once_no_model_is_left():
         await proc.process_frame(ErrorFrame(error=TPD_429), FrameDirection.DOWNSTREAM)
 
     assert task.model_updates == []
-    assert task.spoken == ["I'm having a little trouble right now, one moment please."]
+    # The constant, not a copy of its wording — see resilience._FALLBACK_PHRASES
+    # for why that wording changed (it used to promise a wait that nothing sends).
+    from backend.agent.resilience import fallback_phrase
+
+    assert task.spoken == [fallback_phrase("en-IN")]
 
 
 @pytest.mark.asyncio

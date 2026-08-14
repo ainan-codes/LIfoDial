@@ -68,6 +68,7 @@ leaving the caller listening to silence forever. Same rule, and the same
 reasoning, as BookingProcessor's guard.
 """
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -80,6 +81,7 @@ from pipecat.frames.frames import (
     LLMRunFrame,
     TextFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -93,6 +95,7 @@ _USER_TEXT_FRAMES = (TranscriptionFrame, InterimTranscriptionFrame)
 
 from backend.agent.booking_rules import BOOKING_RESULT_FALSE, BOOKING_RESULT_TRUE
 from backend.models.appointment import SOURCE_VOICE
+from backend.services import tag_recovery
 from backend.services.action_tag import (
     ActionTag,
     claims_any_completion,
@@ -101,11 +104,11 @@ from backend.services.action_tag import (
     missing_identity_fields,
     needs_real_time,
     parse_action_tag,
-    promises_followup,
     scrub_reply,
 )
 from backend.services.booking_trace import (
     CONFIRMED,
+    DROPPED,
     EXECUTED,
     EXECUTING,
     INTENT,
@@ -114,6 +117,15 @@ from backend.services.booking_trace import (
     new_trace_id,
     trace,
 )
+
+#: How long the caller's request may be "in progress" — shielding them from the
+#: silence watchdog — before that shield is force-released and the backstop
+#: speaks. Must exceed the slowest legitimate window it covers: a DB write plus
+#: one LLM round trip, measured at 2-3s each on this stack. It must also stay
+#: comfortably BELOW the configured silence timeout (>= 20s, see
+#: pipeline.py), so the shield expiring gives the caller a real answer before the
+#: watchdog would end their call outright.
+BUSY_TIMEOUT_SECONDS = 12.0
 
 logger = logging.getLogger(__name__)
 
@@ -250,42 +262,28 @@ def build_result_message(action: str, res: dict) -> str:
 
 #: Appended when the LLM is re-run so it never emits a second tag for work that
 #: has already happened (which would re-enter this whole flow).
+#:
+#: (The re-prompts themselves — for a reply that claimed/promised an action
+#: without emitting a tag, and for a reply that was an unreadable tag and nothing
+#: else — used to be two long literals here. They now come from
+#: services/tag_recovery.py, which the chat path reads from too: three separate
+#: fixes to this wording had already been made on one channel and never ported to
+#: the other. See that module's docstring for which ones.)
 _NO_SECOND_TAG = (
     " The action has already been carried out by the system — do NOT emit another "
     "[ACTION: ...] tag in this reply."
 )
 
-#: One strict re-prompt after the model told the caller an appointment was
-#: booked/cancelled/rescheduled without emitting a tag — so nothing happened.
-#: The voice analogue of the chat path's _repair_missing_action_tag.
-_REPAIR_INSTRUCTION = (
-    "[BOOKING_RESULT success=false] You just told the caller an appointment was booked, cancelled "
-    "or rescheduled — or that you were about to do it — but you did NOT emit an [ACTION: ...] tag, "
-    "so NOTHING happened and what you said is not true. Saying it does not do it; only the tag "
-    "does. There is nothing running in the background and nothing will happen later.\n"
-    "Fix it NOW in your next reply, choosing EXACTLY ONE of:\n"
-    "  (a) Output the correct [ACTION: ...] tag as the WHOLE of your reply, nothing else. For a "
-    "CANCEL you need only the caller's name and number — put N/A in the date, time and doctor "
-    "fields. If the caller's existing appointments are listed above, every detail you need is "
-    "already there; do not ask for it again.\n"
-    "  (b) If a detail is genuinely missing, ask for THAT ONE detail in one short question, and "
-    "claim nothing.\n"
-    "Never say 'hold on', 'one moment', 'I'll start the process' or 'I'll proceed' — nothing "
-    "follows it, and the caller will wait for a reply that never comes."
-)
+def _repair_instruction(reason: str) -> str:
+    """The re-prompt for one strict second attempt, as a voice system message.
 
-#: The model's whole reply was a machine tag this system could not parse (a
-#: mangled field list, or the token cap cutting it off mid-tag). Nothing was
-#: written and nothing could be spoken, so the caller is sitting in silence.
-_MALFORMED_TAG_INSTRUCTION = (
-    "[BOOKING_RESULT success=false] Your last reply was a machine tag this system could not read, so "
-    "NOTHING was saved and the caller heard nothing at all. Reply again, choosing EXACTLY ONE of:\n"
-    "  (a) The correct tag, exactly in the form "
-    "[ACTION: BOOK|Name|Phone|DD/MM/YYYY|Time|Doctor|Notes] — seven fields separated by | inside one "
-    "pair of square brackets, and nothing else in the reply.\n"
-    "  (b) If any field is missing, ONE short spoken question asking the caller for it, with no tag "
-    "and no claim that anything is done."
-)
+    The wording is ``tag_recovery.repair_instruction`` — shared with the chat path
+    — and the ``[BOOKING_RESULT success=false]`` prefix is this channel's envelope
+    for it: the line goes into the live LLM context, where every authoritative
+    system update this processor injects wears that marker, and tag_scrub removes
+    it from anything the model echoes back toward TTS.
+    """
+    return f"{BOOKING_RESULT_FALSE} {tag_recovery.repair_instruction(reason, spoken=True)}"
 
 
 class VoiceActionProcessor(FrameProcessor):
@@ -316,6 +314,7 @@ class VoiceActionProcessor(FrameProcessor):
         agent_config: dict,
         call_meta: dict,
         call_logger=None,
+        busy_timeout_seconds: float = BUSY_TIMEOUT_SECONDS,
     ) -> None:
         super().__init__()
         self._context = context
@@ -323,6 +322,13 @@ class VoiceActionProcessor(FrameProcessor):
         self._agent_config = agent_config or {}
         self._call_meta = call_meta or {}
         self._call_logger = call_logger
+        self._busy_timeout = float(busy_timeout_seconds)
+        #: The independent watchdog on _set_busy(True) — see _set_busy.
+        self._busy_timer: Optional[asyncio.Task] = None
+        #: The direction to speak in if that watchdog has to fire. Captured from
+        #: real frame flow rather than assumed, so the backstop cannot be pushed
+        #: the wrong way by a timer that has no frame of its own.
+        self._speak_direction: FrameDirection = FrameDirection.DOWNSTREAM
 
         # ── Per-response state (one LLM generation) ───────────────────────────
         #: Everything the model produced this response, kept whole. The end-of-
@@ -361,6 +367,12 @@ class VoiceActionProcessor(FrameProcessor):
         #: ``(action, result)`` of the last action executed this turn, so the
         #: backstop can state the REAL outcome instead of a generic apology.
         self._outcome_this_turn: Optional[tuple[str, dict]] = None
+        #: The action name while its write is ACTUALLY RUNNING — set when
+        #: _execute begins, cleared when it returns. Only the busy watchdog reads
+        #: it, and only to tell two very different silences apart: "we never
+        #: understood you" and "we were part-way through your booking". See
+        #: _speak_backstop.
+        self._action_in_flight: Optional[str] = None
 
         self._trace_id: str = new_trace_id()
 
@@ -379,6 +391,11 @@ class VoiceActionProcessor(FrameProcessor):
         if direction != FrameDirection.DOWNSTREAM:
             await self.push_frame(frame, direction)
             return
+
+        # Every branch below speaks downstream; remembering it here is what lets
+        # the busy watchdog — which fires from a timer, with no frame in hand —
+        # speak in the same direction the pipeline actually flows.
+        self._speak_direction = direction
 
         try:
             if isinstance(frame, InterruptionFrame):
@@ -402,7 +419,11 @@ class VoiceActionProcessor(FrameProcessor):
                     return  # held or dropped — do NOT push it
 
             elif isinstance(frame, LLMFullResponseEndFrame):
-                # The end frame goes first, so the response is closed before any
+                # Held text that turned out to be real speech goes out BEFORE the
+                # end frame — see _speak_held_leftover for why the order is the
+                # difference between spoken and stranded.
+                await self._speak_held_leftover(direction)
+                # The end frame goes next, so the response is closed before any
                 # re-run is requested (see _pending_rerun).
                 await self.push_frame(frame, direction)
                 await self._on_response_end(direction)
@@ -487,8 +508,6 @@ class VoiceActionProcessor(FrameProcessor):
         """Resolve whatever this response left unfinished, then honour an owed
         re-run. Called AFTER the LLMFullResponseEndFrame has been forwarded."""
         full = self._full
-        held = self._buf
-        was_holding = self._holding is True
         was_followup = self._is_followup
         acted = self._acted_this_turn
         # A re-run already owed means this response's action ran and its outcome
@@ -497,43 +516,37 @@ class VoiceActionProcessor(FrameProcessor):
         owed_rerun = self._pending_rerun
         self._reset_response()
 
-        if was_holding and held:
-            # Held to the end without ever becoming a parseable tag. An
-            # unterminated machine tag is dropped (tag_scrub would drop it too);
-            # anything else is real speech and must not be swallowed.
-            speakable_held = scrub_reply(held)
-            if speakable_held:
-                logger.warning(
-                    "VoiceActionProcessor: held a bracketed reply that never became a tag — "
-                    "speaking it: %r", speakable_held[:120],
-                )
-                self._spoke_this_turn = True
-                await self.push_frame(TextFrame(speakable_held), direction)
-
         if owed_rerun or not full.strip():
             await self._flush_rerun(direction, backstop=True)
             return
 
         speakable = scrub_reply(full)
         tag = parse_action_tag(full)
+        # The shared decision: is this reply safe to leave standing, does it earn
+        # one re-prompt, or has this turn already had its one? Identical on both
+        # channels — see services/tag_recovery.py.
+        recovery = tag_recovery.classify_untagged_reply(
+            full, already_repaired=self._repaired_this_turn,
+        )
 
-        if not speakable:
+        if recovery.reason == tag_recovery.TAG_ONLY:
             # NOTHING reached TTS: the model replied with a machine tag this
             # system could not parse, or one the token cap cut off mid-way. The
             # caller is sitting in silence — the worst possible outcome on a
             # phone call — so re-prompt rather than hang up on them.
-            if self._repaired_this_turn:
+            if not recovery.needs_repair:
                 logger.error(
                     "VoiceActionProcessor: an unspeakable machine-tag reply AGAIN — giving up on "
                     "this turn rather than looping: %r", full[:160],
                 )
             else:
                 logger.error(
-                    "VoiceActionProcessor: the whole reply was an unparseable machine tag, so there "
-                    "was nothing to speak — re-prompting: %r", full[:160],
+                    "VoiceActionProcessor: the reply %s, so there was nothing to speak — "
+                    "re-prompting: %r",
+                    tag_recovery.log_summary(recovery.reason), full[:160],
                 )
                 self._repaired_this_turn = True
-                self._inject(_MALFORMED_TAG_INSTRUCTION, rerun=True)
+                self._inject(_repair_instruction(recovery.reason), rerun=True)
 
         elif not was_followup:
             # ── Recovery 1: the tag came LATE (after words already spoken) ─────
@@ -578,23 +591,17 @@ class VoiceActionProcessor(FrameProcessor):
             #
             # A promise is worse than a claim, because the caller waits for it. The
             # chat path has caught both since 2026-08-10; voice caught neither.
-            elif (
-                tag is None
-                and not acted
-                and not self._repaired_this_turn
-                and (claims_any_completion(speakable) or promises_followup(speakable))
-            ):
-                fabricated = claims_any_completion(speakable)
+            elif tag is None and not acted and recovery.needs_repair:
                 logger.error(
-                    "VoiceActionProcessor: the agent %s an appointment action with no [ACTION:] "
-                    "tag — nothing was written. Re-prompting for the tag. Said: %r",
-                    "CLAIMED" if fabricated else "PROMISED to perform",
-                    speakable[:160],
+                    "VoiceActionProcessor: the agent %s with no [ACTION:] tag — nothing was "
+                    "written. Re-prompting for the tag. Said: %r",
+                    tag_recovery.log_summary(recovery.reason), speakable[:160],
                 )
                 trace(self._trace_id, VOICE, "action_tag_missing",
-                      repairing="true", fabricated=str(fabricated).lower())
+                      repairing="true", reason=recovery.reason,
+                      fabricated=str(recovery.reason == tag_recovery.FABRICATED).lower())
                 self._repaired_this_turn = True
-                self._inject(_REPAIR_INSTRUCTION, rerun=True)
+                self._inject(_repair_instruction(recovery.reason), rerun=True)
 
         await self._flush_rerun(direction, backstop=True)
 
@@ -672,6 +679,11 @@ class VoiceActionProcessor(FrameProcessor):
         if not tenant_id:
             logger.error("VoiceActionProcessor: no tenant on this call — refusing to write.")
             return {"success": False, "reason": "db_error", "appointment_id": None}
+
+        # From here to the outcome below, this caller's write is genuinely in
+        # flight. Only the busy watchdog reads this, and only if it has to speak
+        # before the write finishes.
+        self._action_in_flight = action
 
         trace(
             self._trace_id, VOICE, INTENT, action=action, doctor=tag.doctor or None,
@@ -772,6 +784,7 @@ class VoiceActionProcessor(FrameProcessor):
         # REALLY happened rather than a generic apology — crucially, this is the
         # case where the row exists and only the telling of it failed.
         self._outcome_this_turn = (action, res)
+        self._action_in_flight = None
 
         return res
 
@@ -877,9 +890,91 @@ class VoiceActionProcessor(FrameProcessor):
              reply). Cleared the instant a new response begins (LLMFullResponseStartFrame)
              rather than waiting for audio, so the margin errs toward the caller
              never being penalised for the system's own speed.
+
+        Setting it True also arms an INDEPENDENT timer — see _busy_expired for
+        why that is not optional.
         """
         if self._call_logger is not None:
             self._call_logger.action_in_progress = busy
+        self._cancel_busy_timer()
+        if busy:
+            try:
+                self._busy_timer = asyncio.get_running_loop().create_task(
+                    self._busy_watchdog())
+            except RuntimeError:
+                # No running loop (a synchronous unit test constructing the
+                # processor). The flag is still set; there is simply nothing to
+                # time it, which is the pre-timer behaviour.
+                self._busy_timer = None
+
+    def _cancel_busy_timer(self) -> None:
+        timer, self._busy_timer = self._busy_timer, None
+        if timer is not None and not timer.done():
+            timer.cancel()
+
+    async def _busy_watchdog(self) -> None:
+        """Wait out the busy window; if it never closes, close it."""
+        try:
+            await asyncio.sleep(self._busy_timeout)
+            await self._busy_expired()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error("VoiceActionProcessor: busy watchdog failed: %s", exc, exc_info=True)
+
+    async def _busy_expired(self) -> None:
+        """The busy flag has been set for longer than any real turn takes.
+
+        ``action_in_progress`` STOPS the silence watchdog's clock
+        (pipeline.py::_enforce_silence_timeout) — while it is True, no silence
+        accrues and the call cannot be ended for a caller hearing nothing. That is
+        correct while a DB write or a corrected reply is genuinely in flight, and
+        it is the strongest possible failure mode if the flag is ever left set:
+        the caller sits on an open line that the one mechanism designed to rescue
+        them has been switched off for.
+
+        Every path that clears it depends on a FRAME arriving —
+        ``LLMFullResponseStartFrame`` for the re-run, or ``_flush_rerun`` deciding
+        no re-run is needed. Both hold today: the two installed LLM services push
+        a start frame before the request and an end frame in a ``finally``
+        (openai/base_llm.py:562-573, google/llm.py:443,610-629), so even a 429 or a
+        timeout resolves the flag. But NOTHING STRUCTURALLY ENFORCES THAT. A
+        provider added later, an LLMRunFrame dropped by a processor between here
+        and the aggregator, a cancelled task — any of them leaves the flag set for
+        the rest of the call, and the symptom is the one this whole module exists
+        to prevent, in its least recoverable form.
+
+        So this timer is deliberately not frame-dependent. It clears the flag,
+        which re-arms the silence watchdog, and it speaks the backstop, because
+        re-arming a timer that ends the call is not the same as answering the
+        caller — by this point they have been waiting in silence for the whole
+        window and the honest thing is to say something now.
+        """
+        logger.error(
+            "VoiceActionProcessor: the caller's request has been 'in progress' for %.0fs with "
+            "no reply starting — the reply frame never arrived. Force-clearing the silence "
+            "shield and speaking, rather than leaving the caller on a line whose watchdog is "
+            "switched off.", self._busy_timeout,
+        )
+        self._busy_timer = None
+        if self._call_logger is not None:
+            self._call_logger.action_in_progress = False
+        # Nothing is owed any more: whatever this was waiting for is not coming,
+        # and leaving the re-run pending would let a late frame speak over the
+        # backstop.
+        self._pending_rerun = False
+        trace(self._trace_id, VOICE, DROPPED, reason="busy_timeout",
+              after_seconds=f"{self._busy_timeout:.0f}")
+        try:
+            await self._speak_backstop(self._speak_direction)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("VoiceActionProcessor: the busy-timeout backstop could not speak: %s",
+                         exc, exc_info=True)
+
+    async def cleanup(self) -> None:
+        """Pipecat teardown — the timer must not outlive the call."""
+        self._cancel_busy_timer()
+        await super().cleanup()
 
     # ── State ─────────────────────────────────────────────────────────────────
 
@@ -905,6 +1000,12 @@ class VoiceActionProcessor(FrameProcessor):
         self._spoke_this_turn = False
         self._outcome_this_turn = None
         self._is_followup = False
+        # A new utterance supersedes whatever the last one was waiting for. Clear
+        # the shield rather than only cancelling its timer: leaving the flag set
+        # here with nothing timing it is the exact unbounded state this timer
+        # exists to make impossible. The caller has just spoken, so the silence
+        # clock has been reset by their own speech regardless.
+        self._set_busy(False)
 
     async def _speak_backstop(self, direction: FrameDirection) -> None:
         """Say SOMETHING when a turn is about to end having said nothing.
@@ -930,6 +1031,20 @@ class VoiceActionProcessor(FrameProcessor):
         common case is that the write succeeded and only the telling of it
         failed. Saying "sorry, that didn't work" over a booking that exists would
         trade silence for a lie.
+
+        It is emitted as a TTSSpeakFrame, and that is not a detail. This runs
+        AFTER the response's LLMFullResponseEndFrame has gone downstream — it has
+        to, because whether the turn ended in silence is not knowable until the
+        response is over — and by then a plain TextFrame can no longer be spoken
+        in full. TTSService aggregates TextFrames into sentences and releases the
+        last one only when the end frame flushes it (tts_service.py:711-725), so
+        text arriving after that frame leaves its final sentence stranded in the
+        aggregator: reproduced 2026-08-14, where the Hindi retry phrase reached
+        the caller as "माफ़ कीजिए, मैं समझ नहीं पाया।" with "कृपया दोबारा कहिए।"
+        silently dropped, and a one-sentence phrase would have been dropped
+        entirely. A TTSSpeakFrame is synthesized whole and immediately whatever
+        the turn state (tts_service.py:758-778) — the same mechanism the greeting
+        and resilience.py's fallback phrase use, for the same reason.
         """
         if self._spoke_this_turn:
             return
@@ -944,6 +1059,19 @@ class VoiceActionProcessor(FrameProcessor):
                 "(success=%s) — speaking the constant fallback so the caller is not "
                 "left in silence.", action, res.get("success"),
             )
+        elif self._action_in_flight is not None:
+            # The busy watchdog fired while the write was STILL RUNNING, so there
+            # is no outcome to report and there may yet be one. "Sorry, I did not
+            # catch that" would be false — we understood perfectly and are part-way
+            # through it — so this says we could not complete it and points the
+            # caller at someone who can check. The one honest thing available when
+            # the answer is genuinely unknown.
+            key = spoken_fallback.ACTION_FAILED
+            logger.error(
+                "VoiceActionProcessor: the %s write was still in flight when the busy "
+                "watchdog fired — telling the caller it could not be completed rather "
+                "than claiming an outcome that is not known yet.", self._action_in_flight,
+            )
         else:
             key = spoken_fallback.NOT_UNDERSTOOD
             logger.error(
@@ -954,13 +1082,56 @@ class VoiceActionProcessor(FrameProcessor):
         text = spoken_fallback.sentence(key, self._agent_config.get("language"))
         trace(self._trace_id, VOICE, REPLIED, source="backstop", outcome=key)
         self._spoke_this_turn = True
-        await self.push_frame(TextFrame(text), direction)
+        # append_to_context=False, as in resilience.py: this sentence is a
+        # constant the system said on the model's behalf, and the real outcome has
+        # already been injected into the context by _execute's result message, so
+        # a later "is it done?" is still answered from the truth.
+        await self.push_frame(TTSSpeakFrame(text, append_to_context=False), direction)
 
     async def _release_held(self, direction: FrameDirection) -> None:
         """Speak text that was held and turned out not to be a machine tag."""
         if not self._buf:
             return
         text, self._buf = self._buf, ""
-        if text.strip():
+        if not text.strip():
+            return
+        # `text` goes out RAW (tag_scrub downstream is what removes tags from
+        # spoken text), so what the caller actually hears is the scrubbed form —
+        # and that can be nothing at all, e.g. when this releases a second
+        # [ACTION:] tag that the one-action-per-turn cap declined to execute.
+        # _spoke_this_turn must mean "the caller heard something", never "a frame
+        # was pushed": the silence backstop is switched off by it, so claiming
+        # speech that tag_scrub then deletes reinstates the very hang this
+        # processor exists to prevent.
+        if scrub_reply(text):
             self._spoke_this_turn = True
-            await self.push_frame(TextFrame(text), direction)
+        await self.push_frame(TextFrame(text), direction)
+
+    async def _speak_held_leftover(self, direction: FrameDirection) -> None:
+        """Emit text held to the end of a response that never became a tag.
+
+        Called from the LLMFullResponseEndFrame branch BEFORE that frame is
+        forwarded, and the order is load-bearing. A plain TextFrame is not spoken
+        on arrival: pipecat's TTSService feeds it to a sentence aggregator
+        (tts_service.py:695-701) which holds the tail after the final "." or "।"
+        waiting for non-whitespace lookahead that never comes
+        (simple_text_aggregator.py:96-116), and the ONLY things that flush it are
+        LLMFullResponseEndFrame and EndFrame (tts_service.py:711-725). Pushed
+        after the end frame, as this used to be, the last sentence is stranded in
+        the aggregator and is never synthesized at all.
+
+        An unterminated machine tag is dropped (tag_scrub would drop it too);
+        anything else is real speech and must not be swallowed.
+        """
+        if self._holding is not True or not self._buf:
+            return
+        held, self._buf = self._buf, ""
+        speakable_held = scrub_reply(held)
+        if not speakable_held:
+            return
+        logger.warning(
+            "VoiceActionProcessor: held a bracketed reply that never became a tag — "
+            "speaking it: %r", speakable_held[:120],
+        )
+        self._spoke_this_turn = True
+        await self.push_frame(TextFrame(speakable_held), direction)
