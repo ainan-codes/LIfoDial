@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { CalendarCheck, Search, Filter, Clock, User, Building2, Stethoscope, Phone, MessageSquare } from 'lucide-react';
 import { EmptyState, StatusBadge } from '../../components/superadmin/SAShared';
-import fetchWithAuth from '../../api/client';
+import fetchWithAuth, { fetchWithAuthMeta } from '../../api/client';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface SAAppointment {
@@ -79,17 +79,17 @@ export default function SAAppointments() {
     setError(null);
     try {
       const windowDays = opts.days ?? days;
-      const data = await fetchWithAuth(
+      // Rows come back as a plain ARRAY; the paging counts ride in response
+      // headers. Keeping the body an array is what makes this page immune to a
+      // frontend/backend version skew — an older bundle that ignores the headers
+      // still renders every row it was sent, instead of silently showing an
+      // empty table (which is exactly what an envelope did on 2026-08-15).
+      const { data, total: totalCount, hasMore: more } = await fetchWithAuthMeta(
         `/admin/appointments?days=${windowDays}&offset=${nextOffset}`,
       );
-      // The endpoint returns an envelope now ({appointments, total, has_more}).
-      // It used to return a bare array — and it returned EVERY appointment for
-      // every clinic for all time, which is what made this page time out. The
-      // Array.isArray branch keeps this working against an older backend during
-      // a rolling deploy.
       const rows = Array.isArray(data) ? data : (data?.appointments ?? []);
-      setTotal(Array.isArray(data) ? rows.length : (data?.total ?? rows.length));
-      setHasMore(Array.isArray(data) ? false : Boolean(data?.has_more));
+      setTotal(totalCount ?? rows.length);
+      setHasMore(more);
       // Normalise the backend's lowercase status ("confirmed") to the Title-case
       // the UI compares against — this is what makes the summary cards count
       // correctly instead of all reading 0.

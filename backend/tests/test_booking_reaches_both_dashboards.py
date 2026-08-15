@@ -96,11 +96,9 @@ async def _book(tenant_id: str, doctor_id: str, phone: str, call_id: str,
 def _admin_rows(payload):
     """The superadmin appointments list, from either response shape.
 
-    The endpoint returns an envelope now — {"appointments": [...], "total": N,
-    "has_more": bool} — because it used to return EVERY appointment for EVERY
-    clinic for all time in a bare array, which is what made the page time out
-    and 500 (2026-08-15). These tests care about which rows come back, not about
-    the envelope, so they read through it.
+    The body is a JSON ARRAY and must stay one — see
+    test_the_superadmin_list_is_a_json_array for the incident that settled that.
+    This helper tolerates an envelope only so a test reads the same either way.
     """
     return payload if isinstance(payload, list) else payload["appointments"]
 
@@ -280,3 +278,79 @@ async def test_one_call_cannot_produce_two_appointments(two_clinics):
 
     rows = (await client.get(f"/tenants/{CLINIC_A}/appointments", headers=_clinic(CLINIC_A))).json()
     assert len(rows) == 1
+
+
+# ── The response SHAPE is part of the contract ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_the_superadmin_list_is_a_json_array(two_clinics):
+    """A bare array, not an envelope — and this is a real incident, not a style
+    preference.
+
+    On 2026-08-15 this endpoint was changed to return
+    ``{"appointments": [...], "total": N}``. Every dashboard already loaded in a
+    browser did
+
+        const rows = Array.isArray(data) ? data : [];
+
+    so the object fell straight through to an empty list. The API answered 200
+    with the correct rows and the page showed NOTHING — no error, no empty-state
+    explanation, nothing to debug from. A frontend deploy cannot fix that for a
+    user whose browser is still holding the old bundle.
+
+    Paging metadata therefore rides in response headers, which a client that has
+    never heard of them can ignore while still rendering every row it was sent.
+    """
+    client = two_clinics
+    await _book(CLINIC_A, DOCTOR_A, "+919876543210", "call-shape-1")
+
+    r = await client.get("/admin/appointments", headers=_superadmin())
+    assert r.status_code == 200, r.text
+
+    payload = r.json()
+    assert isinstance(payload, list), (
+        f"the appointments list must be a JSON array; got {type(payload).__name__}. "
+        "An envelope silently renders as an empty table on any client that has "
+        "not been redeployed in lockstep."
+    )
+    assert payload, "the array came back empty for a clinic that has a booking"
+
+
+@pytest.mark.asyncio
+async def test_paging_metadata_travels_in_headers(two_clinics):
+    client = two_clinics
+    await _book(CLINIC_A, DOCTOR_A, "+919876543210", "call-hdr-1")
+
+    r = await client.get("/admin/appointments", headers=_superadmin())
+    assert r.headers.get("X-Total-Count") == "1", dict(r.headers)
+    assert r.headers.get("X-Has-More") == "false"
+    # Cross-origin (Vercel -> Railway): without this the browser hides them from JS.
+    exposed = r.headers.get("Access-Control-Expose-Headers", "")
+    assert "X-Total-Count" in exposed and "X-Has-More" in exposed
+
+
+@pytest.mark.asyncio
+async def test_no_date_window_is_applied_by_default(two_clinics):
+    """A default `days` window is another way to hide rows that exist.
+
+    It briefly defaulted to 90 days. Nothing in the UI said so, so an older
+    appointment simply was not there, which is indistinguishable from data loss
+    to whoever is looking at the page.
+    """
+    client = two_clinics
+    # A year and a bit in the past — well outside the 90-day window that briefly
+    # became the default. Inserted directly so the row's slot_time is exact and
+    # nothing depends on how a date string happens to parse.
+    async with AsyncSessionLocal() as s:
+        from backend.models.appointment import Appointment
+        from datetime import datetime, timedelta, timezone
+        s.add(Appointment(
+            id="00000000-dead-beef-0000-000000000002",
+            tenant_id=CLINIC_A, doctor_id=DOCTOR_A,
+            slot_time=datetime.now(timezone.utc) - timedelta(days=400),
+            patient_phone="+919876543298", status="confirmed", source="voice",
+        ))
+        await s.commit()
+
+    rows = _admin_rows((await client.get("/admin/appointments", headers=_superadmin())).json())
+    assert len(rows) == 1, "an appointment outside the old default window vanished"

@@ -1,7 +1,7 @@
 import logging
 import random
 import string
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, func, case
 from backend.auth import CurrentUser, SuperAdmin
@@ -531,14 +531,20 @@ _CHANNEL_LABELS = {
 APPOINTMENTS_PAGE_SIZE = 200
 APPOINTMENTS_MAX_PAGE_SIZE = 500
 
-#: Default history window. Appointments are overwhelmingly read forwards ("who is
-#: coming"), and an unbounded backwards scan is what made the page unopenable.
-#: Older rows stay reachable — pass `days=0` for everything, or page with offset.
-APPOINTMENTS_DEFAULT_DAYS = 90
+#: No default history window.
+#:
+#: This briefly defaulted to 90 days. That was a mistake of the same kind as the
+#: envelope below: a filter the caller never asked for, which silently hides rows
+#: that exist. `ORDER BY slot_time DESC LIMIT 200` served by
+#: ix_appointments_tenant_slot_time is already cheap without it — the limit is
+#: what bounds the work, and the date window was only ever belt-and-braces.
+#: Callers that want one can still pass `days`.
+APPOINTMENTS_DEFAULT_DAYS = 0
 
 
 @router.get("/appointments")
 async def list_all_appointments(
+    response: Response,
     status: Optional[str] = None,
     clinic_id: Optional[str] = None,
     days: int = APPOINTMENTS_DEFAULT_DAYS,
@@ -549,9 +555,21 @@ async def list_all_appointments(
 ):
     """Super admin view of appointments across all clinics.
 
-    Bounded by default (see APPOINTMENTS_PAGE_SIZE): ``days=0`` lifts the date
-    window, and ``limit``/``offset`` page through the rest. Returns an envelope
-    with ``total`` so the UI can say how many more there are.
+    Returns a JSON ARRAY, and paging metadata rides in response headers
+    (``X-Total-Count``, ``X-Has-More``, ``X-Limit``, ``X-Offset``).
+
+    The array shape is deliberate and must not change again. This endpoint was
+    briefly changed to return ``{"appointments": [...], "total": N}``, and every
+    already-loaded dashboard did
+
+        const rows = Array.isArray(data) ? data : [];
+
+    so the object fell through to an EMPTY LIST. The API answered 200 with the
+    correct rows, the page showed nothing at all, and there was no error anywhere
+    to explain it — the worst possible failure mode, and one that hits every user
+    whose browser is still holding the previous bundle no matter how correct the
+    new one is. Response headers carry the same information without ever being
+    able to do that, because a client that ignores them still gets its rows.
     """
     try:
         limit = max(1, min(int(limit or APPOINTMENTS_PAGE_SIZE), APPOINTMENTS_MAX_PAGE_SIZE))
@@ -621,14 +639,17 @@ async def list_all_appointments(
             }
             for apt, tenant, doctor in rows
         ]
-        return {
-            "appointments": items,
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "has_more": offset + len(items) < total,
-            "days": int(days or 0),
-        }
+        response.headers["X-Total-Count"] = str(total)
+        response.headers["X-Limit"] = str(limit)
+        response.headers["X-Offset"] = str(offset)
+        response.headers["X-Has-More"] = "true" if offset + len(items) < total else "false"
+        # Browsers hide every non-safelisted response header from JS unless the
+        # server says otherwise, and this API is cross-origin (Vercel -> Railway).
+        # Without this the paging headers would arrive and be unreadable.
+        response.headers["Access-Control-Expose-Headers"] = (
+            "X-Total-Count, X-Limit, X-Offset, X-Has-More"
+        )
+        return items
     except Exception as e:
         logger.exception("GET /admin/appointments failed")
         raise HTTPException(status_code=500, detail=str(e))

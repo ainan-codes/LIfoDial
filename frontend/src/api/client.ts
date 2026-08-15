@@ -140,4 +140,64 @@ export async function fetchWithAuth(endpoint: string, options: RequestInit = {})
   return text ? JSON.parse(text) : null;
 }
 
+/**
+ * Like fetchWithAuth, but also hands back the response headers.
+ *
+ * For endpoints that page: the rows stay a plain JSON array (so a client that
+ * knows nothing about paging still renders them) and the counts ride in
+ * X-Total-Count / X-Has-More. See backend/routers/admin.py::list_all_appointments
+ * for why that shape is not negotiable.
+ */
+export async function fetchWithAuthMeta(
+  endpoint: string,
+  options: RequestInit = {},
+): Promise<{ data: any; total: number | null; hasMore: boolean }> {
+  const url = `${API_URL}${endpoint}`;
+  const token = getToken();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...options,
+      signal: options.signal ?? controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'ngrok-skip-browser-warning': 'true',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...options.headers,
+      },
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (response.status === 401) {
+    // Same handling as fetchWithAuth — delegate rather than duplicate it.
+    return fetchWithAuth(endpoint, options).then(data => ({
+      data,
+      total: null,
+      hasMore: false,
+    }));
+  }
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(
+      error.detail ||
+        (response.status >= 500
+          ? `The server did not respond in time (${response.status}). Please try again.`
+          : `Request failed (${response.status}).`),
+    );
+  }
+
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : null;
+  const totalRaw = response.headers.get('X-Total-Count');
+  return {
+    data,
+    total: totalRaw === null ? null : Number(totalRaw),
+    hasMore: response.headers.get('X-Has-More') === 'true',
+  };
+}
+
 export default fetchWithAuth;
