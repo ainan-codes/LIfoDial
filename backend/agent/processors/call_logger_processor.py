@@ -17,7 +17,6 @@ All DB writes are async and non-blocking.
 import asyncio
 import logging
 import time
-import uuid
 from typing import Optional
 
 from pipecat.frames.frames import (
@@ -67,6 +66,17 @@ _BUILTIN_CLOSING_PHRASES: tuple[str, ...] = (
 # Words that turn a "bye" into something that is NOT a farewell. "by the way" is
 # the one that matters: STT routinely transcribes it as "bye the way".
 _CLOSING_TRAP_FOLLOWERS: frozenset[str] = frozenset({"the", "then"})
+
+# A bare "thank you" is NOT a farewell (see above) UNLESS the caller's action
+# (BOOK/CANCEL/RESCHEDULE) has already been resolved and spoken this call —
+# call_meta["action_resolved"], set by VoiceActionProcessor. At that point
+# "thank you" is how a caller actually signs off, and making them say a second,
+# unrelated word to hang up is exactly the "sounds like they're in a hurry"
+# stiffness this exists to avoid. Same language scope as the builtin list.
+_GRATITUDE_PHRASES: tuple[str, ...] = (
+    "thank you", "thanks", "thank you very much", "thanks a lot",
+    "dhanyavaad", "dhanyavad", "dhanyawad", "shukriya",
+)
 
 # How close to the end of the utterance a phrase must sit to count as closing
 # intent, and how short an utterance may be to count anywhere in it.
@@ -550,10 +560,14 @@ class CallLoggerProcessor(FrameProcessor):
         # the positional guard that keeps a mid-sentence "bye" from ending a live
         # call. The previous check was a bare substring test over the configured
         # phrases only, so "bye the way" would have hung up and "ok bye" would not.
+        closing_phrases = self._end_call_phrases
+        if self._call_meta.get("action_resolved"):
+            closing_phrases = closing_phrases + list(_GRATITUDE_PHRASES)
+
         if (
             not self._ending_call
             and self.task is not None
-            and is_closing_utterance(text, self._end_call_phrases)
+            and is_closing_utterance(text, closing_phrases)
         ):
             self._ending_call = True
             logger.info("Caller said goodbye ('%s') — ending call.", text[:80])
@@ -716,7 +730,6 @@ async def _finalize_call_record(
 ) -> None:
     """Write final call stats, status, and transcript to the CallRecord row."""
     try:
-        import json
         from datetime import datetime, timezone
 
         from backend.db import AsyncSessionLocal

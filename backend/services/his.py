@@ -4,10 +4,9 @@ from typing import List, Dict, Any, Optional
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from datetime import datetime, time as dt_time, timedelta, timezone
-import json
 
 from backend.config import settings
-from backend.db import AsyncSessionLocal, scoped_session, session_scope
+from backend.db import scoped_session, session_scope
 from backend.models.doctor import Doctor
 from backend.models.appointment import Appointment
 from backend.services.timeutil import IST, ist_now
@@ -19,9 +18,7 @@ _TIME_FORMATS = ("%I:%M %p", "%I %p", "%H:%M", "%I:%M%p", "%H.%M")
 
 #: Date parsing (formats AND every language's relative-day words) lives in
 #: services/dayref.py — see that module for why a model must never be the thing
-#: that computes what "tomorrow" is. Re-exported under the old name because
-#: availability_prompt.py imports `_DATE_FORMATS` from here.
-from backend.services.dayref import DATE_FORMATS as _DATE_FORMATS  # noqa: E402
+#: that computes what "tomorrow" is.
 from backend.services.dayref import parse_day_string  # noqa: E402
 
 
@@ -288,7 +285,6 @@ async def get_slots(doctor_id: str, date: str = None, tenant_id: str | None = No
 
 from backend.models.tenant import Tenant
 import asyncio
-import httpx
 
 async def send_to_sheets_webhook(webhook_url: str | None, payload: dict):
     """Sends appointment details to a Google Sheets webhook in the background.

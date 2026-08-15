@@ -37,8 +37,6 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from loguru import logger as pipecat_logger
-
 # ── Pipecat core ──────────────────────────────────────────────────────────────
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams

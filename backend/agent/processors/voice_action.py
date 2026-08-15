@@ -735,6 +735,10 @@ class VoiceActionProcessor(FrameProcessor):
                 trace(self._trace_id, VOICE, REPLIED, source="immediate_success", action=tag.action)
                 self._mark_spoke()
                 await self.push_frame(TTSSpeakFrame(text, append_to_context=False), direction)
+            # A bare "thank you" after this point is a caller signing off, not
+            # a mid-conversation courtesy — CallLoggerProcessor reads this to
+            # let a gratitude phrase end the call.
+            self._call_meta["action_resolved"] = True
         else:
             self._inject(build_result_message(tag.action, res), rerun=True)
 
@@ -864,7 +868,11 @@ class VoiceActionProcessor(FrameProcessor):
         )
 
         if res.get("success") and res.get("reason") != "already_at_that_time":
-            await self._mark_call_outcome(action)
+            # Fire-and-forget: this is a SECOND DB session, purely for the
+            # dashboard's resolution rate. The caller's booking already
+            # succeeded and is owed their confirmation now, not after another
+            # ~2.3s Supabase connect for a write they can't hear.
+            asyncio.create_task(self._mark_call_outcome(action))
 
         # Remembered for the whole turn so the silence backstop can state what
         # REALLY happened rather than a generic apology — crucially, this is the
