@@ -531,7 +531,7 @@ class VoiceActionProcessor(FrameProcessor):
                 await self._release_held(direction)
                 self._holding = False
                 return True
-            await self._execute_and_regenerate(tag)
+            await self._execute_and_regenerate(tag, direction)
             return True
 
         if not has_open_action_tag(self._buf):
@@ -555,7 +555,12 @@ class VoiceActionProcessor(FrameProcessor):
         owed_rerun = self._pending_rerun
         self._reset_response()
 
-        if owed_rerun or not full.strip():
+        # `acted` covers the case owed_rerun used to cover alone: an immediate
+        # success speaks a constant and owes no rerun (see
+        # _execute_and_regenerate), but its response is still just the tag —
+        # scrub_reply(full) is empty — which would otherwise misread as
+        # TAG_ONLY below and re-prompt for a tag that already ran.
+        if owed_rerun or acted or not full.strip():
             await self._flush_rerun(direction, backstop=True)
             return
 
@@ -677,13 +682,24 @@ class VoiceActionProcessor(FrameProcessor):
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
-    async def _execute_and_regenerate(self, tag: ActionTag) -> None:
+    async def _execute_and_regenerate(self, tag: ActionTag, direction: FrameDirection) -> None:
         """The compliant path: the tag came first, so NOTHING has been spoken yet.
 
-        The write is awaited and the model's pre-outcome text is discarded, then
-        the LLM is re-run with the real result — so the first words the caller
-        hears about their appointment are generated from what actually happened.
-        Exactly what the chat path does with its phase-1 text.
+        The write is awaited and the model's pre-outcome text is discarded.
+
+        On SUCCESS, the caller is told immediately with a constant sentence
+        (spoken_fallback.outcome_key) instead of paying for a second LLM round
+        trip: the outcome is fully known and has no details worth getting from
+        the model (no name, time or doctor — see spoken_fallback's own docstring
+        for why those are deliberately left out), so a regenerated reply adds
+        latency without adding information. Reported 2026-08-15: the write lands
+        in the database at once, but the caller was still waiting out a whole
+        extra LLM call on top of it before hearing anything.
+
+        On FAILURE, the LLM is still re-run: the reason varies (wrong time,
+        doctor unavailable, slot taken, …) and the caller needs a reply that
+        explains THAT reason and asks the right follow-up question, which only
+        the model can compose.
         """
         held, self._buf = self._buf, ""
         # Everything else in this response was written before the outcome was
@@ -699,7 +715,28 @@ class VoiceActionProcessor(FrameProcessor):
                 "VoiceActionProcessor: discarding pre-outcome text from the action turn: %r",
                 leftover[:120],
             )
-        self._inject(build_result_message(tag.action, res), rerun=True)
+
+        # Injected either way, rerun or not: a LATER turn ("is it done?") must be
+        # answered from the real outcome regardless of how THIS turn spoke it.
+        if res.get("success"):
+            self._inject(build_result_message(tag.action, res), rerun=False)
+            # The busy watchdog can fire WHILE _execute (just above) is still
+            # awaiting the write, if the write outruns busy_timeout_seconds —
+            # and its backstop speaks its own account of this same outcome (see
+            # _speak_backstop). Guarded the same way the backstop guards
+            # itself: only one sentence about this turn's result is ever owed,
+            # so if that already happened, saying it again would be a second,
+            # redundant confirmation stacked on top of the first.
+            if not self._spoke_this_turn:
+                from backend.agent import spoken_fallback
+
+                key = spoken_fallback.outcome_key(tag.action, True)
+                text = spoken_fallback.sentence(key, self._agent_config.get("language"))
+                trace(self._trace_id, VOICE, REPLIED, source="immediate_success", action=tag.action)
+                self._mark_spoke()
+                await self.push_frame(TTSSpeakFrame(text, append_to_context=False), direction)
+        else:
+            self._inject(build_result_message(tag.action, res), rerun=True)
 
     async def _execute(self, tag: ActionTag) -> dict:
         """Run one tag against the real booking service and return its result dict.

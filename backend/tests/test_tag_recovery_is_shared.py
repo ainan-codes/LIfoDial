@@ -113,8 +113,11 @@ async def test_the_same_mangled_tag_is_repaired_into_a_real_row_on_both_channels
     """The behavioural half. One unreadable tag, two channels, two real rows —
     and neither conversation ends on a promise or on nothing."""
     async with VoiceCall([MANGLED, VOICE_TAG, "Done — 2 PM tomorrow with Dr Salman."]) as call:
+        # 2 generations, not 3: the repaired tag's booking succeeds and is
+        # confirmed immediately (see _execute_and_regenerate), so the third
+        # scripted reply is never reached.
         await call.says("Book me with Dr Salman tomorrow at 2 PM, I'm Ainan",
-                        expect_generations=3)
+                        expect_generations=2)
         spoken = call.speaker.spoken
 
     chat_reply, _ = await _run_chat(
@@ -197,8 +200,10 @@ async def test_both_channels_read_the_re_prompt_from_the_one_function(seeded_db)
 
     with patch.object(tag_recovery, "repair_instruction", side_effect=fake_instruction):
         async with VoiceCall([MANGLED, VOICE_TAG, "Booked."]) as call:
+            # 2 generations, not 3: the repaired tag's booking succeeds and is
+            # confirmed immediately (see _execute_and_regenerate).
             await call.says("Book me with Dr Salman tomorrow at 2 PM, I'm Ainan",
-                            expect_generations=3)
+                            expect_generations=2)
             voice_system = call.llm.system_lines()
 
         _, chat_system = await _run_chat(

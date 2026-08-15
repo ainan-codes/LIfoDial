@@ -333,6 +333,7 @@ class VoiceCall:
         call_meta = {"caller_phone": PHONE, "call_record_id": call_record_id}
 
         context = LLMContext(messages=[])
+        self.context = context
         pair = LLMContextAggregatorPair(context)
 
         from backend.agent.processors.call_logger_processor import CallLoggerProcessor
@@ -399,13 +400,24 @@ class VoiceCall:
         for _ in range(200):
             await asyncio.sleep(0.05)
             if self.llm.calls >= target:
-                # Let the last reply drain all the way to the speaker.
-                await asyncio.sleep(0.25)
-                return
-        raise AssertionError(
-            f"expected {expect_generations} LLM generation(s) for {text!r}, "
-            f"got {self.llm.calls - (target - expect_generations)}"
-        )
+                break
+        else:
+            raise AssertionError(
+                f"expected {expect_generations} LLM generation(s) for {text!r}, "
+                f"got {self.llm.calls - (target - expect_generations)}"
+            )
+        # Reaching the target generation count only means the model has been
+        # ASKED that many times. A successful action is confirmed immediately
+        # with no further generation (see VoiceActionProcessor._execute_and_
+        # regenerate), so the last generation's own write + speech can still be
+        # in flight here — wait for the busy shield to clear before treating
+        # the turn as settled.
+        for _ in range(200):
+            if not self.call_logger.action_in_progress:
+                break
+            await asyncio.sleep(0.05)
+        # Let the last reply drain all the way to the speaker.
+        await asyncio.sleep(0.25)
 
 
 def _book_tag(time_str: str = "02:00 PM", *, name: str = PATIENT, phone: str = PHONE,
@@ -417,10 +429,16 @@ def _book_tag(time_str: str = "02:00 PM", *, name: str = PATIENT, phone: str = P
 
 @pytest.mark.asyncio
 async def test_a_tag_first_reply_books_a_real_row(seeded_db):
-    """The fix, end to end: the model emits a tag, a row exists."""
+    """The fix, end to end: the model emits a tag, a row exists.
+
+    A successful action is confirmed immediately (see
+    _execute_and_regenerate) and never triggers a second generation — the
+    outcome is fully known and the constant sentence needs nothing from
+    another LLM round trip.
+    """
     async with VoiceCall([_book_tag(), "Your appointment with Dr Salman is confirmed for 2 PM."]) as call:
         await call.says("Book me with Dr Salman tomorrow at 2 PM, I'm Ainan",
-                        expect_generations=2)
+                        expect_generations=1)
 
     rows = await _appointments()
     assert len(rows) == 1, f"the voice call did not create an appointment: {rows}"
@@ -436,17 +454,24 @@ async def test_nothing_is_spoken_until_the_row_exists(seeded_db):
     """The ORDER is the guarantee, not just the row.
 
     The model's tag-turn text is written before the outcome is known, so it is
-    discarded: the only words the caller hears come from the reply generated
-    AFTER the write, with the real result injected.
+    discarded. On success, the caller is told with the constant confirmation
+    sentence (spoken_fallback) rather than a regenerated reply — there is
+    nothing left to regenerate for: the outcome is fully known the moment the
+    write returns.
     """
+    from backend.agent import spoken_fallback
+
     async with VoiceCall([
         _book_tag() + " Your appointment is booked!",   # a claim made too early
-        "Done — Dr Salman will see you at 2 PM tomorrow.",
     ]) as call:
         await call.says("Book me with Dr Salman tomorrow at 2 PM, I'm Ainan",
-                        expect_generations=2)
+                        expect_generations=1)
         spoken = call.speaker.spoken
-        lines = call.llm.system_lines()
+        # The injected result lives in the live context, not in what any
+        # generation observed: a successful action owes no second generation
+        # (see _execute_and_regenerate), so no LLM call is ever asked to look
+        # at it in THIS turn — it is there for a LATER turn's "is it done?".
+        context_messages = call.context.get_messages()
 
     assert "Your appointment is booked!" not in spoken, (
         "the pre-outcome text was spoken to the caller — it must be discarded"
@@ -454,10 +479,11 @@ async def test_nothing_is_spoken_until_the_row_exists(seeded_db):
     assert "[ACTION" not in spoken and "BOOKING_RESULT" not in spoken, (
         f"a machine tag reached TTS: {spoken!r}"
     )
-    assert spoken == "Done — Dr Salman will see you at 2 PM tomorrow."
-    assert any("[BOOKING_RESULT success=true]" in line for line in lines), (
-        "the model was not told the real outcome before it spoke"
-    )
+    assert spoken == spoken_fallback.sentence(spoken_fallback.BOOKED, None)
+    assert any(
+        m.get("role") == "system" and "[BOOKING_RESULT success=true]" in str(m.get("content"))
+        for m in context_messages
+    ), "the real outcome was not injected into the context for a later turn"
     assert len(await _appointments()) == 1
 
 
@@ -488,10 +514,12 @@ async def test_a_fabricated_hindi_confirmation_is_repaired_into_a_real_booking(s
     async with VoiceCall([
         fabricated,
         _book_tag(),
-        "जी हाँ, कल दोपहर 2 बजे डॉक्टर सलमान के साथ आपकी अपॉइंटमेंट कन्फर्म है।",
     ]) as call:
+        # 2 generations, not 3: the repaired tag's booking succeeds and is
+        # confirmed immediately (see _execute_and_regenerate) — no third
+        # generation is owed for a known outcome.
         await call.says("मेरा नाम ऐनान है, कल दोपहर के दो बजे डॉक्टर सलमान के पास आ जाऊँगा",
-                        expect_generations=3)
+                        expect_generations=2)
         lines = call.llm.system_lines()
 
     rows = await _appointments()
@@ -626,7 +654,7 @@ async def test_cancel_via_tag_cancels_the_real_row(seeded_db):
         "Your appointment has been cancelled.",
     ]) as call:
         await call.says("I want to cancel my appointment, this is Ainan",
-                        expect_generations=2)
+                        expect_generations=1)
 
     rows = await _appointments()
     assert len(rows) == 1
@@ -641,7 +669,7 @@ async def test_reschedule_via_tag_moves_the_real_row(seeded_db):
         "Moved to 4 PM tomorrow.",
     ]) as call:
         await call.says("Please move my appointment to 4 PM, this is Ainan",
-                        expect_generations=2)
+                        expect_generations=1)
 
     rows = await _appointments()
     assert len(rows) == 1
@@ -673,18 +701,23 @@ async def test_a_cancel_for_someone_with_no_appointment_says_so(seeded_db):
 
 @pytest.mark.asyncio
 async def test_one_utterance_can_only_produce_one_action(seeded_db):
-    """The re-run is told not to emit another tag. If it does anyway, executing
-    it would be a second write for one request — and, worse, an endless
-    execute/re-run cycle."""
+    """A successful action is confirmed immediately and owes no re-run — so a
+    disobedient second reply that confirms AND emits a second tag (which used
+    to arrive as the re-run) never gets a generation to arrive on at all. That
+    is a stronger guarantee than ignoring a second tag: the second write is
+    now structurally unreachable for a turn that already succeeded."""
     async with VoiceCall([
         _book_tag("02:00 PM"),
-        # A disobedient re-run: confirms AND emits a second tag.
+        # Would be a disobedient re-run if one were ever requested — it must
+        # never be reached.
         _book_tag("03:00 PM") + " Booked for 3 PM.",
     ]) as call:
         await call.says("Book me with Dr Salman tomorrow at 2 PM, I'm Ainan",
-                        expect_generations=2)
+                        expect_generations=1)
         await asyncio.sleep(0.5)
-        assert call.llm.calls == 2, f"the action/re-run cycle looped: {call.llm.calls}"
+        assert call.llm.calls == 1, (
+            f"a successful action must not trigger another generation: {call.llm.calls}"
+        )
 
     rows = await _appointments()
     assert len(rows) == 1, "one utterance produced two appointments"
@@ -701,8 +734,8 @@ async def test_a_call_can_book_then_reschedule_in_separate_turns(seeded_db):
         "Moved to 4 PM.",
     ]) as call:
         await call.says("Book me with Dr Salman tomorrow at 2 PM, I'm Ainan",
-                        expect_generations=2)
-        await call.says("Actually make it 4 PM instead", expect_generations=2)
+                        expect_generations=1)
+        await call.says("Actually make it 4 PM instead", expect_generations=1)
 
     rows = await _appointments()
     assert len(rows) == 1
@@ -751,7 +784,7 @@ async def test_the_day_the_caller_said_beats_the_day_the_model_calculated(seeded
         "कल दोपहर 3 बजे डॉक्टर सलमान के साथ आपकी अपॉइंटमेंट कन्फर्म है।",
     ]) as call:
         await call.says("मेरा नाम ऐनान है, कल दोपहर 3 बजे डॉक्टर सलमान के पास",
-                        expect_generations=2)
+                        expect_generations=1)
 
     rows = await _appointments()
     assert len(rows) == 1, rows
@@ -773,10 +806,11 @@ async def test_promising_to_cancel_without_acting_is_repaired(seeded_db):
     async with VoiceCall([
         promise,
         f"[ACTION: CANCEL|{PATIENT}|{PHONE}|N/A|N/A|N/A|N/A]",
-        "आपका अपॉइंटमेंट कैंसिल कर दिया गया है।",
     ]) as call:
+        # 2 generations, not 3: the repaired tag's cancellation succeeds and is
+        # confirmed immediately (see _execute_and_regenerate).
         await call.says("मुझे एक अपॉइंटमेंट कैंसिल करना है, मेरा नाम ऐनान है",
-                        expect_generations=3)
+                        expect_generations=2)
         lines = call.llm.system_lines()
 
     rows = await _appointments()
@@ -814,15 +848,22 @@ async def test_asking_again_is_told_it_is_booked_not_that_the_slot_is_taken(seed
         _book_tag("02:00 PM"), "Yes — it's confirmed for 2 PM with Dr Salman.",
     ]) as call:
         await call.says("Book me with Dr Salman tomorrow at 2 PM, I'm Ainan",
-                        expect_generations=2)
-        await call.says("हो गया क्या अपॉइंटमेंट बुक?", expect_generations=2)
-        lines = call.llm.system_lines()
+                        expect_generations=1)
+        await call.says("हो गया क्या अपॉइंटमेंट बुक?", expect_generations=1)
+        # Both turns succeed and are confirmed immediately with no further
+        # generation (see _execute_and_regenerate), so the second turn's
+        # injected result is never observed by a generation within this test —
+        # read it straight from the live context instead.
+        context_lines = [
+            str(m.get("content")) for m in call.context.get_messages()
+            if m.get("role") == "system"
+        ]
 
     assert len(await _appointments()) == 1
-    assert any("ALREADY has an appointment booked on this call" in line for line in lines), (
+    assert any("ALREADY has an appointment booked on this call" in line for line in context_lines), (
         "asking again was answered as a slot conflict against the caller's own booking"
     )
-    assert not any("ALREADY BOOKED for that doctor" in line for line in lines)
+    assert not any("ALREADY BOOKED for that doctor" in line for line in context_lines)
 
 
 @pytest.mark.asyncio
@@ -836,7 +877,7 @@ async def test_the_number_the_caller_read_out_is_the_one_stored(seeded_db):
     ) as call:
         await call.says(
             f"मेरा नाम आइनान है, मेरा नंबर है {PHONE} और मैं कल दोपहर के 2 बजे आना चाहता हूँ",
-            expect_generations=2,
+            expect_generations=1,
         )
 
     rows = await _appointments()
@@ -856,12 +897,21 @@ async def test_the_silence_timer_is_shielded_for_the_whole_booking_round_trip(se
     a mock: busy must already be True by the time the rerun's generation starts
     (covering the full LLM-call latency, not just the DB write), and it must be
     False again once that reply is available to speak — never left dangling.
+
+    A FAILURE is scripted here, not a success: a successful action is now
+    confirmed immediately with no second generation at all (see
+    _execute_and_regenerate), so there is no rerun latency left to shield on
+    that path. The two-generation round trip this test protects still happens
+    on the failure/repair path, exactly as it always has.
     """
-    async with VoiceCall([_book_tag(), "Confirmed for 2 PM."]) as call:
+    async with VoiceCall([
+        _book_tag("08:00 PM"),  # outside the doctor's hours -> failure, still reruns
+        "Sorry, Dr Salman isn't available at 8 PM.",
+    ]) as call:
         assert call.call_logger.action_in_progress is False, (
             "must not be busy before any action has started"
         )
-        await call.says("Book me with Dr Salman tomorrow at 2 PM, I'm Ainan",
+        await call.says("Book me with Dr Salman tomorrow at 8 PM, I'm Ainan",
                         expect_generations=2)
 
     assert call.llm.busy_at_call == [False, True], (
@@ -910,7 +960,7 @@ async def test_the_call_record_shows_the_booking(seeded_db):
     a real booking that leaves them untouched reads as an unresolved call."""
     async with VoiceCall([_book_tag(), "Confirmed for 2 PM."]) as call:
         await call.says("Book me with Dr Salman tomorrow at 2 PM, I'm Ainan",
-                        expect_generations=2)
+                        expect_generations=1)
 
     async with AsyncSessionLocal() as s:
         rec = (await s.execute(select(CallRecord).where(CallRecord.id == CALL_ID))).scalar_one()
@@ -927,7 +977,7 @@ async def test_a_second_confirm_on_the_same_call_cannot_double_book(seeded_db):
         _book_tag("02:00 PM"), "Still booked for 2 PM.",
     ]) as call:
         await call.says("Book me with Dr Salman tomorrow at 2 PM, I'm Ainan",
-                        expect_generations=2)
-        await call.says("Sorry, did that go through? Book it again", expect_generations=2)
+                        expect_generations=1)
+        await call.says("Sorry, did that go through? Book it again", expect_generations=1)
 
     assert len(await _appointments()) == 1, "one call produced two appointments"

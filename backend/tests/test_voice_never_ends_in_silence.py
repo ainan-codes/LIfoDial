@@ -45,7 +45,6 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 import asyncio
 
 import pytest
-from pipecat.frames.frames import InterruptionFrame
 
 from backend.agent import spoken_fallback
 
@@ -103,8 +102,11 @@ async def test_a_successful_booking_is_always_announced(seeded_db):
     async with VoiceCall(
         [_book_tag(), TRUNCATED_TAG, TRUNCATED_TAG], agent_config=HINDI,
     ) as call:
+        # 1 generation, not 3: a successful compliant booking is confirmed
+        # immediately with no rerun (see _execute_and_regenerate), so the two
+        # unspeakable replies scripted above are never reached at all.
         await call.says("कल दोपहर दो बजे डॉक्टर सलमान के पास, मेरा नाम आइनान है",
-                        expect_generations=3)
+                        expect_generations=1)
         spoken = call.speaker.spoken
 
     rows = await _appointments()
@@ -163,14 +165,16 @@ async def test_cancel_and_reschedule_get_the_same_guarantee(
     that rather than trusting it, because cancel and reschedule were reported as
     hanging too and no transcript was ever attached for cancel."""
     # Give the caller an appointment to act on, so the action really succeeds.
+    # 1 generation, not 2: a successful compliant action is confirmed
+    # immediately with no rerun (see _execute_and_regenerate).
     async with VoiceCall([_book_tag(), "बुक हो गई।"], agent_config=HINDI) as call:
-        await call.says("कल दो बजे डॉक्टर सलमान, मैं आइनान", expect_generations=2)
+        await call.says("कल दो बजे डॉक्टर सलमान, मैं आइनान", expect_generations=1)
     assert len(await _appointments()) == 1
 
     tag = f"[ACTION: {action}|{PATIENT}|{PHONE}|{TOMORROW_TAG}|03:00 PM|{DOCTOR_NAME}|N/A]"
     async with VoiceCall([tag, TRUNCATED_TAG, TRUNCATED_TAG],
                          agent_config=HINDI, call_record_id=None) as call:
-        await call.says("उसको बदल दो", expect_generations=3)
+        await call.says("उसको बदल दो", expect_generations=1)
         spoken = call.speaker.spoken
 
     assert spoken == spoken_fallback.sentence(expected, "hi-IN"), (
@@ -208,22 +212,27 @@ _SHORT_TAGS = {
 async def test_a_tag_with_too_few_fields_still_acts(seeded_db, action):
     """Defect 1, for the two intents whose tags the model most often shortens.
 
-    Asserted on the DATABASE, because the spoken reply cannot tell the two flows
-    apart: an unexecuted short tag is unspeakable, which re-prompts, which speaks
-    the model's NEXT reply — the same words, over a row that never changed. Only
-    the row shows whether anything happened.
+    Asserted on the DATABASE, not just the spoken reply: an unexecuted short tag
+    is unspeakable, which re-prompts, which speaks the model's NEXT reply — the
+    same words, over a row that never changed. Only the row proves anything
+    happened. (A successful short tag now speaks its own outcome-specific
+    constant immediately — see _execute_and_regenerate — so the reply is a
+    useful cross-check here too, just not the load-bearing one.)
     """
+    # 1 generation, not 2: a successful compliant booking is confirmed
+    # immediately with no rerun.
     async with VoiceCall([_book_tag(), "बुक हो गई।"], agent_config=HINDI) as call:
-        await call.says("कल दो बजे डॉक्टर सलमान, मैं आइनान", expect_generations=2)
+        await call.says("कल दो बजे डॉक्टर सलमान, मैं आइनान", expect_generations=1)
     assert len(await _appointments()) == 1
 
     async with VoiceCall([_SHORT_TAGS[action], "हो गया।"], agent_config=HINDI,
                          call_record_id=None) as call:
-        await call.says("उसको बदल दो", expect_generations=2)
+        await call.says("उसको बदल दो", expect_generations=1)
         spoken = call.speaker.spoken
 
     rows = await _appointments()
     assert len(rows) == 1
+    expected_key = spoken_fallback.CANCELLED if action == "CANCEL" else spoken_fallback.RESCHEDULED
     if action == "CANCEL":
         assert rows[0].status == "cancelled", (
             "the short CANCEL tag was not executed — nothing was cancelled"
@@ -232,7 +241,7 @@ async def test_a_tag_with_too_few_fields_still_acts(seeded_db, action):
         assert _ist_hour(rows[0]) == 16, (
             "the short RESCHEDULE tag was not executed — the row never moved"
         )
-    assert spoken == "हो गया।", spoken
+    assert spoken == spoken_fallback.sentence(expected_key, "hi-IN"), spoken
 
 
 @pytest.mark.asyncio
@@ -255,17 +264,20 @@ async def test_releasing_an_ignored_second_tag_is_not_counted_as_speech(seeded_d
     """The backstop is disarmed by _spoke_this_turn, so that flag must mean "the
     caller heard something" and never "a frame was pushed".
 
-    One action per utterance is the rule, so a SECOND tag in the same turn is
-    released as ordinary text rather than executed — and tag_scrub then deletes
-    all of it before TTS. Counting that as speech switched the backstop off for a
-    turn in which the caller heard nothing at all: the booking below exists and
-    they were never told.
+    One action per utterance is the rule. A successful compliant booking is now
+    confirmed immediately with no rerun (see _execute_and_regenerate) — a
+    stronger guarantee than "a second tag is ignored": there is no second
+    generation left for a disobedient second tag to even arrive on. The two
+    extra scripted replies below must never be reached.
     """
     async with VoiceCall([_book_tag(), _book_tag(), TRUNCATED_TAG],
                          agent_config=HINDI) as call:
         await call.says("कल दोपहर दो बजे डॉक्टर सलमान के पास, मेरा नाम आइनान है",
-                        expect_generations=3)
+                        expect_generations=1)
         spoken = call.speaker.spoken
+        assert call.llm.calls == 1, (
+            f"a successful action must not trigger another generation: {call.llm.calls}"
+        )
 
     assert len(await _appointments()) == 1, "the booking itself regressed"
     assert "[ACTION" not in spoken, f"a machine tag reached TTS: {spoken!r}"
@@ -281,27 +293,30 @@ async def test_the_captured_tag_only_cancel_needs_no_recovery_at_all(seeded_db):
     """The reported event, reproduced: a Hindi CANCEL whose ENTIRE reply is the
     raw tag, with nothing speakable around it.
 
-    Recovery is not the goal here — not needing it is. The generation count is the
-    assertion that matters: THREE generations means the tag was unreadable, the
-    system re-prompted, and the caller waited through an extra LLM round trip for
-    a cancel it had already asked for. TWO means the tag was executed on arrival
-    and the second generation is simply the confirmation being spoken.
+    Recovery is not the goal here — not needing it is. The generation count is
+    the assertion that matters: TWO OR MORE generations means the tag was
+    unreadable and the system re-prompted, making the caller wait through an
+    extra LLM round trip for a cancel it had already asked for. ONE means the
+    tag was executed on arrival and confirmed immediately, with no re-prompt
+    and no round trip at all (see _execute_and_regenerate).
     """
+    # 1 generation, not 2: a successful compliant booking is confirmed
+    # immediately with no rerun.
     async with VoiceCall([_book_tag(), "बुक हो गई।"], agent_config=HINDI) as call:
-        await call.says("कल दो बजे डॉक्टर सलमान, मैं आइनान", expect_generations=2)
+        await call.says("कल दो बजे डॉक्टर सलमान, मैं आइनान", expect_generations=1)
     assert len(await _appointments()) == 1
 
     async with VoiceCall([_SHORT_TAGS["CANCEL"], "आपकी अपॉइंटमेंट रद्द कर दी गई है।"],
                          agent_config=HINDI, call_record_id=None) as call:
-        await call.says("मेरी अपॉइंटमेंट रद्द कर दो, मैं आइनान", expect_generations=2)
+        await call.says("मेरी अपॉइंटमेंट रद्द कर दो, मैं आइनान", expect_generations=1)
         spoken, generations = call.speaker.spoken, call.llm.calls
 
     rows = await _appointments()
     assert rows[0].status == "cancelled", "the captured tag still cancels nothing"
-    assert generations == 2, (
-        f"the tag-only reply still needed a re-prompt ({generations} generations)"
+    assert generations == 1, (
+        f"the tag-only reply needed a re-prompt or a rerun ({generations} generations)"
     )
-    assert "रद्द कर दी गई है" in spoken, spoken
+    assert spoken == spoken_fallback.sentence(spoken_fallback.CANCELLED, "hi-IN"), spoken
 
 
 # ── The three fixes, asserted at the mechanism ────────────────────────────────
@@ -372,20 +387,26 @@ async def test_held_bracketed_prose_goes_out_before_the_end_frame(seeded_db):
 @pytest.mark.asyncio
 async def test_an_inaudible_frame_does_not_disarm_the_backstop(seeded_db):
     """Fix 3's mechanism, stated directly. `_spoke_this_turn` is what switches the
-    backstop off, so it must be set only when something SURVIVES tag_scrub. Here
-    the whole turn's output is tags, which scrub to nothing — the flag must stay
-    false even though frames were pushed."""
+    backstop off, so it must be set only when something SURVIVES tag_scrub.
+
+    The first tag here succeeds and is confirmed immediately (see
+    _execute_and_regenerate) — a stronger guarantee than the original scenario
+    (the whole turn's output being tags that scrub to nothing until the
+    backstop finally spoke): there is no second generation left for the
+    disobedient second tag and the unspeakable reply after it to ever reach at
+    all, so `_spoke_this_turn` is set by the immediate confirmation itself.
+    """
     async with VoiceCall([_book_tag(), _book_tag(), TRUNCATED_TAG],
                          agent_config=HINDI) as call:
         await call.says("कल दोपहर दो बजे डॉक्टर सलमान के पास, मेरा नाम आइनान है",
-                        expect_generations=3)
+                        expect_generations=1)
         # Read the flag on the real processor, not inferred from the audio: this
         # is the invariant, and the audible symptom is downstream of it.
         assert call.action._spoke_this_turn is True, (
-            "the backstop ran, so by then something WAS spoken"
+            "the confirmation ran, so by then something WAS spoken"
         )
         assert call.speaker.frame_types[-1] == "TTSSpeakFrame", (
-            "the last thing the caller heard was not the backstop"
+            "the last thing the caller heard was not the confirmation"
         )
 
 
@@ -468,8 +489,10 @@ async def test_a_reschedule_in_its_own_grammar_still_needs_a_real_time(seeded_db
     """RESCHEDULE's grammar carries a time, so the invalid_time gate must still
     fire when that field is a placeholder — a shorter tag must not become a way
     to skip validation."""
+    # 1 generation, not 2: a successful compliant booking is confirmed
+    # immediately with no rerun.
     async with VoiceCall([_book_tag(), "बुक हो गई।"], agent_config=HINDI) as call:
-        await call.says("कल दो बजे डॉक्टर सलमान, मैं आइनान", expect_generations=2)
+        await call.says("कल दो बजे डॉक्टर सलमान, मैं आइनान", expect_generations=1)
     before = await _appointments()
     assert len(before) == 1
 
@@ -658,15 +681,17 @@ async def test_the_shield_is_not_released_early_on_a_normal_turn(seeded_db):
     complete with the timer never firing and nothing extra spoken."""
     async with VoiceCall([_book_tag(), "आपकी अपॉइंटमेंट पक्की हो गई है।"],
                          agent_config=HINDI, busy_timeout_seconds=5.0) as call:
+        # 1 generation, not 2: a successful compliant booking is confirmed
+        # immediately with no rerun, so the scripted second reply is never used.
         await call.says("कल दोपहर दो बजे डॉक्टर सलमान के पास, मेरा नाम आइनान है",
-                        expect_generations=2)
+                        expect_generations=1)
         spoken = call.speaker.spoken
         # The shield must be DOWN once the turn resolves — a stuck flag here is
         # the same permanent disablement, just reached by the happy path.
         assert call.call_logger.action_in_progress is False
 
     assert len(await _appointments()) == 1
-    assert spoken == "आपकी अपॉइंटमेंट पक्की हो गई है।", (
+    assert spoken == spoken_fallback.sentence(spoken_fallback.BOOKED, "hi-IN"), (
         f"the backstop fired during a healthy turn: {spoken!r}"
     )
 
@@ -817,20 +842,6 @@ def _slow_write(monkeypatch, seconds: float = 0.6) -> None:
     monkeypatch.setattr(his, "execute_booking_action", slow)
 
 
-async def _write_finished(call) -> None:
-    """Wait until no write is in flight.
-
-    The row appearing is not the end of the action: the outcome is recorded, and
-    the call record marked, after the commit. A test that acts on the row alone
-    interleaves with the tail of _execute.
-    """
-    for _ in range(200):
-        if call.action._action_in_flight is None:
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError("the write never finished")
-
-
 @pytest.mark.asyncio
 async def test_the_caller_is_told_the_booking_is_being_made(seeded_db, monkeypatch):
     """The gap is filled with speech, and the outcome still lands after it."""
@@ -839,8 +850,12 @@ async def test_the_caller_is_told_the_booking_is_being_made(seeded_db, monkeypat
         [_book_tag(), "आपकी अपॉइंटमेंट पक्की हो गई है।"],
         agent_config=HINDI, filler_after_seconds=0.05,
     ) as call:
+        # 1 generation, not 2: a successful compliant booking is confirmed
+        # immediately with no rerun, so the scripted second reply is never used
+        # — the filler plus the immediate constant IS the whole of what the
+        # caller hears.
         await call.says("कल दोपहर दो बजे डॉक्टर सलमान के पास, मेरा नाम आइनान है",
-                        expect_generations=2)
+                        expect_generations=1)
         spoken = call.speaker.spoken
         frame_types = list(call.speaker.frame_types)
 
@@ -848,7 +863,7 @@ async def test_the_caller_is_told_the_booking_is_being_made(seeded_db, monkeypat
     assert _filler("BOOK") in spoken, (
         f"the caller sat through the write in silence: {spoken!r}"
     )
-    assert spoken.endswith("आपकी अपॉइंटमेंट पक्की हो गई है।"), (
+    assert spoken.endswith(spoken_fallback.sentence(spoken_fallback.BOOKED, "hi-IN")), (
         f"the real confirmation must still be the last thing said: {spoken!r}"
     )
     # Pushed from a timer, with no LLMFullResponseEndFrame coming to flush a
@@ -924,8 +939,11 @@ async def test_the_filler_does_not_switch_the_backstop_off(seeded_db, monkeypatc
         [_book_tag(), TRUNCATED_TAG, TRUNCATED_TAG],
         agent_config=HINDI, filler_after_seconds=0.05,
     ) as call:
+        # 1 generation, not 3: a successful compliant booking is confirmed
+        # immediately with no rerun, so the two unspeakable replies are never
+        # reached.
         await call.says("कल दोपहर दो बजे डॉक्टर सलमान के पास, मेरा नाम आइनान है",
-                        expect_generations=3)
+                        expect_generations=1)
         spoken = call.speaker.spoken
 
     assert len(await _appointments()) == 1, "the booking itself regressed"
@@ -937,39 +955,32 @@ async def test_the_filler_does_not_switch_the_backstop_off(seeded_db, monkeypatc
 
 @pytest.mark.asyncio
 async def test_an_outcome_the_caller_never_heard_survives_the_next_turn(seeded_db):
-    """The barge-in case, which the turn's own backstop cannot reach.
+    """The barge-in case this bug used to reach — no longer reachable for a
+    successful compliant action, and this proves why.
 
-    The caller speaks into the gap, pipecat cancels the reply that was forming,
-    and the turn ends having told them nothing — but the appointment is real. The
-    outcome must therefore outlive the turn, so that if the NEXT turn also fails
-    to speak, what the caller finally hears is the truth about their booking and
-    not "sorry, I did not catch that".
+    Before _execute_and_regenerate spoke a successful outcome immediately, a
+    successful compliant booking still depended on a SECOND generation (the
+    rerun) to say anything about it at all — and that rerun could be lost (a
+    barge-in cancelling it, a dropped frame, here simulated with
+    swallow_reruns so the test does not have to race a real interruption). If
+    it was lost, the row existed and the caller heard nothing THAT TURN, and
+    the outcome had to survive to the NEXT turn to ever be told the truth.
+
+    A successful compliant action no longer has that gap: it is confirmed
+    synchronously, inside _execute_and_regenerate itself, before any rerun is
+    even requested — so destroying every rerun this call could ever produce
+    must have NO effect on whether the caller hears the outcome, this turn.
     """
-    # swallow_reruns destroys the LLMRunFrame that would have produced the
-    # confirmation — the same end state a barge-in leaves behind (the reply is
-    # gone before a word of it is synthesized), and unlike a real interruption it
-    # does not race the test.
     async with VoiceCall(
-        [_book_tag(), " "], agent_config=HINDI, swallow_reruns=True,
+        [_book_tag()], agent_config=HINDI, swallow_reruns=True,
     ) as call:
         await call.says("कल दोपहर दो बजे डॉक्टर सलमान के पास, मेरा नाम आइनान है",
                         expect_generations=1)
-        await _write_finished(call)
-        assert len(await _appointments()) == 1, "the booking itself regressed"
-        assert not call.speaker.spoken, "this turn was supposed to say nothing"
-
-        # The caller talks into the gap. This is what wiped the state the backstop
-        # needed: reset_turn cleared the outcome unconditionally.
-        await call.task.queue_frame(InterruptionFrame())
-        await asyncio.sleep(0.2)
-
-        # Turn 2 produces nothing speakable either, so the backstop must answer
-        # it — and it is the only thing left that can tell the caller anything.
-        await call.says("हेलो? हेलो?", expect_generations=1)
         spoken = call.speaker.spoken
 
+    assert len(await _appointments()) == 1, "the booking itself regressed"
     assert spoken == spoken_fallback.sentence(spoken_fallback.BOOKED, "hi-IN"), (
-        f"the appointment exists and the caller was told {spoken!r}"
+        f"a successful booking must be confirmed even with every rerun destroyed: {spoken!r}"
     )
 
 
