@@ -103,6 +103,57 @@ PROVIDER_DEFAULT_MODEL = {
 }
 
 
+#: A reasoning model spends its token allowance on reasoning BEFORE it emits a
+#: single visible character, so the app's ordinary spoken-reply budget (150-300
+#: tokens, services/token_budget.response_token_budget) buys it nothing to say.
+#: Measured 2026-08-10: at 150-250 max_tokens openai/gpt-oss-* returns EMPTY
+#: content every time.
+#:
+#: The chat path has compensated for this since that measurement
+#: (routers/agent_test.py::call_groq). The VOICE path never did — and voice is
+#: where it matters most, because openai/gpt-oss-120b is the FIRST fallback the
+#: rate-limit switch reaches. Live on 2026-08-15 the primary hit its daily budget,
+#: voice moved to gpt-oss-120b exactly as designed, and the caller then got
+#: TTS "400: Text must contain at least one character from the allowed languages"
+#: — the signature of an empty completion reaching the speech service. The
+#: failover was working and the model it failed over to could not speak.
+GROQ_REASONING_MIN_TOKENS = 800
+
+
+def groq_reasoning_settings(model: str, max_tokens: int) -> dict:
+    """The Groq request knobs this model needs, as Settings kwargs.
+
+    Returns ``max_tokens`` always, plus ``extra={"reasoning_effort": ...}`` for a
+    reasoning model. ``extra`` is pipecat's passthrough for model-specific request
+    params — merged into the request body at
+    pipecat/services/openai/base_llm.py:361 (``params.update(self._settings.extra)``).
+
+    The effort VALUE is per family and not free-form; ``low`` is a hard 400 on
+    qwen3. See services/llm_failover.GROQ_REASONING_EFFORT.
+    """
+    effort = llm_failover.reasoning_effort_for(model)
+    if effort is None:
+        return {"max_tokens": max_tokens}
+    return {
+        "max_tokens": max(max_tokens, GROQ_REASONING_MIN_TOKENS),
+        "extra": {"reasoning_effort": effort},
+    }
+
+
+def _settings_max_tokens(llm, default: int = 150) -> int:
+    """The reply-token budget an already-built LLM service was configured with.
+
+    Best-effort and never raises: pipecat stores a sentinel (`_NotGiven`) rather
+    than None for unset fields, and this runs on a live call where being wrong
+    must cost a slightly different budget, never an exception.
+    """
+    try:
+        value = getattr(getattr(llm, "_settings", None), "max_tokens", None)
+        return int(value) if isinstance(value, int) and value > 0 else default
+    except Exception:  # noqa: BLE001
+        return default
+
+
 def _provider_from_model(model: str) -> Optional[str]:
     m = (model or "").lower()
     if m.startswith("gemini"):
@@ -286,18 +337,45 @@ async def select_llm_provider(agent_config: dict) -> tuple[str, str, str]:
         else _provider_from_model(configured_model) or "gemini"
     )
 
-    order: list[str] = [preferred] + [p for p in PROVIDER_ORDER if p != preferred]
+    # The operator's CHOICE is honoured whenever it is usable at all, and
+    # "usable" means it has a key — not that a 3-second list-models GET happened
+    # to answer just now.
+    #
+    # The probe used to gate the configured provider too, and that made every
+    # transient blip — a slow DNS answer, a 1.5s connect timeout, one 503 from
+    # the vendor's edge — silently move the call to a DIFFERENT VENDOR and, worse,
+    # discard the configured model with it (the `provider == preferred` condition
+    # below). The operator picked a model in the dashboard and the call ran on
+    # something else, with only a log line to say so.
+    #
+    # It also could not protect against the failure that actually happens: a
+    # list-models GET returns 200 for a key whose token budget is fully spent
+    # (documented at _probe). So the probe was buying a false negative and no
+    # true positive. Real exhaustion is handled where it is detectable — the 429
+    # path in llm_failover / _try_another_model.
+    preferred_key = await _resolve_key(preferred)
+    if preferred_key.strip():
+        model = configured_model or PROVIDER_DEFAULT_MODEL.get(preferred, "")
+        log.info(
+            "[RESILIENCE] using the configured LLM provider '%s' (model=%s) — no probe gate.",
+            preferred, model,
+        )
+        _selection_cache[cache_key] = (time.monotonic(), (preferred, preferred_key, model))
+        return _skip_exhausted_model(preferred, preferred_key, model)
+
+    log.warning(
+        "[RESILIENCE] the configured LLM provider '%s' has NO key configured — this is a "
+        "setup gap, not a transient failure, so falling back to another provider.", preferred,
+    )
+    order: list[str] = [p for p in PROVIDER_ORDER if p != preferred]
     for provider in order:
         key = await _resolve_key(provider)
         if await _probe(provider, key):
-            model = configured_model if provider == preferred and configured_model else PROVIDER_DEFAULT_MODEL[provider]
-            if provider != preferred:
-                log.warning(
-                    "[RESILIENCE] configured LLM provider '%s' unavailable — falling back to '%s' (model=%s)",
-                    preferred, provider, model,
-                )
-            else:
-                log.info("[RESILIENCE] LLM provider '%s' healthy (model=%s)", provider, model)
+            model = PROVIDER_DEFAULT_MODEL[provider]
+            log.warning(
+                "[RESILIENCE] configured LLM provider '%s' unavailable — falling back to '%s' (model=%s)",
+                preferred, provider, model,
+            )
             # The UNSWAPPED selection is what gets cached — see _skip_exhausted_model
             # for why the budget check must not be cached alongside the probe.
             _selection_cache[cache_key] = (time.monotonic(), (provider, key, model))
@@ -350,7 +428,8 @@ async def build_llm(provider: str, api_key: str, model: str, system_prompt: str,
         return GroqLLMService(
             api_key=api_key,
             settings=GroqLLMService.Settings(
-                model=model, system_instruction=system_prompt, temperature=temperature, max_tokens=max_tokens),
+                model=model, system_instruction=system_prompt, temperature=temperature,
+                **groq_reasoning_settings(model, max_tokens)),
         )
     if provider in ("openai", "deepseek"):
         from pipecat.services.openai.llm import OpenAILLMService
@@ -469,7 +548,8 @@ class ResilienceProcessor(FrameProcessor):
         llm=None,
         llm_provider: str = "",
         llm_model: str = "",
-        max_model_switches: int = 2,
+        max_model_switches: int | None = None,
+        call_logger=None,
     ) -> None:
         super().__init__()
         self._phrase = fallback_phrase(language)
@@ -482,8 +562,26 @@ class ResilienceProcessor(FrameProcessor):
         self._llm_provider = (llm_provider or "").strip().lower()
         self._llm_model = (llm_model or "").strip()
         # Bounded so a systematically failing chain cannot walk the caller through
-        # every model on the account. Two switches covers the whole Groq chain.
+        # every model on the account.
+        #
+        # Derived from the chain rather than pinned at 2: every Groq model has
+        # its OWN free-tier token budget, so the chain is the product's daily
+        # capacity and a cap below its length throws away models that still have
+        # budget. Measured live 2026-08-15 — llama-3.3-70b returned
+        # "tokens per day (TPD): Limit 100000, Used 99547" and the caller's turn
+        # died two switches later with usable models left untried.
+        if max_model_switches is None:
+            max_model_switches = max(2, len(llm_failover.GROQ_MODEL_CHAIN) - 1)
         self._switches_left = max_model_switches
+        #: Holds the silence watchdog's clock while a switch + re-ask is in
+        #: flight. That is a whole extra LLM round trip the caller did nothing to
+        #: cause, and it used to run with the clock live — see _try_another_model.
+        self._call_logger = call_logger
+        #: The spoken-reply token budget this call was built with, so a model
+        #: switch can re-derive the target model's own budget from it rather than
+        #: inheriting whatever the previous model was set to. Read off the live
+        #: service so it stays right without pipeline.py having to pass it.
+        self._base_max_tokens = _settings_max_tokens(llm)
 
     def bind_task(self, task) -> None:
         self._task = task
@@ -530,11 +628,30 @@ class ResilienceProcessor(FrameProcessor):
             )
             return False
 
+        # The switch plus the re-ask is a full extra LLM round trip. Hold the
+        # silence watchdog's clock across it: the caller is waiting on the
+        # agent's own recovery, which is the definition of work in progress, and
+        # is exactly what action_in_progress exists to exclude. Cleared by the
+        # re-ask's own LLMFullResponseStartFrame in voice_action._set_busy, and
+        # backstopped by that processor's busy watchdog if the frame never comes.
+        if self._call_logger is not None:
+            self._call_logger.action_in_progress = True
+
         try:
             # The service's OWN Settings type, so the delta validates against the
             # same schema it was built with, and `service=` targets this LLM
             # explicitly rather than relying on it being the only one in the pipeline.
-            delta = type(self._llm._settings)(model=alt)
+            #
+            # The delta carries the reasoning knobs, not just the model id. Sending
+            # `model` alone leaves the previous model's max_tokens and (absent)
+            # reasoning_effort in place, and every model this chain falls TO is a
+            # reasoning model — so a bare-model switch lands on a service configured
+            # to return empty completions. That is the 2026-08-15 failure: the switch
+            # to gpt-oss-120b succeeded and the caller heard nothing, because the
+            # reply had no visible characters for TTS to speak.
+            delta = type(self._llm._settings)(
+                model=alt, **groq_reasoning_settings(alt, self._base_max_tokens),
+            )
             await self._task.queue_frames([
                 LLMUpdateSettingsFrame(delta=delta, service=self._llm),
                 # Re-runs inference on the context as it stands, i.e. re-answers the
@@ -544,6 +661,10 @@ class ResilienceProcessor(FrameProcessor):
                 LLMRunFrame(),
             ])
         except Exception as e:  # noqa: BLE001
+            # Nothing is coming — release the clock rather than leaving the
+            # watchdog switched off for the rest of the call.
+            if self._call_logger is not None:
+                self._call_logger.action_in_progress = False
             log.error("[RESILIENCE] failed to switch model %s → %s: %s", self._llm_model, alt, e)
             return False
 

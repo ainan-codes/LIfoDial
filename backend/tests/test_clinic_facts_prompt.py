@@ -21,10 +21,15 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 import pytest
 
 from backend.agent.pipeline import (
-    _DEFAULT_WORKING_HOURS,
+    _UNKNOWN_WORKING_HOURS,
     _build_system_prompt,
     _clinic_facts_block,
 )
+
+#: The hours the agent used to invent for a clinic that never configured any.
+#: There is no longer a constant for it — this literal exists so the tests can
+#: assert it never comes back.
+FABRICATED_HOURS = "9 AM – 7 PM, Mon–Sat"
 
 HOURS = "10:00 AM - 6:00 PM"
 
@@ -46,7 +51,7 @@ TENANT = {
 def test_block_states_the_configured_hours():
     block = _clinic_facts_block(TENANT)
     assert HOURS in block
-    assert _DEFAULT_WORKING_HOURS not in block, "fell back to the hardcoded default"
+    assert FABRICATED_HOURS not in block, "fell back to the hardcoded default"
 
 
 def test_block_lists_available_doctors_and_omits_absent_ones():
@@ -78,10 +83,46 @@ def test_all_doctors_on_leave_is_stated_explicitly():
     assert "every doctor on staff is on leave" in block.lower()
 
 
-def test_missing_hours_falls_back_to_the_documented_default():
+def test_missing_hours_are_never_invented():
+    """A clinic that never set its hours has none — and the agent must say
+    nothing about them rather than quote a plausible default as fact.
+
+    This used to assert the opposite: an unconfigured clinic got
+    "Working hours: 9 AM - 7 PM, Mon-Sat" stated as fact, immediately followed by
+    the block's own instruction to refuse anything outside those hours and to
+    "say the clinic is closed then". So the agent quoted invented opening times
+    AND turned callers away on the strength of them. Reported 2026-08-15 as the
+    agent giving out wrong time slots.
+
+    What the caller can actually be told about is the REAL DOCTOR AVAILABILITY
+    block, which is computed from the clinic's real DoctorAvailability rows by
+    the same engine that gates the write.
+    """
     for value in ("", "   ", None):
         block = _clinic_facts_block({**TENANT, "working_hours": value})
-        assert _DEFAULT_WORKING_HOURS in block
+        assert FABRICATED_HOURS not in block, "invented opening hours"
+        assert "Working hours:" not in block, (
+            "stated an hours line for a clinic that has no hours on file"
+        )
+        low = block.lower()
+        assert "never state" in low and "opening" in low, (
+            "the model was not told it does not know this clinic's hours, so it "
+            "will fill the silence with a plausible answer"
+        )
+
+
+def test_missing_hours_do_not_make_the_agent_declare_the_clinic_closed():
+    """The closed-at-that-hour instruction is only honest when hours are known."""
+    block = _clinic_facts_block({**TENANT, "working_hours": ""}).lower()
+    assert "inside the working hours" not in block
+    assert "say the clinic is closed then" not in block
+
+
+def test_a_template_gets_an_honest_placeholder_when_hours_are_unknown():
+    """Templates interpolate {working_hours} into a sentence and so cannot omit
+    the line the facts block can. The substituted text must still be true."""
+    assert "do not state" in _UNKNOWN_WORKING_HOURS.lower()
+    assert "9 am" not in _UNKNOWN_WORKING_HOURS.lower()
 
 
 # ── Reaching EVERY prompt path ────────────────────────────────────────────────

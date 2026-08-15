@@ -20,6 +20,7 @@ import datetime as dt
 import logging
 import re
 import unicodedata
+from contextlib import contextmanager
 from typing import Callable, Optional
 
 from pipecat.frames.frames import Frame, LLMContextFrame, TranscriptionFrame, TTSSpeakFrame
@@ -1336,6 +1337,7 @@ class BookingTranscriptTap(FrameProcessor):
         self,
         booking_processor: BookingProcessor,
         on_new_turn: Optional[Callable[[], None]] = None,
+        call_logger=None,
     ) -> None:
         super().__init__()
         self._booking = booking_processor
@@ -1346,6 +1348,13 @@ class BookingTranscriptTap(FrameProcessor):
         # giving it its own tap would cost a second passthrough hop for every
         # audio frame on a CPU-starved free-tier worker.
         self._on_new_turn = on_new_turn
+        #: The pipeline's CallLoggerProcessor, whose ``action_in_progress`` flag
+        #: STOPS the silence watchdog's clock (pipeline.py::_enforce_silence_timeout).
+        #: The FSM chain below is the agent working on the caller's request, so
+        #: none of it may be counted as the caller having gone quiet — see
+        #: process_frame. Optional so tests that build this tap standalone need
+        #: not construct one.
+        self._call_logger = call_logger
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         # REQUIRED first (pipecat 1.5): handle system frames + mark started.
@@ -1367,9 +1376,52 @@ class BookingTranscriptTap(FrameProcessor):
             # LLMContextFrame, and BookingProcessor must already have armed
             # (or committed) by the time that frame reaches it. Pushing first
             # would let the context frame overtake the state it depends on.
-            await self._booking.on_user_utterance(frame.text)
+            #
+            # Because it IS awaited here, this chain sits in front of the whole
+            # LLM turn — the caller is waiting through every second of it. Two
+            # things therefore wrap it, and both are load-bearing:
+            #
+            #   session_scope()  — one connection for the entire chain. The FSM
+            #     can run availability refresh, the caller's-appointments read,
+            #     is_doctor_open_at and _build_availability_note in a single
+            #     utterance, and each used to open its OWN session. Under
+            #     NullPool that is a fresh TCP+TLS+auth round trip to Supabase
+            #     EACH TIME — measured 1.97-3.01s, median 2.31s (see
+            #     backend/db.py), so a four-read utterance cost ~9s of dead air
+            #     before the model had even been asked. Every helper underneath
+            #     already uses scoped_session(), which reuses an outer scope, so
+            #     this one line collapses all of them onto one connect.
+            #
+            #   _busy()          — the silence watchdog must not count the agent
+            #     working as the caller being quiet. Nothing in this chain set
+            #     action_in_progress before, so the whole window ran with the
+            #     clock live. It did not fire today only because the caller's
+            #     own speech had just reset last_activity_ts; that is a
+            #     coincidence of ordering, not a guarantee.
+            with self._busy():
+                from backend.db import session_scope
+
+                async with session_scope():
+                    await self._booking.on_user_utterance(frame.text)
 
         await self.push_frame(frame, direction)
+
+    @contextmanager
+    def _busy(self):
+        """Hold the silence watchdog's clock for the duration of this block.
+
+        Synchronous (not async) on purpose: it only flips a flag, so it is
+        correct around an await without needing to be a coroutine, and it stays
+        usable from tests that never build a CallLoggerProcessor.
+        """
+        logger_obj = self._call_logger
+        if logger_obj is not None:
+            logger_obj.action_in_progress = True
+        try:
+            yield
+        finally:
+            if logger_obj is not None:
+                logger_obj.action_in_progress = False
 
 
 async def _build_availability_note(

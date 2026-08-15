@@ -47,6 +47,22 @@ class Appointment(Base):
             postgresql_where=text("status <> 'cancelled'"),
             sqlite_where=text("status <> 'cancelled'"),
         ),
+        # Every list view orders by slot_time DESC and windows on it
+        # (routers/admin.py::list_all_appointments,
+        # routers/appointments.py::list_appointments). Nothing could serve that:
+        # the unique index above leads with doctor_id, and tenant_id/status are
+        # single-column, so both queries did a full scan plus an in-memory sort
+        # on every dashboard load. Past ~8s that hits asyncpg's command_timeout
+        # and the page 500s, which is the 2026-08-15 report.
+        #
+        # tenant_id first, then slot_time DESC: the clinic view filters on tenant
+        # and orders within it (an index prefix serves that directly), while the
+        # superadmin view crosses tenants and still gets the ordered slot_time
+        # column for its date window.
+        Index(
+            "ix_appointments_tenant_slot_time",
+            "tenant_id", text("slot_time DESC"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(

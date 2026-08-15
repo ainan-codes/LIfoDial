@@ -39,15 +39,48 @@ async def _fake_resolve_key(provider):
 
 
 @pytest.mark.asyncio
-async def test_dead_primary_falls_back_to_next_healthy():
-    """Gemini dead, Groq healthy → pick Groq with its default model."""
+async def test_an_unconfigured_primary_falls_back_to_the_next_healthy():
+    """A provider with NO KEY is a setup gap, and that IS grounds to fall back.
+
+    Contrast test_a_probe_failure_never_changes_the_operators_choice below: the
+    distinction this pair draws is the whole selection policy — "not set up" and
+    "did not answer a 3-second GET" are not the same condition and must not have
+    the same consequence.
+    """
     async def fake_probe(provider, key):
         return provider == "groq"
+
+    async def no_key_for_gemini(provider):
+        return "" if provider == "gemini" else "k" * 40
+
     with patch.object(R, "_probe", fake_probe), \
-         patch.object(R, "_resolve_key", _fake_resolve_key):
+         patch.object(R, "_resolve_key", no_key_for_gemini):
         prov, key, model = await select_llm_provider({"llm_model": "gemini-2.5-flash"})
     assert prov == "groq"
     assert model == "llama-3.3-70b-versatile"
+
+
+@pytest.mark.asyncio
+async def test_a_probe_failure_never_changes_the_operators_choice():
+    """The operator picked a provider and a model. A probe blip must not move
+    the call to a different VENDOR and silently drop the chosen model with it.
+
+    The probe is a list-models GET on a 1.5s connect / 3s read timeout. It fails
+    for slow DNS, one edge 503, a cold TLS handshake — none of which mean the
+    provider cannot serve this call. And it cannot detect the failure that
+    actually happens, because list-models returns 200 for a key whose token
+    budget is fully spent (see resilience._probe). Reported 2026-08-15: a model
+    was selected in the dashboard and calls ran on a different provider's default.
+    """
+    async def every_probe_fails(provider, key):
+        return False
+
+    with patch.object(R, "_probe", every_probe_fails), \
+         patch.object(R, "_resolve_key", _fake_resolve_key):
+        prov, key, model = await select_llm_provider(
+            {"llm_provider": "groq", "llm_model": "openai/gpt-oss-120b"})
+    assert prov == "groq", "a probe blip moved the call to another vendor"
+    assert model == "openai/gpt-oss-120b", "the operator's chosen model was discarded"
 
 
 @pytest.mark.asyncio
@@ -63,11 +96,16 @@ async def test_configured_provider_kept_when_healthy():
 
 
 @pytest.mark.asyncio
-async def test_no_provider_reachable_raises():
+async def test_no_provider_configured_at_all_raises():
+    """Nothing has a key — there is genuinely nothing to run the call on."""
     async def fake_probe(provider, key):
         return False
+
+    async def no_keys(provider):
+        return ""
+
     with patch.object(R, "_probe", fake_probe), \
-         patch.object(R, "_resolve_key", _fake_resolve_key):
+         patch.object(R, "_resolve_key", no_keys):
         with pytest.raises(RuntimeError):
             await select_llm_provider({"llm_model": "gemini-2.5-flash"})
 

@@ -93,6 +93,18 @@ async def _book(tenant_id: str, doctor_id: str, phone: str, call_id: str,
     )
 
 
+def _admin_rows(payload):
+    """The superadmin appointments list, from either response shape.
+
+    The endpoint returns an envelope now — {"appointments": [...], "total": N,
+    "has_more": bool} — because it used to return EVERY appointment for EVERY
+    clinic for all time in a bare array, which is what made the page time out
+    and 500 (2026-08-15). These tests care about which rows come back, not about
+    the envelope, so they read through it.
+    """
+    return payload if isinstance(payload, list) else payload["appointments"]
+
+
 @pytest.mark.asyncio
 async def test_a_booking_appears_in_both_dashboards(two_clinics):
     client = two_clinics
@@ -103,7 +115,7 @@ async def test_a_booking_appears_in_both_dashboards(two_clinics):
     # ── Clinic admin's own Appointments view ──────────────────────────────────
     r = await client.get(f"/tenants/{CLINIC_A}/appointments", headers=_clinic(CLINIC_A))
     assert r.status_code == 200, r.text
-    rows = r.json()
+    rows = _admin_rows(r.json())
     assert len(rows) == 1
     assert rows[0]["id"] == result["appointment_id"]
     assert rows[0]["doctor_name"] == "Dr Anjali Sharma"
@@ -117,7 +129,7 @@ async def test_a_booking_appears_in_both_dashboards(two_clinics):
     # ── Superadmin's All Appointments view ────────────────────────────────────
     r = await client.get("/admin/appointments", headers=_superadmin())
     assert r.status_code == 200, r.text
-    rows = r.json()
+    rows = _admin_rows(r.json())
     assert len(rows) == 1
     assert rows[0]["id"] == result["appointment_id"]
     # Attributed to the right clinic — the whole point of this view.
@@ -156,12 +168,12 @@ async def test_superadmin_sees_every_clinic_and_can_filter_to_one(two_clinics):
     await _book(CLINIC_A, DOCTOR_A, "+919876543210", "call-a-1")
     await _book(CLINIC_B, DOCTOR_B, "+919812345678", "call-b-1")
 
-    rows = (await client.get("/admin/appointments", headers=_superadmin())).json()
+    rows = _admin_rows((await client.get("/admin/appointments", headers=_superadmin())).json())
     assert {r["clinic_name"] for r in rows} == {"Clinic A", "Clinic B"}
 
-    rows = (await client.get(
+    rows = _admin_rows((await client.get(
         f"/admin/appointments?clinic_id={CLINIC_A}", headers=_superadmin()
-    )).json()
+    )).json())
     assert {r["clinic_name"] for r in rows} == {"Clinic A"}
 
 
@@ -206,7 +218,7 @@ async def test_the_superadmin_view_reports_the_real_channel(two_clinics):
     chat = await _book(CLINIC_B, DOCTOR_B, "+919812345678", "chat-b-1",
                        source="chat", slot_time="4 pm")
 
-    rows = (await client.get("/admin/appointments", headers=_superadmin())).json()
+    rows = _admin_rows((await client.get("/admin/appointments", headers=_superadmin())).json())
     by_id = {r["id"]: r for r in rows}
     assert by_id[voice["appointment_id"]]["channel"] == "Phone Call"
     assert by_id[chat["appointment_id"]]["channel"] == "Chat", (
@@ -237,7 +249,7 @@ async def test_a_row_with_no_recorded_channel_reads_as_unknown(two_clinics):
                              headers=_clinic(CLINIC_A))).json()
     assert rows[0]["source"] is None
 
-    rows = (await client.get("/admin/appointments", headers=_superadmin())).json()
+    rows = _admin_rows((await client.get("/admin/appointments", headers=_superadmin())).json())
     assert rows[0]["channel"] == "Unknown"
 
 

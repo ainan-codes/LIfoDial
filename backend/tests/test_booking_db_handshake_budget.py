@@ -254,3 +254,125 @@ async def test_writes_inside_a_scope_are_actually_persisted(counter):
         rows = (await s.execute(select(Appointment))).scalars().all()
     assert len(rows) == 1, "the booking did not survive its session scope"
     assert rows[0].patient_phone == PHONE
+
+
+# ── The per-utterance FSM chain ───────────────────────────────────────────────
+#
+# Everything above budgets the WRITE. This budgets the read chain that runs
+# BEFORE it, on every single caller utterance, and which nothing was budgeting.
+#
+# BookingTranscriptTap awaits BookingProcessor.on_user_utterance before the
+# transcription is allowed downstream (deliberately — the aggregator turns that
+# same frame into the LLMContextFrame the FSM must have armed for). So this chain
+# sits in front of the entire LLM turn: the caller has stopped speaking and is
+# listening to nothing for the whole of it.
+#
+# A single utterance can trigger four separate reads — availability refresh, the
+# caller's own appointments, is_doctor_open_at for the time they asked for, and
+# _build_availability_note when that time is not open — and each one used to open
+# its own session. At the measured 2.31s median that is ~9.2s of dead air before
+# the model was even asked, which is the "agent makes the caller wait" report
+# from 2026-08-15.
+
+
+@pytest.mark.asyncio
+async def test_one_utterance_opens_one_connection(counter):
+    """The whole per-utterance read chain shares a single connection."""
+    from backend.agent.processors.booking_processor import (
+        BookingProcessor,
+        BookingTranscriptTap,
+    )
+    from pipecat.frames.frames import TranscriptionFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    tenant = {
+        "id": TENANT,
+        "clinic_name": "C",
+        "doctors": [{"id": DOCTOR, "name": "Dr Salman", "specialization": "Cardiologist"}],
+    }
+    cfg = {"can_book_appointments": True, "can_cancel_appointments": True,
+           "can_check_availability": True, "language": "en-IN"}
+    booking = BookingProcessor(
+        tenant=tenant, agent_config=cfg,
+        call_meta={"caller_phone": PHONE, "call_record_id": None},
+    )
+    tap = BookingTranscriptTap(booking)
+
+    # An utterance that drives the chain as hard as it goes: it names the doctor,
+    # states a time, and gives an identity — so availability, the caller's
+    # appointments and the slot check are all reachable from this one turn.
+    frame = TranscriptionFrame(
+        text=f"I'm {NAME}, book me with Dr Salman tomorrow at 2 PM",
+        user_id="caller", timestamp="t",
+    )
+
+    pushed = []
+
+    async def _capture(f, d=None):
+        pushed.append(f)
+
+    tap.push_frame = _capture  # type: ignore[assignment]
+
+    counter.count = 0
+    await tap.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+    assert counter.count <= 1, _budget_msg(
+        "one caller utterance (FSM chain)", counter.count, 1)
+
+
+@pytest.mark.asyncio
+async def test_the_utterance_chain_holds_the_silence_clock(counter):
+    """The silence watchdog must not count the agent working as the caller
+    being quiet.
+
+    pipeline.py::_enforce_silence_timeout stops accruing silence while
+    call_logger.action_in_progress is True. Nothing in this chain set it, so the
+    whole multi-second window ran with the clock live. It did not end calls today
+    only because the caller's own speech had just reset last_activity_ts — an
+    accident of ordering, not a guarantee, and one that stops holding the moment
+    the chain gets slower than the timeout.
+    """
+    from backend.agent.processors.booking_processor import (
+        BookingProcessor,
+        BookingTranscriptTap,
+    )
+    from pipecat.frames.frames import TranscriptionFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    class _Logger:
+        action_in_progress = False
+
+    seen = []
+
+    class _WatchingBooking(BookingProcessor):
+        async def on_user_utterance(self, text):
+            # What the watchdog would observe at the slowest moment of the turn.
+            seen.append(logger_obj.action_in_progress)
+            return await super().on_user_utterance(text)
+
+    logger_obj = _Logger()
+    booking = _WatchingBooking(
+        tenant={"id": TENANT, "clinic_name": "C", "doctors": []},
+        agent_config={"can_book_appointments": True, "language": "en-IN"},
+        call_meta={"caller_phone": PHONE, "call_record_id": None},
+    )
+    tap = BookingTranscriptTap(booking, call_logger=logger_obj)
+
+    async def _swallow(f, d=None):
+        return None
+
+    tap.push_frame = _swallow  # type: ignore[assignment]
+
+    await tap.process_frame(
+        TranscriptionFrame(text="book me tomorrow at 2 PM", user_id="caller", timestamp="t"),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    assert seen == [True], (
+        "the FSM chain ran with the silence clock live — a slow chain can end "
+        "the caller's call while the agent is working on their request"
+    )
+    assert logger_obj.action_in_progress is False, (
+        "the shield was left up after the turn, which disables the silence "
+        "watchdog for the REST OF THE CALL"
+    )

@@ -104,7 +104,26 @@ GROQ_MODEL_CHAIN: tuple[str, ...] = (
     "llama-3.3-70b-versatile",
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
+    "qwen/qwen3.6-27b",
 )
+
+#: Why qwen3.6-27b was added (2026-08-15). Every model here has its OWN daily
+#: token budget, so the chain IS the product's daily capacity — a clinic that
+#: exhausts one model keeps taking calls on the next. Live measurement that
+#: prompted this: llama-3.3-70b returned "tokens per day (TPD): Limit 100000,
+#: Used 99547, Requested 4808", i.e. roughly twenty turns of headroom left for
+#: the whole account, and the chain ran out of models mid-call.
+#:
+#: It was admitted on the same evidence the others were, not on availability:
+#: scored 3/3 on this app's [ACTION:] tag task (English BOOK, Hindi BOOK, CANCEL)
+#: against the real voice_action_tag_block prompt. It is the ONLY model on the
+#: account's live list that both passes and is not already here — measured the
+#: same day, llama-3.1-8b-instant scored 2/3 (dropped the tag on the Hindi turn)
+#: and openai/gpt-oss-safeguard-20b 2/3 (Groq returns a tool_use_failed 400 on
+#: the Hindi turn), so neither is in the chain. allam-2-7b's 4,096-token context
+#: is below groq_catalog.MIN_CONTEXT_WINDOW and cannot hold this system prompt.
+#:
+#: NOTE it needs reasoning_effort="none" — see GROQ_REASONING_EFFORT.
 
 #: Free-tier tokens-per-day per model, verified 2026-08-11. Reported to operators so
 #: an exhausted budget reads as a known ceiling rather than a mystery outage; nothing
@@ -114,7 +133,51 @@ GROQ_FREE_TIER_TPD: dict[str, int] = {
     "openai/gpt-oss-120b": 200_000,
     "openai/gpt-oss-20b": 200_000,
     "llama-3.1-8b-instant": 500_000,
+    # qwen/qwen3.6-27b is deliberately ABSENT rather than guessed. Groq's
+    # response headers expose RPD and TPM but never TPD, so the numbers above
+    # come from the account's published free-tier table; this model was added
+    # before that table listed it. Callers already treat a miss as "unknown"
+    # (see the .get() at the report sites), and an invented ceiling would be
+    # worse than no ceiling — it would read as measured.
 }
+
+#: ``reasoning_effort`` per Groq model family. It is NOT a free-form field and the
+#: accepted values differ by family, so one wrong value is a hard 400 on every
+#: request — the model never answers at all.
+#:
+#: Measured against the live API 2026-08-15:
+#:   openai/gpt-oss-*  -> "low" is accepted (and needed: these return an EMPTY
+#:                        completion at 150-250 max_tokens without it)
+#:   qwen/qwen3.6-27b  -> "low" is REJECTED:
+#:                          400 "`reasoning_effort` must be one of `none` or `default`"
+#:
+#: This existed as a bare ``("gpt-oss", "qwen3", "deepseek-r1")`` marker tuple in
+#: routers/agent_test.py that sent "low" to all three, so selecting qwen3 from the
+#: model dropdown 400'd on EVERY turn — the agent could not answer once. Kept here,
+#: beside the chain the value has to agree with, so the two cannot drift.
+GROQ_REASONING_EFFORT: dict[str, str] = {
+    "qwen3": "none",
+    "gpt-oss": "low",
+    "deepseek-r1": "low",
+}
+
+
+def reasoning_effort_for(model: str) -> str | None:
+    """The ``reasoning_effort`` this model accepts, or None if it takes none.
+
+    Longest marker first so a more specific family wins over a generic one.
+    """
+    low = (model or "").lower()
+    for marker in sorted(GROQ_REASONING_EFFORT, key=len, reverse=True):
+        if marker in low:
+            return GROQ_REASONING_EFFORT[marker]
+    return None
+
+
+def is_reasoning_model(model: str) -> bool:
+    """True if this model needs the reasoning-model request shape (a
+    ``reasoning_effort`` value and a raised token cap)."""
+    return reasoning_effort_for(model) is not None
 
 #: A wait this short is a BURST limit (RPM/TPM), so the right move is to wait it out
 #: on the model that is already configured rather than drop to a fallback. Grounded

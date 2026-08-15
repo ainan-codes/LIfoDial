@@ -81,6 +81,7 @@ from backend.agent.processors.call_logger_processor import (
     UserTranscriptTap,
 )
 from backend.agent.processors.language_switcher import LanguageSwitchProcessor
+from backend.agent.processors.context_trim import ContextTrimProcessor
 from backend.agent.processors.tag_scrub import TagScrubProcessor
 from backend.agent.processors.voice_action import VoiceActionProcessor
 from backend.agent.processors.transcript_publisher import LiveKitTranscriptPublisher
@@ -128,7 +129,18 @@ def _kb_context_block(tenant: dict) -> str:
     )
 
 
-_DEFAULT_WORKING_HOURS = "9 AM – 7 PM, Mon–Sat"
+#: What a prompt TEMPLATE gets for {working_hours} when the clinic never set any.
+#:
+#: There is deliberately no _DEFAULT_WORKING_HOURS any more. It read
+#: "9 AM – 7 PM, Mon–Sat" and was substituted wherever real hours were missing,
+#: which meant an unconfigured clinic's agent stated invented opening times as
+#: fact — and, because _clinic_facts_block pairs the hours with "say the clinic
+#: is closed then", turned callers away on the strength of them. Reported
+#: 2026-08-15 as the agent giving out wrong time slots.
+#:
+#: A template cannot omit an interpolated value the way the facts block can omit
+#: a line, so it gets a phrase that is TRUE when hours are unknown.
+_UNKNOWN_WORKING_HOURS = "not on file — do not state any opening hours"
 
 # ── Deepgram language support ─────────────────────────────────────────────────
 # Verified by live probes against the Deepgram API on 2026-07-28. Deepgram's own
@@ -308,7 +320,20 @@ def _clinic_facts_block(tenant: dict) -> str:
     the roster is empty when the roster could not be READ: see the
     _facts_unavailable branch.
     """
-    hours = (tenant.get("working_hours") or "").strip() or _DEFAULT_WORKING_HOURS
+    # NOT defaulted to _DEFAULT_WORKING_HOURS. A clinic that has never filled in
+    # its hours has no hours to state, and the old fallback turned that absence
+    # into the confident sentence "Working hours: 9 AM - 7 PM, Mon-Sat" —
+    # immediately followed by the instruction below to refuse anything outside
+    # them and to "say the clinic is closed then". So an unconfigured clinic
+    # had the agent quoting invented opening times as fact and turning callers
+    # away on the strength of them.
+    #
+    # The honest source for what is actually bookable is the REAL DOCTOR
+    # AVAILABILITY block (services/availability_prompt.py), which is computed
+    # from the clinic's real DoctorAvailability rows by the same engine that
+    # gates the write. When there are no configured clinic hours, say nothing
+    # about hours and let that block do its job.
+    hours = (tenant.get("working_hours") or "").strip()
     doctors = tenant.get("doctors") or []
 
     if tenant.get("_facts_unavailable"):
@@ -321,7 +346,7 @@ def _clinic_facts_block(tenant: dict) -> str:
 
         return lookup_failed_block()
 
-    lines = [f"Working hours: {hours}"]
+    lines = [f"Working hours: {hours}"] if hours else []
     if tenant.get("address"):
         lines.append(f"Address: {tenant['address']}")
 
@@ -346,14 +371,34 @@ def _clinic_facts_block(tenant: dict) -> str:
             "doctor's name."
         )
 
+    if hours:
+        hours_rule = (
+            "Only ever offer or confirm appointment times that fall INSIDE the working "
+            "hours above. If the caller asks for a time outside them, say the clinic is "
+            "closed then and offer the nearest time that is open. "
+        )
+    else:
+        # No hours on file. The model must not fill that silence — asked when the
+        # clinic opens, it will happily produce a plausible answer, and a plausible
+        # answer here is a wrong one told to a patient.
+        hours_rule = (
+            "This clinic has NOT told you its opening hours. You therefore do not know "
+            "them: never state, guess, imply or agree to any opening or closing time, "
+            "and never say the clinic is closed at a particular hour. Offer only the "
+            "specific times listed in the REAL DOCTOR AVAILABILITY section — that "
+            "section is built from the doctors' actual schedules and is the only thing "
+            "you know about when appointments can happen. If the caller asks what time "
+            "the clinic opens, say you can check which appointment times are free and "
+            "then offer them. "
+        )
+
     return (
         "\n\n--- CLINIC DETAILS ---\n"
         + "\n".join(lines)
         + "\n--- END CLINIC DETAILS ---\n"
-        "Only ever offer or confirm appointment times that fall INSIDE the working "
-        "hours above. If the caller asks for a time outside them, say the clinic is "
-        "closed then and offer the nearest time that is open. Never invent a doctor, "
-        "a specialization, or an opening time that is not listed above.\n"
+        + hours_rule
+        + "Never invent a doctor, a specialization, or an opening time that is not "
+        "listed above.\n"
     )
 
 
@@ -602,7 +647,14 @@ def _build_system_prompt(
                 "clinic_name": tenant.get("clinic_name", "the clinic"),
                 "agent_name": agent_config.get("agent_name", "Receptionist"),
                 "clinic_location": tenant.get("location", "India"),
-                "working_hours": tenant.get("working_hours") or _DEFAULT_WORKING_HOURS,
+                # The templates interpolate {working_hours} into a sentence, so
+                # unlike the facts block this one cannot simply omit the line.
+                # It gets an honest placeholder instead of invented hours — the
+                # binding rule the model follows is the one in _clinic_facts_block,
+                # which for an unconfigured clinic forbids stating any hours at all.
+                "working_hours": (
+                    tenant.get("working_hours") or _UNKNOWN_WORKING_HOURS
+                ),
                 "emergency_number": tenant.get("emergency_number", "108"),
                 "doctors_list": doctors_list,
             },
@@ -768,7 +820,11 @@ async def _load_tenant_and_config(
     tenant: dict = {
         "id":            tenant_id or "",
         "clinic_name":   metadata.get("clinic_name", "Clinic"),
-        "working_hours": "9 AM – 7 PM, Mon–Sat",
+        # Empty, not "9 AM – 7 PM, Mon–Sat". This literal is the seed for a room
+        # that carries no tenant at all, so there is nothing behind it — stating
+        # it would be inventing a clinic's opening hours out of nothing. The DB
+        # branch below overwrites this with the real value when there is one.
+        "working_hours": "",
         "doctors":       [],
         "knowledge_base": [],
     }
@@ -875,11 +931,15 @@ async def _load_tenant_and_config(
                     # through to that default. Every clinic's agent therefore believed it
                     # opened 9-7 Mon-Sat no matter what the clinic had configured, and a
                     # clinic that set 10:00-18:00 had an agent happily offering 9 AM.
+                    #
+                    # Left EMPTY when the clinic has not set them, rather than
+                    # defaulted: _clinic_facts_block now omits the hours line
+                    # entirely in that case and forbids the model from inventing
+                    # one. Defaulting here would put the fabrication back one
+                    # layer down, where the block can no longer tell a real
+                    # "9 AM - 7 PM" from a made-up one.
                     _ci = agent_config.get("clinic_info") or {}
-                    tenant["working_hours"] = (
-                        (_ci.get("working_hours") or "").strip()
-                        or _DEFAULT_WORKING_HOURS
-                    )
+                    tenant["working_hours"] = (_ci.get("working_hours") or "").strip()
                     # Same source for the other clinic facts the prompt interpolates.
                     if (_ci.get("emergency_number") or "").strip():
                         tenant["emergency_number"] = _ci["emergency_number"].strip()
@@ -1981,12 +2041,24 @@ async def entrypoint(ctx) -> None:
     # BookingTranscriptTap's docstring for the full account.
     booking_transcript_tap = BookingTranscriptTap(
         booking_processor, on_new_turn=voice_action.reset_turn,
+        # The FSM chain this tap awaits is the agent working on the caller's
+        # request, and it runs BEFORE the LLM turn. Handing it the call logger
+        # lets it hold the silence watchdog's clock for that window, the same
+        # way voice_action holds it for a booking write.
+        call_logger=call_logger,
     )
     # Feeds user utterances to call_logger from a position where
     # TranscriptionFrames still exist. Without it the logger counts zero turns
     # and stores an empty transcript, because context_aggregator.user() swallows
     # those frames before they can reach it (see UserTranscriptTap's docstring).
     user_transcript_tap = UserTranscriptTap(call_logger)
+
+    # Caps what one turn can cost. Placed immediately before `llm` so it trims
+    # the context exactly as the model would receive it — after booking_processor
+    # has injected this turn's system messages. Keeps every system message and
+    # only drops old dialogue; see the module docstring for why that distinction
+    # is load-bearing rather than a detail.
+    context_trim = ContextTrimProcessor()
 
     # Never-silence guard (audit FIX 2): sits at the tail of the pipeline and,
     # on any LLM/TTS ErrorFrame, speaks a short reassurance phrase in the agent's
@@ -2002,6 +2074,9 @@ async def entrypoint(ctx) -> None:
         llm=llm,
         llm_provider=llm_provider,
         llm_model=llm_model,
+        # A rate-limit model switch re-asks the LLM; that round trip is agent
+        # work, not caller silence.
+        call_logger=call_logger,
     )
 
     # Mid-call language switching: watches the caller's final transcripts and
@@ -2078,6 +2153,7 @@ async def entrypoint(ctx) -> None:
         booking_transcript_tap,                  # Feed caller utterances to booking_processor (transparent)
         context_aggregator.user(),               # Accumulates user turns into LLMContext
         booking_processor,                       # Booking state machine (transparent)
+        context_trim,                            # Cap the context's token cost (transparent)
         llm,                                     # LLMContext → LLMResponseFrame (streaming)
         voice_action,                            # Execute the model's [ACTION:] tags for real
         tag_scrub,                               # Never speak a machine tag (transparent)

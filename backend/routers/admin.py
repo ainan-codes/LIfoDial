@@ -1,3 +1,4 @@
+import logging
 import random
 import string
 from fastapi import APIRouter, Depends, HTTPException
@@ -15,6 +16,13 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 router = APIRouter()
+
+#: This module had no logger, so every ``except Exception`` here reached the logs
+#: as a bare line with the message swallowed — which is why the live 500 on
+#: /admin/appointments (2026-08-15) showed up as an empty error, alongside
+#: "Agent health error for ...:" and "_broadcast_platform_stats poll error:" with
+#: nothing after the colon. An error you cannot read is an error you cannot fix.
+logger = logging.getLogger(__name__)
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
 async def get_db():
@@ -513,15 +521,58 @@ _CHANNEL_LABELS = {
 }
 
 
+#: Default rows per page. The endpoint used to return EVERY appointment for
+#: EVERY clinic for all time, unbounded — the response grew with the product and
+#: the query had no index to serve its ORDER BY, so it eventually exceeded
+#: asyncpg's 8s command_timeout (backend/db.py) and 500'd. Observed live
+#: 2026-08-15: `GET /admin/appointments 500` followed six seconds later by a 200
+#: on the user's manual refresh, which is exactly what an intermittently-too-slow
+#: query looks like from the dashboard.
+APPOINTMENTS_PAGE_SIZE = 200
+APPOINTMENTS_MAX_PAGE_SIZE = 500
+
+#: Default history window. Appointments are overwhelmingly read forwards ("who is
+#: coming"), and an unbounded backwards scan is what made the page unopenable.
+#: Older rows stay reachable — pass `days=0` for everything, or page with offset.
+APPOINTMENTS_DEFAULT_DAYS = 90
+
+
 @router.get("/appointments")
 async def list_all_appointments(
     status: Optional[str] = None,
     clinic_id: Optional[str] = None,
+    days: int = APPOINTMENTS_DEFAULT_DAYS,
+    limit: int = APPOINTMENTS_PAGE_SIZE,
+    offset: int = 0,
     user: SuperAdmin = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """Super admin view of ALL appointments across all clinics."""
+    """Super admin view of appointments across all clinics.
+
+    Bounded by default (see APPOINTMENTS_PAGE_SIZE): ``days=0`` lifts the date
+    window, and ``limit``/``offset`` page through the rest. Returns an envelope
+    with ``total`` so the UI can say how many more there are.
+    """
     try:
+        limit = max(1, min(int(limit or APPOINTMENTS_PAGE_SIZE), APPOINTMENTS_MAX_PAGE_SIZE))
+        offset = max(0, int(offset or 0))
+
+        filters = []
+        if status:
+            filters.append(Appointment.status == status)
+        if clinic_id:
+            filters.append(Appointment.tenant_id == clinic_id)
+        if days and int(days) > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
+            filters.append(Appointment.slot_time >= cutoff)
+
+        # Counted with the same filters but no join/order/limit, so "showing 200
+        # of N" is honest without paying for the rows themselves.
+        count_stmt = select(func.count()).select_from(Appointment)
+        for f in filters:
+            count_stmt = count_stmt.where(f)
+        total = (await db.execute(count_stmt)).scalar() or 0
+
         # Outer-join Doctor so each row shows the real doctor name (was hardcoded
         # "—"). Outer (not inner) so an appointment whose doctor was removed still
         # lists rather than vanishing.
@@ -529,17 +580,15 @@ async def list_all_appointments(
             Tenant, Appointment.tenant_id == Tenant.id
         ).outerjoin(
             Doctor, Appointment.doctor_id == Doctor.id
-        ).order_by(Appointment.slot_time.desc())
-
-        if status:
-            stmt = stmt.where(Appointment.status == status)
-        if clinic_id:
-            stmt = stmt.where(Appointment.tenant_id == clinic_id)
+        )
+        for f in filters:
+            stmt = stmt.where(f)
+        stmt = stmt.order_by(Appointment.slot_time.desc()).limit(limit).offset(offset)
 
         result = await db.execute(stmt)
         rows = result.all()
 
-        return [
+        items = [
             {
                 "id": str(apt.id),
                 # Show the real captured patient name when present; otherwise fall
@@ -572,6 +621,15 @@ async def list_all_appointments(
             }
             for apt, tenant, doctor in rows
         ]
+        return {
+            "appointments": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(items) < total,
+            "days": int(days or 0),
+        }
     except Exception as e:
+        logger.exception("GET /admin/appointments failed")
         raise HTTPException(status_code=500, detail=str(e))
 

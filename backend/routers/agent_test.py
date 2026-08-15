@@ -3708,12 +3708,18 @@ async def call_anthropic(api_key: str, system_prompt: str,
 # the same models match llama-3.3-70b on this app's hardest task, emitting a
 # well-formed [ACTION: ...] tag 3/3. So these two knobs are not tuning, they
 # are the difference between "works" and "replies with nothing".
-_GROQ_REASONING_MODEL_MARKERS = ("gpt-oss", "qwen3", "deepseek-r1")
+# The marker list and the effort VALUE now live together in
+# services/llm_failover.py, because "which models are reasoning models" and "what
+# reasoning_effort each one accepts" are the same fact and were previously split.
+# The split had already broken one model: this tuple listed "qwen3" and the line
+# below sent "low", but qwen/qwen3.6-27b rejects "low" with
+#   400 "`reasoning_effort` must be one of `none` or `default`"
+# so every turn on that model failed outright. See GROQ_REASONING_EFFORT.
 _GROQ_REASONING_MIN_TOKENS = 800
 
 
 def is_groq_reasoning_model(model: str) -> bool:
-    return any(marker in (model or "").lower() for marker in _GROQ_REASONING_MODEL_MARKERS)
+    return llm_failover.is_reasoning_model(model)
 
 
 async def call_groq(api_key: str, system_prompt: str,
@@ -3734,8 +3740,9 @@ async def call_groq(api_key: str, system_prompt: str,
         "max_tokens": max_tokens,
         "temperature": 0.7,
     }
-    if is_groq_reasoning_model(model):
-        payload["reasoning_effort"] = "low"
+    effort = llm_failover.reasoning_effort_for(model)
+    if effort is not None:
+        payload["reasoning_effort"] = effort
         payload["max_tokens"] = max(max_tokens, _GROQ_REASONING_MIN_TOKENS)
 
     async with httpx.AsyncClient(timeout=30.0) as client:

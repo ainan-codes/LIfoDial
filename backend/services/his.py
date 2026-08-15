@@ -167,7 +167,29 @@ def parse_slot_datetime(date_str: str | None, time_str: str | None) -> datetime:
 
 # Simple in-memory cache for doctors (no Redis dependency)
 _doctor_cache: dict[str, tuple[float, list]] = {}
-_CACHE_TTL = 3600  # 1 hour
+
+#: Short ON PURPOSE, and the reason is process topology rather than staleness
+#: tolerance.
+#:
+#: This cache is a module-level dict, so each PROCESS has its own copy, and the
+#: voice agent runs in a different service from the API (Railway
+#: lifodial-agent-worker vs lifodial-backend). ``invalidate_doctor_cache`` is
+#: called correctly from every doctor write route — but it only ever clears the
+#: API process's copy. The worker that actually answers the phone never hears
+#: about it, so at the old 1-hour TTL a doctor added, deleted, or marked on leave
+#: in the dashboard took up to an hour to reach callers, and there was no action
+#: an operator could take to hurry it. Reported 2026-08-15 as a newly added
+#: doctor not being bookable.
+#:
+#: 60s makes the invalidation call a latency optimisation rather than the
+#: correctness mechanism it cannot be across processes. The cost is one small
+#: indexed SELECT per tenant per minute — and on the voice path it lands inside
+#: the per-utterance session_scope() (see BookingTranscriptTap), so it shares a
+#: connection rather than paying its own Supabase handshake.
+#:
+#: The real fix is cross-process invalidation via backend/redis_client.py; that
+#: needs Redis provisioned, which it is not. Revisit when it is.
+_CACHE_TTL = 60
 
 
 async def _get_cached_doctors(tenant_id: str) -> List[Dict[str, Any]] | None:

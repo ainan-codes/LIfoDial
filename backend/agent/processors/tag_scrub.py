@@ -53,6 +53,24 @@ _COMPLETE_TAG_RE = re.compile(
 )
 
 
+def _is_speakable(text: str) -> bool:
+    """Is there anything here a speech service could actually pronounce?
+
+    Whitespace and punctuation are not. A speech service does not treat that as
+    an empty no-op — it REJECTS the request, and on this stack the rejection
+    becomes an ErrorFrame that spends one of the caller's limited fallback
+    utterances (Sarvam: "400: Text must contain at least one character from the
+    allowed languages").
+
+    Deliberately script-agnostic: ``str.isalnum()`` is true for Devanagari,
+    Malayalam, Tamil, Kannada, Telugu and Latin alike, so this asks "is there a
+    letter or a digit" and never "is it in the configured language". Judging the
+    script here would silently drop a correct reply that happens to quote an
+    English word, which is a normal thing for these agents to do.
+    """
+    return any(ch.isalnum() for ch in (text or ""))
+
+
 def _could_start_a_tag(fragment: str) -> bool:
     """True if `fragment` (which starts with '[') could still grow into a
     machine tag — i.e. what follows the bracket so far is a prefix of one of
@@ -99,6 +117,26 @@ class TagScrubProcessor(FrameProcessor):
         # immediately — never held.
         if isinstance(frame, TTSSpeakFrame):
             frame.text = scrub_spoken_text(frame.text).strip()
+            if not _is_speakable(frame.text):
+                # Nothing left to say. Forwarding it anyway is not harmless: a
+                # speech service REJECTS text with no pronounceable content, and
+                # Sarvam's rejection is an ErrorFrame —
+                #   "400: Text must contain at least one character from the
+                #    allowed languages"
+                # — which travels upstream to ResilienceProcessor and spends one
+                # of the caller's four fallback utterances on a frame that was
+                # empty to begin with. Seen live 2026-08-15, twice in one turn.
+                #
+                # The TextFrame path has always dropped these (see
+                # _handle_text_frame's `if not emit.strip()`); this branch, which
+                # carries every constant the system speaks on its own behalf —
+                # the booking confirmation, the in-progress filler, the silence
+                # backstop — did not.
+                logger.warning(
+                    "Dropped an unspeakable TTSSpeakFrame before TTS (nothing "
+                    "pronounceable after scrubbing).",
+                )
+                return
             await self.push_frame(frame, direction)
             return
 

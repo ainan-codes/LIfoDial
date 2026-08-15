@@ -60,21 +60,40 @@ export default function SAAppointments() {
   const [channelFilter, setChannelFilter] = useState('All');
   const [sortBy, setSortBy] = useState<'slot_time' | 'clinic_name'>('slot_time');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  // Paging state. The page loads a recent window by default (the endpoint's
+  // `days`) and reveals the rest on demand, because loading all history at once
+  // is what made it time out.
+  const [days, setDays] = useState(90);
+  const [total, setTotal] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
 
   useEffect(() => {
     fetchAppointments();
   }, []);
 
-  async function fetchAppointments() {
-    setLoading(true);
+  async function fetchAppointments(opts: { append?: boolean; days?: number } = {}) {
+    const nextOffset = opts.append ? appointments.length : 0;
+    if (opts.append) setLoadingMore(true);
+    else setLoading(true);
     setError(null);
     try {
-      const data = await fetchWithAuth(`/admin/appointments`);
-      const rows = Array.isArray(data) ? data : [];
+      const windowDays = opts.days ?? days;
+      const data = await fetchWithAuth(
+        `/admin/appointments?days=${windowDays}&offset=${nextOffset}`,
+      );
+      // The endpoint returns an envelope now ({appointments, total, has_more}).
+      // It used to return a bare array — and it returned EVERY appointment for
+      // every clinic for all time, which is what made this page time out. The
+      // Array.isArray branch keeps this working against an older backend during
+      // a rolling deploy.
+      const rows = Array.isArray(data) ? data : (data?.appointments ?? []);
+      setTotal(Array.isArray(data) ? rows.length : (data?.total ?? rows.length));
+      setHasMore(Array.isArray(data) ? false : Boolean(data?.has_more));
       // Normalise the backend's lowercase status ("confirmed") to the Title-case
       // the UI compares against — this is what makes the summary cards count
       // correctly instead of all reading 0.
-      setAppointments(rows.map((a: any): SAAppointment => ({
+      const mapped = rows.map((a: any): SAAppointment => ({
         id: a.id,
         patient_name: a.patient_name || '—',
         patient_phone: a.patient_phone || '—',
@@ -86,13 +105,15 @@ export default function SAAppointments() {
         source: (a.source || 'unknown').toLowerCase(),
         duration: a.duration,
         wasRescheduled: Boolean(a.rescheduled_at),
-      })));
+      }));
+      setAppointments(prev => (opts.append ? [...prev, ...mapped] : mapped));
     } catch (e: any) {
       // No mock fallback — show an honest error and an empty table.
       setError(e?.message || 'Failed to load appointments');
-      setAppointments([]);
+      if (!opts.append) setAppointments([]);
     } finally {
       setLoading(false);
+      setLoadingMore(false);
     }
   }
 
@@ -168,7 +189,7 @@ export default function SAAppointments() {
           </p>
         </div>
         <button
-          onClick={fetchAppointments}
+          onClick={() => fetchAppointments()}
           style={{ ...sel, display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600 }}
         >
           <Clock size={14} /> Refresh
@@ -214,12 +235,30 @@ export default function SAAppointments() {
           <option value="All">All Channels</option>
           {channels.map(c => <option key={c} value={c}>{c}</option>)}
         </select>
+        {/* The date window is a server-side filter, not a client one: it is what
+            keeps the query bounded. Changing it refetches. */}
+        <select
+          value={days}
+          onChange={e => { const d = Number(e.target.value); setDays(d); fetchAppointments({ days: d }); }}
+          style={sel}
+        >
+          <option value={30}>Last 30 days</option>
+          <option value={90}>Last 90 days</option>
+          <option value={365}>Last year</option>
+          <option value={0}>All time</option>
+        </select>
       </div>
 
       {/* Error banner */}
       {error && (
-        <div style={{ backgroundColor: '#EF444410', border: '1px solid #EF444430', borderRadius: '8px', padding: '12px 16px', color: '#EF4444', fontSize: '13px' }}>
-          ⚠️ Could not load appointments: {error}
+        <div style={{ backgroundColor: '#EF444410', border: '1px solid #EF444430', borderRadius: '8px', padding: '12px 16px', color: '#EF4444', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <span>⚠️ Could not load appointments: {error}</span>
+          <button
+            onClick={() => fetchAppointments()}
+            style={{ marginLeft: 'auto', backgroundColor: '#EF444420', border: '1px solid #EF444450', color: '#EF4444', borderRadius: '6px', padding: '4px 12px', fontSize: '12px', cursor: 'pointer' }}
+          >
+            Retry
+          </button>
         </div>
       )}
 
@@ -333,11 +372,32 @@ export default function SAAppointments() {
         )}
       </div>
 
-      {/* Pagination info */}
+      {/* Pagination info. `total` is the server's count for the current window,
+          so "of N" stays honest even though only a page has been loaded. */}
       {!loading && filtered.length > 0 && (
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', color: '#555', fontSize: '12px' }}>
-          <span>Showing {filtered.length} results</span>
+          <span>
+            Showing {filtered.length}
+            {total > appointments.length ? ` of ${total}` : ''} results
+          </span>
           <span>Sort by: <strong style={{ color: '#888' }}>{sortBy === 'slot_time' ? 'Date' : 'Clinic'}</strong> ({sortDir})</span>
+        </div>
+      )}
+
+      {/* Load more — the rest of the window, a page at a time. */}
+      {!loading && hasMore && (
+        <div style={{ display: 'flex', justifyContent: 'center' }}>
+          <button
+            onClick={() => fetchAppointments({ append: true })}
+            disabled={loadingMore}
+            style={{
+              backgroundColor: '#1A1A1A', border: '1px solid #2E2E2E', color: '#888',
+              borderRadius: '8px', padding: '8px 20px', fontSize: '13px',
+              cursor: loadingMore ? 'default' : 'pointer',
+            }}
+          >
+            {loadingMore ? 'Loading…' : `Load more (${total - appointments.length} remaining)`}
+          </button>
         </div>
       )}
 
