@@ -1451,10 +1451,25 @@ async def _build_availability_note(
             "Ask the caller for a different day."
         )
 
-    times = ", ".join(format_ist_clock(to_ist(s)) for s in slots[:5])
+    # Read out one slot per part of the day instead of every open slot —
+    # rattling off 5 raw times ate seconds of caller time for no reason.
+    morning, afternoon, evening = [], [], []
+    for s in slots:
+        hour = to_ist(s).hour
+        if hour < 12:
+            morning.append(s)
+        elif hour < 17:
+            afternoon.append(s)
+        else:
+            evening.append(s)
+
+    sample = [bucket[0] for bucket in (morning, afternoon, evening) if bucket]
+    times = ", ".join(format_ist_clock(to_ist(s)) for s in sample)
     return (
-        f"[AVAILABILITY_NOTE] {name} is only actually open at these times that day: {times}. "
-        "Only offer these specific times to the caller — never invent a nearby time."
+        f"[AVAILABILITY_NOTE] {name} has open slots that day; here is one example from each "
+        f"part of the day so you can offer a couple of options, not a full list: {times}. "
+        "Only offer these specific times to the caller — never invent a nearby time. "
+        "Mention at most two or three of them, not all of them."
     )
 
 
