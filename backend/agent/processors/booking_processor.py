@@ -1588,34 +1588,41 @@ async def _commit_action_to_db(
     Routes through his.execute_booking_action — the SAME function the
     chat/embed path uses — so voice and chat share one real, doctor/DB-backed
     implementation instead of drifting into two.
+
+    Wrapped in one session_scope() so _mark_call_action reuses the connection
+    execute_booking_action already opened instead of paying a second ~2.3s
+    Supabase handshake for what is otherwise the same logical commit (mirrors
+    his.execute_booking_action's own docstring on connection count).
     """
     try:
+        from backend.db import session_scope
         from backend.services.his import execute_booking_action  # Lazy import — avoids circular deps
 
         from backend.models.appointment import SOURCE_VOICE
 
-        result = await execute_booking_action(
-            action=action,
-            tenant_id=tenant_id,
-            name=patient_name,
-            phone=patient_phone,
-            date_str=new_slot_day or "",
-            time_str=new_slot_time or "",
-            doctor_name="",
-            call_id=call_record_id,
-            source=SOURCE_VOICE,
-        )
-        if not result.get("success"):
-            logger.warning("[BookingProcessor] %s failed: %s", action, result)
-            return False, result
-        logger.info(
-            "[BookingProcessor] %s committed: appointment_id=%s reason=%s",
-            action, result.get("appointment_id"), result.get("reason") or "-",
-        )
-        # A no-op reschedule succeeded without changing the appointment, so the
-        # call outcome must not be recorded as "rescheduled".
-        if result.get("reason") != "already_at_that_time":
-            await _mark_call_action(call_record_id, action)
+        async with session_scope():
+            result = await execute_booking_action(
+                action=action,
+                tenant_id=tenant_id,
+                name=patient_name,
+                phone=patient_phone,
+                date_str=new_slot_day or "",
+                time_str=new_slot_time or "",
+                doctor_name="",
+                call_id=call_record_id,
+                source=SOURCE_VOICE,
+            )
+            if not result.get("success"):
+                logger.warning("[BookingProcessor] %s failed: %s", action, result)
+                return False, result
+            logger.info(
+                "[BookingProcessor] %s committed: appointment_id=%s reason=%s",
+                action, result.get("appointment_id"), result.get("reason") or "-",
+            )
+            # A no-op reschedule succeeded without changing the appointment, so the
+            # call outcome must not be recorded as "rescheduled".
+            if result.get("reason") != "already_at_that_time":
+                await _mark_call_action(call_record_id, action)
         return True, result
     except Exception as exc:
         logger.error(
@@ -1637,10 +1644,10 @@ async def _mark_call_action(call_record_id: Optional[str], action: str) -> None:
     try:
         from sqlalchemy import update
 
-        from backend.db import AsyncSessionLocal
+        from backend.db import scoped_session
         from backend.models.call_record import CallRecord
 
-        async with AsyncSessionLocal() as db:
+        async with scoped_session() as db:
             await db.execute(
                 update(CallRecord)
                 .where(CallRecord.id == call_record_id)
