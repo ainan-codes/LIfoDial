@@ -1503,34 +1503,40 @@ async def _commit_booking_to_db(
     NULL name can never match.
     """
     try:
+        from backend.db import session_scope
         from backend.services.his import create_appointment  # Lazy import — avoids circular deps
 
         from backend.models.appointment import SOURCE_VOICE
 
-        result = await create_appointment(
-            tenant_id=tenant_id,
-            doctor_id=doctor_id,
-            slot_time=slot_time,
-            slot_date=slot_date,
-            patient_phone=patient_phone,
-            patient_name=patient_name,
-            call_id=call_record_id,
-            source=SOURCE_VOICE,
-        )
-        if not result or not result.get("appointment_id"):
-            logger.error("[BookingProcessor] create_appointment returned no appointment_id: %r", result)
-            return False, (result or {})
-        logger.info(
-            "[BookingProcessor] Appointment saved: id=%s doctor=%s slot=%s",
-            result.get("appointment_id"),
-            result.get("doctor_name"),
-            slot_time,
-        )
-        # Record the booking on the call itself so platform analytics reflect
-        # reality: Overview's resolution rate and the All Calls status read
-        # call_records.outcome, which was never set on a successful booking → a
-        # clinic with real bookings showed 0% resolution (audit P3).
-        await _mark_call_booked(call_record_id)
+        async with session_scope():
+            result = await create_appointment(
+                tenant_id=tenant_id,
+                doctor_id=doctor_id,
+                slot_time=slot_time,
+                slot_date=slot_date,
+                patient_phone=patient_phone,
+                patient_name=patient_name,
+                call_id=call_record_id,
+                source=SOURCE_VOICE,
+            )
+            if not result or not result.get("appointment_id"):
+                logger.error("[BookingProcessor] create_appointment returned no appointment_id: %r", result)
+                return False, (result or {})
+            logger.info(
+                "[BookingProcessor] Appointment saved: id=%s doctor=%s slot=%s",
+                result.get("appointment_id"),
+                result.get("doctor_name"),
+                slot_time,
+            )
+            # Record the booking on the call itself so platform analytics reflect
+            # reality: Overview's resolution rate and the All Calls status read
+            # call_records.outcome, which was never set on a successful booking → a
+            # clinic with real bookings showed 0% resolution (audit P3).
+            #
+            # Reuses create_appointment's connection (session_scope nests) instead
+            # of opening a second ~2.3s Supabase handshake for this bookkeeping
+            # write, mirroring the same fix applied to the cancel/reschedule path.
+            await _mark_call_booked(call_record_id)
         return True, result
     except Exception as exc:
         logger.error(
@@ -1556,10 +1562,10 @@ async def _mark_call_booked(call_record_id: Optional[str]) -> None:
     try:
         from sqlalchemy import update
 
-        from backend.db import AsyncSessionLocal
+        from backend.db import scoped_session
         from backend.models.call_record import CallRecord
 
-        async with AsyncSessionLocal() as db:
+        async with scoped_session() as db:
             await db.execute(
                 update(CallRecord)
                 .where(CallRecord.id == call_record_id)
